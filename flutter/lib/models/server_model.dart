@@ -61,6 +61,8 @@ class ServerModel with ChangeNotifier {
 
   bool get showElevation => _showElevation;
 
+  bool get hidecm => _hideCm;
+  
   int get connectStatus => _connectStatus;
 
   String get verificationMethod {
