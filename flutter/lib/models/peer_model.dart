@@ -247,11 +247,29 @@ class Peers extends ChangeNotifier {
   }
 
   List<Peer> _decodePeers(String peersStr) {
+    final isRecent = 'load_recent_peers' == loadEvent;
+
     try {
       if (peersStr == "") return [];
       List<dynamic> peers = json.decode(peersStr);
       return peers.map((peer) {
-        return Peer.fromJson(peer as Map<String, dynamic>);
+        final peer2 = peer as Map<String, dynamic>;
+        final p = Peer.fromJson(peer2);
+        if (isRecent) {
+          if (p.username.trim().isEmpty) {
+            debugPrint('test load peers ======================= load, empty username ${p.id}, original username: ${peer2['username']}');
+          }
+          if (p.hostname.trim().isEmpty) {
+            debugPrint('test load peers ======================= load, empty hostname ${p.id}, original hostname: ${peer2['hostname']}');
+          }
+          if (p.platform.trim().isEmpty) {
+            debugPrint('test load peers ======================= load, empty platform ${p.id}, original platform: ${peer2['platform']}');
+          }
+          if (p.id == "77939181") {
+            debugPrint('test load peers ======================= load, 77939181, ${p.platform}, ${p.hostname}, ${p.username}');
+          }
+        }
+        return p;
       }).toList();
     } catch (e) {
       debugPrint('peers(): $e');

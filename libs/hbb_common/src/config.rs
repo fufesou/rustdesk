@@ -1317,6 +1317,23 @@ impl PeerConfig {
                     .filter(|p| !p.2.info.platform.is_empty())
                     .collect();
                 peers.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+                println!("test load peers ======================= load peers");
+                for (id, _, p) in &peers {
+                    if p.info.platform.is_empty() {
+                        println!("test load peers ======================= empty platform {}", id);
+                    }
+                    if p.info.hostname.is_empty() {
+                        println!("test load peers ======================= empty hostname {}", id);
+                    }
+                    if p.info.username.is_empty() {
+                        println!("test load peers ======================= empty username {}", id);
+                    }
+                    if id == "77939181" {
+                        println!("test load peers ======================= 77939181, {}, {}, {}", p.info.platform, p.info.hostname, p.info.username);
+                    }
+                }
+
                 return peers;
             }
         }

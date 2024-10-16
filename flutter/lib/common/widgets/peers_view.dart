@@ -460,10 +460,28 @@ class RecentPeersView extends BasePeersView {
       : super(
           key: key,
           peerTabIndex: PeerTabIndex.recent,
-          peerCardBuilder: (Peer peer) => RecentPeerCard(
-            peer: peer,
-            menuPadding: menuPadding,
-          ),
+          peerCardBuilder: (Peer peer) {
+            if (peer.username.trim().isEmpty) {
+              debugPrint(
+                  'test load peers ======================= before build card, empty username ${peer.id}}');
+            }
+            if (peer.hostname.trim().isEmpty) {
+              debugPrint(
+                  'test load peers ======================= before build card, empty hostname ${peer.id}}');
+            }
+            if (peer.platform.trim().isEmpty) {
+              debugPrint(
+                  'test load peers ======================= before build card, empty platform ${peer.id}');
+            }
+            if (peer.id == "77939181") {
+              debugPrint(
+                  'test load peers ======================= before build card, 77939181, ${peer.platform}, ${peer.hostname}, ${peer.username}');
+            }
+            return RecentPeerCard(
+              peer: peer,
+              menuPadding: menuPadding,
+            );
+          },
         );
 
   @override
