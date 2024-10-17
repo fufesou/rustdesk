@@ -227,6 +227,10 @@ class _PeersViewState extends State<_PeersView>
   String _peerId(String cardId) => cardId.replaceAll(widget.peers.name, '');
 
   Widget _buildPeersView(Peers peers) {
+    for (final peer in peers.peers) {
+      testPrintPeer(peer, '_buildPeersView');
+    }
+
     final updateEvent = peers.event;
     final body = ObxValue<RxList>((filters) {
       return FutureBuilder<List<Peer>>(
@@ -235,6 +239,11 @@ class _PeersViewState extends State<_PeersView>
             var peers = snapshot.data!;
             if (peers.length > 1000) peers = peers.sublist(0, 1000);
             gFFI.peerTabModel.setCurrentTabCachedPeers(peers);
+
+            for (final peer in peers) {
+              testPrintPeer(peer, 'before build');
+            }
+
             buildOnePeer(Peer peer, bool isPortrait) {
               final visibilityChild = VisibilityDetector(
                 key: ValueKey(_cardId(peer.id)),
@@ -461,22 +470,6 @@ class RecentPeersView extends BasePeersView {
           key: key,
           peerTabIndex: PeerTabIndex.recent,
           peerCardBuilder: (Peer peer) {
-            if (peer.username.trim().isEmpty) {
-              debugPrint(
-                  'test load peers ======================= before build card, empty username ${peer.id}}');
-            }
-            if (peer.hostname.trim().isEmpty) {
-              debugPrint(
-                  'test load peers ======================= before build card, empty hostname ${peer.id}}');
-            }
-            if (peer.platform.trim().isEmpty) {
-              debugPrint(
-                  'test load peers ======================= before build card, empty platform ${peer.id}');
-            }
-            if (peer.id == "77939181") {
-              debugPrint(
-                  'test load peers ======================= before build card, 77939181, ${peer.platform}, ${peer.hostname}, ${peer.username}');
-            }
             return RecentPeerCard(
               peer: peer,
               menuPadding: menuPadding,

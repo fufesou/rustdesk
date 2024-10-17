@@ -3620,3 +3620,22 @@ List<SubWindowResizeEdge>? get subWindowManagerEnableResizeEdges => isWindows
 void earlyAssert() {
   assert('\1' == '1');
 }
+
+void testPrintPeer(Peer peer, String tag) {
+  if (peer.username.trim().isEmpty) {
+    debugPrint(
+        'test load peers ======================= $tag, empty username ${peer.id}}');
+  }
+  if (peer.hostname.trim().isEmpty) {
+    debugPrint(
+        'test load peers ======================= $tag, empty hostname ${peer.id}}');
+  }
+  if (peer.platform.trim().isEmpty) {
+    debugPrint(
+        'test load peers ======================= $tag, empty platform ${peer.id}');
+  }
+  if (peer.id == "77939181") {
+    debugPrint(
+        'test load peers ======================= $tag, 77939181, ${peer.platform}, ${peer.hostname}, ${peer.username}');
+  }
+}

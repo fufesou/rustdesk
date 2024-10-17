@@ -208,6 +208,12 @@ class _PeerCardState extends State<_PeerCard>
     );
   }
 
+  printPeer(Peer peer, bool isTile) {
+    if (widget.tab == PeerTabIndex.recent) {
+      testPrintPeer(peer, 'build ${isTile ? 'tile' : 'card'}');
+    }
+  }
+
   Widget _buildPeerTile(
       BuildContext context, Peer peer, Rx<BoxDecoration?>? deco) {
     hideUsernameOnCard ??=
@@ -215,6 +221,7 @@ class _PeerCardState extends State<_PeerCard>
     final colors = _frontN(peer.tags, 25)
         .map((e) => gFFI.abModel.getCurrentAbTagColor(e))
         .toList();
+    printPeer(peer, true);
     return Tooltip(
       message: !(isDesktop || isWebDesktop)
           ? ''
@@ -249,24 +256,7 @@ class _PeerCardState extends State<_PeerCard>
     final name = hideUsernameOnCard == true
         ? peer.hostname
         : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
-    if (widget.tab == PeerTabIndex.recent) {
-      if (peer.username.trim().isEmpty) {
-        debugPrint(
-            'test load peers ======================= build card, empty username ${peer.id}}');
-      }
-      if (peer.hostname.trim().isEmpty) {
-        debugPrint(
-            'test load peers ======================= build card, empty hostname ${peer.id}}');
-      }
-      if (peer.platform.trim().isEmpty) {
-        debugPrint(
-            'test load peers ======================= build card, empty platform ${peer.id}');
-      }
-      if (peer.id == "77939181") {
-        debugPrint(
-            'test load peers ======================= build card, 77939181, ${peer.platform}, ${peer.hostname}, ${peer.username}');
-      }
-    }
+    printPeer(peer, false);
     final child = Card(
       color: Colors.transparent,
       elevation: 0,
