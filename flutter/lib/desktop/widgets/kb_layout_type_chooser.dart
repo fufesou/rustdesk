@@ -137,7 +137,7 @@ class KBLayoutTypeChooser extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final imageWidth = width / 2 - dividerWidth;
+    final imageWidth = width / 2 - dividerWidth - (isMobile ? 30 : 0);
     return SizedBox(
       width: width,
       height: height,
@@ -168,6 +168,10 @@ class KBLayoutTypeChooser extends StatelessWidget {
 
 RxString KBLayoutType = ''.obs;
 
+refreshKBLayoutType() {
+  KBLayoutType.value = bind.getLocalKbLayoutType();
+}
+
 String getLocalPlatformForKBLayoutType(String peerPlatform) {
   String localPlatform = '';
   if (peerPlatform != kPeerPlatformMacOS) {
@@ -178,6 +182,10 @@ String getLocalPlatformForKBLayoutType(String peerPlatform) {
     localPlatform = kPeerPlatformWindows;
   } else if (isLinux) {
     localPlatform = kPeerPlatformLinux;
+  } else if (isAndroid) {
+    localPlatform = kPeerPlatformAndroid;
+  } else if (isIOS) {
+    localPlatform = kPeerPlatformIOS;
   } else if (isWebOnWindows || isWebOnLinux) {
     localPlatform = kPeerPlatformWebDesktop;
   }
@@ -205,14 +213,25 @@ showKBLayoutTypeChooser(
   OverlayDialogManager dialogManager,
 ) {
   dialogManager.show((setState, close, context) {
+    final platform = localPlatform != kPeerPlatformAndroid &&
+            localPlatform != kPeerPlatformIOS
+        ? ' ($localPlatform)'
+        : '';
+    var width = 360.0;
+    final height = 200.0;
+    if (isMobile) {
+      final w = MediaQuery.of(context).size.width - 100;
+      if (w < width) {
+        width = w;
+      }
+    }
     return CustomAlertDialog(
-      title:
-          Text('${translate('Select local keyboard type')} ($localPlatform)'),
+      title: Text('${translate('Select local keyboard type')}$platform'),
       content: KBLayoutTypeChooser(
           chosenType: KBLayoutType,
-          width: 360,
-          height: 200,
-          dividerWidth: 4.0,
+          width: width,
+          height: height,
+          dividerWidth: isMobile ? 1.0 : 4.0,
           cb: (String v) async {
             await bind.setLocalKbLayoutType(kbLayoutType: v);
             KBLayoutType.value = bind.getLocalKbLayoutType();

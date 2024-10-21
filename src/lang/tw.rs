@@ -652,5 +652,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Upload folder", "上傳資料夾"),
         ("Upload files", "上傳檔案"),
         ("Clipboard is synchronized", ""),
+        ("Soft keyboard", ""),
     ].iter().cloned().collect();
 }

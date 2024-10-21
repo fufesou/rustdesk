@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
 import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/desktop/widgets/kb_layout_type_chooser.dart';
 import 'package:flutter_hbb/mobile/widgets/gesture_help.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
@@ -43,6 +44,7 @@ class _RemotePageState extends State<RemotePage> {
   bool _showGestureHelp = false;
   String _value = '';
   Orientation? _currentOrientation;
+  bool _isLayoutTypeInited = false;
 
   final _blockableOverlayState = BlockableOverlayState();
 
@@ -207,7 +209,7 @@ class _RemotePageState extends State<RemotePage> {
   }
 
   void _handleNonIOSSoftKeyboardInput(String newValue) {
-        _composingTimer?.cancel();
+    _composingTimer?.cancel();
     if (_textController.value.isComposingRangeValid) {
       _composingTimer = Timer(Duration(milliseconds: 25), () {
         _handleNonIOSSoftKeyboardInput(_textController.value.text);
@@ -274,6 +276,69 @@ class _RemotePageState extends State<RemotePage> {
       char = 'VK_SPACE';
     }
     inputModel.inputKey(char);
+  }
+
+  showKeyboardOptions() async {
+    if (!_isLayoutTypeInited) {
+      refreshKBLayoutType();
+      _isLayoutTypeInited = true;
+    }
+
+    makeKeyboardMenu(Widget child, Widget? icon, VoidCallback onPressed) =>
+        TTextMenu(
+          child: child,
+          trailingIcon: icon == null
+              ? null
+              : Transform.scale(
+                  scale: (isDesktop || isWebDesktop) ? 0.8 : 1,
+                  child: IgnorePointer(
+                    child: IconButton(
+                      onPressed: null,
+                      icon: icon,
+                    ),
+                  ),
+                ),
+          onPressed: onPressed,
+        );
+
+    final menus = [
+      makeKeyboardMenu(
+          Text('${translate('Local keyboard type')}: ${KBLayoutType.value}'),
+          Icon(Icons.settings, color: MyTheme.accent),
+          () => showKBLayoutTypeChooser(
+              getLocalPlatformForKBLayoutType(gFFI.ffiModel.pi.platform),
+              gFFI.dialogManager)),
+      makeKeyboardMenu(
+          Text(translate('Soft keyboard')), null, openKeyboard)
+    ];
+
+    final menuItems = menus
+        .asMap()
+        .entries
+        .map((e) => PopupMenuItem<int>(child: e.value.getChild(), value: e.key))
+        .toList();
+    Future.delayed(Duration.zero, () async {
+      final size = MediaQuery.of(context).size;
+      final x = 120.0;
+      final y = size.height;
+      var index = await showMenu(
+        context: context,
+        position: RelativeRect.fromLTRB(x, y, x, y),
+        items: menuItems,
+        elevation: 8,
+      );
+      if (index != null && index < menus.length) {
+        menus[index].onPressed.call();
+      }
+    });
+  }
+
+  void onKeyboardPressed() {
+    if (gFFI.ffiModel.pi.platform == kPeerPlatformMacOS) {
+      showKeyboardOptions();
+    } else {
+      openKeyboard();
+    }
   }
 
   void openKeyboard() {
@@ -447,7 +512,7 @@ class _RemotePageState extends State<RemotePage> {
                               IconButton(
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
-                                  onPressed: openKeyboard),
+                                  onPressed: onKeyboardPressed),
                               IconButton(
                                 color: Colors.white,
                                 icon: const Icon(Icons.build),
@@ -459,7 +524,7 @@ class _RemotePageState extends State<RemotePage> {
                               IconButton(
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
-                                  onPressed: openKeyboard),
+                                  onPressed: onKeyboardPressed),
                               IconButton(
                                 color: Colors.white,
                                 icon: Icon(gFFI.ffiModel.touchMode
