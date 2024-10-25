@@ -1,20 +1,28 @@
 use super::{PrivacyMode, INVALID_PRIVACY_MODE_CONN_ID};
 use crate::{platform::windows::get_user_token, privacy_mode::PrivacyModeState};
-use hbb_common::{allow_err, bail, log, ResultType};
+use hbb_common::{
+    allow_err, bail,
+    dlopen::{
+        symbor::{Library, Symbol},
+        Error as LibError,
+    },
+    log, ResultType,
+};
 use std::{
     ffi::CString,
     io::Error,
+    os::raw::{c_char, c_int, c_ulong, c_void},
     time::{Duration, Instant},
 };
 use winapi::{
     shared::{
-        minwindef::FALSE,
+        minwindef::{FALSE, HMODULE},
         ntdef::{HANDLE, NULL},
         windef::HWND,
     },
     um::{
         handleapi::CloseHandle,
-        libloaderapi::{GetModuleHandleA, GetProcAddress},
+        libloaderapi::{GetModuleHandleA, GetModuleHandleExA, GetProcAddress, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT},
         memoryapi::{VirtualAllocEx, WriteProcessMemory},
         processthreadsapi::{
             CreateProcessAsUserW, QueueUserAPC, ResumeThread, TerminateProcess,
@@ -32,6 +40,13 @@ pub const ORIGIN_PROCESS_EXE: &'static str = "C:\\Windows\\System32\\RuntimeBrok
 pub const WIN_TOPMOST_INJECTED_PROCESS_EXE: &'static str = "RuntimeBroker_rustdesk.exe";
 pub const INJECTED_PROCESS_EXE: &'static str = WIN_TOPMOST_INJECTED_PROCESS_EXE;
 pub(super) const PRIVACY_WINDOW_NAME: &'static str = "RustDeskPrivacyWindow";
+
+pub type APIPrivacyMode = unsafe extern "C" fn(lpParam: *mut c_void) -> c_ulong;
+
+#[cfg(target_os = "windows")]
+lazy_static::lazy_static! {
+    pub static ref PRIVACY_WINDOW_PLUGIN: Result<Library, LibError> = Library::open("WindowInjection.dll");
+}
 
 struct WindowHandlers {
     hthread: u64,
@@ -102,13 +117,13 @@ impl PrivacyMode for PrivacyModeImpl {
             );
         }
 
-        if self.handlers.is_default() {
-            log::info!("turn_on_privacy, dll not found when started, try start");
-            self.start()?;
-            std::thread::sleep(std::time::Duration::from_millis(1_000));
-        }
+        // if self.handlers.is_default() {
+        //     log::info!("turn_on_privacy, dll not found when started, try start");
+        //     self.start()?;
+        //     std::thread::sleep(std::time::Duration::from_millis(1_000));
+        // }
 
-        let hwnd = wait_find_privacy_hwnd(0)?;
+        let hwnd = wait_find_privacy_hwnd(1_000)?;
         if hwnd.is_null() {
             bail!("No privacy window created");
         }
@@ -219,86 +234,130 @@ impl PrivacyModeImpl {
             .to_string();
 
         unsafe {
-            let cmd_utf16: Vec<u16> = cmdline.encode_utf16().chain(Some(0).into_iter()).collect();
+            // let cmd_utf16: Vec<u16> = cmdline.encode_utf16().chain(Some(0).into_iter()).collect();
 
-            let mut start_info = STARTUPINFOW {
-                cb: 0,
-                lpReserved: NULL as _,
-                lpDesktop: NULL as _,
-                lpTitle: NULL as _,
-                dwX: 0,
-                dwY: 0,
-                dwXSize: 0,
-                dwYSize: 0,
-                dwXCountChars: 0,
-                dwYCountChars: 0,
-                dwFillAttribute: 0,
-                dwFlags: 0,
-                wShowWindow: 0,
-                cbReserved2: 0,
-                lpReserved2: NULL as _,
-                hStdInput: NULL as _,
-                hStdOutput: NULL as _,
-                hStdError: NULL as _,
+            // let mut start_info = STARTUPINFOW {
+            //     cb: 0,
+            //     lpReserved: NULL as _,
+            //     lpDesktop: NULL as _,
+            //     lpTitle: NULL as _,
+            //     dwX: 0,
+            //     dwY: 0,
+            //     dwXSize: 0,
+            //     dwYSize: 0,
+            //     dwXCountChars: 0,
+            //     dwYCountChars: 0,
+            //     dwFillAttribute: 0,
+            //     dwFlags: 0,
+            //     wShowWindow: 0,
+            //     cbReserved2: 0,
+            //     lpReserved2: NULL as _,
+            //     hStdInput: NULL as _,
+            //     hStdOutput: NULL as _,
+            //     hStdError: NULL as _,
+            // };
+            // let mut proc_info = PROCESS_INFORMATION {
+            //     hProcess: NULL as _,
+            //     hThread: NULL as _,
+            //     dwProcessId: 0,
+            //     dwThreadId: 0,
+            // };
+
+            // let session_id = WTSGetActiveConsoleSessionId();
+            // let token = get_user_token(session_id, true);
+            // if token.is_null() {
+            //     bail!("Failed to get token of current user");
+            // }
+
+            // let create_res = CreateProcessAsUserW(
+            //     token,
+            //     NULL as _,
+            //     cmd_utf16.as_ptr() as _,
+            //     NULL as _,
+            //     NULL as _,
+            //     FALSE,
+            //     CREATE_SUSPENDED | DETACHED_PROCESS,
+            //     NULL,
+            //     NULL as _,
+            //     &mut start_info,
+            //     &mut proc_info,
+            // );
+            // CloseHandle(token);
+            // if 0 == create_res {
+            //     bail!(
+            //         "Failed to create privacy window process {}, error {}",
+            //         cmdline,
+            //         Error::last_os_error()
+            //     );
+            // };
+
+            // inject_dll(
+            //     proc_info.hProcess,
+            //     proc_info.hThread,
+            //     dll_file.to_string_lossy().as_ref(),
+            // )?;
+
+            // if 0xffffffff == ResumeThread(proc_info.hThread) {
+            //     // CloseHandle
+            //     CloseHandle(proc_info.hThread);
+            //     CloseHandle(proc_info.hProcess);
+
+            //     bail!(
+            //         "Failed to create privacy window process, error {}",
+            //         Error::last_os_error()
+            //     );
+            // }
+
+            // self.handlers.hthread = proc_info.hThread as _;
+            // self.handlers.hprocess = proc_info.hProcess as _;
+
+            let api_privacy_mode = match &*PRIVACY_WINDOW_PLUGIN {
+                Ok(lib) => {
+                    let find_sym_res = unsafe { lib.symbol::<APIPrivacyMode>("UwU") };
+                    match find_sym_res {
+                        Ok(sym) => Some(sym),
+                        Err(e) => {
+                            log::error!("Failed to find symbol UwU, {e}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to load texture rgba renderer plugin, {e}");
+                    None
+                }
             };
-            let mut proc_info = PROCESS_INFORMATION {
-                hProcess: NULL as _,
-                hThread: NULL as _,
-                dwProcessId: 0,
-                dwThreadId: 0,
-            };
+            if let Some(api_privacy_mode) = api_privacy_mode {
+                // HMODULE hInstance = nullptr;
+                // BOOL result =
+                //     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                //         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                //         reinterpret_cast<char*>(&DefWindowProc), &hInstance);
+                // if (FALSE == result)
+                // {
+                //     printf("Failed to GetModuleHandleExA, 0x%x\n", GetLastError());
+                //     return 0;
+                // }
 
-            let session_id = WTSGetActiveConsoleSessionId();
-            let token = get_user_token(session_id, true);
-            if token.is_null() {
-                bail!("Failed to get token of current user");
-            }
-
-            let create_res = CreateProcessAsUserW(
-                token,
-                NULL as _,
-                cmd_utf16.as_ptr() as _,
-                NULL as _,
-                NULL as _,
-                FALSE,
-                CREATE_SUSPENDED | DETACHED_PROCESS,
-                NULL,
-                NULL as _,
-                &mut start_info,
-                &mut proc_info,
-            );
-            CloseHandle(token);
-            if 0 == create_res {
-                bail!(
-                    "Failed to create privacy window process {}, error {}",
-                    cmdline,
-                    Error::last_os_error()
+                // return UwU(hInstance);
+                let mut hinstance: HMODULE = 0 as _;
+                let result = GetModuleHandleExA(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    std::mem::transmute(api_privacy_mode),
+                    &mut hinstance,
                 );
-            };
+                if FALSE == result {
+                    bail!("Failed to GetModuleHandleExA, {:?}", std::io::Error::last_os_error());
+                }
+                let _ = api_privacy_mode(hinstance as _);
 
-            inject_dll(
-                proc_info.hProcess,
-                proc_info.hThread,
-                dll_file.to_string_lossy().as_ref(),
-            )?;
-
-            if 0xffffffff == ResumeThread(proc_info.hThread) {
-                // CloseHandle
-                CloseHandle(proc_info.hThread);
-                CloseHandle(proc_info.hProcess);
-
-                bail!(
-                    "Failed to create privacy window process, error {}",
-                    Error::last_os_error()
-                );
-            }
-
-            self.handlers.hthread = proc_info.hThread as _;
-            self.handlers.hprocess = proc_info.hProcess as _;
-
-            let hwnd = wait_find_privacy_hwnd(1_000)?;
-            if hwnd.is_null() {
-                bail!("Failed to get hwnd after started");
+                let hwnd = wait_find_privacy_hwnd(1_000)?;
+                if hwnd.is_null() {
+                    bail!("Failed to get hwnd after started");
+                }
+            } else {
+                bail!("Failed to start privacy window");
             }
         }
 

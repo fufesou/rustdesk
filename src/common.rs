@@ -837,7 +837,7 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
                 let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
             }
         }
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url; 
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
     }
     Ok(())
 }
@@ -1032,7 +1032,9 @@ pub fn is_keyboard_mode_supported(
     match keyboard_mode {
         KeyboardMode::Legacy => true,
         KeyboardMode::Map => {
-            if peer_platform.to_lowercase() == crate::PLATFORM_ANDROID.to_lowercase() {
+            if peer_platform.to_lowercase() == crate::PLATFORM_ANDROID.to_lowercase()
+                && version_number < hbb_common::get_version_number("1.3.2")
+            {
                 false
             } else {
                 version_number >= hbb_common::get_version_number("1.2.0")
