@@ -554,7 +554,10 @@ impl FuseServer {
             clip_data_id: 0,
         };
 
-        send_data(node.conn_id, request.clone());
+        send_data(node.conn_id, request.clone()).map_err(|e| {
+            log::error!("failed to send file list to channel: {:?}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
 
         log::debug!(
             "waiting for read reply for {:?} on stream: {}",
@@ -590,7 +593,10 @@ impl FuseServer {
                             ));
                         }
 
-                        send_data(node.conn_id, request.clone());
+                        send_data(node.conn_id, request.clone()).map_err(|e| {
+                            log::error!("failed to send file list to channel: {:?}", e);
+                            std::io::Error::new(std::io::ErrorKind::Other, e)
+                        })?;
                         continue;
                     }
                     return Ok(requested_data);
@@ -1064,8 +1070,6 @@ impl FileHandles {
 
 #[cfg(test)]
 mod fuse_test {
-    use std::str::FromStr;
-
     use super::*;
 
     // todo: more tests needed!

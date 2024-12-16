@@ -7,10 +7,10 @@ use crate::CliprdrError;
 // url encode and decode is needed
 const ENCODE_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS.add(b' ').remove(b'/');
 
-pub(super) fn encode_path_to_uri(path: &PathBuf) -> io::Result<String> {
+pub(super) fn encode_path_to_uri(path: &PathBuf) -> Option<String> {
     let encoded =
         percent_encoding::percent_encode(path.to_str()?.as_bytes(), &ENCODE_SET).to_string();
-    format!("file://{}", encoded)
+    Some(format!("file://{}", encoded))
 }
 
 pub(super) fn parse_uri_to_path(encoded_uri: &str) -> Result<PathBuf, CliprdrError> {

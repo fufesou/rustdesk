@@ -4,8 +4,8 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
-use hbb_common::{allow_err, bail};
+#[cfg(feature = "unix-file-copy-paste")]
+use hbb_common::{allow_err, log};
 use hbb_common::{
     lazy_static,
     tokio::sync::{
@@ -66,6 +66,8 @@ pub enum CliprdrError {
     FileError { path: PathBuf, err: std::io::Error },
     #[error("invalid request")]
     InvalidRequest { description: String },
+    #[error("common request")]
+    CommonError { description: String },
     #[error("unknown cliprdr error")]
     Unknown(u32),
 }
@@ -200,29 +202,36 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
 
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
 #[inline]
-fn send_data(conn_id: i32, data: ClipboardFile) -> ResultType<()> {
+fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     #[cfg(target_os = "windows")]
     return send_data_to_channel(conn_id, data);
     #[cfg(not(target_os = "windows"))]
     if conn_id == 0 {
-        send_data_to_all(data);
+        let _ = send_data_to_all(data);
+        Ok(())
     } else {
-        send_data_to_channel(conn_id, data);
+        send_data_to_channel(conn_id, data)
     }
 }
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
 #[inline]
-fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> ResultType<()> {
+fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     if let Some(msg_channel) = VEC_MSG_CHANNEL
         .read()
         .unwrap()
         .iter()
         .find(|x| x.conn_id == conn_id)
     {
-        msg_channel.sender.send(data)?;
-        Ok(())
+        msg_channel
+            .sender
+            .send(data)
+            .map_err(|e| CliprdrError::CommonError {
+                description: e.to_string(),
+            })
     } else {
-        bail!("conn_id not found");
+        Err(CliprdrError::InvalidRequest {
+            description: "conn_id not found".to_string(),
+        })
     }
 }
 

@@ -188,7 +188,12 @@ impl LocalFile {
     pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), CliprdrError> {
         self.load_handle()?;
 
-        let handle = self.handle.as_mut()?;
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(CliprdrError::FileError {
+                path: self.path.clone(),
+                err: std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+            });
+        };
 
         if offset != self.offset.load(Ordering::Relaxed) {
             handle
@@ -238,9 +243,15 @@ pub(super) fn construct_file_list(paths: &[PathBuf]) -> Result<Vec<LocalFile>, C
         })?;
 
         if mt.is_dir() {
-            let dir = std::fs::read_dir(path)?;
+            let dir = std::fs::read_dir(path).map_err(|e| CliprdrError::FileError {
+                path: path.clone(),
+                err: e,
+            })?;
             for entry in dir {
-                let entry = entry?;
+                let entry = entry.map_err(|e| CliprdrError::FileError {
+                    path: path.clone(),
+                    err: e,
+                })?;
                 let path = entry.path();
                 constr_file_lst(&path, file_list, visited)?;
             }

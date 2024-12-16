@@ -217,7 +217,7 @@ impl ClipboardContext {
                         file_idx,
                         conn_id
                     );
-                    resp_file_contents_fail(conn_id, stream_id);
+                    let _ = resp_file_contents_fail(conn_id, stream_id);
 
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
@@ -262,7 +262,7 @@ impl ClipboardContext {
                         file_idx,
                         conn_id
                     );
-                    resp_file_contents_fail(conn_id, stream_id);
+                    let _ = resp_file_contents_fail(conn_id, stream_id);
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
                             "invalid file index {} requested from conn: {}",
@@ -279,7 +279,7 @@ impl ClipboardContext {
 
                 if offset > file.size {
                     log::error!("invalid reading offset requested from conn: {}", conn_id);
-                    resp_file_contents_fail(conn_id, stream_id);
+                    let _ = resp_file_contents_fail(conn_id, stream_id);
 
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
@@ -309,7 +309,7 @@ impl ClipboardContext {
             }
         };
 
-        send_data(conn_id, file_contents_resp);
+        send_data(conn_id, file_contents_resp)?;
         log::debug!("file contents sent to conn: {}", conn_id);
         // hot reload next file
         for next_file in file_list.iter_mut().skip(file_idx + 1) {
@@ -322,7 +322,7 @@ impl ClipboardContext {
     }
 }
 
-fn resp_file_contents_fail(conn_id: i32, stream_id: i32) {
+fn resp_file_contents_fail(conn_id: i32, stream_id: i32) -> Result<(), CliprdrError> {
     let resp = ClipboardFile::FileContentsResponse {
         msg_flags: 0x2,
         stream_id,
@@ -380,14 +380,22 @@ impl ClipboardContext {
                     return Ok(());
                 }
                 log::debug!("supported formats: {:?}", fmt_lst);
-                let file_contents_id = fmt_lst
+                let Some(file_contents_id) = fmt_lst
                     .iter()
                     .find(|(_, name)| name == FILECONTENTS_FORMAT_NAME)
-                    .map(|(id, _)| *id)?;
-                let file_descriptor_id = fmt_lst
+                    .map(|(id, _)| *id)
+                else {
+                    log::error!("no file contents format found");
+                    return Ok(());
+                };
+                let Some(file_descriptor_id) = fmt_lst
                     .iter()
                     .find(|(_, name)| name == FILEDESCRIPTORW_FORMAT_NAME)
-                    .map(|(id, _)| *id)?;
+                    .map(|(id, _)| *id)
+                else {
+                    log::error!("no file descriptor format found");
+                    return Ok(());
+                };
 
                 add_remote_format(FILECONTENTS_FORMAT_NAME, file_contents_id);
                 add_remote_format(FILEDESCRIPTORW_FORMAT_NAME, file_descriptor_id);
@@ -396,9 +404,7 @@ impl ClipboardContext {
                 let data = ClipboardFile::FormatDataRequest {
                     requested_format_id: file_descriptor_id,
                 };
-                send_data(conn_id, data);
-
-                Ok(())
+                send_data(conn_id, data)
             }
             ClipboardFile::FormatListResponse { msg_flags } => {
                 log::debug!("server_format_list_response called");
@@ -418,27 +424,25 @@ impl ClipboardContext {
                         requested_format_id,
                         conn_id
                     );
-                    resp_format_data_failure(conn_id);
-                    return Ok(());
+                    return resp_format_data_failure(conn_id);
                 };
 
                 if format == FILEDESCRIPTORW_FORMAT_NAME {
-                    self.send_file_list(conn_id)?;
+                    self.send_file_list(conn_id)
                 } else if format == FILECONTENTS_FORMAT_NAME {
                     log::error!(
                         "try to read file contents with FormatDataRequest from conn={}",
                         conn_id
                     );
-                    resp_format_data_failure(conn_id);
+                    resp_format_data_failure(conn_id)
                 } else {
                     log::error!(
                         "got unsupported format data request: id={} from conn={}",
                         requested_format_id,
                         conn_id
                     );
-                    resp_format_data_failure(conn_id);
+                    resp_format_data_failure(conn_id)
                 }
-                Ok(())
             }
             ClipboardFile::FormatDataResponse {
                 msg_flags,
@@ -450,8 +454,7 @@ impl ClipboardContext {
                 );
 
                 if msg_flags != 0x1 {
-                    resp_format_data_failure(conn_id);
-                    return Ok(());
+                    return resp_format_data_failure(conn_id);
                 }
 
                 log::debug!("parsing file descriptors");
@@ -475,8 +478,7 @@ impl ClipboardContext {
                 self.fuse_tx.send(msg).map_err(|e| {
                     log::error!("failed to send file contents response to fuse: {:?}", e);
                     CliprdrError::ClipboardInternalError
-                })?;
-                Ok(())
+                })
             }
             ClipboardFile::FileContentsRequest {
                 stream_id,
@@ -505,8 +507,7 @@ impl ClipboardContext {
                     }
                 } else {
                     log::error!("got invalid FileContentsRequest from conn={}", conn_id);
-                    resp_file_contents_fail(conn_id, stream_id);
-                    return Ok(());
+                    return resp_file_contents_fail(conn_id, stream_id);
                 };
 
                 self.serve_file_contents(conn_id, fcr)
@@ -542,7 +543,7 @@ impl CliprdrServiceContext for ClipboardContext {
     }
 }
 
-fn resp_format_data_failure(conn_id: i32) {
+fn resp_format_data_failure(conn_id: i32) -> Result<(), CliprdrError> {
     let data = ClipboardFile::FormatDataResponse {
         msg_flags: 0x2,
         format_data: vec![],
@@ -563,7 +564,7 @@ fn send_format_list(conn_id: i32) -> Result<(), CliprdrError> {
         ],
     };
 
-    send_data(conn_id, format_list);
+    send_data(conn_id, format_list)?;
     log::debug!("format list to remote dispatched, conn={}", conn_id);
     Ok(())
 }
@@ -593,6 +594,5 @@ fn send_file_list(files: &[LocalFile], conn_id: i32) -> Result<(), CliprdrError>
             msg_flags: 1,
             format_data,
         },
-    );
-    Ok(())
+    )
 }

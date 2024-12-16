@@ -48,7 +48,7 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
     let (tx_cb_result, rx_cb_result) = channel();
     let handler = Handler {
         sp: sp.clone(),
-        ctx: Some(ClipboardContext::new()?),
+        ctx: Some(ClipboardContext::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?),
         tx_cb_result,
         #[cfg(target_os = "windows")]
         stream: None,

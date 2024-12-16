@@ -92,7 +92,7 @@ impl SysClipboard for X11Clipboard {
         let uri_list: Vec<String> = {
             let mut v = Vec::new();
             for path in paths {
-                v.push(encode_path_to_uri(path)?);
+                v.push(encode_path_to_uri(path).ok_or(CliprdrError::ConversionFailure)?);
             }
             v
         };
