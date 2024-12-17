@@ -79,7 +79,13 @@ impl X11Clipboard {
     }
 
     fn wait_file_list(&self) -> Result<Option<Vec<PathBuf>>, CliprdrError> {
-        let v = self.load(self.text_uri_list)?;
+        let mut v = self.load(self.text_uri_list)?;
+        if v.is_empty() {
+            v = self.load(self.gnome_copied_files)?;
+        }
+        if v.is_empty() {
+            v = self.load(self.nautilus_clipboard)?;
+        }
         let p = parse_plain_uri_list(v)?;
         Ok(Some(p))
     }
@@ -138,6 +144,8 @@ impl SysClipboard for X11Clipboard {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
+
+            println!("REMOVE ME =========================== filtered: {:?}", filtered);
 
             {
                 let mut former = self.former_file_list.lock();

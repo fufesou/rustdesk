@@ -72,6 +72,7 @@ impl fuser::Filesystem for FuseClient {
         req: &fuser::Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
+        println!("REMOVE ME ========================== init");
         let mut server = self.server.lock();
         server.init(req, config)
     }
@@ -83,11 +84,13 @@ impl fuser::Filesystem for FuseClient {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        println!("REMOVE ME ========================== lookup");
         let mut server = self.server.lock();
         server.lookup(req, parent, name, reply)
     }
 
     fn opendir(&mut self, req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        println!("REMOVE ME ========================== opendir");
         let mut server = self.server.lock();
         server.opendir(req, ino, flags, reply)
     }
@@ -100,6 +103,7 @@ impl fuser::Filesystem for FuseClient {
         offset: i64,
         reply: fuser::ReplyDirectory,
     ) {
+        println!("REMOVE ME ========================== readdir");
         let mut server = self.server.lock();
         server.readdir(req, ino, fh, offset, reply)
     }
@@ -112,6 +116,7 @@ impl fuser::Filesystem for FuseClient {
         _flags: i32,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("REMOVE ME ========================== releasedir");
         let mut server = self.server.lock();
         server.releasedir(req, ino, fh, _flags, reply)
     }
@@ -132,6 +137,7 @@ impl fuser::Filesystem for FuseClient {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
+        println!("REMOVE ME ========================== read");
         let mut server = self.server.lock();
         server.read(req, ino, fh, offset, size, flags, lock_owner, reply)
     }
@@ -146,16 +152,19 @@ impl fuser::Filesystem for FuseClient {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("REMOVE ME ========================== release");
         let mut server = self.server.lock();
         server.release(req, ino, fh, _flags, _lock_owner, _flush, reply)
     }
 
     fn getattr(&mut self, req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
+        println!("REMOVE ME ========================== getattr");
         let mut server = self.server.lock();
         server.getattr(req, ino, reply)
     }
 
     fn statfs(&mut self, req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyStatfs) {
+        println!("REMOVE ME ========================== statfs");
         let mut server = self.server.lock();
         server.statfs(req, ino, reply)
     }
@@ -527,8 +536,8 @@ impl FuseServer {
         size: u32,
     ) -> Result<Vec<u8>, std::io::Error> {
         // todo: async and concurrent read, generate stream_id per request
-        log::debug!(
-            "reading {:?} offset {} size {} on stream: {}",
+        log::info!(
+            "REMOVE ME ================================ reading {:?} offset {} size {} on stream: {}",
             node.name,
             offset,
             size,
@@ -560,7 +569,7 @@ impl FuseServer {
         })?;
 
         log::debug!(
-            "waiting for read reply for {:?} on stream: {}",
+            "REMOVE ME ================================= waiting for read reply for {:?} on stream: {}",
             node.name,
             node.stream_id
         );

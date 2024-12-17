@@ -349,25 +349,26 @@ impl ClipboardContext {
     }
 
     pub fn serve(&self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError> {
-        log::debug!("serve clipboard file from conn: {}", conn_id);
+        log::info!("REMOVE ME =========================== serve clipboard file from conn: {}", conn_id);
         if self.is_stopped() {
             log::debug!("cliprdr stopped, restart it");
             self.run()?;
         }
         match msg {
             ClipboardFile::NotifyCallback { .. } => {
-                unreachable!()
+                // unreachable!()
+                Ok(())
             }
             ClipboardFile::MonitorReady => {
                 log::debug!("server_monitor_ready called");
 
-                self.send_file_list(conn_id)?;
+                // self.send_file_list(conn_id)?;
 
                 Ok(())
             }
 
             ClipboardFile::FormatList { format_list } => {
-                log::debug!("server_format_list called");
+                log::info!("REMOVE ME ======================= server_format_list called");
                 // filter out "FileGroupDescriptorW" and "FileContents"
                 let fmt_lst: Vec<(i32, String)> = format_list
                     .into_iter()
@@ -379,7 +380,7 @@ impl ClipboardContext {
                     log::debug!("no supported formats");
                     return Ok(());
                 }
-                log::debug!("supported formats: {:?}", fmt_lst);
+                log::info!("REMOVE ME ========================= supported formats: {:?}", fmt_lst);
                 let Some(file_contents_id) = fmt_lst
                     .iter()
                     .find(|(_, name)| name == FILECONTENTS_FORMAT_NAME)
@@ -407,7 +408,7 @@ impl ClipboardContext {
                 send_data(conn_id, data)
             }
             ClipboardFile::FormatListResponse { msg_flags } => {
-                log::debug!("server_format_list_response called");
+                log::info!("REMOVE ME ============================== server_format_list_response called");
                 if msg_flags != 0x1 {
                     send_format_list(conn_id)
                 } else {
@@ -417,7 +418,7 @@ impl ClipboardContext {
             ClipboardFile::FormatDataRequest {
                 requested_format_id,
             } => {
-                log::debug!("server_format_data_request called");
+                log::info!("REMOVE ME ========================= server_format_data_request called");
                 let Some(format) = get_local_format(requested_format_id) else {
                     log::error!(
                         "got unsupported format data request: id={} from conn={}",
@@ -431,13 +432,13 @@ impl ClipboardContext {
                     self.send_file_list(conn_id)
                 } else if format == FILECONTENTS_FORMAT_NAME {
                     log::error!(
-                        "try to read file contents with FormatDataRequest from conn={}",
+                        "REMOVE ME ======================= try to read file contents with FormatDataRequest from conn={}",
                         conn_id
                     );
                     resp_format_data_failure(conn_id)
                 } else {
                     log::error!(
-                        "got unsupported format data request: id={} from conn={}",
+                        "REMOVE ME ========================== got unsupported format data request: id={} from conn={}",
                         requested_format_id,
                         conn_id
                     );
@@ -448,8 +449,8 @@ impl ClipboardContext {
                 msg_flags,
                 format_data,
             } => {
-                log::debug!(
-                    "server_format_data_response called, msg_flags={}",
+                log::info!(
+                    "REMOVE ME =============================== server_format_data_response called, msg_flags={}",
                     msg_flags
                 );
 
@@ -468,12 +469,12 @@ impl ClipboardContext {
                     fuse_guard.list_root()
                 };
 
-                log::debug!("load file list: {:?}", paths);
+                log::info!("REMOVE ME =============================== load file list: {:?}", paths);
                 self.set_clipboard(&paths)?;
                 Ok(())
             }
             ClipboardFile::FileContentsResponse { .. } => {
-                log::debug!("server_file_contents_response called");
+                log::info!("REMOVE ME ================================= server_file_contents_response called");
                 // we don't know its corresponding request, no resend can be performed
                 self.fuse_tx.send(msg).map_err(|e| {
                     log::error!("failed to send file contents response to fuse: {:?}", e);
@@ -489,7 +490,7 @@ impl ClipboardContext {
                 cb_requested,
                 ..
             } => {
-                log::debug!("server_file_contents_request called");
+                log::info!("REMOVE ME ========================== server_file_contents_request called");
                 let fcr = if dw_flags == 0x1 {
                     FileContentsRequest::Size {
                         stream_id,
@@ -580,8 +581,8 @@ fn build_file_list_pdu(files: &[LocalFile]) -> Vec<u8> {
 }
 
 fn send_file_list(files: &[LocalFile], conn_id: i32) -> Result<(), CliprdrError> {
-    log::debug!(
-        "send file list to remote, conn={}, list={:?}",
+    log::info!(
+        "REMOVE ME ============================ send file list to remote, conn={}, list={:?}",
         conn_id,
         files.iter().map(|f| f.path.display()).collect::<Vec<_>>()
     );
