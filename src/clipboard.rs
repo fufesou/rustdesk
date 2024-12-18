@@ -74,6 +74,34 @@ pub fn check_clipboard(
     None
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+pub fn check_clipboard_files(
+    ctx: &mut Option<ClipboardContext>,
+    side: ClipboardSide,
+) -> Option<Vec<String>> {
+    if ctx.is_none() {
+        *ctx = ClipboardContext::new().ok();
+    }
+    let ctx2 = ctx.as_mut()?;
+    match ctx2.get_files(side) {
+        Ok(content) => {
+            if !content.is_empty() {
+                let mut msg = Message::new();
+                let clipboards = proto::create_multi_clipboards(content);
+                msg.set_multi_clipboards(clipboards.clone());
+                *LAST_MULTI_CLIPBOARDS.lock().unwrap() = clipboards;
+                return Some(msg);
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to get clipboard content. {}", e);
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn check_clipboard_cm() -> ResultType<MultiClipboards> {
     let mut ctx = CLIPBOARD_CTX.lock().unwrap();
@@ -127,10 +155,56 @@ fn update_clipboard_(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
     }
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+fn update_clipboard_files_(urls: Vec<String>, side: ClipboardSide) {
+    if urls.is_empty() {
+        return;
+    }
+    let mut ctx = CLIPBOARD_CTX.lock().unwrap();
+    if ctx.is_none() {
+        match ClipboardContext::new() {
+            Ok(x) => {
+                *ctx = Some(x);
+            }
+            Err(e) => {
+                log::error!("Failed to create clipboard context: {}", e);
+                return;
+            }
+        }
+    }
+    if let Some(ctx) = ctx.as_mut() {
+        let to_update_data = vec![
+            ClipboardData::FileUrl(urls),
+            ClipboardData::Special((
+                RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
+                side.get_owner_data(),
+            )),
+        ];
+        if let Err(e) = ctx.set(&to_update_data) {
+            log::debug!("Failed to set clipboard: {}", e);
+        } else {
+            log::debug!("{} updated on {}", CLIPBOARD_NAME, side);
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn update_clipboard(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
     std::thread::spawn(move || {
         update_clipboard_(multi_clipboards, side);
+    });
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+fn update_clipboard_files(urls: Vec<String>, side: ClipboardSide) {
+    std::thread::spawn(move || {
+        update_clipboard_files_(urls, side);
     });
 }
 
@@ -209,8 +283,17 @@ impl ClipboardContext {
     }
 
     pub fn get(&mut self, side: ClipboardSide, force: bool) -> ResultType<Vec<ClipboardData>> {
+        get_formats_filter(SUPPORTED_FORMATS, side, force)
+    }
+
+    fn get_formats_filter(
+        &mut self,
+        formats: &[ClipboardFormat],
+        side: ClipboardSide,
+        force: bool,
+    ) -> ResultType<Vec<ClipboardData>> {
         let _lock = ARBOARD_MTX.lock().unwrap();
-        let data = self.get_formats(SUPPORTED_FORMATS)?;
+        let data = self.get_formats(formats)?;
         if data.is_empty() {
             return Ok(data);
         }
@@ -236,6 +319,30 @@ impl ClipboardContext {
         let _lock = ARBOARD_MTX.lock().unwrap();
         self.inner.set_formats(data)?;
         Ok(())
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "unix-file-copy-paste"
+    ))]
+    fn get_files(&mut self, side: ClipboardSide) -> ResultType<Vec<String>> {
+        let files_data = self.get_formats_filter(
+            &[
+                ClipboardFormat::FileUrl,
+                ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
+            ],
+            side,
+            false,
+        )?;
+        for c in files_data.into_iter() {
+            if let ClipboardData::FileUrl(files) = c {
+                return Ok(files
+                    .into_iter()
+                    .filter(|x| !x.starts_with(clipboard::FUSE_MOUNT_POINT))
+                    .collect());
+            }
+        }
+        Ok(vec![])
     }
 }
 

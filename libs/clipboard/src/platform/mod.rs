@@ -22,6 +22,21 @@ pub mod fuse;
 #[cfg(feature = "unix-file-copy-paste")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod unix;
+#[cfg(feature = "unix-file-copy-paste")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::Arc;
+
+#[cfg(feature = "unix-file-copy-paste")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+lazy_static::lazy_static! {
+    pub static ref FUSE_MOUNT_POINT: Arc<String> = {
+        let app_name = hbb_common::config::APP_NAME.read().unwrap().clone();
+        let mnt_path = format!("/tmp/{}/{}", app_name, "cliprdr");
+        // No need to run `canonicalize()` here.
+        Arc::new(mnt_path)
+    };
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn create_cliprdr_context(
     _enable_files: bool,
