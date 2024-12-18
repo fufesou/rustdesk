@@ -1,3 +1,4 @@
+use super::clipboard_file;
 #[cfg(not(target_os = "android"))]
 use arboard::{ClipboardData, ClipboardFormat};
 #[cfg(not(target_os = "android"))]
@@ -9,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+pub const FILE_CLIPBOARD_NAME: &'static str = "file-clipboard";
 pub const CLIPBOARD_NAME: &'static str = "clipboard";
 pub const CLIPBOARD_INTERVAL: u64 = 333;
 
@@ -57,6 +59,23 @@ pub fn check_clipboard(
         *ctx = ClipboardContext::new().ok();
     }
     let ctx2 = ctx.as_mut()?;
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "unix-file-copy-paste"
+    ))]
+    match ctx2.get_files(side, force) {
+        Ok(Some(urls)) => {
+            if !urls.is_empty() {
+                return Some(super::clipboard_file::get_file_format_msg());
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to get clipboard file urls. {}", e);
+        }
+        _ => {}
+    }
+
     match ctx2.get(side, force) {
         Ok(content) => {
             if !content.is_empty() {
@@ -72,6 +91,50 @@ pub fn check_clipboard(
         }
     }
     None
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+#[inline]
+pub fn check_clipboard_files(
+    ctx: &mut Option<ClipboardContext>,
+    side: ClipboardSide,
+    force: bool,
+) -> Option<Message> {
+    match get_clipboard_file_urls(ctx, side, false) {
+        Ok(Some(urls)) => {
+            if !urls.is_empty() {
+                return Some(crate::clipboard_file::get_file_format_msg());
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to read clipboard files: {}", e);
+        }
+        _ => {}
+    }
+    None
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+#[inline]
+pub fn get_clipboard_file_urls(
+    ctx: &mut Option<ClipboardContext>,
+    side: ClipboardSide,
+    force: bool,
+) -> ResultType<Option<Vec<String>>> {
+    if ctx.is_none() {
+        *ctx = ClipboardContext::new().ok();
+    }
+    if let Some(ctx) = ctx.as_mut() {
+        ctx.get_files(side, force)
+    } else {
+        bail!("Failed to create clipboard context")
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -209,8 +272,17 @@ impl ClipboardContext {
     }
 
     pub fn get(&mut self, side: ClipboardSide, force: bool) -> ResultType<Vec<ClipboardData>> {
+        self.get_formats_filter(SUPPORTED_FORMATS, side, force)
+    }
+
+    fn get_formats_filter(
+        &mut self,
+        formats: &[ClipboardFormat],
+        side: ClipboardSide,
+        force: bool,
+    ) -> ResultType<Vec<ClipboardData>> {
         let _lock = ARBOARD_MTX.lock().unwrap();
-        let data = self.get_formats(SUPPORTED_FORMATS)?;
+        let data = self.get_formats(formats)?;
         if data.is_empty() {
             return Ok(data);
         }
@@ -230,6 +302,29 @@ impl ClipboardContext {
                 _ => true,
             })
             .collect())
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "unix-file-copy-paste"
+    ))]
+    pub fn get_files(
+        &mut self,
+        side: ClipboardSide,
+        force: bool,
+    ) -> ResultType<Option<Vec<String>>> {
+        let data = self.get_formats_filter(
+            &[
+                ClipboardFormat::FileUrl,
+                ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
+            ],
+            side,
+            force,
+        )?;
+        Ok(data.into_iter().find_map(|c| match c {
+            ClipboardData::FileUrl(urls) => Some(urls),
+            _ => None,
+        }))
     }
 
     fn set(&mut self, data: &[ClipboardData]) -> ResultType<()> {
@@ -443,6 +538,18 @@ mod proto {
             ClipboardData::Rtf(s) => plain_to_proto(s, ClipboardFormat::Rtf),
             ClipboardData::Html(s) => plain_to_proto(s, ClipboardFormat::Html),
             ClipboardData::Image(a) => image_to_proto(a),
+            #[cfg(all(
+                any(target_os = "linux", target_os = "macos"),
+                feature = "unix-file-copy-paste"
+            ))]
+            ClipboardData::FileUrl(urls) => {
+                let s = urls
+                    .into_iter()
+                    .filter(|s| !s.starts_with(clipboard::FUSE_MOUNT_POINT.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                plain_to_proto(s, ClipboardFormat::FileUrl)
+            }
             ClipboardData::Special((s, d)) => special_to_proto(d, s),
             _ => return None,
         };
@@ -482,6 +589,13 @@ mod proto {
             Ok(ClipboardFormat::ImageSvg) => Some(ClipboardData::Image(arboard::ImageData::svg(
                 std::str::from_utf8(&data).unwrap_or_default(),
             ))),
+            #[cfg(all(
+                any(target_os = "linux", target_os = "macos"),
+                feature = "unix-file-copy-paste"
+            ))]
+            Ok(ClipboardFormat::FileUrl) => String::from_utf8(data)
+                .ok()
+                .map(|s| ClipboardData::FileUrl(s.split('\n').map(|x| x.to_owned()).collect())),
             Ok(ClipboardFormat::Special) => {
                 Some(ClipboardData::Special((clipboard.special_name, data)))
             }

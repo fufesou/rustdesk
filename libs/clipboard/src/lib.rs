@@ -30,6 +30,10 @@ const ERR_CODE_SEND_MSG: u32 = 0x00000003;
 
 pub(crate) use platform::create_cliprdr_context;
 
+#[cfg(feature = "unix-file-copy-paste")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use platform::FUSE_MOUNT_POINT;
+
 /// Ability to handle Clipboard File from remote rustdesk client
 ///
 /// # Note

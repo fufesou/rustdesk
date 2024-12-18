@@ -325,6 +325,7 @@ enum ClipboardFormat {
   Text = 0;
   Rtf = 1;
   Html = 2;
+  FileUrl = 19;  // For linux or macOS. windows uses `Cliprdr` messages.
   ImageRgba = 21;
   ImagePng = 22;
   ImageSvg = 23;

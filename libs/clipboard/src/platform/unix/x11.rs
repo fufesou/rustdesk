@@ -55,16 +55,18 @@ impl X11Clipboard {
         // NOTE:
         // # why not use `load_wait`
         // load_wait is likely to wait forever, which is not what we want
+        log::info!("REMOVE ME ======================= x11 clipboard get content, target: {:?}", target);
         let res = get_clip()?.load_wait(clip, target, prop);
+        log::info!("REMOVE ME ======================= x11 clipboard get content, res: {:?}", res);
         match res {
             Ok(res) => Ok(res),
             Err(x11_clipboard::error::Error::UnexpectedType(_)) => Ok(vec![]),
             Err(x11_clipboard::error::Error::Timeout) => {
-                log::debug!("x11 clipboard get content timeout.");
+                log::info!("REMOVE ME ======================= x11 clipboard get content timeout.");
                 Err(CliprdrError::ClipboardInternalError)
             }
             Err(e) => {
-                log::debug!("x11 clipboard get content fail: {:?}", e);
+                log::info!("REMOVE ME ========================== x11 clipboard get content fail: {:?}", e);
                 Err(CliprdrError::ClipboardInternalError)
             }
         }
@@ -79,14 +81,17 @@ impl X11Clipboard {
     }
 
     fn wait_file_list(&self) -> Result<Option<Vec<PathBuf>>, CliprdrError> {
-        let mut v = self.load(self.text_uri_list)?;
-        if v.is_empty() {
-            v = self.load(self.gnome_copied_files)?;
-        }
-        if v.is_empty() {
-            v = self.load(self.nautilus_clipboard)?;
-        }
+        // let mut v = self.load(self.text_uri_list)?;
+        // if v.is_empty() {
+        //     v = self.load(self.gnome_copied_files)?;
+        // }
+        // if v.is_empty() {
+        //     v = self.load(self.nautilus_clipboard)?;
+        // }
+        let v = self.load(self.gnome_copied_files)?;
+        println!("REMOVE ME =========================== wait_file_list 11: {:?}", &v);
         let p = parse_plain_uri_list(v)?;
+        println!("REMOVE ME =========================== wait_file_list 22: {:?}", &p);
         Ok(Some(p))
     }
 }
@@ -119,17 +124,19 @@ impl SysClipboard for X11Clipboard {
             // clear cached file list
             *self.former_file_list.lock() = vec![];
         }
+        log::info!("REMOVE ME ============================= start listening file related atoms on clipboard");
         loop {
             let sth = match self.wait_file_list() {
                 Ok(sth) => sth,
                 Err(e) => {
-                    log::warn!("failed to get file list from clipboard: {}", e);
+                    log::info!("REMOVE ME ===================== failed to get file list from clipboard: {}", e);
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue;
                 }
             };
 
             let Some(paths) = sth else {
+                log::info!("REMOVE ME ============================= empty file list from clipboard");
                 // just sleep
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -141,6 +148,7 @@ impl SysClipboard for X11Clipboard {
                 .collect::<Vec<_>>();
 
             if filtered.is_empty() {
+                log::info!("REMOVE ME ============================= empty filtered file list from clipboard 22");
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }

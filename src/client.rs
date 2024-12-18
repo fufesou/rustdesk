@@ -843,6 +843,7 @@ impl ClientClipboardHandler {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ClipboardHandler for ClientClipboardHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
+        println!("REMOVE ME ============================ on_clipboard_change");
         if TEXT_CLIPBOARD_STATE.lock().unwrap().running
             && TEXT_CLIPBOARD_STATE.lock().unwrap().is_required
         {
@@ -854,6 +855,7 @@ impl ClipboardHandler for ClientClipboardHandler {
     }
 
     fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
+        println!("REMOVE ME ============================ on_clipboard_change");
         self.tx_cb_result
             .send(CallbackResult::StopWithError(error))
             .ok();

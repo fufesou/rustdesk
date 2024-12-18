@@ -1,4 +1,14 @@
 use super::*;
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+use crate::clipboard::check_clipboard_files;
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "unix-file-copy-paste"
+))]
+pub use crate::clipboard::FILE_CLIPBOARD_NAME as FILE_NAME;
 #[cfg(not(target_os = "android"))]
 pub use crate::clipboard::{check_clipboard, ClipboardContext, ClipboardSide};
 pub use crate::clipboard::{CLIPBOARD_INTERVAL as INTERVAL, CLIPBOARD_NAME as NAME};
@@ -37,8 +47,8 @@ pub fn is_clipboard_service_ok() -> bool {
     CLIPBOARD_SERVICE_OK.load(Ordering::SeqCst)
 }
 
-pub fn new() -> GenericService {
-    let svc = EmptyExtraFieldService::new(NAME.to_owned(), false);
+pub fn new(name: String) -> GenericService {
+    let svc = EmptyExtraFieldService::new(name, false);
     GenericService::run(&svc.clone(), run);
     svc.sp
 }
@@ -91,7 +101,7 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
 impl ClipboardHandler for Handler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
         if self.sp.ok() {
-            if let Some(msg) = self.get_clipboard_msg() {
+            if let Some(msg) = self.get_clipboard_msg(self.sp.name() == FILE_NAME) {
                 self.sp.send(msg);
             }
         }
@@ -108,7 +118,7 @@ impl ClipboardHandler for Handler {
 
 #[cfg(not(target_os = "android"))]
 impl Handler {
-    fn get_clipboard_msg(&mut self) -> Option<Message> {
+    fn get_clipboard_msg(&mut self, _is_file_clip: bool) -> Option<Message> {
         #[cfg(target_os = "windows")]
         if crate::common::is_server() && crate::platform::is_root() {
             match self.read_clipboard_from_cm_ipc() {
@@ -143,6 +153,13 @@ impl Handler {
                     }
                 }
             }
+        }
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            feature = "unix-file-copy-paste"
+        ))]
+        if _is_file_clip {
+            return check_clipboard_files(&mut self.ctx, ClipboardSide::Host, false);
         }
         check_clipboard(&mut self.ctx, ClipboardSide::Host, false)
     }

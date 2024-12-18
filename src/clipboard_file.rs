@@ -1,6 +1,54 @@
 use clipboard::ClipboardFile;
 use hbb_common::message_proto::*;
 
+use std::{collections::HashMap, iter::FromIterator, sync::RwLock};
+
+// not actual format id, just a placeholder
+const FILEDESCRIPTOR_FORMAT_ID: i32 = 49334;
+const FILEDESCRIPTORW_FORMAT_NAME: &str = "FileGroupDescriptorW";
+// not actual format id, just a placeholder
+const FILECONTENTS_FORMAT_ID: i32 = 49267;
+const FILECONTENTS_FORMAT_NAME: &str = "FileContents";
+
+lazy_static::lazy_static! {
+    static ref REMOTE_FORMAT_MAP: RwLock<HashMap<i32, String>> = RwLock::new(HashMap::from_iter([
+        (
+            FILEDESCRIPTOR_FORMAT_ID,
+            FILEDESCRIPTORW_FORMAT_NAME.to_string()
+        ),
+        (FILECONTENTS_FORMAT_ID, FILECONTENTS_FORMAT_NAME.to_string())
+    ]));
+}
+
+fn get_local_format(remote_id: i32) -> Option<String> {
+    REMOTE_FORMAT_MAP
+        .read()
+        .unwrap()
+        .get(&remote_id)
+        .map(|s| s.clone())
+}
+
+fn add_remote_format(local_name: &str, remote_id: i32) {
+    REMOTE_FORMAT_MAP
+        .write()
+        .unwrap()
+        .insert(remote_id, local_name.to_string());
+}
+
+pub fn get_file_format_msg() -> Message {
+    let fd_format_name = get_local_format(FILEDESCRIPTOR_FORMAT_ID)
+        .unwrap_or(FILEDESCRIPTORW_FORMAT_NAME.to_string());
+    let fc_format_name =
+        get_local_format(FILECONTENTS_FORMAT_ID).unwrap_or(FILECONTENTS_FORMAT_NAME.to_string());
+    let format_list = ClipboardFile::FormatList {
+        format_list: vec![
+            (FILEDESCRIPTOR_FORMAT_ID, fd_format_name),
+            (FILECONTENTS_FORMAT_ID, fc_format_name),
+        ],
+    };
+    clip_2_msg(format_list)
+}
+
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
         ClipboardFile::NotifyCallback {

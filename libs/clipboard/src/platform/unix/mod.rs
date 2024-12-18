@@ -552,7 +552,7 @@ fn resp_format_data_failure(conn_id: i32) -> Result<(), CliprdrError> {
     send_data(conn_id, data)
 }
 
-fn send_format_list(conn_id: i32) -> Result<(), CliprdrError> {
+pub fn send_format_list(conn_id: i32) -> Result<(), CliprdrError> {
     log::debug!("send format list to remote, conn={}", conn_id);
     let fd_format_name = get_local_format(FILEDESCRIPTOR_FORMAT_ID)
         .unwrap_or(FILEDESCRIPTORW_FORMAT_NAME.to_string());

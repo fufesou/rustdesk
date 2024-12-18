@@ -106,7 +106,16 @@ pub fn new() -> ServerPtr {
     #[cfg(not(target_os = "ios"))]
     {
         server.add_service(Box::new(display_service::new()));
-        server.add_service(Box::new(clipboard_service::new()));
+        server.add_service(Box::new(clipboard_service::new(
+            clipboard_service::NAME.to_string(),
+        )));
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            feature = "unix-file-copy-paste"
+        ))]
+        server.add_service(Box::new(clipboard_service::new(
+            clipboard_service::FILE_NAME.to_string(),
+        )));
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
