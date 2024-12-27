@@ -1,10 +1,12 @@
 use super::*;
-#[cfg(not(target_os = "android"))]
-pub use crate::clipboard::{check_clipboard, ClipboardContext, ClipboardSide};
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::clipboard::check_clipboard_files;
+#[cfg(not(target_os = "android"))]
+use crate::clipboard::clipboard_listener;
 #[cfg(feature = "unix-file-copy-paste")]
 pub use crate::clipboard::FILE_CLIPBOARD_NAME as FILE_NAME;
+#[cfg(not(target_os = "android"))]
+pub use crate::clipboard::{check_clipboard, ClipboardContext, ClipboardSide};
 pub use crate::clipboard::{CLIPBOARD_INTERVAL as INTERVAL, CLIPBOARD_NAME as NAME};
 #[cfg(windows)]
 use crate::ipc::{self, ClipboardFile, ClipboardNonFile, Data};
@@ -59,7 +61,7 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
 
     let (tx_cb_result, rx_cb_result) = channel();
     let ctx = Some(ClipboardContext::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?);
-    clipboard_listener::subscribe(sp.name(), tx_cb_result.clone())?;
+    clipboard_listener::subscribe(sp.name(), tx_cb_result)?;
     let mut handler = Handler {
         ctx,
         #[cfg(target_os = "windows")]
@@ -88,7 +90,10 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
                 bail!("Clipboard listener stopped with error: {}", err);
             }
             Err(RecvTimeoutError::Timeout) => {}
-            _ => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                log::error!("Clipboard listener disconnected");
+                break;
+            }
         }
     }
 
@@ -251,98 +256,4 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
     }
     CLIPBOARD_SERVICE_OK.store(false, Ordering::SeqCst);
     Ok(())
-}
-
-// We need this mod to notify multiple subscribers when the clipboard changes.
-// Because only one clipboard master(listener) can tigger the clipboard change event multiple listeners are created on Linux(x11).
-// https://github.com/rustdesk-org/clipboard-master/blob/4fb62e5b62fb6350d82b571ec7ba94b3cd466695/src/master/x11.rs#L226
-#[cfg(not(target_os = "android"))]
-mod clipboard_listener {
-    use clipboard_master::{CallbackResult, ClipboardHandler, Shutdown};
-    use hbb_common::{bail, ResultType};
-    use std::{
-        collections::HashMap,
-        io,
-        sync::mpsc::{channel, Sender},
-        sync::{Arc, Mutex},
-        thread::JoinHandle,
-    };
-
-    lazy_static::lazy_static! {
-        pub static ref CLIPBOARD_LISTENER: Arc<Mutex<ClipboardListener>> = Default::default();
-    }
-
-    struct Handler {
-        subscribers: Arc<Mutex<HashMap<String, Sender<CallbackResult>>>>,
-    }
-
-    impl ClipboardHandler for Handler {
-        fn on_clipboard_change(&mut self) -> CallbackResult {
-            let sub_lock = self.subscribers.lock().unwrap();
-            for tx in sub_lock.values() {
-                tx.send(CallbackResult::Next).ok();
-            }
-            CallbackResult::Next
-        }
-
-        fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
-            let msg = format!("Clipboard listener error: {}", error);
-            let sub_lock = self.subscribers.lock().unwrap();
-            for tx in sub_lock.values() {
-                tx.send(CallbackResult::StopWithError(io::Error::new(
-                    io::ErrorKind::Other,
-                    msg.clone(),
-                )))
-                .ok();
-            }
-            CallbackResult::Next
-        }
-    }
-
-    #[derive(Default)]
-    pub struct ClipboardListener {
-        subscribers: Arc<Mutex<HashMap<String, Sender<CallbackResult>>>>,
-        handle: Option<(Shutdown, JoinHandle<()>)>,
-    }
-
-    pub fn subscribe(name: String, tx: Sender<CallbackResult>) -> ResultType<()> {
-        let mut listener_lock = CLIPBOARD_LISTENER.lock().unwrap();
-        listener_lock.subscribers.lock().unwrap().insert(name, tx);
-
-        if listener_lock.handle.is_none() {
-            let handler = Handler {
-                subscribers: listener_lock.subscribers.clone(),
-            };
-            let (tx_start_res, rx_start_res) = channel();
-            let h = crate::clipboard::start_clipbard_master_thread(handler, tx_start_res);
-            let shutdown = match rx_start_res.recv() {
-                Ok((Some(s), _)) => s,
-                Ok((None, err)) => {
-                    bail!(err);
-                }
-
-                Err(e) => {
-                    bail!("Failed to create clipboard listener: {}", e);
-                }
-            };
-            listener_lock.handle = Some((shutdown, h));
-        }
-
-        Ok(())
-    }
-
-    pub fn unsubscribe(name: &str) {
-        let mut listener_lock = CLIPBOARD_LISTENER.lock().unwrap();
-        let is_empty = {
-            let mut sub_lock = listener_lock.subscribers.lock().unwrap();
-            sub_lock.remove(name);
-            sub_lock.is_empty()
-        };
-        if is_empty {
-            if let Some((shutdown, h)) = listener_lock.handle.take() {
-                shutdown.signal();
-                h.join().ok();
-            }
-        }
-    }
 }

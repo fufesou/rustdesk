@@ -553,6 +553,7 @@ impl FuseServer {
 
         let mut retry_times = 0;
 
+        // to-do: more tests needed
         loop {
             let reply = self.rx.recv_timeout(self.timeout).map_err(|e| {
                 log::error!("failed to receive file list from channel: {:?}", e);

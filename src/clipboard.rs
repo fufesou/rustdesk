@@ -1,7 +1,5 @@
 #[cfg(not(target_os = "android"))]
 use arboard::{ClipboardData, ClipboardFormat};
-#[cfg(not(target_os = "android"))]
-use clipboard_master::{ClipboardHandler, Master, Shutdown};
 use hbb_common::{bail, log, message_proto::*, ResultType};
 use std::{
     sync::{mpsc::Sender, Arc, Mutex},
@@ -45,6 +43,8 @@ const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
     ClipboardFormat::ImageRgba,
     ClipboardFormat::ImagePng,
     ClipboardFormat::ImageSvg,
+    #[cfg(feature = "unix-file-copy-paste")]
+    ClipboardFormat::FileUrl,
     ClipboardFormat::Special(CLIPBOARD_FORMAT_EXCEL_XML_SPREADSHEET),
     ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
 ];
@@ -275,7 +275,16 @@ impl ClipboardContext {
     }
 
     pub fn get(&mut self, side: ClipboardSide, force: bool) -> ResultType<Vec<ClipboardData>> {
-        self.get_formats_filter(SUPPORTED_FORMATS, side, force)
+        let data = self.get_formats_filter(SUPPORTED_FORMATS, side, force)?;
+        // We have a seperate service named `file-clipboard` to handle file copy-paste.
+        // We need to read the file urls because file copy may set the other clipboard formats.
+        #[cfg(feature = "unix-file-copy-paste")]
+        {
+            if data.iter().any(|c| matches!(c, ClipboardData::FileUrl(_))) {
+                return Ok(vec![]);
+            }
+        }
+        Ok(data)
     }
 
     fn get_formats_filter(
@@ -439,36 +448,6 @@ impl std::fmt::Display for ClipboardSide {
             ClipboardSide::Client => write!(f, "client"),
         }
     }
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn start_clipbard_master_thread(
-    handler: impl ClipboardHandler + Send + 'static,
-    tx_start_res: Sender<(Option<Shutdown>, String)>,
-) -> JoinHandle<()> {
-    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessage#:~:text=The%20window%20must%20belong%20to%20the%20current%20thread.
-    let h = std::thread::spawn(move || match Master::new(handler) {
-        Ok(mut master) => {
-            tx_start_res
-                .send((Some(master.shutdown_channel()), "".to_owned()))
-                .ok();
-            log::debug!("Clipboard listener started");
-            if let Err(err) = master.run() {
-                log::error!("Failed to run clipboard listener: {}", err);
-            } else {
-                log::debug!("Clipboard listener stopped");
-            }
-        }
-        Err(err) => {
-            tx_start_res
-                .send((
-                    None,
-                    format!("Failed to create clipboard listener: {}", err),
-                ))
-                .ok();
-        }
-    });
-    h
 }
 
 pub use proto::get_msg_if_not_support_multi_clip;
@@ -684,4 +663,141 @@ pub fn get_clipboards_msg(client: bool) -> Option<Message> {
     }
     msg.set_multi_clipboards(clipboards);
     Some(msg)
+}
+
+// We need this mod to notify multiple subscribers when the clipboard changes.
+// Because only one clipboard master(listener) can tigger the clipboard change event multiple listeners are created on Linux(x11).
+// https://github.com/rustdesk-org/clipboard-master/blob/4fb62e5b62fb6350d82b571ec7ba94b3cd466695/src/master/x11.rs#L226
+#[cfg(not(target_os = "android"))]
+pub mod clipboard_listener {
+    use clipboard_master::{CallbackResult, ClipboardHandler, Master, Shutdown};
+    use hbb_common::{bail, log, ResultType};
+    use std::{
+        collections::HashMap,
+        io,
+        sync::mpsc::{channel, Sender},
+        sync::{Arc, Mutex},
+        thread::JoinHandle,
+    };
+
+    lazy_static::lazy_static! {
+        pub static ref CLIPBOARD_LISTENER: Arc<Mutex<ClipboardListener>> = Default::default();
+    }
+
+    struct Handler {
+        subscribers: Arc<Mutex<HashMap<String, Sender<CallbackResult>>>>,
+    }
+
+    impl ClipboardHandler for Handler {
+        fn on_clipboard_change(&mut self) -> CallbackResult {
+            let sub_lock = self.subscribers.lock().unwrap();
+            for tx in sub_lock.values() {
+                tx.send(CallbackResult::Next).ok();
+            }
+            CallbackResult::Next
+        }
+
+        fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
+            let msg = format!("Clipboard listener error: {}", error);
+            let sub_lock = self.subscribers.lock().unwrap();
+            for tx in sub_lock.values() {
+                tx.send(CallbackResult::StopWithError(io::Error::new(
+                    io::ErrorKind::Other,
+                    msg.clone(),
+                )))
+                .ok();
+            }
+            CallbackResult::Next
+        }
+    }
+
+    #[derive(Default)]
+    pub struct ClipboardListener {
+        subscribers: Arc<Mutex<HashMap<String, Sender<CallbackResult>>>>,
+        handle: Option<(Shutdown, JoinHandle<()>)>,
+    }
+
+    pub fn subscribe(name: String, tx: Sender<CallbackResult>) -> ResultType<()> {
+        log::info!("Subscribe clipboard listener: {}", &name);
+        let mut listener_lock = CLIPBOARD_LISTENER.lock().unwrap();
+        listener_lock
+            .subscribers
+            .lock()
+            .unwrap()
+            .insert(name.clone(), tx);
+
+        if listener_lock.handle.is_none() {
+            log::info!("Start clipboard listener thread");
+            let handler = Handler {
+                subscribers: listener_lock.subscribers.clone(),
+            };
+            let (tx_start_res, rx_start_res) = channel();
+            let h = start_clipbard_master_thread(handler, tx_start_res);
+            let shutdown = match rx_start_res.recv() {
+                Ok((Some(s), _)) => s,
+                Ok((None, err)) => {
+                    bail!(err);
+                }
+
+                Err(e) => {
+                    bail!("Failed to create clipboard listener: {}", e);
+                }
+            };
+            listener_lock.handle = Some((shutdown, h));
+            log::info!("Clipboard listener thread started");
+        }
+
+        log::info!("Clipboard listener subscribed: {}", name);
+        Ok(())
+    }
+
+    pub fn unsubscribe(name: &str) {
+        log::info!("Unsubscribe clipboard listener: {}", name);
+        let mut listener_lock = CLIPBOARD_LISTENER.lock().unwrap();
+        let is_empty = {
+            let mut sub_lock = listener_lock.subscribers.lock().unwrap();
+            if let Some(tx) = sub_lock.remove(name) {
+                tx.send(CallbackResult::Stop).ok();
+            }
+            sub_lock.is_empty()
+        };
+        if is_empty {
+            if let Some((shutdown, h)) = listener_lock.handle.take() {
+                log::info!("Stop clipboard listener thread");
+                shutdown.signal();
+                h.join().ok();
+                log::info!("Clipboard listener thread stopped");
+            }
+        }
+        log::info!("Clipboard listener unsubscribed: {}", name);
+    }
+
+    fn start_clipbard_master_thread(
+        handler: impl ClipboardHandler + Send + 'static,
+        tx_start_res: Sender<(Option<Shutdown>, String)>,
+    ) -> JoinHandle<()> {
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessage#:~:text=The%20window%20must%20belong%20to%20the%20current%20thread.
+        let h = std::thread::spawn(move || match Master::new(handler) {
+            Ok(mut master) => {
+                tx_start_res
+                    .send((Some(master.shutdown_channel()), "".to_owned()))
+                    .ok();
+                log::debug!("Clipboard listener started");
+                if let Err(err) = master.run() {
+                    log::error!("Failed to run clipboard listener: {}", err);
+                } else {
+                    log::debug!("Clipboard listener stopped");
+                }
+            }
+            Err(err) => {
+                tx_start_res
+                    .send((
+                        None,
+                        format!("Failed to create clipboard listener: {}", err),
+                    ))
+                    .ok();
+            }
+        });
+        h
+    }
 }

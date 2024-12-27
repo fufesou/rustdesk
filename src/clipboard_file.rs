@@ -376,6 +376,7 @@ pub mod unix_file_clip {
                 title,
                 text,
             } => {
+                // unreachable, but still log it
                 log::debug!(
                     "notify callback: type: {}, title: {}, text: {}",
                     r#type,

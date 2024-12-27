@@ -1151,7 +1151,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
     let mut video_conn_count = 0;
     #[cfg(not(feature = "flutter"))]
     let mut id = "".to_owned();
-    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+    #[cfg(target_os = "windows")]
     let mut enable_file_transfer = "".to_owned();
     let is_cm = crate::common::is_cm();
 
