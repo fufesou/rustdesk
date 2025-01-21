@@ -326,12 +326,7 @@ impl<T: InvokeUiSession> Remote<T> {
 
         #[cfg(target_os = "windows")]
         if _set_disconnected_ok {
-            let conn_id = self.client_conn_id;
-            log::debug!("try empty cliprdr for conn_id {}", conn_id);
-            let _ = ContextSend::proc(|context| -> ResultType<()> {
-                context.empty_clipboard(conn_id)?;
-                Ok(())
-            });
+            crate::clipboard::try_empty_clipboard_files(ClipboardSide::Client, self.client_conn_id);
         }
     }
 
@@ -1987,7 +1982,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     .map_err(|e| e.into())
             });
             #[cfg(feature = "unix-file-copy-paste")]
-            if let Some(msg) = unix_file_clip::serve_clip_messages(true, clip, 0) {
+            if let Some(msg) =
+                unix_file_clip::serve_clip_messages(true, clip, 0, &self.handler.get_id())
+            {
                 allow_err!(_peer.send(&msg).await);
             }
         }

@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(target_os = "windows")]
+use hbb_common::ResultType;
 #[cfg(feature = "unix-file-copy-paste")]
 use hbb_common::{allow_err, log};
 use hbb_common::{
@@ -8,7 +10,6 @@ use hbb_common::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex as TokioMutex,
     },
-    ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
@@ -109,6 +110,7 @@ pub enum ClipboardFile {
         stream_id: i32,
         requested_data: Vec<u8>,
     },
+    TryEmpty,
 }
 
 struct MsgChannel {
@@ -202,17 +204,29 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
 
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
 #[inline]
-pub fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
-    #[cfg(target_os = "windows")]
-    return send_data_to_channel(conn_id, data);
-    #[cfg(not(target_os = "windows"))]
-    if conn_id == 0 {
-        let _ = send_data_to_all(data);
+pub fn send_data(
+    include: Option<i32>,
+    exclude: Option<i32>,
+    data: ClipboardFile,
+) -> Result<(), CliprdrError> {
+    if let Some(conn_id) = exclude {
+        send_data_exclude(conn_id, data);
         Ok(())
+    } else if let Some(conn_id) = include {
+        if conn_id == 0 {
+            #[cfg(not(target_os = "windows"))]
+            send_data_to_all(data);
+            Ok(())
+        } else {
+            send_data_to_channel(conn_id, data)
+        }
     } else {
-        send_data_to_channel(conn_id, data)
+        #[cfg(not(target_os = "windows"))]
+        send_data_to_all(data);
+        Ok(())
     }
 }
+
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
 #[inline]
 fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
@@ -235,14 +249,25 @@ fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), Cliprdr
     }
 }
 
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+#[inline]
+fn send_data_exclude(conn_id: i32, data: ClipboardFile) {
+    use hbb_common::{allow_err, log};
+    // Need more tests to see if it's necessary to handle the error.
+    for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
+        if msg_channel.conn_id != conn_id {
+            allow_err!(msg_channel.sender.send(data.clone()));
+        }
+    }
+}
+
 #[cfg(feature = "unix-file-copy-paste")]
 #[inline]
-fn send_data_to_all(data: ClipboardFile) -> ResultType<()> {
+fn send_data_to_all(data: ClipboardFile) {
     // Need more tests to see if it's necessary to handle the error.
     for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
         allow_err!(msg_channel.sender.send(data.clone()));
     }
-    Ok(())
 }
 
 #[cfg(test)]

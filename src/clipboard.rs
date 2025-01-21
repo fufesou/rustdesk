@@ -2,8 +2,7 @@
 use arboard::{ClipboardData, ClipboardFormat};
 use hbb_common::{bail, log, message_proto::*, ResultType};
 use std::{
-    sync::{mpsc::Sender, Arc, Mutex},
-    thread::JoinHandle,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -138,6 +137,15 @@ pub fn try_empty_clipboard_files(side: ClipboardSide) {
             }
             unix::serv_files::clear_files();
         }
+    });
+}
+
+#[cfg(target_os = "windows")]
+pub fn try_empty_clipboard_files(side: ClipboardSide, conn_id: i32) {
+    log::debug!("try empty {} cliprdr for conn_id {}", side, conn_id);
+    let _ = clipboard::ContextSend::proc(|context| -> ResultType<()> {
+        context.empty_clipboard(conn_id)?;
+        Ok(())
     });
 }
 

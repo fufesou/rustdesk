@@ -1,3 +1,4 @@
+use crate::clipboard::ClipboardSide;
 #[cfg(target_os = "windows")]
 use crate::ipc::ClipboardNonFile;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -192,10 +193,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
 
         #[cfg(target_os = "windows")]
         {
-            let _ = ContextSend::proc(|context| -> ResultType<()> {
-                context.empty_clipboard(id)?;
-                Ok(())
-            });
+            crate::clipboard::try_empty_clipboard_files(ClipboardSide::Host, id);
         }
 
         #[cfg(any(target_os = "android"))]

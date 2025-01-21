@@ -1,8 +1,5 @@
 use super::local_file::LocalFile;
-use crate::{
-    platform::unix::{local_file::construct_file_list, send_failed_resp_file_contents},
-    ClipboardFile, CliprdrError,
-};
+use crate::{platform::unix::local_file::construct_file_list, ClipboardFile, CliprdrError};
 use hbb_common::{
     bytes::{BufMut, BytesMut},
     log,
@@ -85,8 +82,6 @@ impl ClipFiles {
                         file_idx,
                         conn_id
                     );
-                    let _ = send_failed_resp_file_contents(conn_id, stream_id);
-
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
                             "invalid file index {} requested from conn: {}",
@@ -130,7 +125,6 @@ impl ClipFiles {
                         file_idx,
                         conn_id
                     );
-                    let _ = send_failed_resp_file_contents(conn_id, stream_id);
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
                             "invalid file index {} requested from conn: {}",
@@ -147,8 +141,6 @@ impl ClipFiles {
 
                 if offset > file.size {
                     log::error!("invalid reading offset requested from conn: {}", conn_id);
-                    let _ = send_failed_resp_file_contents(conn_id, stream_id);
-
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
                             "invalid reading offset requested from conn: {}",

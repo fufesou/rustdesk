@@ -1283,10 +1283,15 @@ pub fn update_file_clipboard_required() {
 }
 
 #[cfg(not(target_os = "ios"))]
-pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
+pub fn send_clipboard_msg(msg: Message, _is_file: bool, _exclude: Option<&str>) {
     for s in sessions::get_sessions() {
         #[cfg(feature = "unix-file-copy-paste")]
         if _is_file {
+            if let Some(ex) = _exclude {
+                if ex == s.get_id() {
+                    continue;
+                }
+            }
             if s.is_file_clipboard_required() {
                 s.send(Data::Message(msg.clone()));
             }

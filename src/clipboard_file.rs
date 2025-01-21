@@ -134,6 +134,15 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
             })),
             ..Default::default()
         },
+        ClipboardFile::TryEmpty => Message {
+            union: Some(message::Union::Cliprdr(Cliprdr {
+                union: Some(cliprdr::Union::TryEmpty(CliprdrTryEmpty {
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
     }
 }
 
@@ -176,12 +185,15 @@ pub fn msg_2_clip(msg: Cliprdr) -> Option<ClipboardFile> {
                 requested_data: data.requested_data.into(),
             })
         }
+        Some(cliprdr::Union::TryEmpty(_)) => Some(ClipboardFile::TryEmpty),
         _ => None,
     }
 }
 
 #[cfg(feature = "unix-file-copy-paste")]
 pub mod unix_file_clip {
+    use crate::clipboard::try_empty_clipboard_files;
+
     use super::{
         super::clipboard::{update_clipboard_files, ClipboardSide},
         *,
@@ -233,11 +245,11 @@ pub mod unix_file_clip {
         })
     }
 
-    // to-do: conn_id may not be needed
     pub fn serve_clip_messages(
         is_client: bool,
         clip: ClipboardFile,
         conn_id: i32,
+        peer_id: &str,
     ) -> Option<Message> {
         log::debug!("got clipfile from client peer");
         match clip {
@@ -266,6 +278,7 @@ pub mod unix_file_clip {
                 let data = ClipboardFile::FormatDataRequest {
                     requested_format_id: file_descriptor_id,
                 };
+                try_empty_other_connections(is_client, conn_id, peer_id);
                 return Some(clip_2_msg(data));
             }
             ClipboardFile::FormatListResponse {
@@ -387,10 +400,33 @@ pub mod unix_file_clip {
                     text
                 );
             }
+            ClipboardFile::TryEmpty => {
+                try_empty_clipboard_files(if is_client {
+                    ClipboardSide::Client
+                } else {
+                    ClipboardSide::Host
+                });
+            }
             _ => {
                 log::error!("unsupported clipboard file type");
             }
         }
         None
+    }
+
+    fn try_empty_other_connections(is_client: bool, conn_id: i32, peer_id: &str) {
+        if is_client {
+            crate::flutter::send_clipboard_msg(
+                clip_2_msg(ClipboardFile::TryEmpty),
+                true,
+                Some(peer_id),
+            );
+        } else {
+            hbb_common::allow_err!(clipboard::send_data(
+                None,
+                Some(conn_id),
+                ClipboardFile::TryEmpty
+            ));
+        }
     }
 }

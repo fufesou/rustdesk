@@ -3,7 +3,7 @@ use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use clipboard_master::{CallbackResult, ClipboardHandler};
+use clipboard_master::CallbackResult;
 #[cfg(not(target_os = "linux"))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -17,12 +17,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::c_void,
-    io,
     net::SocketAddr,
     ops::Deref,
     str::FromStr,
     sync::{
-        mpsc::{self, RecvTimeoutError, Sender},
+        mpsc::{self, RecvTimeoutError},
         Arc, Mutex, RwLock,
     },
 };
@@ -867,7 +866,7 @@ impl ClientClipboardHandler {
     #[inline]
     #[cfg(feature = "flutter")]
     fn send_msg(&self, msg: Message, _is_file: bool) {
-        crate::flutter::send_clipboard_msg(msg, _is_file);
+        crate::flutter::send_clipboard_msg(msg, _is_file, None);
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -2380,6 +2379,10 @@ impl LoginConfigHandler {
             session_id: self.session_id,
         })
         .ok()
+    }
+
+    pub fn get_id(&self) -> &str {
+        &self.id
     }
 }
 

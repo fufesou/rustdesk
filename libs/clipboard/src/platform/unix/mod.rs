@@ -1,8 +1,5 @@
 use dashmap::DashMap;
-use hbb_common::log;
 use lazy_static::lazy_static;
-
-use crate::{send_data, ClipboardFile, CliprdrError};
 
 mod filetype;
 /// use FUSE for file pasting on these platforms
@@ -51,33 +48,7 @@ lazy_static! {
     );
 }
 
+#[inline]
 pub fn get_local_format(remote_id: i32) -> Option<String> {
     REMOTE_FORMAT_MAP.get(&remote_id).map(|s| s.clone())
-}
-
-fn send_failed_resp_file_contents(conn_id: i32, stream_id: i32) -> Result<(), CliprdrError> {
-    let resp = ClipboardFile::FileContentsResponse {
-        msg_flags: 0x2,
-        stream_id,
-        requested_data: vec![],
-    };
-    send_data(conn_id, resp)
-}
-
-pub fn send_format_list(conn_id: i32) -> Result<(), CliprdrError> {
-    log::debug!("send format list to remote, conn={}", conn_id);
-    let fd_format_name = get_local_format(FILEDESCRIPTOR_FORMAT_ID)
-        .unwrap_or(FILEDESCRIPTORW_FORMAT_NAME.to_string());
-    let fc_format_name =
-        get_local_format(FILECONTENTS_FORMAT_ID).unwrap_or(FILECONTENTS_FORMAT_NAME.to_string());
-    let format_list = ClipboardFile::FormatList {
-        format_list: vec![
-            (FILEDESCRIPTOR_FORMAT_ID, fd_format_name),
-            (FILECONTENTS_FORMAT_ID, fc_format_name),
-        ],
-    };
-
-    send_data(conn_id, format_list)?;
-    log::debug!("format list to remote dispatched, conn={}", conn_id);
-    Ok(())
 }

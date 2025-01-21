@@ -2172,7 +2172,7 @@ impl Connection {
                     #[cfg(feature = "unix-file-copy-paste")]
                     if let Some(clip) = msg_2_clip(_clip) {
                         if let Some(msg) =
-                            unix_file_clip::serve_clip_messages(false, clip, self.inner.id())
+                            unix_file_clip::serve_clip_messages(false, clip, self.inner.id(), "")
                         {
                             self.send(msg).await;
                         }
