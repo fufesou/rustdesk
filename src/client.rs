@@ -842,11 +842,9 @@ impl ClientClipboardHandler {
     fn check_clipboard(&mut self) {
         if CLIPBOARD_STATE.lock().unwrap().running {
             #[cfg(feature = "unix-file-copy-paste")]
-            if self.is_file_required() {
-                if let Some(msg) =
-                    check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false)
-                {
-                    if !msg.is_empty() {
+            if let Some(msg) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false) {
+                if !msg.is_empty() {
+                    if self.is_file_required() {
                         let msg =
                             crate::clipboard_file::clip_2_msg(unix_file_clip::get_format_list());
                         self.send_msg(msg, true);
@@ -855,8 +853,8 @@ impl ClientClipboardHandler {
                 }
             }
 
-            if self.is_text_required() {
-                if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
+            if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
+                if self.is_text_required() {
                     self.send_msg(msg, false);
                 }
             }
@@ -1853,7 +1851,7 @@ impl LoginConfigHandler {
 
         #[cfg(feature = "unix-file-copy-paste")]
         if option.enable_file_transfer.enum_value() == Ok(BoolOption::No) {
-            crate::clipboard::try_empty_clipboard_files(crate::clipboard::ClipboardSide::Client);
+            crate::clipboard::try_empty_clipboard_files(crate::clipboard::ClipboardSide::Client, 0);
         }
         if !name.contains("block-input") {
             self.save_config(config);

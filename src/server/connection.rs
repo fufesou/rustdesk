@@ -535,7 +535,7 @@ impl Connection {
                                 conn.send_permission(Permission::File, enabled).await;
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if !enabled {
-                                    conn.try_empty_file_clipboard();
+                                    conn.try_empty_file_clipboard(conn.inner.id);
                                 }
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if let Some(s) = conn.server.upgrade() {
@@ -2978,7 +2978,7 @@ impl Connection {
                 ));
                 #[cfg(feature = "unix-file-copy-paste")]
                 if !self.enable_file_transfer {
-                    self.try_empty_file_clipboard();
+                    self.try_empty_file_clipboard(self.inner.id);
                 }
                 #[cfg(feature = "unix-file-copy-paste")]
                 if let Some(s) = self.server.upgrade() {
@@ -3438,10 +3438,10 @@ impl Connection {
 
     #[inline]
     #[cfg(feature = "unix-file-copy-paste")]
-    fn try_empty_file_clipboard(&mut self) {
+    fn try_empty_file_clipboard(&mut self, conn_id: i32) {
         // No need to check if current clipboard files are set by this connection or the other ones.
         // It's a rare case.
-        try_empty_clipboard_files(ClipboardSide::Host);
+        try_empty_clipboard_files(ClipboardSide::Host, conn_id);
     }
 }
 

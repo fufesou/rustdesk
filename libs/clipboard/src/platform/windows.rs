@@ -516,6 +516,7 @@ extern "C" {
     pub(crate) fn init_cliprdr(context: *mut CliprdrClientContext) -> BOOL;
     pub(crate) fn uninit_cliprdr(context: *mut CliprdrClientContext) -> BOOL;
     pub(crate) fn empty_cliprdr(context: *mut CliprdrClientContext, connID: UINT32) -> BOOL;
+    pub(crate) fn clear_cliprdr_conn_id(context: *mut CliprdrClientContext);
 }
 
 unsafe impl Send for CliprdrClientContext {}
@@ -598,6 +599,10 @@ impl CliprdrServiceContext for CliprdrClientContext {
         Ok(empty_clipboard(self, conn_id))
     }
 
+    fn clear_clipboarod_conn_id(&mut self) {
+        clear_clipboard_conn_id(self);
+    }
+
     fn server_clip_file(&mut self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError> {
         let ret = server_clip_file(self, conn_id, msg);
         ret_to_result(ret)
@@ -617,6 +622,10 @@ fn ret_to_result(ret: u32) -> Result<(), CliprdrError> {
 
 pub fn empty_clipboard(context: &mut CliprdrClientContext, conn_id: i32) -> bool {
     unsafe { TRUE == empty_cliprdr(context, conn_id as u32) }
+}
+
+pub fn clear_clipboard_conn_id(context: &mut CliprdrClientContext) {
+    unsafe { clear_cliprdr_conn_id(context) }
 }
 
 pub fn server_clip_file(

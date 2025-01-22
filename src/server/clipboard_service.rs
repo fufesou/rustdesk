@@ -3,11 +3,14 @@ use super::*;
 use crate::clipboard::clipboard_listener;
 #[cfg(not(target_os = "android"))]
 pub use crate::clipboard::{check_clipboard, ClipboardContext, ClipboardSide};
-#[cfg(feature = "unix-file-copy-paste")]
-pub use crate::clipboard::{check_clipboard_files, FILE_CLIPBOARD_NAME as FILE_NAME};
 pub use crate::clipboard::{CLIPBOARD_INTERVAL as INTERVAL, CLIPBOARD_NAME as NAME};
 #[cfg(windows)]
 use crate::ipc::{self, ClipboardFile, ClipboardNonFile, Data};
+#[cfg(feature = "unix-file-copy-paste")]
+pub use crate::{
+    clipboard::{check_clipboard_files, FILE_CLIPBOARD_NAME as FILE_NAME},
+    clipboard_file::unix_file_clip,
+};
 #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
 use clipboard::platform::unix::fuse::{init_fuse_context, uninit_fuse_context};
 #[cfg(not(target_os = "android"))]
@@ -112,7 +115,6 @@ impl Handler {
     fn check_clipboard_file(&mut self) {
         if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Host, false) {
             if !urls.is_empty() {
-                use crate::clipboard_file::unix_file_clip;
                 // Use `send_data()` here to reuse `handle_file_clip()` in `connection.rs`.
                 hbb_common::allow_err!(clipboard::send_data(
                     None,

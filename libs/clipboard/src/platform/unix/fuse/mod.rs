@@ -88,6 +88,7 @@ pub fn init_fuse_context(is_client: bool) -> Result<(), CliprdrError> {
         tx,
         mount_point,
         session,
+        conn_id: 0,
     };
     *fuse_context_lock = Some(ctx);
     Ok(())
@@ -102,12 +103,12 @@ pub fn format_data_response_to_urls(
     format_data: Vec<u8>,
     conn_id: i32,
 ) -> Result<Vec<String>, CliprdrError> {
-    let ctx = if is_client {
+    let mut ctx = if is_client {
         FUSE_CONTEXT_CLIENT.lock()
     } else {
         FUSE_CONTEXT_SERVER.lock()
     };
-    ctx.as_ref()
+    ctx.as_mut()
         .ok_or(CliprdrError::CliprdrInit)?
         .format_data_response_to_urls(format_data, conn_id)
 }
@@ -133,13 +134,13 @@ pub fn handle_file_content_response(
     Ok(())
 }
 
-pub fn empty_local_files(is_client: bool) {
+pub fn empty_local_files(is_client: bool, conn_id: i32) {
     let ctx = if is_client {
         FUSE_CONTEXT_CLIENT.lock()
     } else {
         FUSE_CONTEXT_SERVER.lock()
     };
-    ctx.as_ref().map(|c| c.empty_local_files());
+    ctx.as_ref().map(|c| c.empty_local_files(conn_id));
 }
 
 struct FuseContext {
@@ -148,6 +149,8 @@ struct FuseContext {
     mount_point: PathBuf,
     // stores fuse background session handle
     session: Mutex<Option<fuser::BackgroundSession>>,
+    // Indicates the connection ID of that set the clipboard content
+    conn_id: i32,
 }
 
 // this function must be called after the main IPC is up
@@ -183,13 +186,16 @@ impl Drop for FuseContext {
 }
 
 impl FuseContext {
-    pub fn empty_local_files(&self) {
+    pub fn empty_local_files(&self, conn_id: i32) {
+        if conn_id != 0 || self.conn_id != conn_id {
+            return;
+        }
         let mut fuse_guard = self.server.lock();
         let _ = fuse_guard.load_file_list(vec![]);
     }
 
     pub fn format_data_response_to_urls(
-        &self,
+        &mut self,
         format_data: Vec<u8>,
         conn_id: i32,
     ) -> Result<Vec<String>, CliprdrError> {
@@ -198,6 +204,7 @@ impl FuseContext {
         let paths = {
             let mut fuse_guard = self.server.lock();
             fuse_guard.load_file_list(files)?;
+            self.conn_id = conn_id;
 
             fuse_guard.list_root()
         };

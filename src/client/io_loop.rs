@@ -1515,7 +1515,10 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_permission("file", p.enabled);
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if !p.enabled {
-                                    try_empty_clipboard_files(ClipboardSide::Client);
+                                    try_empty_clipboard_files(
+                                        ClipboardSide::Client,
+                                        self.client_conn_id,
+                                    );
                                 }
                             }
                             Ok(Permission::Restart) => {

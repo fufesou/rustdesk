@@ -295,7 +295,7 @@ pub mod unix_file_clip {
                 ) {
                     Ok(Some(files)) => {
                         if !files.is_empty() {
-                            match serv_files::build_file_list_format_data(&files) {
+                            match serv_files::build_file_list_format_data(conn_id, &files) {
                                 Ok(format_data) => {
                                     return Some(clip_2_msg(ClipboardFile::FormatDataResponse {
                                         msg_flags: 1,
@@ -401,11 +401,14 @@ pub mod unix_file_clip {
                 );
             }
             ClipboardFile::TryEmpty => {
-                try_empty_clipboard_files(if is_client {
-                    ClipboardSide::Client
-                } else {
-                    ClipboardSide::Host
-                });
+                try_empty_clipboard_files(
+                    if is_client {
+                        ClipboardSide::Client
+                    } else {
+                        ClipboardSide::Host
+                    },
+                    conn_id,
+                );
             }
             _ => {
                 log::error!("unsupported clipboard file type");

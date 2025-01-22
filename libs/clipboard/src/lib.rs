@@ -42,7 +42,8 @@ pub trait CliprdrServiceContext: Send + Sync {
     fn set_is_stopped(&mut self) -> Result<(), CliprdrError>;
     /// clear the content on clipboard
     fn empty_clipboard(&mut self, conn_id: i32) -> Result<bool, CliprdrError>;
-
+    /// clear the connection id flag on clipboard
+    fn clear_clipboarod_conn_id(&mut self);
     /// run as a server for clipboard RPC
     fn server_clip_file(&mut self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError>;
 }

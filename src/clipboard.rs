@@ -88,6 +88,8 @@ pub fn check_clipboard_files(
     match ctx2.get_files(side, force) {
         Ok(Some(urls)) => {
             if !urls.is_empty() {
+                // clipboard is updated, so we need to clear the existing file clipboard data.
+                clear_file_clipboard();
                 return Some(urls);
             }
         }
@@ -125,7 +127,7 @@ pub fn update_clipboard_files(files: Vec<String>, side: ClipboardSide) {
 }
 
 #[cfg(feature = "unix-file-copy-paste")]
-pub fn try_empty_clipboard_files(side: ClipboardSide) {
+pub fn try_empty_clipboard_files(side: ClipboardSide, conn_id: i32) {
     std::thread::spawn(move || {
         if let Ok(mut ctx) = ClipboardContext::new() {
             use clipboard::platform::unix;
@@ -133,20 +135,38 @@ pub fn try_empty_clipboard_files(side: ClipboardSide) {
             ctx.try_empty_clipboard_files();
             #[cfg(target_os = "linux")]
             {
-                unix::fuse::empty_local_files(side == ClipboardSide::Client);
+                unix::fuse::empty_local_files(side == ClipboardSide::Client, conn_id);
             }
-            unix::serv_files::clear_files();
+            unix::serv_files::clear_files(conn_id);
         }
     });
 }
 
 #[cfg(target_os = "windows")]
 pub fn try_empty_clipboard_files(side: ClipboardSide, conn_id: i32) {
-    log::debug!("try empty {} cliprdr for conn_id {}", side, conn_id);
+    log::debug!("try to empty {} cliprdr for conn_id {}", side, conn_id);
     let _ = clipboard::ContextSend::proc(|context| -> ResultType<()> {
         context.empty_clipboard(conn_id)?;
         Ok(())
     });
+}
+
+// 1. When the clipboard is changed.
+// 2. When the clipboard is updated by non-file data.
+pub fn clear_file_clipboard() {
+    #[cfg(feature = "unix-file-copy-paste")]
+    {
+        try_empty_clipboard_files(ClipboardSide::Host, 0);
+        try_empty_clipboard_files(ClipboardSide::Client, 0);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        log::debug!("try to clear file clipboard conn id");
+        let _ = clipboard::ContextSend::proc(|context| -> ResultType<()> {
+            context.clear_clipboarod_conn_id();
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -209,6 +229,7 @@ fn do_update_clipboard_(mut to_update_data: Vec<ClipboardData>, side: ClipboardS
 
 #[cfg(not(target_os = "android"))]
 pub fn update_clipboard(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
+    clear_file_clipboard();
     std::thread::spawn(move || {
         update_clipboard_(multi_clipboards, side);
     });
@@ -297,6 +318,9 @@ impl ClipboardContext {
             if data.iter().any(|c| matches!(c, ClipboardData::FileUrl(_))) {
                 return Ok(vec![]);
             }
+        }
+        if !data.is_empty() {
+            clear_file_clipboard();
         }
         Ok(data)
     }
