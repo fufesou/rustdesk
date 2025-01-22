@@ -864,7 +864,7 @@ impl ClientClipboardHandler {
     #[inline]
     #[cfg(feature = "flutter")]
     fn send_msg(&self, msg: Message, _is_file: bool) {
-        crate::flutter::send_clipboard_msg(msg, _is_file, None);
+        crate::flutter::send_clipboard_msg(msg, _is_file);
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -1851,8 +1851,12 @@ impl LoginConfigHandler {
 
         #[cfg(feature = "unix-file-copy-paste")]
         if option.enable_file_transfer.enum_value() == Ok(BoolOption::No) {
-            crate::clipboard::try_empty_clipboard_files(crate::clipboard::ClipboardSide::Client, 0);
+            crate::clipboard::try_empty_clipboard_files(
+                crate::clipboard::ClipboardSide::Client,
+                0,
+            );
         }
+
         if !name.contains("block-input") {
             self.save_config(config);
         }

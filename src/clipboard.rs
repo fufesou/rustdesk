@@ -88,8 +88,6 @@ pub fn check_clipboard_files(
     match ctx2.get_files(side, force) {
         Ok(Some(urls)) => {
             if !urls.is_empty() {
-                // clipboard is updated, so we need to clear the existing file clipboard data.
-                clear_file_clipboard();
                 return Some(urls);
             }
         }
@@ -127,17 +125,14 @@ pub fn update_clipboard_files(files: Vec<String>, side: ClipboardSide) {
 }
 
 #[cfg(feature = "unix-file-copy-paste")]
-pub fn try_empty_clipboard_files(side: ClipboardSide, conn_id: i32) {
+pub fn try_empty_clipboard_files(_side: ClipboardSide, _conn_id: i32) {
+    #[cfg(target_os = "linux")]
     std::thread::spawn(move || {
         if let Ok(mut ctx) = ClipboardContext::new() {
             use clipboard::platform::unix;
-
-            ctx.try_empty_clipboard_files();
-            #[cfg(target_os = "linux")]
-            {
-                unix::fuse::empty_local_files(side == ClipboardSide::Client, conn_id);
+            if unix::fuse::empty_local_files(_side == ClipboardSide::Client, _conn_id) {
+                ctx.try_empty_clipboard_files(_side);
             }
-            unix::serv_files::clear_files(conn_id);
         }
     });
 }
@@ -149,24 +144,6 @@ pub fn try_empty_clipboard_files(side: ClipboardSide, conn_id: i32) {
         context.empty_clipboard(conn_id)?;
         Ok(())
     });
-}
-
-// 1. When the clipboard is changed.
-// 2. When the clipboard is updated by non-file data.
-pub fn clear_file_clipboard() {
-    #[cfg(feature = "unix-file-copy-paste")]
-    {
-        try_empty_clipboard_files(ClipboardSide::Host, 0);
-        try_empty_clipboard_files(ClipboardSide::Client, 0);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        log::debug!("try to clear file clipboard conn id");
-        let _ = clipboard::ContextSend::proc(|context| -> ResultType<()> {
-            context.clear_clipboarod_conn_id();
-            Ok(())
-        });
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -229,7 +206,6 @@ fn do_update_clipboard_(mut to_update_data: Vec<ClipboardData>, side: ClipboardS
 
 #[cfg(not(target_os = "android"))]
 pub fn update_clipboard(multi_clipboards: Vec<Clipboard>, side: ClipboardSide) {
-    clear_file_clipboard();
     std::thread::spawn(move || {
         update_clipboard_(multi_clipboards, side);
     });
@@ -319,9 +295,6 @@ impl ClipboardContext {
                 return Ok(vec![]);
             }
         }
-        if !data.is_empty() {
-            clear_file_clipboard();
-        }
         Ok(data)
     }
 
@@ -383,19 +356,20 @@ impl ClipboardContext {
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
-    fn try_empty_clipboard_files(&mut self) {
+    fn try_empty_clipboard_files(&mut self, side: ClipboardSide) {
         let _lock = ARBOARD_MTX.lock().unwrap();
         if let Ok(data) = self.get_formats(&[ClipboardFormat::FileUrl]) {
             #[cfg(target_os = "linux")]
-            let exclude_paths = clipboard::platform::unix::fuse::get_exclude_paths();
+            let exclude_path =
+                clipboard::platform::unix::fuse::get_exclude_paths(side == ClipboardSide::Client);
             #[cfg(target_os = "macos")]
-            let exclude_paths: Vec<Arc<String>> = vec![];
+            let exclude_path: Arc<String> = Default::default();
             let urls = data
                 .into_iter()
                 .filter_map(|c| match c {
                     ClipboardData::FileUrl(urls) => Some(
                         urls.into_iter()
-                            .filter(|s| exclude_paths.iter().any(|p| s.starts_with(&**p)))
+                            .filter(|s| s.starts_with(&*exclude_path))
                             .collect::<Vec<_>>(),
                     ),
                     _ => None,

@@ -553,7 +553,7 @@ impl FuseServer {
             clip_data_id: 0,
         };
 
-        send_data(Some(node.conn_id), None, request.clone()).map_err(|e| {
+        send_data(node.conn_id, request.clone()).map_err(|e| {
             log::error!("failed to send file list to channel: {:?}", e);
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
@@ -587,7 +587,7 @@ impl FuseServer {
                             ));
                         }
 
-                        send_data(Some(node.conn_id), None, request.clone()).map_err(|e| {
+                        send_data(node.conn_id, request.clone()).map_err(|e| {
                             log::error!("failed to send file list to channel: {:?}", e);
                             std::io::Error::new(std::io::ErrorKind::Other, e)
                         })?;

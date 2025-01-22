@@ -31,11 +31,12 @@ lazy_static::lazy_static! {
 
 static FUSE_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub fn get_exclude_paths() -> Vec<Arc<String>> {
-    vec![
-        FUSE_MOUNT_POINT_CLIENT.clone(),
-        FUSE_MOUNT_POINT_SERVER.clone(),
-    ]
+pub fn get_exclude_paths(is_client: bool) -> Arc<String> {
+    if is_client {
+        FUSE_MOUNT_POINT_CLIENT.clone()
+    } else {
+        FUSE_MOUNT_POINT_SERVER.clone()
+    }
 }
 
 pub fn is_fuse_context_inited(is_client: bool) -> bool {
@@ -134,13 +135,15 @@ pub fn handle_file_content_response(
     Ok(())
 }
 
-pub fn empty_local_files(is_client: bool, conn_id: i32) {
+pub fn empty_local_files(is_client: bool, conn_id: i32) -> bool {
     let ctx = if is_client {
         FUSE_CONTEXT_CLIENT.lock()
     } else {
         FUSE_CONTEXT_SERVER.lock()
     };
-    ctx.as_ref().map(|c| c.empty_local_files(conn_id));
+    ctx.as_ref()
+        .map(|c| c.empty_local_files(conn_id))
+        .unwrap_or(false)
 }
 
 struct FuseContext {
@@ -186,12 +189,13 @@ impl Drop for FuseContext {
 }
 
 impl FuseContext {
-    pub fn empty_local_files(&self, conn_id: i32) {
-        if conn_id != 0 || self.conn_id != conn_id {
-            return;
+    pub fn empty_local_files(&self, conn_id: i32) -> bool {
+        if conn_id != 0 && self.conn_id != conn_id {
+            return false;
         }
         let mut fuse_guard = self.server.lock();
         let _ = fuse_guard.load_file_list(vec![]);
+        true
     }
 
     pub fn format_data_response_to_urls(

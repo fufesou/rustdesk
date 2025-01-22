@@ -278,7 +278,6 @@ pub mod unix_file_clip {
                 let data = ClipboardFile::FormatDataRequest {
                     requested_format_id: file_descriptor_id,
                 };
-                try_empty_other_connections(is_client, conn_id, peer_id);
                 return Some(clip_2_msg(data));
             }
             ClipboardFile::FormatListResponse {
@@ -295,7 +294,7 @@ pub mod unix_file_clip {
                 ) {
                     Ok(Some(files)) => {
                         if !files.is_empty() {
-                            match serv_files::build_file_list_format_data(conn_id, &files) {
+                            match serv_files::build_file_list_format_data(&files) {
                                 Ok(format_data) => {
                                     return Some(clip_2_msg(ClipboardFile::FormatDataResponse {
                                         msg_flags: 1,
@@ -415,21 +414,5 @@ pub mod unix_file_clip {
             }
         }
         None
-    }
-
-    fn try_empty_other_connections(is_client: bool, conn_id: i32, peer_id: &str) {
-        if is_client {
-            crate::flutter::send_clipboard_msg(
-                clip_2_msg(ClipboardFile::TryEmpty),
-                true,
-                Some(peer_id),
-            );
-        } else {
-            hbb_common::allow_err!(clipboard::send_data(
-                None,
-                Some(conn_id),
-                ClipboardFile::TryEmpty
-            ));
-        }
     }
 }

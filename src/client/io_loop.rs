@@ -1979,11 +1979,13 @@ impl<T: InvokeUiSession> Remote<T> {
                 log::error!("failed to restart clipboard context: {}", e);
             };
             #[cfg(target_os = "windows")]
-            let _ = ContextSend::proc(|context| -> ResultType<()> {
-                context
-                    .server_clip_file(self.client_conn_id, clip)
-                    .map_err(|e| e.into())
-            });
+            {
+                let _ = ContextSend::proc(|context| -> ResultType<()> {
+                    context
+                        .server_clip_file(self.client_conn_id, clip)
+                        .map_err(|e| e.into())
+                });
+            }
             #[cfg(feature = "unix-file-copy-paste")]
             if let Some(msg) =
                 unix_file_clip::serve_clip_messages(true, clip, 0, &self.handler.get_id())

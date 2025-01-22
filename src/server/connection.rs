@@ -2164,13 +2164,14 @@ impl Connection {
                     #[cfg(target_os = "android")]
                     crate::clipboard::handle_msg_multi_clipboards(_mcb);
                 }
-                Some(message::Union::Cliprdr(_clip)) => {
-                    #[cfg(target_os = "windows")]
-                    if let Some(clip) = msg_2_clip(_clip) {
-                        self.send_to_cm(ipc::Data::ClipboardFile(clip))
-                    }
-                    #[cfg(feature = "unix-file-copy-paste")]
-                    if let Some(clip) = msg_2_clip(_clip) {
+                #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+                Some(message::Union::Cliprdr(clip)) => {
+                    if let Some(clip) = msg_2_clip(clip) {
+                        #[cfg(target_os = "windows")]
+                        {
+                            self.send_to_cm(ipc::Data::ClipboardFile(clip));
+                        }
+                        #[cfg(feature = "unix-file-copy-paste")]
                         if let Some(msg) =
                             unix_file_clip::serve_clip_messages(false, clip, self.inner.id(), "")
                         {
@@ -3439,8 +3440,6 @@ impl Connection {
     #[inline]
     #[cfg(feature = "unix-file-copy-paste")]
     fn try_empty_file_clipboard(&mut self, conn_id: i32) {
-        // No need to check if current clipboard files are set by this connection or the other ones.
-        // It's a rare case.
         try_empty_clipboard_files(ClipboardSide::Host, conn_id);
     }
 }

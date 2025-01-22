@@ -42,8 +42,6 @@ pub trait CliprdrServiceContext: Send + Sync {
     fn set_is_stopped(&mut self) -> Result<(), CliprdrError>;
     /// clear the content on clipboard
     fn empty_clipboard(&mut self, conn_id: i32) -> Result<bool, CliprdrError>;
-    /// clear the connection id flag on clipboard
-    fn clear_clipboarod_conn_id(&mut self);
     /// run as a server for clipboard RPC
     fn server_clip_file(&mut self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError>;
 }
@@ -205,26 +203,15 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
 
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
 #[inline]
-pub fn send_data(
-    include: Option<i32>,
-    exclude: Option<i32>,
-    data: ClipboardFile,
-) -> Result<(), CliprdrError> {
-    if let Some(conn_id) = exclude {
-        send_data_exclude(conn_id, data);
+pub fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
+    #[cfg(target_os = "windows")]
+    return send_data_to_channel(conn_id, data);
+    #[cfg(not(target_os = "windows"))]
+    if conn_id == 0 {
+        let _ = send_data_to_all(data);
         Ok(())
-    } else if let Some(conn_id) = include {
-        if conn_id == 0 {
-            #[cfg(not(target_os = "windows"))]
-            send_data_to_all(data);
-            Ok(())
-        } else {
-            send_data_to_channel(conn_id, data)
-        }
     } else {
-        #[cfg(not(target_os = "windows"))]
-        send_data_to_all(data);
-        Ok(())
+        send_data_to_channel(conn_id, data)
     }
 }
 
@@ -250,9 +237,8 @@ fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), Cliprdr
     }
 }
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
-#[inline]
-fn send_data_exclude(conn_id: i32, data: ClipboardFile) {
+#[cfg(target_os = "windows")]
+pub fn send_data_exclude(conn_id: i32, data: ClipboardFile) {
     use hbb_common::{allow_err, log};
     // Need more tests to see if it's necessary to handle the error.
     for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {

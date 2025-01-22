@@ -116,11 +116,7 @@ impl Handler {
         if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Host, false) {
             if !urls.is_empty() {
                 // Use `send_data()` here to reuse `handle_file_clip()` in `connection.rs`.
-                hbb_common::allow_err!(clipboard::send_data(
-                    None,
-                    None,
-                    unix_file_clip::get_format_list()
-                ));
+                hbb_common::allow_err!(clipboard::send_data(0, unix_file_clip::get_format_list()));
             }
         }
     }

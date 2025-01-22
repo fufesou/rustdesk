@@ -12,7 +12,7 @@ lazy_static::lazy_static! {
     // Because `CliprdrFileContentsRequest` only contains the index of the file in the list.
     // We need to keep the file list in the same order as the remote side.
     // We may add a `FileId` field to `CliprdrFileContentsRequest` in the future.
-    static ref CLIP_FILES: Arc<Mutex<(i32, ClipFiles)>> = Default::default();
+    static ref CLIP_FILES: Arc<Mutex<ClipFiles>> = Default::default();
 }
 
 #[derive(Debug)]
@@ -181,12 +181,9 @@ impl ClipFiles {
     }
 }
 
-pub fn clear_files(conn_id: i32) {
-    let mut files_lock = CLIP_FILES.lock();
-    if files_lock.0 == conn_id {
-        files_lock.0 = 0;
-        files_lock.1.clear();
-    }
+#[inline]
+pub fn clear_files() {
+    CLIP_FILES.lock().clear();
 }
 
 pub fn read_file_contents(
@@ -219,25 +216,11 @@ pub fn read_file_contents(
         });
     };
 
-    let mut files_lock = CLIP_FILES.lock();
-    if conn_id == files_lock.0 {
-        files_lock.1.serve_file_contents(conn_id, fcr)
-    } else {
-        Err(CliprdrError::InvalidRequest {
-            description: format!(
-                "conn_id {} does not match the current conn_id {}",
-                conn_id, files_lock.0
-            ),
-        })
-    }
+    CLIP_FILES.lock().serve_file_contents(conn_id, fcr)
 }
 
-pub fn build_file_list_format_data(
-    conn_id: i32,
-    files: &[String],
-) -> Result<Vec<u8>, CliprdrError> {
+pub fn build_file_list_format_data(files: &[String]) -> Result<Vec<u8>, CliprdrError> {
     let mut files_lock = CLIP_FILES.lock();
-    files_lock.1.sync_files(files)?;
-    files_lock.0 = conn_id;
-    Ok(files_lock.1.build_file_list_pdu())
+    files_lock.sync_files(files)?;
+    Ok(files_lock.build_file_list_pdu())
 }

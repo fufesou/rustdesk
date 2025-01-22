@@ -1,10 +1,12 @@
-use crate::clipboard::ClipboardSide;
 #[cfg(target_os = "windows")]
 use crate::ipc::ClipboardNonFile;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::ipc::Connection;
 #[cfg(not(any(target_os = "ios")))]
-use crate::ipc::{self, Data};
+use crate::{
+    clipboard::ClipboardSide,
+    ipc::{self, Data},
+};
 #[cfg(target_os = "windows")]
 use clipboard::ContextSend;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
