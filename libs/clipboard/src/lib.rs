@@ -201,7 +201,7 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
     }
 }
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 #[inline]
 pub fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     #[cfg(target_os = "windows")]
@@ -215,7 +215,7 @@ pub fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> 
     }
 }
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 #[inline]
 fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     if let Some(msg_channel) = VEC_MSG_CHANNEL

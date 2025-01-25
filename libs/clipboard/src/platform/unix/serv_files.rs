@@ -34,18 +34,17 @@ enum FileContentsRequest {
 struct ClipFiles {
     files: Vec<String>,
     file_list: Vec<LocalFile>,
+    files_pdu: Vec<u8>,
 }
 
 impl ClipFiles {
     fn clear(&mut self) {
         self.files.clear();
         self.file_list.clear();
+        self.files_pdu.clear();
     }
 
     fn sync_files(&mut self, clipboard_files: &[String]) -> Result<(), CliprdrError> {
-        if self.files == clipboard_files {
-            return Ok(());
-        }
         let clipboard_paths = clipboard_files
             .iter()
             .map(|s| PathBuf::from(s))
@@ -55,14 +54,13 @@ impl ClipFiles {
         Ok(())
     }
 
-    fn build_file_list_pdu(&self) -> Vec<u8> {
+    fn build_file_list_pdu(&mut self) {
         let mut data = BytesMut::with_capacity(4 + 592 * self.file_list.len());
         data.put_u32_le(self.file_list.len() as u32);
         for file in self.file_list.iter() {
             data.put(file.as_bin().as_slice());
         }
-
-        data.to_vec()
+        self.files_pdu = data.to_vec()
     }
 
     fn serve_file_contents(
@@ -219,8 +217,15 @@ pub fn read_file_contents(
     CLIP_FILES.lock().serve_file_contents(conn_id, fcr)
 }
 
-pub fn build_file_list_format_data(files: &[String]) -> Result<Vec<u8>, CliprdrError> {
+pub fn sync_files(files: &[String]) -> Result<(), CliprdrError> {
     let mut files_lock = CLIP_FILES.lock();
+    if files_lock.files == files {
+        return Ok(());
+    }
     files_lock.sync_files(files)?;
     Ok(files_lock.build_file_list_pdu())
+}
+
+pub fn get_file_list_pdu() -> Vec<u8> {
+    CLIP_FILES.lock().files_pdu.clone()
 }

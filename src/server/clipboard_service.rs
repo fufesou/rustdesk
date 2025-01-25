@@ -115,8 +115,18 @@ impl Handler {
     fn check_clipboard_file(&mut self) {
         if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Host, false) {
             if !urls.is_empty() {
-                // Use `send_data()` here to reuse `handle_file_clip()` in `connection.rs`.
-                hbb_common::allow_err!(clipboard::send_data(0, unix_file_clip::get_format_list()));
+                match clipboard::platform::unix::serv_files::sync_files(&urls) {
+                    Ok(()) => {
+                        // Use `send_data()` here to reuse `handle_file_clip()` in `connection.rs`.
+                        hbb_common::allow_err!(clipboard::send_data(
+                            0,
+                            unix_file_clip::get_format_list()
+                        ));
+                    }
+                    Err(e) => {
+                        log::error!("Failed to sync clipboard files: {}", e);
+                    }
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 use clipboard::ClipboardFile;
-use hbb_common::message_proto::*;
+use hbb_common::{log, message_proto::*};
 
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
@@ -287,33 +287,14 @@ pub mod unix_file_clip {
                 requested_format_id: _requested_format_id,
             } => {
                 log::debug!("requested format id: {}", _requested_format_id);
-                match crate::clipboard::get_clipboard_file_urls(
-                    &mut CLIPBOARD_CTX.lock().unwrap(),
-                    crate::clipboard::ClipboardSide::Host,
-                    false,
-                ) {
-                    Ok(Some(files)) => {
-                        if !files.is_empty() {
-                            match serv_files::build_file_list_format_data(&files) {
-                                Ok(format_data) => {
-                                    return Some(clip_2_msg(ClipboardFile::FormatDataResponse {
-                                        msg_flags: 1,
-                                        format_data,
-                                    }));
-                                }
-                                Err(e) => {
-                                    log::error!("build file list format data error: {:?}", e);
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        log::error!("no file list found");
-                    }
-                    Err(e) => {
-                        log::error!("get file list error: {:?}", e);
-                    }
+                let format_data = serv_files::get_file_list_pdu();
+                if !format_data.is_empty() {
+                    return Some(clip_2_msg(ClipboardFile::FormatDataResponse {
+                        msg_flags: 1,
+                        format_data,
+                    }));
                 }
+                // empty file list, send failure message
                 return Some(msg_resp_format_data_failure());
             }
             #[cfg(target_os = "linux")]

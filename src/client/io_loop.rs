@@ -243,7 +243,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _msg = rx_clip_client.recv() => {
-                            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                            #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                             self.handle_local_clipboard_msg(&mut peer, _msg).await;
                         }
                         _ = self.timer.tick() => {
@@ -324,13 +324,13 @@ impl<T: InvokeUiSession> Remote<T> {
             Client::try_stop_clipboard();
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         if _set_disconnected_ok {
             crate::clipboard::try_empty_clipboard_files(ClipboardSide::Client, self.client_conn_id);
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     async fn handle_local_clipboard_msg(
         &self,
         peer: &mut crate::client::FramedStream,

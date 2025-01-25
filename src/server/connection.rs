@@ -535,7 +535,7 @@ impl Connection {
                                 conn.send_permission(Permission::File, enabled).await;
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if !enabled {
-                                    conn.try_empty_file_clipboard(conn.inner.id);
+                                    conn.try_empty_file_clipboard();
                                 }
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if let Some(s) = conn.server.upgrade() {
@@ -814,6 +814,10 @@ impl Connection {
             s.remove_connection(&conn.inner);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             try_stop_record_cursor_pos();
+        }
+        #[cfg(feature = "unix-file-copy-paste")]
+        {
+            conn.try_empty_file_clipboard();
         }
         conn.on_close("End", true).await;
         log::info!("#{} connection loop exited", id);
@@ -2979,7 +2983,7 @@ impl Connection {
                 ));
                 #[cfg(feature = "unix-file-copy-paste")]
                 if !self.enable_file_transfer {
-                    self.try_empty_file_clipboard(self.inner.id);
+                    self.try_empty_file_clipboard();
                 }
                 #[cfg(feature = "unix-file-copy-paste")]
                 if let Some(s) = self.server.upgrade() {
@@ -3439,8 +3443,8 @@ impl Connection {
 
     #[inline]
     #[cfg(feature = "unix-file-copy-paste")]
-    fn try_empty_file_clipboard(&mut self, conn_id: i32) {
-        try_empty_clipboard_files(ClipboardSide::Host, conn_id);
+    fn try_empty_file_clipboard(&mut self) {
+        try_empty_clipboard_files(ClipboardSide::Host, self.inner.id());
     }
 }
 
