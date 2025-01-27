@@ -2340,6 +2340,11 @@ impl LoginConfigHandler {
             })
             .into(),
             hwid,
+            client_feature: Some(ClientFeature {
+                printer: cfg!(windows) && cfg!(feature = "flutter"),
+                ..Default::default()
+            })
+            .into(),
             ..Default::default()
         };
         match self.conn_type {
