@@ -218,6 +218,9 @@ const double kDefaultQuality = 50;
 const double kMaxQuality = 100;
 const double kMaxMoreQuality = 2000;
 
+const String kKeySelectedPrinterName = 'selected-printer-name';
+const String kKeyAllowAutoPrint = 'allow-auto-print';
+
 double kNewWindowOffset = isWindows
     ? 56.0
     : isLinux
