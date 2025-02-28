@@ -761,8 +761,8 @@ impl Connection {
                 },
                 Some(data) = rx_from_authed.recv() => {
                     match data {
-                        ipc::Data::PrinterFile(path) => {
-                            conn.send_printer_file(path).await;
+                        ipc::Data::PrinterDriver { file } => {
+                            conn.send_printer_file(file).await;
                         }
                         _ => {}
                     }
@@ -3896,10 +3896,14 @@ pub fn on_printer_file(file_path: String) {
         .lock()
         .unwrap()
         .iter()
-        .filter(|c| c.conn_type == crate::server::AuthConnType::Remote && c.printer)
+        .filter(|c| c.printer)
         .next()
         .map(|c| {
-            c.sender.send(Data::PrinterFile(file_path.clone())).ok();
+            c.sender
+                .send(Data::PrinterDriver {
+                    file: file_path.clone(),
+                })
+                .ok();
         });
 }
 
@@ -4076,12 +4080,24 @@ mod raii {
             sender: mpsc::UnboundedSender<Data>,
             lr: LoginRequest,
         ) -> Self {
+            let platform_additions: HashMap<String, Value> =
+                serde_json::from_str(&lr.platform_additions).unwrap_or_default();
+            let is_flutter = platform_additions.get("flutter").map_or(true, |v| {
+                if let Value::Bool(true) = v {
+                    true
+                } else {
+                    false
+                }
+            });
+            let printer = conn_type == crate::server::AuthConnType::Remote
+                && lr.my_platform == whoami::Platform::Windows.to_string()
+                && is_flutter;
             AUTHED_CONNS.lock().unwrap().push(AuthedConn {
                 conn_id,
                 conn_type,
                 session_key,
                 sender,
-                printer: lr.client_feature.printer,
+                printer,
             });
             Self::check_wake_lock();
             use std::sync::Once;
