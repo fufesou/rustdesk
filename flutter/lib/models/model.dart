@@ -9,7 +9,6 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
 import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
@@ -425,14 +424,29 @@ class FfiModel with ChangeNotifier {
     final id = evt['id'];
     final dialogManager = parent.target!.dialogManager;
     dialogManager.show((setState, close, context) {
-      final defaultOrSelectedGroupValue = ''.obs;
-      final selectedPrinterName =
-          bind.mainGetLocalOption(key: kKeySelectedPrinterName).obs;
-      final saveSettings = false.obs;
+      final defaultOrSelectedGroupValue = kValuePrinterIncomingJobDefault.obs;
+      final saveSettings = mainGetLocalBoolOptionSync(kKeyPrinterSave).obs;
       final dontShowAgain = false.obs;
+      final Rx<String> selectedPrinterName =
+          bind.mainGetLocalOption(key: kKeyPrinterSelected).obs;
+      final printerNames = getPrinterNames();
+
+      if (selectedPrinterName.value.isNotEmpty) {
+        if (printerNames.contains(selectedPrinterName.value)) {
+          defaultOrSelectedGroupValue.value = kValuePrinterIncomingJobSelected;
+        } else {
+          defaultOrSelectedGroupValue.value = kValuePrinterIncomingJobDefault;
+          if (printerNames.isEmpty) {
+            selectedPrinterName.value = '';
+          } else {
+            selectedPrinterName.value = printerNames.first;
+          }
+        }
+      }
 
       onRatioChanged(String? value) {
-        defaultOrSelectedGroupValue.value = value ?? '';
+        defaultOrSelectedGroupValue.value =
+            value ?? kValuePrinterIncomingJobDefault;
       }
 
       onSubmit() {
@@ -445,11 +459,10 @@ class FfiModel with ChangeNotifier {
             accepted: true,
             printerName: printerName);
         if (saveSettings.value) {
-          bind.mainSetLocalOption(
-              key: kKeySelectedPrinterName, value: selectedPrinterName.value);
+          bind.mainSetLocalOption(key: kKeyPrinterSelected, value: printerName);
         }
         if (dontShowAgain.value) {
-          bind.mainSetLocalOption(key: kKeyAllowAutoPrint, value: 'Y');
+          mainSetLocalBoolOption(kKeyPrinterAllowAutoPrint, true);
         }
         close();
       }
@@ -457,77 +470,127 @@ class FfiModel with ChangeNotifier {
       onCancel() {
         bind.sessionPrinterResponse(
             sessionId: sessionId, id: id, accepted: false, printerName: '');
+        if (dontShowAgain.value) {
+          bind.mainSetLocalOption(
+              key: kKeyPrinterIncommingJobActionKey,
+              value: kValuePrinterIncomingJobDismiss);
+        }
         close();
       }
 
-      var printerNames = <String>[];
-      final printerNamesJson = bind.mainGetPrinterNames();
-      try {
-        printerNames = jsonDecode(printerNamesJson);
-      } catch (_) {}
-
+      final printerItemHeight = 30.0;
+      final selectionAreaHeight =
+          printerItemHeight * min(8.0, max(printerNames.length, 3.0));
       final content = Column(
         children: [
           Text(translate('print_incoming_job_confirm_tip')),
           Row(
             children: [
-              Radio<String>(
-                  value: '',
+              Obx(() => Radio<String>(
+                  value: kValuePrinterIncomingJobDefault,
                   groupValue: defaultOrSelectedGroupValue.value,
-                  onChanged: onRatioChanged),
-              Text(translate('Use the default printer')),
+                  onChanged: onRatioChanged)),
+              GestureDetector(
+                  child: Text(translate('use_default_printer_tip')),
+                  onTap: () => onRatioChanged(kValuePrinterIncomingJobDefault)),
             ],
           ),
-          Row(
+          Column(
             children: [
-              Radio<String>(
-                  value: 'selected',
-                  groupValue: defaultOrSelectedGroupValue.value,
-                  onChanged: onRatioChanged),
-              DropdownButton<String>(
-                value: selectedPrinterName.value,
-                onChanged: onRatioChanged,
-                items: printerNames
-                    .map((e) => DropdownMenuItem<String>(
-                          value: e,
-                          child: Text(e),
-                          onTap: () {
-                            selectedPrinterName.value = e;
-                          },
-                        ))
-                    .toList(),
+              Row(children: [
+                Obx(() => Radio<String>(
+                    value: kValuePrinterIncomingJobSelected,
+                    groupValue: defaultOrSelectedGroupValue.value,
+                    onChanged: onRatioChanged)),
+                GestureDetector(
+                    child: Text(translate('use_selected_printer_tip')),
+                    onTap: () =>
+                        onRatioChanged(kValuePrinterIncomingJobSelected)),
+              ]),
+              SizedBox(
+                height: selectionAreaHeight,
+                width: 500,
+                child: ListView.builder(
+                    itemBuilder: (context, index) {
+                      return Obx(() => GestureDetector(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: selectedPrinterName.value ==
+                                        printerNames[index]
+                                    ? (defaultOrSelectedGroupValue.value ==
+                                            kValuePrinterIncomingJobSelected
+                                        ? MyTheme.button
+                                        : MyTheme.button.withOpacity(0.5))
+                                    : Theme.of(context).cardColor,
+                                borderRadius: BorderRadius.all(
+                                  Radius.circular(5.0),
+                                ),
+                              ),
+                              key: ValueKey(printerNames[index]),
+                              height: printerItemHeight,
+                              child: Align(
+                                alignment: Alignment.centerLeft,
+                                child: Padding(
+                                  padding: const EdgeInsets.only(left: 10.0),
+                                  child: Text(
+                                    printerNames[index],
+                                    style: TextStyle(fontSize: 14),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            onTap: defaultOrSelectedGroupValue.value ==
+                                    kValuePrinterIncomingJobSelected
+                                ? () {
+                                    selectedPrinterName.value =
+                                        printerNames[index];
+                                  }
+                                : null,
+                          ));
+                    },
+                    itemCount: printerNames.length),
               ),
             ],
           ),
           Row(
             children: [
-              Checkbox(
+              Obx(() => Checkbox(
                   value: saveSettings.value,
                   onChanged: (value) {
                     if (value != null) {
                       saveSettings.value = value;
+                      mainSetLocalBoolOption(kKeyPrinterSave, value);
                     }
+                  })),
+              GestureDetector(
+                  child: Text(translate('save_settings_tip')),
+                  onTap: () {
+                    saveSettings.value = !saveSettings.value;
+                    mainSetLocalBoolOption(kKeyPrinterSave, saveSettings.value);
                   }),
-              Text(translate('Save Settings')),
             ],
           ),
           Row(
             children: [
-              Checkbox(
+              Obx(() => Checkbox(
                   value: dontShowAgain.value,
                   onChanged: (value) {
                     if (value != null) {
                       dontShowAgain.value = value;
                     }
+                  })),
+              GestureDetector(
+                  child: Text(translate('dont_show_again_tip')),
+                  onTap: () {
+                    dontShowAgain.value = !dontShowAgain.value;
                   }),
-              Text(translate('Don\'t show this again')),
             ],
           ),
         ],
       );
       return CustomAlertDialog(
-        title: Text(translate('Incoming Printer Job')),
-        content: Obx(() => content),
+        title: Text(translate('Incoming Print Job')),
+        content: content,
         actions: [
           dialogButton('OK', onPressed: onSubmit),
           dialogButton('Cancel', onPressed: onCancel),

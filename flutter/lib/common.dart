@@ -3789,3 +3789,21 @@ void updateTextAndPreserveSelection(
         baseOffset: 0, extentOffset: controller.value.text.length);
   }
 }
+
+List<String> getPrinterNames() {
+  final printerNamesJson = bind.mainGetPrinterNames();
+  if (printerNamesJson.isEmpty) {
+    return [];
+  }
+  try {
+    final List<dynamic> printerNamesList = jsonDecode(printerNamesJson);
+    final rdPrinterName = 'RustDesk Printer';
+    return printerNamesList
+        .map((e) => e.toString())
+        .where((name) => name != rdPrinterName)
+        .toList();
+  } catch (e) {
+    debugPrint('failed to parse printer names, err: $e');
+    return [];
+  }
+}

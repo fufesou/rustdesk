@@ -1832,7 +1832,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(printer::Union::PrinterError(e)) => {
-                        if let Some(job) = self.printer_jobs.remove(&e.id) {}
+                        log::error!("Failed to print: {}", e);
+                        let _ = self.printer_jobs.remove(&e.id);
                     }
                     _ => {}
                 },
