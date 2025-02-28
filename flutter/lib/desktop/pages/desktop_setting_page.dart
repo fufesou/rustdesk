@@ -1923,42 +1923,53 @@ class __PrinterState extends State<_Printer> {
   }
 
   Widget incomming(BuildContext context) {
-    const incommingPrintJobActionKey = 'incomming_print_job_action';
     var incommingPrintJobActionGroupValue =
-        bind.mainGetOptionSync(key: incommingPrintJobActionKey);
-    if (!['dismiss', '', 'selected']
-        .contains(incommingPrintJobActionGroupValue)) {
-      incommingPrintJobActionGroupValue = '';
+        bind.mainGetLocalOption(key: kKeyPrinterIncommingJobActionKey);
+    if (![
+      kValuePrinterIncomingJobDismiss,
+      kValuePrinterIncomingJobDefault,
+      kValuePrinterIncomingJobSelected
+    ].contains(incommingPrintJobActionGroupValue)) {
+      incommingPrintJobActionGroupValue = kValuePrinterIncomingJobDefault;
     }
     onRadioChanged(String value) async {
-      await bind.mainSetOption(key: incommingPrintJobActionKey, value: value);
+      await bind.mainSetLocalOption(
+          key: kKeyPrinterIncommingJobActionKey, value: value);
       setState(() {});
     }
 
-    final printerNamesJson = bind.mainGetPrinterNames();
-    var printerNames = <String>[];
-    try {
-      List<dynamic> printerNamesList = jsonDecode(printerNamesJson);
-      printerNames = printerNamesList.map((e) => e.toString()).toList();
-    } catch (e) {
-      debugPrint('failed to parse printer names, err=$e');
+    final printerNames = getPrinterNames();
+    var selectedPrinterName = bind.mainGetLocalOption(key: kKeyPrinterSelected);
+    if (!printerNames.contains(selectedPrinterName)) {
+      if (incommingPrintJobActionGroupValue ==
+          kValuePrinterIncomingJobSelected) {
+        incommingPrintJobActionGroupValue = kValuePrinterIncomingJobDefault;
+        bind.mainSetLocalOption(
+            key: kKeyPrinterIncommingJobActionKey,
+            value: kValuePrinterIncomingJobDefault);
+        if (printerNames.isEmpty) {
+          selectedPrinterName = '';
+        } else {
+          selectedPrinterName = printerNames.first;
+        }
+        bind.mainSetLocalOption(
+            key: kKeyPrinterSelected, value: selectedPrinterName);
+      }
     }
-    final selectedPrinterName =
-        bind.mainGetLocalOption(key: kKeySelectedPrinterName);
 
     return _Card(title: 'Incomming Print Jobs', children: [
       _Radio(context,
-          value: 'dismiss',
+          value: kValuePrinterIncomingJobDismiss,
           groupValue: incommingPrintJobActionGroupValue,
           label: 'Dismiss',
           onChanged: onRadioChanged),
       _Radio(context,
-          value: '',
+          value: kValuePrinterIncomingJobDefault,
           groupValue: incommingPrintJobActionGroupValue,
           label: 'Use the default printer',
           onChanged: onRadioChanged),
       _Radio(context,
-          value: 'selected',
+          value: kValuePrinterIncomingJobSelected,
           groupValue: incommingPrintJobActionGroupValue,
           label: 'Use the selected printer',
           onChanged: onRadioChanged),
@@ -1967,17 +1978,21 @@ class __PrinterState extends State<_Printer> {
           initialKey: selectedPrinterName,
           keys: printerNames,
           values: printerNames,
+          enabled: incommingPrintJobActionGroupValue ==
+              kValuePrinterIncomingJobSelected,
           onChanged: (value) async {
             await bind.mainSetLocalOption(
-                key: kKeySelectedPrinterName, value: value);
+                key: kKeyPrinterSelected, value: value);
             setState(() {});
           },
         ).marginOnly(left: 10),
       _OptionCheckBox(
         context,
         'auto_print_tip',
-        kKeyAllowAutoPrint,
+        kKeyPrinterAllowAutoPrint,
         isServer: false,
+        enabled: incommingPrintJobActionGroupValue !=
+            kValuePrinterIncomingJobDismiss,
       )
     ]);
   }
