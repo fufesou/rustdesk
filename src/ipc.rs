@@ -271,7 +271,9 @@ pub enum Data {
     HwCodecConfig(Option<String>),
     RemoveTrustedDevices(Vec<Bytes>),
     ClearTrustedDevices,
-    PrinterFile(String),
+    PrinterDriver {
+        file: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -661,9 +663,9 @@ async fn handle(data: Data, stream: &mut Connection) {
             Config::clear_trusted_devices();
         }
         #[cfg(windows)]
-        Data::PrinterFile(v) => {
-            log::info!("PrinterDriver: {:?}", v);
-            crate::server::on_printer_file(v);
+        Data::PrinterDriver { file } => {
+            log::info!("PrinterDriver, prn file: {:?}", file);
+            crate::server::on_printer_file(file);
         }
         _ => {}
     }
