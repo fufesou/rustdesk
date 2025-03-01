@@ -195,6 +195,8 @@ SIGN_EXTENSIONS = [
     ".cab",
     ".ps1",
     ".psm1",
+    ".inf",
+    ".cat",
 ]
 
 
