@@ -1912,6 +1912,8 @@ class __PrinterState extends State<_Printer> {
     }
 
     final installed = bind.mainIsInstalled();
+    // `is_rd_printer_installed()` may fail, but it's rare case.
+    // Add additional error message here if it's really needed.
     final driver_installed =
         bind.mainGetCommonSync(key: 'is_rd_printer_installed') == 'true';
 
