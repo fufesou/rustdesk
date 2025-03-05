@@ -1348,6 +1348,9 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
+    if options.contains("printer") {
+        allow_err!(remote_printer::install_update_printer());
+    }
     run_after_run_cmds(silent);
     Ok(())
 }
@@ -1415,6 +1418,7 @@ fn get_uninstall(kill_self: bool) -> String {
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+    remote_printer::uninstall_printer();
     run_cmds(get_uninstall(kill_self), true, "uninstall")
 }
 
