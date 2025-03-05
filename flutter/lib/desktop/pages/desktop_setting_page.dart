@@ -1912,7 +1912,8 @@ class __PrinterState extends State<_Printer> {
     }
 
     final installed = bind.mainIsInstalled();
-    final driver_installed = false;
+    final driver_installed =
+        bind.mainGetCommonSync(key: 'is_rd_printer_installed') == 'true';
 
     return _Card(title: 'Outgoing Print Jobs', children: [
       if (!installed) client_not_installed(),
