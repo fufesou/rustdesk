@@ -2380,6 +2380,21 @@ pub fn main_get_printer_names() -> SyncReturn<String> {
     return SyncReturn("".to_owned());
 }
 
+pub fn main_get_common(key: String) -> String {
+    if key == "is_rd_printer_installed" {
+        #[cfg(target_os = "windows")]
+        return remote_printer::is_rd_printer_installed().to_string();
+        #[cfg(not(target_os = "windows"))]
+        return false.to_string();
+    } else {
+        "".to_owned()
+    }
+}
+
+pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    SyncReturn(main_get_common(key))
+}
+
 #[cfg(target_os = "android")]
 pub mod server_side {
     use hbb_common::{config, log};
