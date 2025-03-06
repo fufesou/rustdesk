@@ -19,6 +19,8 @@ use winapi::{
 };
 use windows_strings::PCWSTR;
 
+const HRESULT_ERR_ELEMENT_NOT_FOUND: u32 = 0x80070490;
+
 fn enum_printer_driver(
     level: DWORD,
     p_driver_info: LPBYTE,
@@ -118,7 +120,7 @@ fn delete_printer_driver_package(inf: Vec<u16>) -> ResultType<()> {
     loop {
         unsafe {
             let res = DeletePrinterDriverPackageW(null_mut(), inf.as_ptr(), null_mut());
-            if res == S_OK {
+            if res == S_OK || res == HRESULT_ERR_ELEMENT_NOT_FOUND as i32 {
                 return Ok(());
             }
             log::error!("Failed to delete the printer driver, result: {}", res);
