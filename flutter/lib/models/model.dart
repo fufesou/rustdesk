@@ -481,7 +481,7 @@ class FfiModel with ChangeNotifier {
           printerItemHeight * min(8.0, max(printerNames.length, 3.0));
       final content = Column(
         children: [
-          Text(translate('print_incoming_job_confirm_tip')),
+          Text(translate('print-incoming-job-confirm-tip')),
           Row(
             children: [
               Obx(() => Radio<String>(
@@ -489,7 +489,7 @@ class FfiModel with ChangeNotifier {
                   groupValue: defaultOrSelectedGroupValue.value,
                   onChanged: onRatioChanged)),
               GestureDetector(
-                  child: Text(translate('use_default_printer_tip')),
+                  child: Text(translate('use-the-default-printer-tip')),
                   onTap: () => onRatioChanged(kValuePrinterIncomingJobDefault)),
             ],
           ),
@@ -501,7 +501,7 @@ class FfiModel with ChangeNotifier {
                     groupValue: defaultOrSelectedGroupValue.value,
                     onChanged: onRatioChanged)),
                 GestureDetector(
-                    child: Text(translate('use_selected_printer_tip')),
+                    child: Text(translate('use-the-selected-printer-tip')),
                     onTap: () =>
                         onRatioChanged(kValuePrinterIncomingJobSelected)),
               ]),
@@ -561,7 +561,7 @@ class FfiModel with ChangeNotifier {
                     }
                   })),
               GestureDetector(
-                  child: Text(translate('save_settings_tip')),
+                  child: Text(translate('save-settings-tip')),
                   onTap: () {
                     saveSettings.value = !saveSettings.value;
                     mainSetLocalBoolOption(kKeyPrinterSave, saveSettings.value);
@@ -578,7 +578,7 @@ class FfiModel with ChangeNotifier {
                     }
                   })),
               GestureDetector(
-                  child: Text(translate('dont_show_again_tip')),
+                  child: Text(translate('dont-show-again-tip')),
                   onTap: () {
                     dontShowAgain.value = !dontShowAgain.value;
                   }),
