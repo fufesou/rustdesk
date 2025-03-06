@@ -2400,6 +2400,31 @@ pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
     SyncReturn(main_get_common(key))
 }
 
+pub fn main_set_common(_key: String, _value: String) {
+    #[cfg(target_os = "windows")]
+    if _key == "install-rd-printer" {
+        std::thread::spawn(move || {
+            let (success, msg) = match remote_printer::install_update_printer() {
+                Ok(_) => (true, "".to_owned()),
+                Err(e) => {
+                    let err = e.to_string();
+                    log::error!("Failed to install/update rd printer: {}", &err);
+                    (false, err)
+                }
+            };
+            let data = HashMap::from([
+                ("name", serde_json::json!("install-rd-printer-res")),
+                ("success", serde_json::json!(success)),
+                ("msg", serde_json::json!(msg)),
+            ]);
+            let _res = flutter::push_global_event(
+                flutter::APP_TYPE_MAIN,
+                serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+            );
+        });
+    }
+}
+
 #[cfg(target_os = "android")]
 pub mod server_side {
     use hbb_common::{config, log};

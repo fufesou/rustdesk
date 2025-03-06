@@ -2797,11 +2797,6 @@ pub fn get_printer_names() -> ResultType<Vec<String>> {
 }
 
 pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> ResultType<()> {
-    log::info!(
-        "=========== send file to printer: {:?}, {:?}",
-        printer_name,
-        file_path
-    );
     let mut printer_name = printer_name.unwrap_or_default();
     if printer_name.is_empty() {
         // use GetDefaultPrinter to get the default printer name
@@ -2819,6 +2814,18 @@ pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> Re
             }
             printer_name = String::from_utf16_lossy(&default_printer_name[..needed_bytes as usize]);
         }
+    } else {
+        if let Ok(names) = crate::platform::windows::get_printer_names() {
+            if !names.contains(&printer_name) {
+                // Don't set the first printer as current printer.
+                // It may not be the desired printer.
+                log::error!(
+                    "Printer name \"{}\" not found, ignore the print job",
+                    printer_name
+                );
+                bail!("Printer name \"{}\" not found", &printer_name);
+            }
+        }
     }
     if printer_name.is_empty() {
         log::error!("Failed to get printer name");
@@ -2826,9 +2833,7 @@ pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> Re
     }
 
     let mut printer_handle = std::ptr::null_mut();
-
     let printer_name = wide_string(&printer_name);
-
     unsafe {
         if OpenPrinterW(
             printer_name.as_ptr() as *mut _,

@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Mutex};
 use crate::{
     driver::{get_installed_driver_version, install_driver, uninstall_driver},
     port::{check_add_local_port, check_delete_local_port},
-    printer::{add_printer, delete_printer, is_printer_added},
+    printer::{add_printer, delete_printer},
     RD_PRINTER_DRIVER_NAME, RD_PRINTER_NAME, RD_PRINTER_PORT,
 };
 
@@ -24,7 +24,7 @@ fn get_driver_inf_abs_path() -> ResultType<PathBuf> {
         ),
     };
     if !abs_path.exists() {
-        bail!("{} not exists", RD_DRIVER_INF_PATH)
+        bail!("The driver inf file \"{}\" does not exists", RD_DRIVER_INF_PATH)
     }
     Ok(abs_path)
 }

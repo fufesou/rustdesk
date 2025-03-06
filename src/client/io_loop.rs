@@ -1795,7 +1795,24 @@ impl<T: InvokeUiSession> Remote<T> {
                 #[cfg(windows)]
                 Some(message::Union::Printer(p)) => match p.union {
                     Some(printer::Union::PrinterRequest(pr)) => {
-                        self.handler.printer_request(pr.id);
+                        let action = LocalConfig::get_option(
+                            config::keys::OPTION_PRINTER_INCOMING_JOB_ACTION,
+                        );
+                        if action == "dismiss" {
+                            self.handler.printer_response(pr.id, false, "".to_string());
+                        } else {
+                            let allow_auto_print = LocalConfig::get_bool_option(
+                                config::keys::OPTION_PRINTER_ALLOW_AUTO_PRINT,
+                            );
+                            if allow_auto_print {
+                                let printer_name = LocalConfig::get_option(
+                                    config::keys::OPTION_PRINTER_SELECTED_NAME,
+                                );
+                                self.handler.printer_response(pr.id, true, printer_name);
+                            } else {
+                                self.handler.printer_request(pr.id);
+                            }
+                        }
                     }
                     Some(printer::Union::PrinterBlock(b)) => {
                         if !self.printer_jobs.contains_key(&b.id) {
@@ -1817,13 +1834,10 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(printer::Union::PrinterDone(d)) => {
-                        log::info!("=========== printer done: {:?}", d);
                         if let Some(job) = self.printer_jobs.remove(&d.id) {
                             let path = job.path();
                             drop(job);
-                            log::info!("=========== printer path: {:?}", path);
                             if path.exists() {
-                                log::info!("=========== printer path exists");
                                 let path = path.to_string_lossy().to_string();
                                 let printer_name =
                                     self.handler.printer_names.write().unwrap().remove(&d.id);
