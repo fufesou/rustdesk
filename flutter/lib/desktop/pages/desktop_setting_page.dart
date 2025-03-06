@@ -1897,18 +1897,55 @@ class __PrinterState extends State<_Printer> {
 
   Widget outgoing(BuildContext context) {
     Widget client_not_installed() {
-      return Text(translate('printer-requires-installed-client-tip'));
+      return Align(
+        alignment: Alignment.topLeft,
+        child: Text(translate('printer-requires-installed-client-tip')),
+      ).marginOnly(left: _kCardLeftMargin);
     }
 
     Widget client_installed_driver_not_installed() {
+      final failedMsg = ''.obs;
+      platformFFI.registerEventHandler(
+          'install-rd-printer-res', 'install-rd-printer-res', (evt) async {
+        if (evt['success'] as bool) {
+          setState(() {});
+        } else {
+          failedMsg.value = evt['msg'] as String;
+        }
+      }, replace: true);
       return Column(children: [
-        Text(translate('printer-driver-not-installed-tip')),
-        _Button('Install RustDesk Printer', () {})
-      ]);
+        Obx(
+          () => failedMsg.value.isNotEmpty
+              ? Offstage()
+              : Align(
+                  alignment: Alignment.topLeft,
+                  child: Text(translate('printer-driver-not-installed-tip'))
+                      .marginOnly(bottom: 10.0),
+                ),
+        ),
+        Obx(
+          () => failedMsg.value.isEmpty
+              ? Offstage()
+              : Align(
+                  alignment: Alignment.topLeft,
+                  child: Text(failedMsg.value,
+                          style: DefaultTextStyle.of(context)
+                              .style
+                              .copyWith(color: Colors.red))
+                      .marginOnly(bottom: 10.0)),
+        ),
+        _Button('Install RustDesk Printer', () {
+          failedMsg.value = '';
+          bind.mainSetCommon(key: 'install-rd-printer', value: '');
+        })
+      ]).marginOnly(left: _kCardLeftMargin, bottom: 2.0);
     }
 
     Widget client_installed_driver_installed() {
-      return Text(translate('printer-driver-installed-tip'));
+      return Align(
+        alignment: Alignment.topLeft,
+        child: Text(translate('printer-driver-installed-tip')),
+      ).marginOnly(left: _kCardLeftMargin);
     }
 
     final installed = bind.mainIsInstalled();
