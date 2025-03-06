@@ -5,6 +5,7 @@ use winapi::{
     shared::{
         minwindef::{BOOL, DWORD, FALSE, LPBYTE, LPDWORD},
         ntdef::HANDLE,
+        winerror::ERROR_INVALID_PRINTER_NAME,
     },
     um::winspool::{
         AddPrinterW, ClosePrinter, DeletePrinter, EnumPrintersW, OpenPrinterW, SetPrinterW,
@@ -129,10 +130,12 @@ pub fn delete_printer(name: &PCWSTR) -> ResultType<()> {
                 &mut dft as *mut PRINTER_DEFAULTSW as _,
             )
         {
-            bail!(format!(
-                "Failed to open printer. Error: {}",
-                io::Error::last_os_error()
-            ))
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_INVALID_PRINTER_NAME as _) {
+                return Ok(());
+            } else {
+                bail!(format!("Failed to open printer. Error: {}", err))
+            }
         }
 
         if FALSE == SetPrinterW(h_printer, 0, null_mut(), PRINTER_CONTROL_PURGE) {
