@@ -240,5 +240,14 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("View camera", "View camera"),
         ("upgrade_remote_rustdesk_client_to_{}_tip", "Please upgrade the RustDesk client to version {} or newer on the remote side!"),
         ("view_camera_unsupported_tip", "The remote device does not support viewing the camera."),
+        ("printer-requires-installed-client-tip", "In order to use remote printing, RustDesk needs to be installed on this device."),
+        ("printer-driver-not-installed-tip", "The RustDesk Printer is not installed."),
+        ("printer-driver-installed-tip", "The RustDesk Printer is installed and ready to use."),
+        ("auto-print-tip", "Print automatically using the selected printer."),
+        ("print-incoming-job-confirm-tip", "You received a print job from remote. Do you want to execute it at your side?"),
+        ("use-the-default-printer-tip", "Use the default printer"),
+        ("use-the-selected-printer-tip", "Use the selected printer"),
+        ("save-settings-tip", "Save settings"),
+        ("dont-show-again-tip", "Don't show this again"),
     ].iter().cloned().collect();
 }

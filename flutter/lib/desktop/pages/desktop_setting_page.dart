@@ -1899,25 +1899,25 @@ class __PrinterState extends State<_Printer> {
 
   Widget outgoing(BuildContext context) {
     Widget client_not_installed() {
-      return Text('printer_requires_install_client_tip');
+      return Text(translate('printer-requires-installed-client-tip'));
     }
 
     Widget client_installed_driver_not_installed() {
       return Column(children: [
-        Text('printer_driver_not_installed_tip'),
+        Text(translate('printer-driver-not-installed-tip')),
         _Button('Install RustDesk Printer', () {})
       ]);
     }
 
     Widget client_installed_driver_installed() {
-      return Text('printer_driver_installed_tip');
+      return Text(translate('printer-driver-installed-tip'));
     }
 
     final installed = bind.mainIsInstalled();
-    // `is_rd_printer_installed()` may fail, but it's rare case.
+    // `is-rd-printer-installed` may fail, but it's rare case.
     // Add additional error message here if it's really needed.
     final driver_installed =
-        bind.mainGetCommonSync(key: 'is_rd_printer_installed') == 'true';
+        bind.mainGetCommonSync(key: 'is-rd-printer-installed') == 'true';
 
     return _Card(title: 'Outgoing Print Jobs', children: [
       if (!installed) client_not_installed(),
@@ -1971,12 +1971,12 @@ class __PrinterState extends State<_Printer> {
       _Radio(context,
           value: kValuePrinterIncomingJobDefault,
           groupValue: incommingPrintJobActionGroupValue,
-          label: 'Use the default printer',
+          label: 'use-the-default-printer-tip',
           onChanged: onRadioChanged),
       _Radio(context,
           value: kValuePrinterIncomingJobSelected,
           groupValue: incommingPrintJobActionGroupValue,
-          label: 'Use the selected printer',
+          label: 'use-the-selected-printer-tip',
           onChanged: onRadioChanged),
       if (printerNames.isNotEmpty)
         ComboBox(
@@ -1993,7 +1993,7 @@ class __PrinterState extends State<_Printer> {
         ).marginOnly(left: 10),
       _OptionCheckBox(
         context,
-        'auto_print_tip',
+        'auto-print-tip',
         kKeyPrinterAllowAutoPrint,
         isServer: false,
         enabled: incommingPrintJobActionGroupValue !=
