@@ -13,6 +13,7 @@ import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:flutter_hbb/models/printer_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/plugin/manager.dart';
@@ -55,6 +56,7 @@ enum SettingsTabKey {
   display,
   plugin,
   account,
+  printer,
   about,
 }
 
@@ -74,6 +76,7 @@ class DesktopSettingPage extends StatefulWidget {
     if (!isWeb && !bind.isIncomingOnly() && bind.pluginFeatureIsEnabled())
       SettingsTabKey.plugin,
     if (!bind.isDisableAccount()) SettingsTabKey.account,
+    SettingsTabKey.printer,
     SettingsTabKey.about,
   ];
 
@@ -198,6 +201,10 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           settingTabs.add(
               _TabInfo(tab, 'Account', Icons.person_outline, Icons.person));
           break;
+        case SettingsTabKey.printer:
+          settingTabs
+              .add(_TabInfo(tab, 'Printer', Icons.print_outlined, Icons.print));
+          break;
         case SettingsTabKey.about:
           settingTabs
               .add(_TabInfo(tab, 'About', Icons.info_outline, Icons.info));
@@ -228,6 +235,9 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           break;
         case SettingsTabKey.account:
           children.add(const _Account());
+          break;
+        case SettingsTabKey.printer:
+          children.add(const _Printer());
           break;
         case SettingsTabKey.about:
           children.add(const _About());
@@ -1868,6 +1878,137 @@ class _PluginState extends State<_Plugin> {
                   ? loginDialog()
                   : logOutConfirmDialog()
             }));
+  }
+}
+
+class _Printer extends StatefulWidget {
+  const _Printer({super.key});
+
+  @override
+  State<_Printer> createState() => __PrinterState();
+}
+
+class __PrinterState extends State<_Printer> {
+  @override
+  Widget build(BuildContext context) {
+    final scrollController = ScrollController();
+    return ListView(controller: scrollController, children: [
+      outgoing(context),
+      incomming(context),
+    ]).marginOnly(bottom: _kListViewBottomMargin);
+  }
+
+  Widget outgoing(BuildContext context) {
+    Widget client_not_installed() {
+      return Align(
+        alignment: Alignment.topLeft,
+        child: Text(translate('printer-requires-installed-client-tip')),
+      ).marginOnly(left: _kCardLeftMargin);
+    }
+
+    Widget client_installed_driver_not_installed() {
+      final failedMsg = ''.obs;
+      platformFFI.registerEventHandler(
+          'install-rd-printer-res', 'install-rd-printer-res', (evt) async {
+        if (evt['success'] as bool) {
+          setState(() {});
+        } else {
+          failedMsg.value = evt['msg'] as String;
+        }
+      }, replace: true);
+      return Column(children: [
+        Obx(
+          () => failedMsg.value.isNotEmpty
+              ? Offstage()
+              : Align(
+                  alignment: Alignment.topLeft,
+                  child: Text(translate('printer-driver-not-installed-tip'))
+                      .marginOnly(bottom: 10.0),
+                ),
+        ),
+        Obx(
+          () => failedMsg.value.isEmpty
+              ? Offstage()
+              : Align(
+                  alignment: Alignment.topLeft,
+                  child: Text(failedMsg.value,
+                          style: DefaultTextStyle.of(context)
+                              .style
+                              .copyWith(color: Colors.red))
+                      .marginOnly(bottom: 10.0)),
+        ),
+        _Button('Install RustDesk Printer', () {
+          failedMsg.value = '';
+          bind.mainSetCommon(key: 'install-rd-printer', value: '');
+        })
+      ]).marginOnly(left: _kCardLeftMargin, bottom: 2.0);
+    }
+
+    Widget client_installed_driver_installed() {
+      return Align(
+        alignment: Alignment.topLeft,
+        child: Text(translate('printer-driver-installed-tip')),
+      ).marginOnly(left: _kCardLeftMargin);
+    }
+
+    final installed = bind.mainIsInstalled();
+    // `is-rd-printer-installed` may fail, but it's rare case.
+    // Add additional error message here if it's really needed.
+    final driver_installed =
+        bind.mainGetCommonSync(key: 'is-rd-printer-installed') == 'true';
+
+    return _Card(title: 'Outgoing Print Jobs', children: [
+      if (!installed) client_not_installed(),
+      if (installed && !driver_installed)
+        client_installed_driver_not_installed(),
+      if (installed && driver_installed) client_installed_driver_installed()
+    ]);
+  }
+
+  Widget incomming(BuildContext context) {
+    onRadioChanged(String value) async {
+      await bind.mainSetLocalOption(
+          key: kKeyPrinterIncommingJobAction, value: value);
+      setState(() {});
+    }
+
+    PrinterOptions printerOptions = PrinterOptions.load();
+    return _Card(title: 'Incomming Print Jobs', children: [
+      _Radio(context,
+          value: kValuePrinterIncomingJobDismiss,
+          groupValue: printerOptions.action,
+          label: 'Dismiss',
+          onChanged: onRadioChanged),
+      _Radio(context,
+          value: kValuePrinterIncomingJobDefault,
+          groupValue: printerOptions.action,
+          label: 'use-the-default-printer-tip',
+          onChanged: onRadioChanged),
+      _Radio(context,
+          value: kValuePrinterIncomingJobSelected,
+          groupValue: printerOptions.action,
+          label: 'use-the-selected-printer-tip',
+          onChanged: onRadioChanged),
+      if (printerOptions.printerNames.isNotEmpty)
+        ComboBox(
+          initialKey: printerOptions.printerName,
+          keys: printerOptions.printerNames,
+          values: printerOptions.printerNames,
+          enabled: printerOptions.action == kValuePrinterIncomingJobSelected,
+          onChanged: (value) async {
+            await bind.mainSetLocalOption(
+                key: kKeyPrinterSelected, value: value);
+            setState(() {});
+          },
+        ).marginOnly(left: 10),
+      _OptionCheckBox(
+        context,
+        'auto-print-tip',
+        kKeyPrinterAllowAutoPrint,
+        isServer: false,
+        enabled: printerOptions.action != kValuePrinterIncomingJobDismiss,
+      )
+    ]);
   }
 }
 

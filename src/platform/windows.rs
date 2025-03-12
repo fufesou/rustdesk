@@ -21,7 +21,7 @@ use std::{
     fs,
     io::{self, prelude::*},
     mem,
-    os::windows::process::CommandExt,
+    os::{raw::c_ulong, windows::process::CommandExt},
     path::*,
     ptr::null_mut,
     sync::{atomic::Ordering, Arc, Mutex},
@@ -54,6 +54,7 @@ use winapi::{
             TOKEN_ELEVATION, TOKEN_QUERY,
         },
         winreg::HKEY_CURRENT_USER,
+        winspool::*,
         winuser::*,
     },
 };
@@ -1346,6 +1347,9 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
+    if options.contains("printer") && crate::platform::is_win_10_or_greater() {
+        allow_err!(remote_printer::install_update_printer());
+    }
     run_after_run_cmds(silent);
     Ok(())
 }
@@ -1413,6 +1417,9 @@ fn get_uninstall(kill_self: bool) -> String {
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+    if crate::platform::is_win_10_or_greater() {
+        remote_printer::uninstall_printer();
+    }
     run_cmds(get_uninstall(kill_self), true, "uninstall")
 }
 
@@ -2727,4 +2734,121 @@ pub mod reg_display_settings {
             _ => RegType::REG_NONE,
         }
     }
+}
+
+pub fn get_printer_names() -> ResultType<Vec<String>> {
+    let mut needed_bytes = 0;
+    let mut returned_count = 0;
+
+    unsafe {
+        // First call to get required buffer size
+        EnumPrintersW(
+            PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+            std::ptr::null_mut(),
+            1,
+            std::ptr::null_mut(),
+            0,
+            &mut needed_bytes,
+            &mut returned_count,
+        );
+
+        let mut buffer = vec![0u8; needed_bytes as usize];
+
+        if EnumPrintersW(
+            PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+            std::ptr::null_mut(),
+            1,
+            buffer.as_mut_ptr() as *mut _,
+            needed_bytes,
+            &mut needed_bytes,
+            &mut returned_count,
+        ) == 0
+        {
+            return Err(anyhow!("Failed to enumerate printers"));
+        }
+
+        let ptr = buffer.as_ptr() as *const PRINTER_INFO_1W;
+        let printers = std::slice::from_raw_parts(ptr, returned_count as usize);
+
+        Ok(printers
+            .iter()
+            .filter_map(|p| {
+                let name = p.pName;
+                if !name.is_null() {
+                    let mut len = 0;
+                    while len < 500 {
+                        if name.add(len).is_null() || *name.add(len) == 0 {
+                            break;
+                        }
+                        len += 1;
+                    }
+                    if len > 0 {
+                        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                            name, len,
+                        )))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+}
+
+extern "C" {
+    fn PrintXPSRawData(printer_name: *const u16, raw_data: *const u8, data_size: c_ulong) -> DWORD;
+}
+
+pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> ResultType<()> {
+    let mut printer_name = printer_name.unwrap_or_default();
+    if printer_name.is_empty() {
+        // use GetDefaultPrinter to get the default printer name
+        let mut needed_bytes = 0;
+        unsafe {
+            GetDefaultPrinterW(std::ptr::null_mut(), &mut needed_bytes);
+        }
+        if needed_bytes > 0 {
+            let mut default_printer_name = vec![0u16; needed_bytes as usize];
+            unsafe {
+                GetDefaultPrinterW(
+                    default_printer_name.as_mut_ptr() as *mut _,
+                    &mut needed_bytes,
+                );
+            }
+            printer_name = String::from_utf16_lossy(&default_printer_name[..needed_bytes as usize]);
+        }
+    } else {
+        if let Ok(names) = crate::platform::windows::get_printer_names() {
+            if !names.contains(&printer_name) {
+                // Don't set the first printer as current printer.
+                // It may not be the desired printer.
+                log::error!(
+                    "Printer name \"{}\" not found, ignore the print job",
+                    printer_name
+                );
+                bail!("Printer name \"{}\" not found", &printer_name);
+            }
+        }
+    }
+    if printer_name.is_empty() {
+        log::error!("Failed to get printer name");
+        return Err(anyhow!("Failed to get printer name"));
+    }
+
+    let printer_name = wide_string(&printer_name);
+    unsafe {
+        let file = std::fs::read(file_path)?;
+        let res = PrintXPSRawData(
+            printer_name.as_ptr(),
+            file.as_ptr() as *const u8,
+            file.len() as c_ulong,
+        );
+        if res != 0 {
+            bail!("Failed to send file to printer, see logs in C:\\Windows\\temp\\test_rustdesk.log for more details.");
+        }
+    }
+
+    Ok(())
 }

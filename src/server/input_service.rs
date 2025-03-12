@@ -457,7 +457,7 @@ static RECORD_CURSOR_POS_RUNNING: AtomicBool = AtomicBool::new(false);
 // We need to do some special handling for macOS when using the legacy mode.
 #[cfg(target_os = "macos")]
 static LAST_KEY_LEGACY_MODE: AtomicBool = AtomicBool::new(true);
-// We use enigo to 
+// We use enigo to
 // 1. Simulate mouse events
 // 2. Simulate the legacy mode key events
 // 3. Simulate the functioin key events, like LockScreen
@@ -505,7 +505,7 @@ pub fn try_stop_record_cursor_pos() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|c| c.1 == AuthConnType::Remote)
+        .filter(|c| c.conn_type == AuthConnType::Remote)
         .count();
     if remote_count > 0 {
         return;
