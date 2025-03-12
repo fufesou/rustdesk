@@ -13,6 +13,7 @@ import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:flutter_hbb/models/printer_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/plugin/manager.dart';
@@ -1965,63 +1966,35 @@ class __PrinterState extends State<_Printer> {
   }
 
   Widget incomming(BuildContext context) {
-    var incommingPrintJobActionGroupValue =
-        bind.mainGetLocalOption(key: kKeyPrinterIncommingJobActionKey);
-    if (![
-      kValuePrinterIncomingJobDismiss,
-      kValuePrinterIncomingJobDefault,
-      kValuePrinterIncomingJobSelected
-    ].contains(incommingPrintJobActionGroupValue)) {
-      incommingPrintJobActionGroupValue = kValuePrinterIncomingJobDefault;
-    }
     onRadioChanged(String value) async {
       await bind.mainSetLocalOption(
-          key: kKeyPrinterIncommingJobActionKey, value: value);
+          key: kKeyPrinterIncommingJobAction, value: value);
       setState(() {});
     }
 
-    final printerNames = getPrinterNames();
-    var selectedPrinterName = bind.mainGetLocalOption(key: kKeyPrinterSelected);
-    if (!printerNames.contains(selectedPrinterName)) {
-      if (incommingPrintJobActionGroupValue ==
-          kValuePrinterIncomingJobSelected) {
-        incommingPrintJobActionGroupValue = kValuePrinterIncomingJobDefault;
-        bind.mainSetLocalOption(
-            key: kKeyPrinterIncommingJobActionKey,
-            value: kValuePrinterIncomingJobDefault);
-        if (printerNames.isEmpty) {
-          selectedPrinterName = '';
-        } else {
-          selectedPrinterName = printerNames.first;
-        }
-        bind.mainSetLocalOption(
-            key: kKeyPrinterSelected, value: selectedPrinterName);
-      }
-    }
-
+    PrinterOptions printerOptions = PrinterOptions.load();
     return _Card(title: 'Incomming Print Jobs', children: [
       _Radio(context,
           value: kValuePrinterIncomingJobDismiss,
-          groupValue: incommingPrintJobActionGroupValue,
+          groupValue: printerOptions.action,
           label: 'Dismiss',
           onChanged: onRadioChanged),
       _Radio(context,
           value: kValuePrinterIncomingJobDefault,
-          groupValue: incommingPrintJobActionGroupValue,
+          groupValue: printerOptions.action,
           label: 'use-the-default-printer-tip',
           onChanged: onRadioChanged),
       _Radio(context,
           value: kValuePrinterIncomingJobSelected,
-          groupValue: incommingPrintJobActionGroupValue,
+          groupValue: printerOptions.action,
           label: 'use-the-selected-printer-tip',
           onChanged: onRadioChanged),
-      if (printerNames.isNotEmpty)
+      if (printerOptions.printerNames.isNotEmpty)
         ComboBox(
-          initialKey: selectedPrinterName,
-          keys: printerNames,
-          values: printerNames,
-          enabled: incommingPrintJobActionGroupValue ==
-              kValuePrinterIncomingJobSelected,
+          initialKey: printerOptions.printerName,
+          keys: printerOptions.printerNames,
+          values: printerOptions.printerNames,
+          enabled: printerOptions.action == kValuePrinterIncomingJobSelected,
           onChanged: (value) async {
             await bind.mainSetLocalOption(
                 key: kKeyPrinterSelected, value: value);
@@ -2033,8 +2006,7 @@ class __PrinterState extends State<_Printer> {
         'auto-print-tip',
         kKeyPrinterAllowAutoPrint,
         isServer: false,
-        enabled: incommingPrintJobActionGroupValue !=
-            kValuePrinterIncomingJobDismiss,
+        enabled: printerOptions.action != kValuePrinterIncomingJobDismiss,
       )
     ]);
   }

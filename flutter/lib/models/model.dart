@@ -18,6 +18,7 @@ import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_hbb/models/group_model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
+import 'package:flutter_hbb/models/printer_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/user_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -424,25 +425,16 @@ class FfiModel with ChangeNotifier {
     final id = evt['id'];
     final dialogManager = parent.target!.dialogManager;
     dialogManager.show((setState, close, context) {
-      final defaultOrSelectedGroupValue = kValuePrinterIncomingJobDefault.obs;
+      PrinterOptions printerOptions = PrinterOptions.load();
       final saveSettings = mainGetLocalBoolOptionSync(kKeyPrinterSave).obs;
       final dontShowAgain = false.obs;
-      final Rx<String> selectedPrinterName =
-          bind.mainGetLocalOption(key: kKeyPrinterSelected).obs;
-      final printerNames = getPrinterNames();
-
-      if (selectedPrinterName.value.isNotEmpty) {
-        if (printerNames.contains(selectedPrinterName.value)) {
-          defaultOrSelectedGroupValue.value = kValuePrinterIncomingJobSelected;
-        } else {
-          defaultOrSelectedGroupValue.value = kValuePrinterIncomingJobDefault;
-          if (printerNames.isEmpty) {
-            selectedPrinterName.value = '';
-          } else {
-            selectedPrinterName.value = printerNames.first;
-          }
-        }
-      }
+      final Rx<String> selectedPrinterName = printerOptions.printerName.obs;
+      final printerNames = printerOptions.printerNames;
+      final defaultOrSelectedGroupValue =
+          (printerOptions.action == kValuePrinterIncomingJobDismiss
+                  ? kValuePrinterIncomingJobDefault
+                  : printerOptions.action)
+              .obs;
 
       onRatioChanged(String? value) {
         defaultOrSelectedGroupValue.value =
@@ -460,6 +452,9 @@ class FfiModel with ChangeNotifier {
             printerName: printerName);
         if (saveSettings.value) {
           bind.mainSetLocalOption(key: kKeyPrinterSelected, value: printerName);
+          bind.mainSetLocalOption(
+              key: kKeyPrinterIncommingJobAction,
+              value: defaultOrSelectedGroupValue.value);
         }
         if (dontShowAgain.value) {
           mainSetLocalBoolOption(kKeyPrinterAllowAutoPrint, true);
@@ -472,7 +467,7 @@ class FfiModel with ChangeNotifier {
             sessionId: sessionId, id: id, accepted: false, printerName: '');
         if (dontShowAgain.value) {
           bind.mainSetLocalOption(
-              key: kKeyPrinterIncommingJobActionKey,
+              key: kKeyPrinterIncommingJobAction,
               value: kValuePrinterIncomingJobDismiss);
         }
         close();

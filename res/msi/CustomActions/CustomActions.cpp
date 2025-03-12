@@ -900,7 +900,7 @@ UINT __stdcall InstallRDPrinter(
     hr = WcaReadStringFromCaData(&pwz, &installFolder);
     ExitOnFailure(hr, "failed to read database key from custom action data: %ls", pwz);
 
-    WcaLog(LOGMSG_STANDARD, "Try install RD printer in : %ls", installFolder);
+    WcaLog(LOGMSG_STANDARD, "Try to install RD printer in : %ls", installFolder);
     RemotePrinter::installUpdatePrinter(installFolder);
     WcaLog(LOGMSG_STANDARD, "Install RD printer done");
 
@@ -922,7 +922,7 @@ UINT __stdcall UninstallRDPrinter(
     hr = WcaInitialize(hInstall, "UninstallRDPrinter");
     ExitOnFailure(hr, "Failed to initialize");
 
-    WcaLog(LOGMSG_STANDARD, "Try uninstall RD printer");
+    WcaLog(LOGMSG_STANDARD, "Try to uninstall RD printer");
     RemotePrinter::uninstallPrinter();
     WcaLog(LOGMSG_STANDARD, "Uninstall RD printer done");
 

@@ -21,7 +21,7 @@ use std::{
     fs,
     io::{self, prelude::*},
     mem,
-    os::windows::process::CommandExt,
+    os::{raw::c_ulong, windows::process::CommandExt},
     path::*,
     ptr::null_mut,
     sync::{atomic::Ordering, Arc, Mutex},
@@ -33,8 +33,7 @@ use winapi::{
     shared::{minwindef::*, ntdef::NULL, windef::*, winerror::*},
     um::{
         errhandlingapi::GetLastError,
-        fileapi::{CreateFileW, ReadFile, OPEN_EXISTING},
-        handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+        handleapi::CloseHandle,
         libloaderapi::{
             GetProcAddress, LoadLibraryExA, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
             LOAD_LIBRARY_SEARCH_USER_DIRS,
@@ -51,8 +50,8 @@ use winapi::{
         wingdi::*,
         winnt::{
             TokenElevation, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GENERIC_READ, HANDLE,
-            PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION, TOKEN_ELEVATION, TOKEN_QUERY,
+            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
+            TOKEN_ELEVATION, TOKEN_QUERY,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::*,
@@ -1348,7 +1347,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
-    if options.contains("printer") {
+    if options.contains("printer") && crate::platform::is_win_10_or_greater() {
         allow_err!(remote_printer::install_update_printer());
     }
     run_after_run_cmds(silent);
@@ -1418,7 +1417,9 @@ fn get_uninstall(kill_self: bool) -> String {
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
-    remote_printer::uninstall_printer();
+    if crate::platform::is_win_10_or_greater() {
+        remote_printer::uninstall_printer();
+    }
     run_cmds(get_uninstall(kill_self), true, "uninstall")
 }
 
@@ -2796,6 +2797,10 @@ pub fn get_printer_names() -> ResultType<Vec<String>> {
     }
 }
 
+extern "C" {
+    fn PrintXPSRawData(printer_name: *const u16, raw_data: *const u8, data_size: c_ulong) -> DWORD;
+}
+
 pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> ResultType<()> {
     let mut printer_name = printer_name.unwrap_or_default();
     if printer_name.is_empty() {
@@ -2832,101 +2837,17 @@ pub fn send_file_to_printer(printer_name: Option<String>, file_path: &str) -> Re
         return Err(anyhow!("Failed to get printer name"));
     }
 
-    let mut printer_handle = std::ptr::null_mut();
     let printer_name = wide_string(&printer_name);
     unsafe {
-        if OpenPrinterW(
-            printer_name.as_ptr() as *mut _,
-            &mut printer_handle,
-            std::ptr::null_mut(),
-        ) == 0
-        {
-            log::error!("Failed to open printer");
-            bail!(format!("Failed to open printer, errno: {}", GetLastError()));
-        }
-
-        let file_path_wide = wide_string(file_path);
-        let file_handle = CreateFileW(
-            file_path_wide.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
+        let file = std::fs::read(file_path)?;
+        let res = PrintXPSRawData(
+            printer_name.as_ptr(),
+            file.as_ptr() as *const u8,
+            file.len() as c_ulong,
         );
-
-        if file_handle == INVALID_HANDLE_VALUE {
-            log::error!("Failed to open file");
-            ClosePrinter(printer_handle);
-            bail!(format!("Failed to open file, errno: {}", GetLastError()));
+        if res != 0 {
+            bail!("Failed to send file to printer, see logs in C:\\Windows\\temp\\test_rustdesk.log for more details.");
         }
-
-        const BUFFER_SIZE: u32 = 4096;
-        let mut buffer = vec![0u8; BUFFER_SIZE as usize];
-
-        let mut doc_name = wide_string("RustDesk Print Job");
-        let mut data_type = wide_string("RAW");
-
-        let doc_info = DOC_INFO_1W {
-            pDocName: doc_name.as_mut_ptr(),
-            pOutputFile: std::ptr::null_mut(),
-            pDatatype: data_type.as_mut_ptr(),
-        };
-
-        if StartDocPrinterW(printer_handle, 1, &doc_info as *const _ as *mut _) > 0 {
-            if StartPagePrinter(printer_handle) != 0 {
-                let mut bytes_read = 0;
-                let mut bytes_written = 0;
-                let mut success = true;
-
-                loop {
-                    if ReadFile(
-                        file_handle,
-                        buffer.as_mut_ptr() as *mut _,
-                        BUFFER_SIZE,
-                        &mut bytes_read,
-                        std::ptr::null_mut(),
-                    ) == FALSE
-                    {
-                        success = false;
-                        log::error!("Failed to read file, errno: {}", GetLastError());
-                        break;
-                    }
-
-                    if bytes_read == 0 {
-                        break;
-                    }
-
-                    if WritePrinter(
-                        printer_handle,
-                        buffer.as_mut_ptr() as *mut _,
-                        bytes_read,
-                        &mut bytes_written,
-                    ) == FALSE
-                    {
-                        log::error!("Failed to write printer, errno: {}", GetLastError());
-                        success = false;
-                        break;
-                    }
-                }
-
-                EndPagePrinter(printer_handle);
-
-                if !success {
-                    log::error!("Failed to print");
-                    EndDocPrinter(printer_handle);
-                    CloseHandle(file_handle);
-                    ClosePrinter(printer_handle);
-                    bail!("Failed to print");
-                }
-            }
-            EndDocPrinter(printer_handle);
-        }
-
-        CloseHandle(file_handle);
-        ClosePrinter(printer_handle);
-        log::info!("Print success");
     }
 
     Ok(())

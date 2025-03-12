@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <winspool.h>
 #include <setupapi.h>
+#include <versionhelpers.h>
 #include <memory>
 #include <string>
 #include <functional>
@@ -453,6 +454,11 @@ namespace RemotePrinter
     // 3. Add the printer.
     VOID installUpdatePrinter(const std::wstring &installFolder)
     {
+        if (FALSE == IsWindows10OrGreater())
+        {
+            WcaLog(LOGMSG_STANDARD, "The OS is not Windows 10 or greater, aborting...\n");
+            return;
+        }
         const std::wstring infFile = installFolder + L"\\" + RemotePrinter::RD_DRIVER_INF_PATH;
         if (!FileExists(infFile))
         {
@@ -501,6 +507,12 @@ namespace RemotePrinter
 
     VOID uninstallPrinter()
     {
+        if (FALSE == IsWindows10OrGreater())
+        {
+            WcaLog(LOGMSG_STANDARD, "The OS is not Windows 10 or greater, aborting...\n");
+            return;
+        }
+
         deletePrinter(RD_PRINTER_NAME);
         WcaLog(LOGMSG_STANDARD, "Printer is deleted\n");
         uninstallDriver(RD_PRINTER_DRIVER_NAME);
