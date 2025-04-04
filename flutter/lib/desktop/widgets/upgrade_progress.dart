@@ -32,7 +32,8 @@ class UpgradeProgressState extends State<UpgradeProgress> {
     platformFFI.registerEventHandler(_eventKeyDownloadNewVersion,
         _eventKeyDownloadNewVersion, handleDownloadNewVersion,
         replace: true);
-    bind.mainSetCommon(key: 'download-new-version', value: downloadUrl);
+    // bind.mainSetCommon(key: 'download-new-version', value: downloadUrl);
+    bind.mainSetCommon(key: 'upgrade-me', value: '');
   }
 
   @override

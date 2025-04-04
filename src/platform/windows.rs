@@ -1777,7 +1777,7 @@ pub fn run_background(exe: &str, arg: &str) -> ResultType<bool> {
     }
 }
 
-pub fn run_uac(exe: &str, arg: &str) -> ResultType<bool> {
+fn run_uac(exe: &str, arg: &str) -> ResultType<bool> {
     let wop = wide_string("runas");
     let wexe = wide_string(exe);
     let warg;
@@ -2327,6 +2327,73 @@ if exist \"{tray_shortcut}\" del /f /q \"{tray_shortcut}\"
     }
     run_after_run_cmds(false);
     std::process::exit(0);
+}
+
+pub fn upgrade_me(debug: bool) -> ResultType<()> {
+    let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
+    let (_, path, _, exe) = get_install_info();
+    let is_installed = std::fs::metadata(&exe).is_ok();
+    if !is_installed {
+        bail!("RustDesk is not installed.");
+    }
+
+    let app_name = crate::get_app_name();
+    let main_window_pids = crate::platform::get_pids_of_process_with_args::<_, &str>(
+        &format!("{}.exe", &app_name),
+        &[],
+    );
+    let is_main_window_running = !main_window_pids.is_empty();
+    for pid in main_window_pids {
+        let _ = crate::platform::kill_process_by_pid(pid);
+    }
+    let tray_pids =
+        crate::platform::get_pids_of_process_with_args(&format!("{}.exe", &app_name), &["--tray"]);
+    let is_tray_running = !tray_pids.is_empty();
+    for pid in tray_pids {
+        let _ = crate::platform::kill_process_by_pid(pid);
+    }
+    let is_service_running = is_self_service_running();
+
+    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    let restore_service_cmd = if is_service_running {
+        format!("sc start {}", &app_name)
+    } else {
+        "".to_owned()
+    };
+    // We need `taskkill` because:
+    // 1. There may be some other processes like `rustdesk --connect` are running.
+    // 2. Sometimes, the main window and the tray icon are showing
+    // while I cannot find them by `tasklist` or the methods above.
+    // There's should be 4 processes running: service, server, tray and main window.
+    // But only 2 processes are shown in the tasklist.
+    let cmds = format!(
+        "
+chcp 65001
+sc stop {app_name}
+taskkill /F /IM {app_name}.exe{filter}
+{copy_exe}
+{restore_service_cmd}
+{sleep}
+    ",
+        app_name = app_name,
+        copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
+        sleep = if debug { "timeout 300" } else { "" },
+    );
+
+    run_cmds(cmds, debug, "upgrade")?;
+
+    if is_tray_running {
+        allow_err!(std::process::Command::new(&exe).arg("--tray").spawn());
+    }
+    if is_main_window_running {
+        allow_err!(std::process::Command::new("cmd")
+            .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .spawn());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    Ok(())
 }
 
 pub fn get_tray_shortcut(exe: &str, tmp_path: &str) -> ResultType<String> {

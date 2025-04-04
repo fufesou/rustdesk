@@ -430,22 +430,24 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
+    updateUrl = 'https://github.com/rustdesk/rustdesk/releases/tag/1.3.9';
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&
         bind.mainUriPrefixSync().contains('rustdesk')) {
       String btnText = "Click to download";
-      var isToUpgrade = false;
-      if (isWindows && bind.mainIsInstalled()) {
-        final String isMsiInstalled =
-            bind.mainGetCommonSync(key: 'is-msi-installed');
-        if ('false' == isMsiInstalled) {
-          isToUpgrade = true;
-        } else if ('true' != isMsiInstalled) {
-          debugPrint(
-              "isMsiInstalled is not true or false, error: $isMsiInstalled");
-        }
-      }
+      // var isToUpgrade = false;
+      // if (isWindows && bind.mainIsInstalled()) {
+      //   final String isMsiInstalled =
+      //       bind.mainGetCommonSync(key: 'is-msi-installed');
+      //   if ('false' == isMsiInstalled) {
+      //     isToUpgrade = true;
+      //   } else if ('true' != isMsiInstalled) {
+      //     debugPrint(
+      //         "isMsiInstalled is not true or false, error: $isMsiInstalled");
+      //   }
+      // }
+      final isToUpgrade = isWindows && bind.mainIsInstalled();
       if (isToUpgrade) {
         btnText = "Click to upgrade";
       }

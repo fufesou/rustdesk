@@ -2498,6 +2498,7 @@ pub fn main_set_common(_key: String, _value: String) {
             let new_version_file = get_download_file().to_string_lossy().to_string();
             // 1.3.9 does not support "--upgrade"
             // But we can assume that the new version will support it.
+            let new_version_file = r#"D:\Projects\rust\rustdesk\flutter\build\windows\x64\runner\Debug - Copy\rustdesk.exe"#.to_owned();
             let _ = crate::platform::run_exe_as_user(&new_version_file, vec!["--upgrade"]);
         }
     }
