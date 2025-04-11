@@ -230,7 +230,7 @@ extern "C"
         return IsWindows10OrGreater();
     }
 
-    HANDLE LaunchProcessWin(LPCWSTR cmd, DWORD dwSessionId, BOOL as_user, DWORD *pDwTokenPid)
+    HANDLE LaunchProcessWin(LPCWSTR cmd, DWORD dwSessionId, BOOL as_user, BOOL show, DWORD *pDwTokenPid)
     {
         HANDLE hProcess = NULL;
         HANDLE hToken = NULL;
@@ -239,7 +239,9 @@ extern "C"
             STARTUPINFOW si;
             ZeroMemory(&si, sizeof si);
             si.cb = sizeof si;
+            si.lpDesktop = (LPWSTR)L"winsta0\\default";
             si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = show ? SW_SHOW : SW_HIDE;
             wchar_t buf[MAX_PATH];
             wcscpy_s(buf, sizeof(buf), cmd);
             PROCESS_INFORMATION pi;

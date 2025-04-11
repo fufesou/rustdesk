@@ -62,6 +62,8 @@ impl RendezvousMediator {
             }
         }
         crate::hbbs_http::sync::start();
+        #[cfg(target_os = "windows")]
+        crate::updater::start_auto_update();
         let mut nat_tested = false;
         check_zombie();
         let server = new_server();
