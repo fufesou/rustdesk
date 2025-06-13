@@ -194,9 +194,9 @@ impl PrivacyModeImpl {
                 );
             }
 
+            let mut displays_to_change = vec![];
             let mut i: DWORD = 0;
             loop {
-                let mut flags = CDS_UPDATEREGISTRY | CDS_NORESET;
                 #[allow(invalid_value)]
                 let mut dd: DISPLAY_DEVICEW = std::mem::MaybeUninit::uninit().assume_init();
                 dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as _;
@@ -208,10 +208,6 @@ impl PrivacyModeImpl {
                 i += 1;
                 if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0 {
                     continue;
-                }
-
-                if dd.DeviceName == display.name {
-                    flags |= CDS_SET_PRIMARY;
                 }
 
                 #[allow(invalid_value)]
@@ -227,6 +223,88 @@ impl PrivacyModeImpl {
                         Error::last_os_error()
                     );
                 }
+                log::info!(
+                    "======================== Display: {:?}, position: ({}, {}), size: ({}, {})",
+                    std::string::String::from_utf16(&dd.DeviceName),
+                    dm.u1.s2().dmPosition.x,
+                    dm.u1.s2().dmPosition.y,
+                    dm.dmPelsWidth,
+                    dm.dmPelsHeight
+                );
+                displays_to_change.push((dd, dm));
+            }
+
+            while displays_to_change.len() > 0 {
+                let mut flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+
+                let mut idx = 0;
+                let mut idx_found = false;
+                while idx < displays_to_change.len() {
+                    let (_, dm) = &displays_to_change[idx];
+                    let new_x = dm.u1.s2().dmPosition.x - new_primary_dm.u1.s2().dmPosition.x;
+                    let new_y = dm.u1.s2().dmPosition.y - new_primary_dm.u1.s2().dmPosition.y;
+                    let w = dm.dmPelsWidth;
+                    let h = dm.dmPelsHeight;
+                    if new_x.abs() > 10000 || new_y.abs() > 10000 || w == 0 || h == 0 {
+                        log::error!("====================== Invalid display position or size, x: {} = ({} - {}), y: {} = ({} - {}), width: {}, height: {}",
+                            dm.u1.s2().dmPosition.x,
+                            new_primary_dm.u1.s2().dmPosition.x,
+                            dm.u1.s2().dmPosition.y,
+                            new_primary_dm.u1.s2().dmPosition.y,
+                            new_x,
+                            new_y,
+                            dm.dmPelsWidth,
+                            dm.dmPelsHeight
+                        );
+                    }
+                    let mut no_intersection = true;
+                    for (i, (_, dm)) in displays_to_change.iter().enumerate() {
+                        if i != idx {
+                            if !(dm.u1.s2().dmPosition.x >= new_x + w as i32
+                                || (dm.u1.s2().dmPosition.x + dm.dmPelsWidth as i32) <= new_x
+                                || dm.u1.s2().dmPosition.y >= new_y + h as i32
+                                || (dm.u1.s2().dmPosition.y + dm.dmPelsHeight as i32) <= new_y)
+                            {
+                                log::info!(
+                                    "====================== not found: ({},{},{},{}), ({},{},{},{})",
+                                    new_x,
+                                    new_y,
+                                    new_x + w as i32,
+                                    new_y + h as i32,
+                                    dm.u1.s2().dmPosition.x,
+                                    dm.u1.s2().dmPosition.y,
+                                    dm.u1.s2().dmPosition.x + dm.dmPelsWidth as i32,
+                                    dm.u1.s2().dmPosition.y + dm.dmPelsHeight as i32
+                                );
+                                no_intersection = false;
+                                break;
+                            }
+                        }
+                    }
+                    if no_intersection {
+                        idx_found = true;
+                        break;
+                    } else {
+                        idx += 1;
+                    }
+                }
+                if !idx_found {
+                    log::warn!(
+                        "====================== No valid display found, using the first one as primary display."
+                    );
+                    idx = 0;
+                }
+                let (dd, mut dm) = displays_to_change.remove(idx);
+
+                log::info!("======================== move display: {:?}, position: ({}, {}), size: ({}, {}), offset: ({}, {})",
+                    std::string::String::from_utf16(&dd.DeviceName),
+                    dm.u1.s2().dmPosition.x,
+                    dm.u1.s2().dmPosition.y,
+                    dm.dmPelsWidth,
+                    dm.dmPelsHeight,
+                    new_primary_dm.u1.s2().dmPosition.x,
+                    new_primary_dm.u1.s2().dmPosition.y
+                );
 
                 dm.u1.s2_mut().dmPosition.x -= new_primary_dm.u1.s2().dmPosition.x;
                 dm.u1.s2_mut().dmPosition.y -= new_primary_dm.u1.s2().dmPosition.y;
@@ -246,7 +324,30 @@ impl PrivacyModeImpl {
                         flags,
                         &err
                     );
-                    bail!("Failed ChangeDisplaySettingsEx, {}", err);
+                    bail!("Failed ChangeDisplaySettingsEx 11, {}", err);
+                }
+
+                thread::sleep(Duration::from_millis(100));
+
+                if dd.DeviceName == display.name {
+                    flags |= CDS_SET_PRIMARY;
+                    let rc = ChangeDisplaySettingsExW(
+                        dd.DeviceName.as_ptr(),
+                        &mut dm,
+                        NULL as _,
+                        flags,
+                        NULL,
+                    );
+                    if rc != DISP_CHANGE_SUCCESSFUL {
+                        let err = Self::change_display_settings_ex_err_msg(rc);
+                        log::error!(
+                            "Failed ChangeDisplaySettingsEx, device name: {:?}, flags: {}, {}",
+                            std::string::String::from_utf16(&dd.DeviceName),
+                            flags,
+                            &err
+                        );
+                        bail!("Failed ChangeDisplaySettingsEx set primary, {}", err);
+                    }
                 }
 
                 // If we want to set dpi, the following references may be helpful.
@@ -287,8 +388,10 @@ impl PrivacyModeImpl {
                         flags,
                         &err
                     );
-                    bail!("Failed ChangeDisplaySettingsEx, {}", err);
+                    bail!("Failed ChangeDisplaySettingsEx 22, {}", err);
                 }
+
+                thread::sleep(Duration::from_millis(100));
             }
         }
         Ok(())
@@ -434,7 +537,11 @@ impl PrivacyMode for PrivacyModeImpl {
         guard.disable_physical_displays()?;
         Self::commit_change_display(CDS_RESET)?;
         // Explicitly set the resolution(virtual display) to 1920x1080.
-        allow_err!(crate::platform::change_resolution(&primary_display_name, 1920, 1080));
+        allow_err!(crate::platform::change_resolution(
+            &primary_display_name,
+            1920,
+            1080
+        ));
         let reg_connectivity_2 = reg_display_settings::read_reg_connectivity()?;
 
         if let Some(reg_recovery) =
