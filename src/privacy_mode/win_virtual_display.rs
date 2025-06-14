@@ -257,17 +257,17 @@ impl PrivacyModeImpl {
                             dm.dmPelsHeight
                         );
 
-                        bail!(
-                            "Invalid display position or size, x: {} = ({} - {}), y: {} = ({} - {}), width: {}, height: {}",
-                            dm.u1.s2().dmPosition.x,
-                            new_primary_dm.u1.s2().dmPosition.x,
-                            dm.u1.s2().dmPosition.y,
-                            new_primary_dm.u1.s2().dmPosition.y,
-                            new_x,
-                            new_y,
-                            w,
-                            h
-                        );
+                        // bail!(
+                        //     "Invalid display position or size, x: {} = ({} - {}), y: {} = ({} - {}), width: {}, height: {}",
+                        //     dm.u1.s2().dmPosition.x,
+                        //     new_primary_dm.u1.s2().dmPosition.x,
+                        //     dm.u1.s2().dmPosition.y,
+                        //     new_primary_dm.u1.s2().dmPosition.y,
+                        //     new_x,
+                        //     new_y,
+                        //     w,
+                        //     h
+                        // );
                     }
                     let mut no_intersection = true;
                     for (i, (_, dm)) in displays_to_change.iter().enumerate() {

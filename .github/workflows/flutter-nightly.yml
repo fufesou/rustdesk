@@ -12,4 +12,4 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "test-win-privacy-mode-2"
+      upload-tag: "test-win-privacy-mode-2-2"
