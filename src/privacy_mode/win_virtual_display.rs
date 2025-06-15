@@ -296,8 +296,11 @@ impl PrivacyModeImpl {
                 }
                 let (dd, mut dm) = displays_to_change.remove(idx);
 
-                log::info!("======================== move display: {:?}, position: ({}, {}), size: ({}, {}), offset: ({}, {})",
+                log::info!("======================== move display {:?}, virtual: {}, dmFields: {}, flags: {}, position: ({}, {}), size: ({}, {}), offset: ({}, {})",
                     std::string::String::from_utf16(&dd.DeviceName),
+                    dd.DeviceName == display.name,
+                    dm.dmFields,
+                    flags,
                     dm.u1.s2().dmPosition.x,
                     dm.u1.s2().dmPosition.y,
                     dm.dmPelsWidth,
@@ -319,7 +322,8 @@ impl PrivacyModeImpl {
                 if rc != DISP_CHANGE_SUCCESSFUL {
                     let err = Self::change_display_settings_ex_err_msg(rc);
                     log::error!(
-                        "Failed ChangeDisplaySettingsEx, device name: {:?}, flags: {}, {}",
+                        "====== Failed ChangeDisplaySettingsEx, virtual: {}, device name: {:?}, flags: {}, {}",
+                        dd.DeviceName == display.name,
                         std::string::String::from_utf16(&dd.DeviceName),
                         flags,
                         &err
