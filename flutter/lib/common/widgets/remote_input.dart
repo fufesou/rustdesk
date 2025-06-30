@@ -113,7 +113,7 @@ class _RawTouchGestureDetectorRegionState
 
   onTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -126,7 +126,7 @@ class _RawTouchGestureDetectorRegionState
   onTapUp(TapUpDetails d) async {
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -142,7 +142,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onTap() async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (!handleTouch) {
@@ -153,7 +153,7 @@ class _RawTouchGestureDetectorRegionState
 
   onDoubleTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -163,7 +163,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onDoubleTap() async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (ffiModel.touchMode && ffi.cursorModel.lastIsBlocked) {
@@ -179,7 +179,7 @@ class _RawTouchGestureDetectorRegionState
 
   onLongPressDown(LongPressDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -198,7 +198,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onLongPressUp() async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -208,7 +208,7 @@ class _RawTouchGestureDetectorRegionState
 
   // for mobiles
   onLongPress() async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (!ffi.ffiModel.isPeerMobile) {
@@ -228,7 +228,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onLongPressMoveUpdate(LongPressMoveUpdateDetails d) async {
-    if (!ffiModel.isPeerMobile || lastDeviceKind != PointerDeviceKind.touch) {
+    if (!ffiModel.isPeerMobile || !kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -241,7 +241,7 @@ class _RawTouchGestureDetectorRegionState
 
   onDoubleFinerTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     _doubleFinerTapPosition = d.localPosition;
@@ -250,7 +250,7 @@ class _RawTouchGestureDetectorRegionState
 
   onDoubleFinerTap(TapDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
 
@@ -266,7 +266,7 @@ class _RawTouchGestureDetectorRegionState
 
   onHoldDragStart(DragStartDetails d) async {
     lastDeviceKind = d.kind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (!handleTouch) {
@@ -275,7 +275,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onHoldDragUpdate(DragUpdateDetails d) async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (!handleTouch) {
@@ -284,7 +284,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onHoldDragEnd(DragEndDetails d) async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (!handleTouch) {
@@ -296,7 +296,7 @@ class _RawTouchGestureDetectorRegionState
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     lastDeviceKind = d.kind ?? lastDeviceKind;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (handleTouch) {
@@ -342,7 +342,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onOneFingerPanUpdate(DragUpdateDetails d) async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
@@ -356,7 +356,7 @@ class _RawTouchGestureDetectorRegionState
 
   onOneFingerPanEnd(DragEndDetails d) async {
     _touchModePanStarted = false;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if (isDesktop || isWebDesktop) {
@@ -370,13 +370,13 @@ class _RawTouchGestureDetectorRegionState
   // scale + pan event
   onTwoFingerScaleStart(ScaleStartDetails d) {
     _lastTapDownDetails = null;
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
   }
 
   onTwoFingerScaleUpdate(ScaleUpdateDetails d) async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if ((isDesktop || isWebDesktop)) {
@@ -401,7 +401,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onTwoFingerScaleEnd(ScaleEndDetails d) async {
-    if (lastDeviceKind != PointerDeviceKind.touch) {
+    if (!kTouchBasedDeviceKinds.contains(lastDeviceKind)) {
       return;
     }
     if ((isDesktop || isWebDesktop)) {
