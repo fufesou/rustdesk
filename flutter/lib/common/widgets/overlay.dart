@@ -575,31 +575,33 @@ class QualityMonitor extends StatelessWidget {
   Widget build(BuildContext context) => ChangeNotifierProvider.value(
       value: qualityMonitorModel,
       child: Consumer<QualityMonitorModel>(
-          builder: (context, qualityMonitorModel, child) => qualityMonitorModel
-                  .show
-              ? Container(
-                  constraints: BoxConstraints(maxWidth: 200),
-                  padding: const EdgeInsets.all(8),
-                  color: MyTheme.canvasColor.withAlpha(150),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _row("Speed", qualityMonitorModel.data.speed ?? '-'),
-                      _row("FPS", qualityMonitorModel.data.fps ?? '-'),
-                      // let delay be 0 if fps is 0
-                      _row(
-                          "Delay",
-                          "${qualityMonitorModel.data.delay == null ? '-' : (qualityMonitorModel.data.fps ?? "").replaceAll(' ', '').replaceAll('0', '').isEmpty ? 0 : qualityMonitorModel.data.delay}ms",
-                          rightColor: Colors.green),
-                      _row("Target Bitrate",
-                          "${qualityMonitorModel.data.targetBitrate ?? '-'}kb"),
-                      _row(
-                          "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
-                      _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
-                    ],
-                  ),
-                )
-              : const SizedBox.shrink()));
+          builder: (context, qualityMonitorModel, child) => Container(
+                constraints: BoxConstraints(maxWidth: 200),
+                padding: const EdgeInsets.all(8),
+                color: MyTheme.canvasColor.withAlpha(150),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // _row("Speed", qualityMonitorModel.data.speed ?? '-'),
+                    // _row("FPS", qualityMonitorModel.data.fps ?? '-'),
+                    // // let delay be 0 if fps is 0
+                    // _row(
+                    //     "Delay",
+                    //     "${qualityMonitorModel.data.delay == null ? '-' : (qualityMonitorModel.data.fps ?? "").replaceAll(' ', '').replaceAll('0', '').isEmpty ? 0 : qualityMonitorModel.data.delay}ms",
+                    //     rightColor: Colors.green),
+                    // _row("Target Bitrate",
+                    //     "${qualityMonitorModel.data.targetBitrate ?? '-'}kb"),
+                    // _row(
+                    //     "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
+                    // _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
+                    for (final evt in qualityMonitorModel.events)
+                      Text(
+                        evt,
+                        style: const TextStyle(fontSize: 14, color: Colors.white),
+                      ),
+                  ],
+                ),
+              )));
 }
 
 class BlockableOverlayState extends OverlayKeyState {

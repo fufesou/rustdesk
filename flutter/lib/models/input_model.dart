@@ -875,6 +875,7 @@ class InputModel {
   }
 
   void onPointHoverImage(PointerHoverEvent e) {
+    gFFI.qualityMonitorModel.addEvents('pointer hover. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     _stopFling = true;
     if (isViewOnly) return;
     if (!kMouseLikeDeviceKinds.contains(e.kind)) return;
@@ -887,6 +888,7 @@ class InputModel {
   }
 
   void onPointerPanZoomStart(PointerPanZoomStartEvent e) {
+    gFFI.qualityMonitorModel.addEvents('zoom start. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     _lastScale = 1.0;
     _stopFling = true;
     if (isViewOnly) return;
@@ -898,6 +900,7 @@ class InputModel {
 
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
+    gFFI.qualityMonitorModel.addEvents('zoom update. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (peerPlatform != kPeerPlatformAndroid) {
@@ -1003,6 +1006,7 @@ class InputModel {
   }
 
   void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
+    gFFI.qualityMonitorModel.addEvents('zoom end. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     if (isViewCamera) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanEnd, e.position);
@@ -1032,6 +1036,8 @@ class InputModel {
   }
 
   void onPointDownImage(PointerDownEvent e) {
+    gFFI.qualityMonitorModel.addEvents(
+        'down. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     debugPrint("onPointDownImage ${e.kind}");
     _stopFling = true;
     if (isDesktop) _queryOtherWindowCoords = true;
@@ -1050,6 +1056,8 @@ class InputModel {
   }
 
   void onPointUpImage(PointerUpEvent e) {
+    gFFI.qualityMonitorModel.addEvents(
+        'up. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     if (isDesktop) _queryOtherWindowCoords = false;
     if (isViewOnly) return;
     if (isViewCamera) return;
@@ -1060,6 +1068,8 @@ class InputModel {
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
+    gFFI.qualityMonitorModel.addEvents(
+        'move. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (!kMouseLikeDeviceKinds.contains(e.kind)) return;
@@ -1095,6 +1105,7 @@ class InputModel {
   }
 
   void onPointerSignalImage(PointerSignalEvent e) {
+    gFFI.qualityMonitorModel.addEvents('ps. ${e.kind}, pos: ${e.position}, btns: ${e.buttons}, device: ${e.device}');
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (e is PointerScrollEvent) {
