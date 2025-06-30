@@ -323,6 +323,7 @@ impl InvokeUiSession for SciterHandler {
             // Left empty code from compilation.
             // Please replace the code in the PR.
             ConnType::VIEW_CAMERA => {}
+            ConnType::TERMINAL => {}
         }
     }
 
