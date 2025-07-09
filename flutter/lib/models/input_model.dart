@@ -1344,7 +1344,10 @@ class InputModel {
       kForwardMouseButton: 'forward'
     };
     evt['buttons'] = mapButtons[evt['buttons']] ?? '';
-    // bind.sessionSendMouse(sessionId: sessionId, msg: json.encode(modify(evt)));
+    final now = DateTime.now();
+    bind.sessionSendMouse(sessionId: sessionId, msg: json.encode(modify(evt)));
+    final timeUsed = DateTime.now().difference(now).inMilliseconds;
+    gFFI.qualityMonitorModel.addEvents('6.sendMouse, timeUsed: $timeUsed ms');
   }
 
   Point? handlePointerDevicePos(
