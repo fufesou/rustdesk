@@ -3,7 +3,16 @@ use arboard::{ClipboardData, ClipboardFormat};
 use hbb_common::{bail, log, message_proto::*, ResultType};
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
+};
+#[cfg(target_os = "windows")]
+use windows::{
+    core::Result,
+    Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    },
+    Win32::System::Ole::CF_HDROP,
+    Win32::UI::Shell::{DragQueryFileW, HDROP},
 };
 
 pub const CLIPBOARD_NAME: &'static str = "clipboard";
