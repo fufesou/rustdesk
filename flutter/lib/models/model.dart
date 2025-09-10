@@ -113,6 +113,7 @@ class FfiModel with ChangeNotifier {
   bool? _secure;
   bool? _direct;
   bool _touchMode = false;
+  bool _showVirtualMouse = false;
   Timer? _timer;
   var _reconnects = 1;
   bool _viewOnly = false;
@@ -150,6 +151,7 @@ class FfiModel with ChangeNotifier {
   bool get inputBlocked => _inputBlocked;
 
   bool get touchMode => _touchMode;
+  bool get showVirtualMouse => _showVirtualMouse;
 
   bool get isPeerAndroid => _pi.platform == kPeerPlatformAndroid;
   bool get isPeerMobile => isPeerAndroid;
@@ -197,6 +199,14 @@ class FfiModel with ChangeNotifier {
   toggleTouchMode() {
     if (!isPeerAndroid) {
       _touchMode = !_touchMode;
+      notifyListeners();
+    }
+  }
+
+  setShowVirtualMouse(bool b) {
+    if (b == _showVirtualMouse) return;
+    if (!isPeerAndroid) {
+      _showVirtualMouse = b;
       notifyListeners();
     }
   }
@@ -1107,6 +1117,11 @@ class FfiModel with ChangeNotifier {
       _touchMode = await bind.sessionGetOption(
               sessionId: sessionId, arg: kOptionTouchMode) !=
           '';
+    }
+    if (isMobile) {
+      _showVirtualMouse = await bind.sessionGetToggleOption(
+              sessionId: sessionId, arg: kOptionShowVirtualMouse) ??
+          false;
     }
     if (connType == ConnType.fileTransfer) {
       parent.target?.fileModel.onReady();
@@ -2243,7 +2258,7 @@ class CursorModel with ChangeNotifier {
   double _displayOriginY = 0;
   DateTime? _firstUpdateMouseTime;
   Rect? _windowRect;
-  List<RemoteWindowCoords> _remoteWindowCoords = [];
+  final List<RemoteWindowCoords> _remoteWindowCoords = [];
   bool gotMouseControl = true;
   DateTime _lastPeerMouse = DateTime.now()
       .subtract(Duration(milliseconds: 3000 * kMouseControlTimeoutMSec));
@@ -2266,9 +2281,18 @@ class CursorModel with ChangeNotifier {
 
   Rect? get keyHelpToolsRectToAdjustCanvas =>
       _lastKeyboardIsVisible ? _keyHelpToolsRect : null;
-  keyHelpToolsVisibilityChanged(Rect? r, bool keyboardIsVisible) {
-    _keyHelpToolsRect = r;
-    if (r == null) {
+  // The blocked rect is used to block the pointer/touch events in the remote page.
+  final List<Rect> _blockedRects = [];
+  // Used in shouldBlock().
+  // 1. In FloatingMouse, when the scroll circle is shown, block the touch events on the remote image.
+  bool _blockEvents = false;
+  List<Rect> get blockedRects => List.unmodifiable(_blockedRects);
+
+  set blockEvents(bool v) => _blockEvents = v;
+
+  keyHelpToolsVisibilityChanged(Rect? rect, bool keyboardIsVisible) {
+    _keyHelpToolsRect = rect;
+    if (rect == null) {
       _lastIsBlocked = false;
     } else {
       // Block the touch event is safe here.
@@ -2281,6 +2305,16 @@ class CursorModel with ChangeNotifier {
       parent.target?.canvasModel.isMobileCanvasChanged = false;
     }
     _lastKeyboardIsVisible = keyboardIsVisible;
+  }
+
+  addBlockedRect(Rect rect) {
+    _blockedRects.add(rect);
+    notifyListeners();
+  }
+
+  removeBlockedRect(Rect rect) {
+    _blockedRects.remove(rect);
+    notifyListeners();
   }
 
   get lastIsBlocked => _lastIsBlocked;
@@ -2349,14 +2383,21 @@ class CursorModel with ChangeNotifier {
 
   // mobile Soft keyboard, block touch event from the KeyHelpTools
   shouldBlock(double x, double y) {
+    if (_blockEvents) {
+      return true;
+    }
     if (!(parent.target?.ffiModel.touchMode ?? false)) {
       return false;
     }
-    if (_keyHelpToolsRect == null) {
-      return false;
-    }
-    if (isPointInRect(Offset(x, y), _keyHelpToolsRect!)) {
+    final offset = Offset(x, y);
+    if (_keyHelpToolsRect != null &&
+        isPointInRect(offset, _keyHelpToolsRect!)) {
       return true;
+    }
+    for (final rect in _blockedRects) {
+      if (isPointInRect(offset, rect)) {
+        return true;
+      }
     }
     return false;
   }
