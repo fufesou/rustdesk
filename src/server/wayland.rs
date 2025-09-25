@@ -127,17 +127,32 @@ pub(super) fn is_inited() -> Option<Message> {
     }
 }
 
-fn get_max_desktop_resolution() -> Option<String> {
+fn get_max_desktop_resolution() -> Option<(i32, i32, usize)> {
     // works with Xwayland
     let output: Output = Command::new(CMD_SH.as_str())
         .arg("-c")
-        .arg("xrandr | awk '/current/ { print $8,$9,$10 }'")
+        .arg("xrandr")
         .output()
         .ok()?;
 
     if output.status.success() {
         let result = String::from_utf8_lossy(&output.stdout);
-        Some(result.trim().to_string())
+        let mut n = 0;
+        let mut w = 0;
+        let mut h = 0;
+        for line in result.lines() {
+            if line.contains("current") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 10 {
+                    w = parts[7].parse::<i32>().unwrap_or(0);
+                    h = parts[9].trim_end_matches(",").parse::<i32>().unwrap_or(0);
+                }
+            }
+            if line.contains("connected") {
+                n += 1;
+            }
+        }
+        Some((w, h, n))
     } else {
         None
     }
@@ -150,9 +165,16 @@ fn calculate_max_resolution_from_displays(displays: &[Display]) -> (i32, i32) {
     // log::warn!("using incorrect max resolution calculation uinput may not work correctly");
     let (mut max_x, mut max_y) = (0, 0);
     for d in displays {
+        log::info!(
+            "========================== display: {:?}, ({}, {}), {}",
+            d.origin(),
+            d.logical_width(),
+            d.logical_height(),
+            d.scale()
+        );
         let (x, y) = d.origin();
-        max_x = max_x.max(x + d.width() as i32);
-        max_y = max_y.max(y + d.height() as i32);
+        max_x = max_x.max(x + d.logical_width() as i32);
+        max_y = max_y.max(y + d.logical_height() as i32);
     }
     (max_x, max_y)
 }
@@ -189,25 +211,26 @@ pub(super) async fn check_init() -> ResultType<()> {
                     rects.push((d.origin(), d.width(), d.height()));
                 }
 
-                log::debug!("#displays={}, primary={}, rects: {:?}, cpus={}/{}", num, primary, rects, num_cpus::get_physical(), num_cpus::get());
+                log::debug!(
+                    "#displays={}, primary={}, rects: {:?}, cpus={}/{}",
+                    num,
+                    primary,
+                    rects,
+                    num_cpus::get_physical(),
+                    num_cpus::get()
+                );
 
                 if use_uinput {
-                    let (max_width, max_height) = match get_max_desktop_resolution() {
-                        Some(result) if !result.is_empty() => {
-                            let resolution: Vec<&str> = result.split(" ").collect();
-                            if let (Ok(w), Ok(h)) = (
-                                resolution[0].parse::<i32>(),
-                                resolution.get(2)
-                                    .unwrap_or(&"0")
-                                    .trim_end_matches(",")
-                                    .parse::<i32>()
-                            ) {
-                                (w, h)
-                            } else {
-                                calculate_max_resolution_from_displays(&all)
-                            }
+                    let (mut max_width, mut max_height) =
+                        calculate_max_resolution_from_displays(&all);
+
+                    // Use xrandr to get max resolution if not all displays are being captured.
+                    // `xrandr` may not provide correct resolution in some cases, but it's better than nothing.
+                    if let Some((w, h, n)) = get_max_desktop_resolution() {
+                        if n > all.len() {
+                            max_width = w;
+                            max_height = h;
                         }
-                        _ => calculate_max_resolution_from_displays(&all),
                     };
 
                     minx = 0;

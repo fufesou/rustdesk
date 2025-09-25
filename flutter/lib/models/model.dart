@@ -154,6 +154,8 @@ class FfiModel with ChangeNotifier {
   bool get isPeerAndroid => _pi.platform == kPeerPlatformAndroid;
   bool get isPeerMobile => isPeerAndroid;
 
+  bool get isPeerLinux => _pi.platform == kPeerPlatformLinux;
+
   bool get viewOnly => _viewOnly;
   bool get showMyCursor => _showMyCursor;
 
@@ -172,6 +174,9 @@ class FfiModel with ChangeNotifier {
   Rect? _getDisplaysRect(List<Display> displays, bool useDisplayScale) {
     if (displays.isEmpty) {
       return null;
+    }
+    if (isPeerLinux) {
+      useDisplayScale = true;
     }
     int scale(int len, double s) {
       if (useDisplayScale) {
@@ -1941,11 +1946,6 @@ class CanvasModel with ChangeNotifier {
         }
       }
     }
-  }
-
-  set scale(v) {
-    _scale = v;
-    notifyListeners();
   }
 
   panX(double dx) {
