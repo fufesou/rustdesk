@@ -150,9 +150,10 @@ fn calculate_max_resolution_from_displays(displays: &[Display]) -> (i32, i32) {
     // log::warn!("using incorrect max resolution calculation uinput may not work correctly");
     let (mut max_x, mut max_y) = (0, 0);
     for d in displays {
+        log::info!("========================== display: {:?}, ({}, {}), {}", d.origin(), d.logical_width(), d.logical_height(), d.scale());
         let (x, y) = d.origin();
-        max_x = max_x.max(x + d.width() as i32);
-        max_y = max_y.max(y + d.height() as i32);
+        max_x = max_x.max(x + d.logical_width() as i32);
+        max_y = max_y.max(y + d.logical_height() as i32);
     }
     (max_x, max_y)
 }
