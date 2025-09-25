@@ -1762,6 +1762,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 s.width,
                                 s.height,
                                 s.cursor_embedded,
+                                s.scale,
                             );
                         }
                     }
