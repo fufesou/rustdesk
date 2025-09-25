@@ -109,7 +109,8 @@ pub struct PipeWireCapturable {
     path: u64,
     source_type: u64,
     pub position: (i32, i32),
-    pub size: (usize, usize),
+    pub logical_size: (usize, usize),
+    pub physical_size: (usize, usize),
 }
 
 impl PipeWireCapturable {
@@ -121,23 +122,26 @@ impl PipeWireCapturable {
     ) -> Self {
         // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let size = get_res(Self {
+        let physical_size = get_res(Self {
             dbus_conn: conn.clone(),
             fd: fd.clone(),
             path: stream.path,
             source_type: stream.source_type,
             position: stream.position,
-            size: stream.size,
+            logical_size: stream.size,
+            physical_size: (0, 0),
         })
         .unwrap_or(stream.size);
-        *resolution.lock().unwrap() = Some(size);
+        *resolution.lock().unwrap() = Some(physical_size);
+        hbb_common::log::info!("=============================== PipeWireCapturable physical_size: {:?}", physical_size);
         Self {
             dbus_conn: conn,
             fd,
             path: stream.path,
             source_type: stream.source_type,
             position: stream.position,
-            size,
+            logical_size: stream.size,
+            physical_size,
         }
     }
 }
@@ -448,6 +452,7 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
                                 .collect::<Vec<&dyn RefArg>>(),
                         )
                         .collect::<HashMap<String, &dyn RefArg>>();
+                    hbb_common::log::info!("======================================= stream attributes: {:?}", &attributes);
                     let mut info = PwStreamInfo {
                         path,
                         source_type: attributes
