@@ -291,6 +291,7 @@ pub enum Data {
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Whiteboard((String, crate::whiteboard::CustomEvent)),
+    ClearTlsCache,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -753,6 +754,9 @@ async fn handle(data: Data, stream: &mut Connection) {
                 // Port forward session count is only a get value.
             }
         },
+        Data::ClearTlsCache => {
+            hbb_common::tls::reset_tls_type_cache();
+        }
         _ => {}
     }
 }
@@ -1386,6 +1390,12 @@ pub async fn clear_wayland_screencast_restore_token(key: String) -> ResultType<b
         return Ok(v.is_empty());
     }
     return Ok(false);
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn reset_tls_type_cache() -> ResultType<()> {
+    connect(1_000, "").await?.send(&Data::ClearTlsCache).await?;
+    Ok(())
 }
 
 #[cfg(all(

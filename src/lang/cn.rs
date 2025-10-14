@@ -721,5 +721,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Show virtual joystick", "显示虚拟摇杆"),
         ("Edit note", "编辑备注"),
         ("Alias", "别名"),
+        ("clear-tls-cache-tip", "如果您的 HTTPS/WSS 服务器配置已变更且无法连接，请清理 TLS 缓存。"),
     ].iter().cloned().collect();
 }

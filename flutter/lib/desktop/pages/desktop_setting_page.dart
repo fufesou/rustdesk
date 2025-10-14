@@ -1497,8 +1497,14 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
   @override
   bool get wantKeepAlive => true;
   bool locked = !isWeb && bind.mainIsInstalled();
-
   final scrollController = ScrollController();
+  late ServerConfig _serverConfig;
+
+  @override
+  void initState() {
+    super.initState();
+    _serverConfig = getServerConfig();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1514,7 +1520,60 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
           network(context),
         ]),
       ),
+      other(context),
     ]).marginOnly(bottom: _kListViewBottomMargin);
+  }
+
+  Widget other(BuildContext context) {
+    return FutureBuilder(
+        future: bind.mainIsUsingPublicServer(),
+        builder: (BuildContext context, AsyncSnapshot<bool> snapshot) {
+          if (!snapshot.hasData) {
+            return Offstage();
+          }
+          final usingPublicServer = snapshot.data!;
+          if (usingPublicServer) {
+            return Offstage();
+          }
+          final useTls = _serverConfig.idServer.startsWith('wss://') ||
+              _serverConfig.apiServer.startsWith('https://') ||
+              _serverConfig.relayServer.startsWith('https://') ||
+              _serverConfig.relayServer.startsWith('wss://');
+          final children = [
+            if (!usingPublicServer && useTls) _buildClearTlsCache(context),
+          ];
+          if (children.isEmpty) {
+            return Offstage();
+          } else {
+            return _Card(title: 'Other', children: children);
+          }
+        });
+  }
+
+  ServerConfig getServerConfig() {
+    Map<String, dynamic> options = {};
+    try {
+      options = jsonDecode(bind.mainGetOptionsSync());
+    } catch (e) {
+      print("Invalid server config: $e");
+    }
+    return ServerConfig.fromOptions(options);
+  }
+
+  Widget _buildClearTlsCache(BuildContext context) {
+    return _Button(
+      'Clear TLS cache',
+      () async {
+        await bind.mainSetCommon(key: 'clear-tls-cache', value: '');
+        msgBox(gFFI.sessionId, 'custom-nocancel-nook-hasclose', 'Prompt',
+            'Successful', '', gFFI.dialogManager);
+      },
+      tip: 'clear-tls-cache-tip',
+      style: ButtonStyle(
+        backgroundColor: WidgetStateProperty.all<Color>(
+            Theme.of(context).colorScheme.error.withOpacity(0.75)),
+      ),
+    );
   }
 
   Widget network(BuildContext context) {
@@ -1737,9 +1796,9 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget trackpadSpeed(BuildContext context) {
-    final initSpeed = (int.tryParse(
-            bind.mainGetUserDefaultOption(key: kKeyTrackpadSpeed)) ??
-        kDefaultTrackpadSpeed);
+    final initSpeed =
+        (int.tryParse(bind.mainGetUserDefaultOption(key: kKeyTrackpadSpeed)) ??
+            kDefaultTrackpadSpeed);
     final curSpeed = SimpleWrapper(initSpeed);
     void onDebouncer(int v) {
       bind.mainSetUserDefaultOption(

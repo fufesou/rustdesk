@@ -128,6 +128,11 @@ impl Default for UserStatus {
     }
 }
 
+#[inline]
+pub fn reset_client() {
+    OIDC_SESSION.write().unwrap().client = None;
+}
+
 impl OidcSession {
     fn new() -> Self {
         Self {

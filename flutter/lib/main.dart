@@ -37,12 +37,21 @@ int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
 
+class MyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) => true;
+  }
+}
+
 Future<void> main(List<String> args) async {
   earlyAssert();
   WidgetsFlutterBinding.ensureInitialized();
 
   debugPrint("launch args: $args");
   kBootArgs = List.from(args);
+  HttpOverrides.global = new MyHttpOverrides();
 
   if (!isDesktop) {
     runMobileApp();

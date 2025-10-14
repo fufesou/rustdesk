@@ -18,6 +18,7 @@ use hbb_common::{
     fs, lazy_static, log,
     rendezvous_proto::ConnType,
     ResultType,
+    tls::reset_tls_type_cache
 };
 use std::{
     collections::HashMap,
@@ -2681,6 +2682,13 @@ pub fn main_set_common(_key: String, _value: String) {
         crate::hbbs_http::downloader::remove(&_value);
     } else if _key == "cancel-downloader" {
         crate::hbbs_http::downloader::cancel(&_value);
+    }
+
+    if _key == "clear-tls-cache" {
+        reset_tls_type_cache();
+        crate::hbbs_http::account::reset_client();
+        #[cfg(not(any(target_os = "ios")))]
+        crate::ipc::reset_tls_type_cache().ok();
     }
 }
 
