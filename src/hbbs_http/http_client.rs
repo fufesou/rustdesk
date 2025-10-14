@@ -114,13 +114,18 @@ pub fn create_http_client_with_url(url: &str) -> SyncClient {
             }
         } else {
             log::warn!(
-                "Failed to connect to server {} with native-tls: {}. Keep using native-tls",
+                "Failed to connect to server {} with {:?}, err: {}.",
                 url,
+                tls_type,
                 e
             );
         }
     } else {
-        log::info!("Successfully connected to server {} with native-tls", url);
+        log::info!(
+            "Successfully connected to server {} with {:?}",
+            url,
+            tls_type
+        );
         upsert_tls_type(url, Some(TlsType::NativeTls));
     }
     client
@@ -149,13 +154,18 @@ pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
             }
         } else {
             log::warn!(
-                "Failed to connect to server {} with native-tls: {}. Keep using native-tls",
+                "Failed to connect to server {} with {:?}, err: {}.",
                 url,
+                tls_type,
                 e
             );
         }
     } else {
-        log::info!("Successfully connected to server {} with native-tls", url);
+        log::info!(
+            "Successfully connected to server {} with {:?}",
+            url,
+            tls_type
+        );
         upsert_tls_type(url, Some(TlsType::NativeTls));
     }
     client

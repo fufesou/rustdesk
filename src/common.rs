@@ -1120,7 +1120,7 @@ async fn post_request_inner(
         }
         Err(e) => {
             if matches!(tls_type, None) && e.is_request() {
-                log::warn!("HTTP request failed: {}, try again with rustls", e);
+                log::warn!("HTTP request failed: {:?}, try again with rustls", e);
                 Ok(None)
             } else {
                 Err(anyhow!("HTTP request failed: {}", e))
@@ -1177,7 +1177,7 @@ async fn get_http_response_async(
         }
         Err(e) => {
             if matches!(tls_type, None) && e.is_request() {
-                log::warn!("HTTP request failed: {}, try again with rustls", e);
+                log::warn!("HTTP request failed: {:?}, try again with rustls", e);
                 Ok(None)
             } else {
                 Err(anyhow!("HTTP request failed: {}", e))
