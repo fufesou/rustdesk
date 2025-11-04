@@ -1277,6 +1277,7 @@ pub fn make_display_changed_msg(
         y: display.y,
         width: display.width,
         height: display.height,
+        scale: display.scale,
         cursor_embedded: match source {
             VideoSource::Monitor => display_service::capture_cursor_embedded(),
             VideoSource::Camera => false,

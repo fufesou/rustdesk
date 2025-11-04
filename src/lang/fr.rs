@@ -727,5 +727,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Disable UDP", "Désactiver UDP"),
         ("disable-udp-tip", "Contrôle l’utilisation exclusive du mode TCP.\nLorsque cette option est activée, RustDesk n’utilise plus le port UDP 21116 et utilise le port TCP 21116 à la place."),
         ("server-oss-not-support-tip", "Note : Cette fonctionnalité n’est pas disponible sous la version open-source du serveur RustDesk."),
+        ("wayland-kde-plasma-all-displays-tip", ""),
     ].iter().cloned().collect();
 }

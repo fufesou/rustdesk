@@ -727,5 +727,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Disable UDP", "禁用 UDP"),
         ("disable-udp-tip", "控制是否仅使用TCP。\n启用此选项后，RustDesk 将不再使用UDP 21116，而是使用TCP 21116。"),
         ("server-oss-not-support-tip", "注意：RustDesk 开源服务器(OSS server) 不包含此功能。"),
+        ("wayland-kde-plasma-all-displays-tip", "检测到 KDE Plasma Wayland，请在远程控制界面勾选所有显示器，这样才能保证光标位置准确。"),
     ].iter().cloned().collect();
 }
