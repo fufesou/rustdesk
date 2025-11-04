@@ -2,9 +2,14 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+
+use hbb_common::platform::linux::{get_wayland_displays, WaylandDisplayInfo};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -17,7 +22,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 
-use hbb_common::config;
+use hbb_common::{config, log};
 
 use super::capturable::PixelProvider;
 use super::capturable::{Capturable, Recorder};
@@ -29,11 +34,31 @@ use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref RDP_SESSION_INFO: Mutex<Option<RdpSessionInfo>> = Mutex::new(None);
+    static ref DISPLAYS: Mutex<Option<Arc<Vec<WaylandDisplayInfo>>>> = Mutex::new(None);
+}
+
+// KDE Plasma may not provide position info
+static HAS_POSITION_ATTR: AtomicBool = AtomicBool::new(false);
+
+pub fn get_share_display_count() -> Option<usize> {
+    if HAS_POSITION_ATTR.load(Ordering::Relaxed) {
+        return None;
+    }
+    if !is_server_running() {
+        return None;
+    }
+    let wayland_displays = get_wayland_displays_();
+    let displays_count = wayland_displays.len();
+    if displays_count <= 1 {
+        return None;
+    }
+    Some(displays_count)
 }
 
 #[inline]
 pub fn close_session() {
     let _ = RDP_SESSION_INFO.lock().unwrap().take();
+    let _ = DISPLAYS.lock().unwrap().take();
 }
 
 #[inline]
@@ -52,6 +77,7 @@ pub fn try_close_session() {
     }
     if close {
         *rdp_info = None;
+        let _ = DISPLAYS.lock().unwrap().take();
     }
 }
 
@@ -109,7 +135,8 @@ pub struct PipeWireCapturable {
     path: u64,
     source_type: u64,
     pub position: (i32, i32),
-    pub size: (usize, usize),
+    pub logical_size: (usize, usize),
+    pub physical_size: (usize, usize),
 }
 
 impl PipeWireCapturable {
@@ -121,23 +148,25 @@ impl PipeWireCapturable {
     ) -> Self {
         // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let size = get_res(Self {
+        let physical_size = get_res(Self {
             dbus_conn: conn.clone(),
             fd: fd.clone(),
             path: stream.path,
             source_type: stream.source_type,
             position: stream.position,
-            size: stream.size,
+            logical_size: stream.size,
+            physical_size: (0, 0),
         })
         .unwrap_or(stream.size);
-        *resolution.lock().unwrap() = Some(size);
+        *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,
             fd,
             path: stream.path,
             source_type: stream.source_type,
             position: stream.position,
-            size,
+            logical_size: stream.size,
+            physical_size,
         }
     }
 }
@@ -396,18 +425,18 @@ where
             0 => {}
             1 => {
                 warn!("DBus response: User cancelled interaction.");
-                failure_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                failure_out.store(true, Ordering::Relaxed);
                 return true;
             }
             c => {
                 warn!("DBus response: Unknown error, code: {}.", c);
-                failure_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                failure_out.store(true, Ordering::Relaxed);
                 return true;
             }
         }
         if let Err(err) = f(r, c, m) {
             warn!("Error requesting screen capture via dbus: {}", err);
-            failure_out.store(true, std::sync::atomic::Ordering::Relaxed);
+            failure_out.store(true, Ordering::Relaxed);
         }
         true
     })
@@ -488,6 +517,7 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
                             if v.len() == 2 {
                                 info.position.0 = v[0] as _;
                                 info.position.1 = v[1] as _;
+                                HAS_POSITION_ATTR.store(true, Ordering::Relaxed);
                             }
                         }
                     }
@@ -586,7 +616,7 @@ pub fn request_remote_desktop() -> Result<
             break;
         }
 
-        if failure_res.load(std::sync::atomic::Ordering::Relaxed) {
+        if failure_res.load(Ordering::Relaxed) {
             break;
         }
     }
@@ -838,7 +868,7 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     };
 
     if rdp_connection.is_none() {
-        let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop()?;
+        let (conn, fd, mut streams, session, is_support_restore_token) = request_remote_desktop()?;
         let conn = Arc::new(conn);
 
         let rdp_info = RdpSessionInfo {
@@ -859,7 +889,7 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
         }
     };
 
-    Ok(rdp_info
+    let mut capturables = rdp_info
         .streams
         .clone()
         .into_iter()
@@ -871,7 +901,141 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
                 s,
             )
         })
-        .collect())
+        .collect();
+
+    try_fill_positions(&mut capturables);
+    // The logical size reported by portal may be different from the size reported by `get_wayland_displays()`.
+    // So we need to use the workaround here.
+    // 1. openSUSE, KDE Plasma
+    // 2. Kubuntu 24.04 TLS, after running `sudo apt install plasma-workspace-wayland`
+    // Maybe it's a bug, and we can remove this workaround in the future.
+    try_fix_logical_size(&mut capturables);
+    Ok(capturables)
+}
+
+fn get_wayland_displays_() -> Arc<Vec<WaylandDisplayInfo>> {
+    let mut displays = DISPLAYS.lock().unwrap();
+    match displays.as_ref() {
+        Some(displays) => displays.clone(),
+        None => match get_wayland_displays() {
+            Ok(wd) => {
+                let wd = Arc::new(wd);
+                *displays = Some(wd.clone());
+                wd
+            }
+            Err(err) => {
+                warn!("Failed to get wayland displays: {}", err);
+                Arc::new(Vec::new())
+            }
+        },
+    }
+}
+
+fn try_fill_positions(capturables: &mut Vec<PipeWireCapturable>) {
+    if !is_server_running() {
+        return;
+    }
+
+    let wayland_displays = get_wayland_displays_();
+    if wayland_displays.len() <= 1 || HAS_POSITION_ATTR.load(Ordering::Relaxed) {
+        return;
+    }
+
+    debug!("Multiple Wayland displays detected, adjusting stream positions accordingly.");
+
+    info!(
+        "================================== wayland dispalys: {:?}",
+        &wayland_displays
+    );
+
+    if capturables.len() != wayland_displays.len() {
+        warn!(
+            "Number of capturables ({}) does not match number of displays ({}). Position assignment may be wrong.",
+            capturables.len(),
+            wayland_displays.len()
+        );
+    }
+
+    let mut used_displays = Vec::new();
+    for capturable in capturables.iter_mut() {
+        info!("=================================== capturable. position: {:?}, physical size: {:?}, logical_size: {:?}", capturable.position, capturable.physical_size, capturable.logical_size);
+
+        let mut matched = false;
+        for i in 0..wayland_displays.len() {
+            let wd = &wayland_displays[i];
+            if used_displays.contains(&i) {
+                continue;
+            }
+
+            if capturable.physical_size.0 == wd.width as usize
+                && capturable.physical_size.1 == wd.height as usize
+            {
+                matched = true;
+                capturable.position = (wd.x, wd.y);
+                used_displays.push(i);
+                debug!(
+                    "Assigned position {:?} to capturable with physical_size {:?} based on display info {:?}.",
+                    capturable.position, capturable.physical_size, wd
+                );
+                break;
+            }
+        }
+        if !matched {
+            warn!(
+                "No matching display found for capturable with size {:?}.",
+                capturable.physical_size
+            );
+        }
+    }
+}
+
+fn try_fix_logical_size(capturables: &mut Vec<PipeWireCapturable>) {
+    if !is_server_running() {
+        return;
+    }
+
+    let wayland_displays = get_wayland_displays_();
+    if wayland_displays.is_empty() {
+        return;
+    }
+
+    for capturable in capturables.iter_mut() {
+        let mut matched = false;
+        for i in 0..wayland_displays.len() {
+            let wd = &wayland_displays[i];
+            if capturable.position.0 == wd.x && capturable.position.1 == wd.y {
+                if let Some(logical_size) = wd.logical_size {
+                    if !(capturable.physical_size.0 == wd.width as usize
+                        && capturable.physical_size.1 == wd.height as usize)
+                    {
+                        // If "Full Workspace" is selected in the portal dialog,
+                        // the physical size reported by portal may not match the display info.
+                        debug!(
+                            "Physical size of capturable ({:?}) does not match display info: ({:?}) - ({:?}). Skipping logical size fix.",
+                            capturable.position,
+                            capturable.physical_size,
+                            (wd.width as usize, wd.height as usize)
+                        );
+                        break;
+                    }
+
+                    if !(capturable.logical_size.0 == logical_size.0 as usize
+                        && capturable.logical_size.1 == logical_size.1 as usize)
+                    {
+                        warn!(
+                            "Fixing logical size of capturable from {:?} to {:?} based on display info {:?}.",
+                            capturable.logical_size,
+                            logical_size,
+                            wd
+                        );
+                        capturable.logical_size =
+                            (logical_size.0 as usize, logical_size.1 as usize);
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 // If `is_server_running()` is true, then `screencast_portal::start` is called.
@@ -899,4 +1063,35 @@ fn is_server_running() -> bool {
     let output_str = String::from_utf8_lossy(&output.stdout);
     let is_running = output_str.contains(&format!("{} --server", app_name));
     is_running
+}
+
+// Return (min_x, max_x, min_y, max_y)
+pub fn get_desktop_rect() -> Option<(i32, i32, i32, i32)> {
+    let wayland_displays = DISPLAYS.lock().unwrap().as_ref()?.clone();
+    if wayland_displays.is_empty() {
+        return None;
+    }
+
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for display in wayland_displays.iter() {
+        if display.x < min_x {
+            min_x = display.x;
+        }
+        if display.y < min_y {
+            min_y = display.y;
+        }
+        let size = display
+            .logical_size
+            .unwrap_or((display.width, display.height));
+        if display.x + size.0 as i32 > max_x {
+            max_x = display.x + size.0;
+        }
+        if display.y + size.1 as i32 > max_y {
+            max_y = display.y + size.1;
+        }
+    }
+    Some((min_x, max_x, min_y, max_y))
 }

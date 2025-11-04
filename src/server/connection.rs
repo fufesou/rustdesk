@@ -7,10 +7,10 @@ use crate::clipboard::{update_clipboard, ClipboardSide};
 use crate::clipboard_file::*;
 #[cfg(target_os = "android")]
 use crate::keyboard::client::map_key_to_control_key;
-#[cfg(target_os = "linux")]
-use crate::platform::linux_desktop_manager;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::platform::WallPaperRemover;
+#[cfg(target_os = "linux")]
+use crate::platform::{is_x11, linux_desktop_manager};
 #[cfg(windows)]
 use crate::portable_service::client as portable_client;
 use crate::{
@@ -1504,6 +1504,9 @@ impl Connection {
         })
         .into();
 
+        #[cfg(target_os = "linux")]
+        let mut display_count = 0;
+
         let mut sub_service = false;
         #[allow(unused_mut)]
         let mut wait_session_id_confirm = false;
@@ -1557,6 +1560,10 @@ impl Connection {
                     #[cfg(target_os = "macos")]
                     {
                         self.retina.set_displays(&displays);
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        display_count = displays.len();
                     }
                     pi.displays = displays;
                     pi.current_display = self.display_idx as _;
@@ -1616,6 +1623,24 @@ impl Connection {
         } else if sub_service {
             if !wait_session_id_confirm {
                 self.try_sub_monitor_services();
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if !is_x11() {
+            if let Some(c) = scrap::wayland::pipewire::get_share_display_count() {
+                if display_count < c {
+                    let mut msg_out = Message::new();
+                    let res = MessageBox {
+                        msgtype: "custom-nook-nocancel-hasclose".to_owned(),
+                        title: "Wayland".to_owned(),
+                        text: "wayland-kde-plasma-all-displays-tip".to_owned(),
+                        link: "rustdesk discussion Plasma Wayland all displays".to_owned(),
+                        ..Default::default()
+                    };
+                    msg_out.set_message_box(res);
+                    self.send(msg_out).await;
+                }
             }
         }
     }
