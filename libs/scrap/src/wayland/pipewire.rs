@@ -146,6 +146,10 @@ impl PipeWireCapturable {
         resolution: Arc<Mutex<Option<(usize, usize)>>>,
         stream: PwStreamInfo,
     ) -> Self {
+        info!(
+            "================================= new PipeWireCapturable, {}",
+            fd.as_raw_fd()
+        );
         // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
         let physical_size = get_res(Self {
@@ -244,6 +248,10 @@ pub struct PipeWireRecorder {
 
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> Result<Self, Box<dyn Error>> {
+        log::info!(
+            "[gstreamer] Creating new PipeWireRecorder for capturable: {}",
+            capturable.name()
+        );
         let pipeline = gst::Pipeline::new(None);
 
         let src = gst::ElementFactory::make("pipewiresrc", None)?;
@@ -275,9 +283,34 @@ impl PipeWireRecorder {
             &[("format", &"RGBx")],
         ));
         appsink.set_caps(Some(&caps));
+        log::info!("[gstreamer] Caps set on appsink.");
 
-        pipeline.set_state(gst::State::Playing)?;
-        Ok(Self {
+
+
+        log::info!("[gstreamer] Setting pipeline to PLAYING state...");
+        let ff = pipeline.set_state(gst::State::Playing);
+
+        if let Err(e) = ff.as_ref() {
+            error!("=================== [gstreamer] Failed to set pipeline to PLAYING state: {:?}", e);
+        }
+
+        let _ = ff?;
+        
+        // Wait for the state change to actually complete before proceeding
+        let state_change = pipeline.get_state(gst::ClockTime::from_seconds(5));
+        match state_change {
+            (Ok(_), gst::State::Playing, _) => {
+                log::info!("[gstreamer] Pipeline state confirmed as PLAYING.");
+            }
+            (result, state, pending) => {
+                log::warn!(
+                    "[gstreamer] Pipeline state change incomplete: result={:?}, state={:?}, pending={:?}",
+                    result, state, pending
+                );
+            }
+        }
+        
+        let recorder = Self {
             pipeline,
             appsink,
             buffer: None,
@@ -287,7 +320,8 @@ impl PipeWireRecorder {
             buffer_cropped: vec![],
             is_cropped: false,
             saved_raw_data: Vec::new(),
-        })
+        };
+        Ok(recorder)
     }
 }
 
@@ -392,9 +426,9 @@ impl Recorder for PipeWireRecorder {
 
 impl Drop for PipeWireRecorder {
     fn drop(&mut self) {
-        if let Err(err) = self.pipeline.set_state(gst::State::Null) {
-            warn!("Failed to stop GStreamer pipeline: {}.", err);
-        }
+        let _ = self.pipeline.set_state(gst::State::Null);
+        // Wait for state change to complete to avoid races during PipeWire teardown.
+        let _ = self.pipeline.get_state(gst::ClockTime::from_mseconds(2000));
     }
 }
 
@@ -889,6 +923,7 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
         }
     };
 
+    info!("================================= get get_capturables");
     let mut capturables = rdp_info
         .streams
         .clone()
