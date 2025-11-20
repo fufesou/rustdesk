@@ -20,6 +20,10 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+[[bin]]
+name = "rustdeskrunner"
+path = "src/rustdesk_runner.rs"
+
 [features]
 inline = []
 cli = []
