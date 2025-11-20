@@ -197,6 +197,12 @@ pub fn core_main() -> Option<Vec<String>> {
                 if config::is_disable_installation() {
                     return None;
                 }
+
+                #[cfg(windows)]
+                if let Err(e) = crate::platform::handle_custom_client_update_logic() {
+                    log::error!("Error handling custom client update logic: {}", e);
+                }
+
                 let res = platform::update_me(false);
                 let text = match res {
                     Ok(_) => translate("Update successfully!".to_string()),

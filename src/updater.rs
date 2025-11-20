@@ -119,7 +119,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 
 fn check_update(manually: bool) -> ResultType<()> {
     #[cfg(target_os = "windows")]
-    let is_msi = crate::platform::is_msi_installed()?;
+    let is_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
         return Ok(());
     }
@@ -218,6 +218,22 @@ fn update_new_version(is_msi: bool, version: &str, file_path: &PathBuf) {
                     }
                 }
             } else {
+                let custom_client_staging_dir = if crate::is_custom_client() {
+                    let custom_client_staging_dir =
+                        crate::platform::get_custom_client_staging_dir();
+                    if let Err(e) = crate::platform::handle_custom_client_staging_dir_before_update(
+                        &custom_client_staging_dir,
+                    ) {
+                        log::error!(
+                            "Failed to handle custom client staging dir before update: {}",
+                            e
+                        );
+                        return;
+                    }
+                    Some(custom_client_staging_dir)
+                } else {
+                    None
+                };
                 match crate::platform::launch_privileged_process(
                     session_id,
                     &format!("{} --update", p),
@@ -225,11 +241,18 @@ fn update_new_version(is_msi: bool, version: &str, file_path: &PathBuf) {
                     Ok(h) => {
                         if h.is_null() {
                             log::error!("Failed to update to the new version: {}", version);
+                        } else {
+                            // unreachable!()
+                            // Because `--update` will exit the current process, so we won't reach here.
+                            log::debug!("New version \"{}\" is launched.", version);
                         }
                     }
                     Err(e) => {
                         log::error!("Failed to run the new version: {}", e);
                     }
+                }
+                if let Some(dir) = custom_client_staging_dir {
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
             }
         } else {

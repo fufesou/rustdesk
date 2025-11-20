@@ -1,6 +1,6 @@
 [package]
 name = "rustdesk"
-version = "1.4.4"
+version = "1.4.5"
 authors = ["rustdesk <info@rustdesk.com>"]
 edition = "2021"
 build= "build.rs"
@@ -19,10 +19,6 @@ path = "src/naming.rs"
 [[bin]]
 name = "service"
 path = "src/service.rs"
-
-[[bin]]
-name = "rustdeskrunner"
-path = "src/rustdesk_runner.rs"
 
 [features]
 inline = []
