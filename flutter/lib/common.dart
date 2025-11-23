@@ -3933,7 +3933,13 @@ void earlyAssert() {
 
 void checkUpdate() {
   if (!isWeb) {
-    if (!bind.isCustomClient()) {
+    // Update check policy:
+    // - Windows installed (including custom client): always check
+    // - Non-custom client on any platform: check
+    // - Custom client on non-Windows or Windows portable: skip
+    final isWindowsInstalled = isWindows && bind.mainIsInstalled();
+    final shouldCheckUpdate = isWindowsInstalled || !bind.isCustomClient();
+    if (shouldCheckUpdate) {
       platformFFI.registerEventHandler(
           kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
           (Map<String, dynamic> evt) async {
