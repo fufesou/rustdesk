@@ -12,7 +12,8 @@ final _isExtracting = false.obs;
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
   String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  // String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  String version = '1.4.5';
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
@@ -22,6 +23,7 @@ void handleUpdate(String releasePageUrl) {
     return;
   }
   downloadUrl = '$downloadUrl/$downloadFile';
+  debugPrint('========================== downloadUrl: $downloadUrl');
 
   SimpleWrapper downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
@@ -173,34 +175,36 @@ class UpdateProgressState extends State<UpdateProgress> {
 
   void _updateDownloadData() {
     String err = '';
-    String downloadData =
-        bind.mainGetCommonSync(key: 'download-data-${widget.downloadId.value}');
-    if (downloadData.startsWith('error:')) {
-      err = downloadData.substring('error:'.length);
-    } else {
-      try {
-        jsonDecode(downloadData).forEach((key, value) {
-          if (key == 'total_size') {
-            if (value != null && value is int) {
-              _totalSize = value;
-            }
-          } else if (key == 'downloaded_size') {
-            _downloadedSize = value as int;
-          } else if (key == 'error') {
-            if (value != null) {
-              err = value.toString();
-            }
-          }
-        });
-      } catch (e) {
-        _getDataFailedCount += 1;
-        debugPrint(
-            'Failed to get download data ${widget.downloadUrl}, error $e');
-        if (_getDataFailedCount > 3) {
-          err = e.toString();
-        }
-      }
-    }
+    // String downloadData =
+    //     bind.mainGetCommonSync(key: 'download-data-${widget.downloadId.value}');
+    // if (downloadData.startsWith('error:')) {
+    //   err = downloadData.substring('error:'.length);
+    // } else {
+    //   try {
+    //     jsonDecode(downloadData).forEach((key, value) {
+    //       if (key == 'total_size') {
+    //         if (value != null && value is int) {
+    //           _totalSize = value;
+    //         }
+    //       } else if (key == 'downloaded_size') {
+    //         _downloadedSize = value as int;
+    //       } else if (key == 'error') {
+    //         if (value != null) {
+    //           err = value.toString();
+    //         }
+    //       }
+    //     });
+    //   } catch (e) {
+    //     _getDataFailedCount += 1;
+    //     debugPrint(
+    //         'Failed to get download data ${widget.downloadUrl}, error $e');
+    //     if (_getDataFailedCount > 3) {
+    //       err = e.toString();
+    //     }
+    //   }
+    // }
+    _downloadedSize = 1;
+    _totalSize = 1;
     if (err != '') {
       _onError(err);
     } else {

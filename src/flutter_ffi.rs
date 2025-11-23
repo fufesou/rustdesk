@@ -2687,15 +2687,16 @@ pub fn main_set_common(_key: String, _value: String) {
             let download_url = _value.clone();
             let event_key = "download-new-version".to_owned();
             let data = if let Some(download_file) = get_download_file_from_url(&download_url) {
-                std::fs::remove_file(&download_file).ok();
-                match crate::hbbs_http::downloader::download_file(
-                    download_url,
-                    Some(PathBuf::from(download_file)),
-                    Some(Duration::from_secs(3)),
-                ) {
-                    Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
-                    Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
-                }
+                // std::fs::remove_file(&download_file).ok();
+                // match crate::hbbs_http::downloader::download_file(
+                //     download_url,
+                //     Some(PathBuf::from(download_file)),
+                //     Some(Duration::from_secs(3)),
+                // ) {
+                //     Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
+                //     Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
+                // }
+                HashMap::from([("name", event_key), ("id", "aa".to_string())])
             } else {
                 HashMap::from([
                     ("name", event_key),
@@ -2716,6 +2717,7 @@ pub fn main_set_common(_key: String, _value: String) {
                     // 1.4.0 does not support "--update"
                     // But we can assume that the new version supports it.
 
+                    let f = "D:\\temp\\rustdesk-1.4.4-x86_64.exe";
                     #[cfg(any(target_os = "windows", target_os = "macos"))]
                     match crate::platform::update_to(f) {
                         Ok(_) => {

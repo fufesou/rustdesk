@@ -430,6 +430,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
+    updateUrl = 'https://github.com/fufesou/rustdesk/releases/tag/test-win-update';
     if (updateUrl.isNotEmpty &&
         !isCardClosed &&
         (isWindows ||
@@ -448,7 +449,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
       return buildInstallCard(
           "Status",
-          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
+          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (1.4.4).",
           btnText,
           onPressed,
           closeButton: true);
