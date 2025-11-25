@@ -9,10 +9,9 @@ use clipboard::ContextSend;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::unbounded_channel;
 use hbb_common::{
-    allow_err,
-    config::Config,
-    fs::is_write_need_confirmation,
-    fs::{self, get_string, new_send_confirm, DigestCheckResult},
+    allow_err, bail,
+    config::{keys::OPTION_ENABLE_FILE_TRANSFER_HASH_VALIDATION, Config},
+    fs::{self, get_string, is_write_need_confirmation, new_send_confirm, DigestCheckResult},
     log,
     message_proto::*,
     protobuf::Message as _,
@@ -21,12 +20,12 @@ use hbb_common::{
         sync::mpsc::{self, UnboundedSender},
         task::spawn_blocking,
     },
+    ResultType,
 };
 #[cfg(target_os = "windows")]
 use hbb_common::{
     config::{keys::*, option2bool},
     tokio::sync::Mutex as TokioMutex,
-    ResultType,
 };
 use serde_derive::Serialize;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
@@ -36,11 +35,17 @@ use std::sync::Arc;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    path::Path,
     sync::{
         atomic::{AtomicI64, Ordering},
         RwLock,
     },
 };
+
+/// Maximum number of files allowed in a single validate_read_access request.
+/// This prevents excessive I/O and potential UI freezes when dealing with large directories.
+#[cfg(not(any(target_os = "ios")))]
+const MAX_VALIDATED_FILES: usize = 10_000;
 
 #[derive(Serialize, Clone)]
 pub struct Client {
@@ -789,6 +794,41 @@ async fn handle_fs(
             total_size,
             conn_id,
         } => {
+            // Validate file names to prevent path traversal attacks.
+            // This must be done BEFORE any path operations to ensure attackers cannot
+            // escape the target directory using names like "../../malicious.txt"
+            if let Err(e) = validate_transfer_file_names(&files) {
+                log::warn!("Path traversal attempt detected for {}: {}", path, e);
+                send_raw(fs::new_error(id, e, file_num), tx);
+                return;
+            }
+
+            // Check parent directory access before allowing write
+            // For new files, the file itself doesn't exist yet, so we canonicalize the parent directory
+            let path_obj = Path::new(&path);
+            if let Err(e) = validate_parent_and_canonicalize(&path_obj) {
+                log::warn!("Write access denied for {}: {}", path, e);
+                send_raw(fs::new_error(id, e, file_num), tx);
+                return;
+            }
+
+            // Convert files to FileEntry and validate write paths
+            let file_entries: Vec<FileEntry> = files
+                .drain(..)
+                .map(|f| FileEntry {
+                    name: f.0,
+                    modified_time: f.1,
+                    ..Default::default()
+                })
+                .collect();
+
+            // Validate that all intermediate directories for each file are accessible
+            if let Err(e) = validate_write_paths(&path_obj, &file_entries) {
+                log::warn!("Write path validation failed for {}: {}", path, e);
+                send_raw(fs::new_error(id, e, file_num), tx);
+                return;
+            }
+
             // cm has no show_hidden context
             // dummy remote, show_hidden, is_remote
             let mut job = fs::TransferJob::new_write(
@@ -799,14 +839,7 @@ async fn handle_fs(
                 file_num,
                 false,
                 false,
-                files
-                    .drain(..)
-                    .map(|f| FileEntry {
-                        name: f.0,
-                        modified_time: f.1,
-                        ..Default::default()
-                    })
-                    .collect(),
+                file_entries,
                 overwrite_detection,
             );
             job.total_size = total_size;
@@ -922,8 +955,333 @@ async fn handle_fs(
         ipc::FS::Rename { id, path, new_name } => {
             rename_file(path, new_name, id, tx).await;
         }
+        ipc::FS::ValidateReadAccess {
+            path,
+            id,
+            include_hidden,
+            conn_id,
+        } => {
+            validate_read_access(path, include_hidden, id, conn_id, tx).await;
+        }
+        ipc::FS::ReadAllFiles {
+            path,
+            id,
+            include_hidden,
+            conn_id,
+        } => {
+            read_all_files(path, include_hidden, id, conn_id, tx).await;
+        }
         _ => {}
     }
+}
+
+fn compute_hash(path: &Path) -> ResultType<Option<String>> {
+    if !Config::get_bool_option(OPTION_ENABLE_FILE_TRANSFER_HASH_VALIDATION) {
+        // Verify read access; close immediately.
+        let _ = std::fs::File::open(path)?;
+        return Ok(None);
+    }
+    let mut file = std::fs::File::open(&path)?;
+    fs::compute_file_hash_sync(&mut file, Some(fs::MAX_HASH_BYTES))
+}
+
+// Although the following function is typically only needed on Windows,
+// we include it for other platforms (except iOS) as well to maintain consistency,
+// and it does not add significant overhead.
+//
+/// Validates that all parent directories of the given path are accessible (readable).
+/// This prevents bypassing directory-level access restrictions by directly accessing
+/// child files/directories using their full paths.
+///
+/// On Windows, denying access to a directory only prevents listing its contents,
+/// but child items can still be accessed if their full paths are known.
+/// This function ensures that if any parent directory is inaccessible,
+/// the entire path is considered inaccessible.
+#[cfg(not(any(target_os = "ios")))]
+fn check_parent_directories_access(path: &Path) -> ResultType<()> {
+    for ancestor in path.ancestors().skip(1) {
+        // Skip empty paths
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+
+        // Check directory list permission for all ancestors including root.
+        // While canonicalize() validates path reachability (Traverse permission),
+        // we also enforce List permission to prevent accessing files when parent
+        // directories are intentionally hidden. This implements defense-in-depth:
+        // even if root directory list access is rarely restricted, checking it
+        // ensures consistent security policy across all path levels.
+        if ancestor.is_dir() {
+            if let Err(e) = std::fs::read_dir(ancestor) {
+                log::error!(
+                    "access denied to parent directory '{}': {}",
+                    ancestor.display(),
+                    e
+                );
+                bail!("access denied: insufficient permissions to access path");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates and canonicalizes a path, checking parent directory access.
+/// This is the main helper function to ensure a path is accessible before operations.
+#[inline]
+#[cfg(not(any(target_os = "ios")))]
+fn validate_and_canonicalize(path: &Path) -> ResultType<std::path::PathBuf> {
+    let canonical = path.canonicalize()?;
+    check_parent_directories_access(&canonical)?;
+    Ok(canonical)
+}
+
+/// Validates parent directory access and canonicalizes the parent path.
+/// Used for operations like create_dir where the target itself doesn't exist yet.
+#[inline]
+#[cfg(not(any(target_os = "ios")))]
+fn validate_parent_and_canonicalize(path: &Path) -> ResultType<std::path::PathBuf> {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => {
+            bail!("invalid path: no parent directory");
+        }
+    };
+    let canonical = parent.canonicalize()?;
+    check_parent_directories_access(&canonical)?;
+    Ok(canonical)
+}
+
+/// Validates that a file name does not contain path traversal sequences.
+/// This prevents attackers from escaping the base directory by using names like
+/// "../../../etc/passwd" or "..\\..\\Windows\\System32\\malicious.dll".
+#[cfg(not(any(target_os = "ios")))]
+fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
+    // Check for path traversal patterns
+    // We check for both Unix and Windows path separators
+    let components: Vec<&str> = name
+        .split(|c| c == '/' || c == '\\')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for component in &components {
+        if *component == ".." {
+            bail!("path traversal detected in file name");
+        }
+    }
+
+    // On Windows, also check for drive letters (e.g., "C:")
+    #[cfg(windows)]
+    {
+        if name.len() >= 2 {
+            let bytes = name.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                bail!("absolute path detected in file name");
+            }
+        }
+    }
+
+    // Check for names starting with path separator (absolute paths on Unix)
+    if name.starts_with('/') || name.starts_with('\\') {
+        bail!("absolute path detected in file name");
+    }
+
+    Ok(())
+}
+
+/// Validates all file names in a transfer request to prevent path traversal attacks.
+/// Returns an error if any file name contains dangerous path components.
+#[cfg(not(any(target_os = "ios")))]
+fn validate_transfer_file_names(files: &[(String, u64)]) -> ResultType<()> {
+    for (name, _) in files {
+        validate_file_name_no_traversal(name)?;
+    }
+    Ok(())
+}
+
+/// Validates that all files in a write operation have accessible parent directories.
+/// This prevents writing files to directories where intermediate paths are restricted.
+/// For example, if base="C:\a\b" and file="c\d\e.txt", this validates
+/// that the user has access to both "C:\a\b\c" and "C:\a\b\c\d".
+#[cfg(not(any(target_os = "ios")))]
+fn validate_write_paths(base_path: &Path, files: &[FileEntry]) -> ResultType<()> {
+    let canonical_base = match base_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => bail!("cannot resolve base path: {}", e),
+    };
+
+    for file in files {
+        if file.name.is_empty() {
+            continue;
+        }
+
+        let full_path = canonical_base.join(&file.name);
+
+        // Validate the parent directory of each file
+        if let Some(parent) = full_path.parent() {
+            // The parent might not exist yet (we'll create it), so check its parent
+            match validate_parent_and_canonicalize(parent) {
+                Ok(_) => {}
+                Err(e) => {
+                    bail!("access denied for file '{}': {}", file.name, e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "ios")))]
+async fn validate_read_access(
+    path: String,
+    include_hidden: bool,
+    id: i32,
+    conn_id: i32,
+    tx: &UnboundedSender<Data>,
+) {
+    let result = spawn_blocking(move || {
+        let path_obj = Path::new(&path);
+
+        match validate_and_canonicalize(&path_obj) {
+            Ok(canonical_path) => {
+                let canonical_str = canonical_path.to_string_lossy().to_string();
+
+                if canonical_path.is_file() {
+                    match std::fs::metadata(&canonical_path) {
+                        Ok(meta) => {
+                            let size = meta.len();
+                            let modified_time = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+
+                            let hash = compute_hash(&canonical_path)?;
+
+                            let file_entry = ipc::ValidatedFile {
+                                name: String::new(),
+                                size,
+                                modified_time,
+                                hash,
+                            };
+                            Ok((canonical_str, vec![file_entry]))
+                        }
+                        Err(e) => bail!("stat file failed: {}", e),
+                    }
+                } else if canonical_path.is_dir() {
+                    match fs::get_recursive_files(&canonical_str, include_hidden) {
+                        Ok(files) => {
+                            // Check file count limit to prevent excessive I/O
+                            if files.len() > MAX_VALIDATED_FILES {
+                                log::warn!(
+                                    "Too many files in directory for validation: {} > {}",
+                                    files.len(),
+                                    MAX_VALIDATED_FILES
+                                );
+                                bail!(
+                                    "too many files in directory ({} > {})",
+                                    files.len(),
+                                    MAX_VALIDATED_FILES
+                                );
+                            }
+
+                            let mut validated_files = Vec::with_capacity(files.len());
+                            for f in files {
+                                let full_path = canonical_path.join(&f.name);
+
+                                // Validate parent directory access for files in subdirectories
+                                if f.name.contains('/') || f.name.contains('\\') {
+                                    if let Some(parent) = full_path.parent() {
+                                        if let Err(e) = validate_and_canonicalize(parent) {
+                                            bail!("access denied to parent of '{}': {}", f.name, e);
+                                        }
+                                    }
+                                }
+
+                                // Check file accessibility before computing hash
+                                if let Err(e) = std::fs::metadata(&full_path) {
+                                    bail!("stat file failed for {}: {}", f.name, e);
+                                }
+                                let hash = compute_hash(&full_path)?;
+                                validated_files.push(ipc::ValidatedFile {
+                                    name: f.name,
+                                    size: f.size,
+                                    modified_time: f.modified_time,
+                                    hash,
+                                });
+                            }
+                            Ok((canonical_str, validated_files))
+                        }
+                        Err(e) => bail!("list directory failed: {}", e),
+                    }
+                } else {
+                    bail!("path is neither file nor directory: {}", canonical_str)
+                }
+            }
+            Err(e) => bail!("canonicalize failed: {}", e),
+        }
+    })
+    .await;
+
+    let result = match result {
+        Ok(Ok((path, files))) => Ok((path, files)),
+        Ok(Err(e)) => Err(format!("validation failed: {}", e)),
+        Err(e) => Err(format!("validation task failed: {}", e)),
+    };
+
+    let _ = tx.send(Data::ReadAccessValidated {
+        id,
+        conn_id,
+        result,
+    });
+}
+
+#[cfg(not(any(target_os = "ios")))]
+async fn read_all_files(
+    path: String,
+    include_hidden: bool,
+    id: i32,
+    conn_id: i32,
+    tx: &UnboundedSender<Data>,
+) {
+    let path_clone = path.clone();
+    let result = spawn_blocking(move || {
+        let path_obj = Path::new(&path);
+
+        // Canonicalize the path so that both ACL checks and recursive listing
+        // operate on the same, fully-resolved filesystem path.
+        match validate_and_canonicalize(&path_obj) {
+            Ok(canonical_path) => {
+                let canonical_str = canonical_path.to_string_lossy().to_string();
+                fs::get_recursive_files(&canonical_str, include_hidden)
+            }
+            Err(e) => bail!("canonicalize failed: {}", e),
+        }
+    })
+    .await;
+
+    let result = match result {
+        Ok(Ok(files)) => {
+            // Serialize FileDirectory to protobuf bytes
+            let mut fd = FileDirectory::new();
+            fd.id = id;
+            fd.path = path_clone.clone();
+            fd.entries = files.into();
+            match fd.write_to_bytes() {
+                Ok(bytes) => Ok(bytes),
+                Err(e) => Err(format!("serialize failed: {}", e)),
+            }
+        }
+        Ok(Err(e)) => Err(format!("{}", e)),
+        Err(e) => Err(format!("task failed: {}", e)),
+    };
+
+    let _ = tx.send(Data::AllFilesResult {
+        id,
+        conn_id,
+        path: path_clone,
+        result,
+    });
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -931,18 +1289,32 @@ async fn read_empty_dirs(dir: &str, include_hidden: bool, tx: &UnboundedSender<D
     let path = dir.to_owned();
     let path_clone = dir.to_owned();
 
-    if let Ok(Ok(fds)) =
-        spawn_blocking(move || fs::get_empty_dirs_recursive(&path, include_hidden)).await
-    {
-        let mut msg_out = Message::new();
-        let mut file_response = FileResponse::new();
-        file_response.set_empty_dirs(ReadEmptyDirsResponse {
-            path: path_clone,
-            empty_dirs: fds,
-            ..Default::default()
-        });
-        msg_out.set_file_response(file_response);
-        send_raw(msg_out, tx);
+    let result = spawn_blocking(move || {
+        let path_obj = Path::new(&path);
+        let canonical = validate_and_canonicalize(&path_obj)?;
+        let canonical_str = canonical.to_string_lossy().to_string();
+        fs::get_empty_dirs_recursive(&canonical_str, include_hidden)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(fds)) => {
+            let mut msg_out = Message::new();
+            let mut file_response = FileResponse::new();
+            file_response.set_empty_dirs(ReadEmptyDirsResponse {
+                path: path_clone,
+                empty_dirs: fds,
+                ..Default::default()
+            });
+            msg_out.set_file_response(file_response);
+            send_raw(msg_out, tx);
+        }
+        Ok(Err(e)) => {
+            log::error!("read_empty_dirs failed for '{}': {}", path_clone, e);
+        }
+        Err(e) => {
+            log::error!("read_empty_dirs task failed for '{}': {}", path_clone, e);
+        }
     }
 }
 
@@ -955,12 +1327,26 @@ async fn read_dir(dir: &str, include_hidden: bool, tx: &UnboundedSender<Data>) {
             fs::get_path(dir)
         }
     };
-    if let Ok(Ok(fd)) = spawn_blocking(move || fs::read_dir(&path, include_hidden)).await {
-        let mut msg_out = Message::new();
-        let mut file_response = FileResponse::new();
-        file_response.set_dir(fd);
-        msg_out.set_file_response(file_response);
-        send_raw(msg_out, tx);
+    let result = spawn_blocking(move || {
+        let canonical = validate_and_canonicalize(&path)?;
+        fs::read_dir(&canonical, include_hidden)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(fd)) => {
+            let mut msg_out = Message::new();
+            let mut file_response = FileResponse::new();
+            file_response.set_dir(fd);
+            msg_out.set_file_response(file_response);
+            send_raw(msg_out, tx);
+        }
+        Ok(Err(e)) => {
+            log::error!("read_dir failed for '{}': {}", dir, e);
+        }
+        Err(e) => {
+            log::error!("read_dir task failed for '{}': {}", dir, e);
+        }
     }
 }
 
@@ -987,7 +1373,13 @@ async fn handle_result<F: std::fmt::Display, S: std::fmt::Display>(
 #[cfg(not(any(target_os = "ios")))]
 async fn remove_file(path: String, id: i32, file_num: i32, tx: &UnboundedSender<Data>) {
     handle_result(
-        spawn_blocking(move || fs::remove_file(&path)).await,
+        spawn_blocking(move || {
+            let path_obj = Path::new(&path);
+            let canonical = validate_and_canonicalize(&path_obj)?;
+            let canonical_str = canonical.to_string_lossy().to_string();
+            fs::remove_file(&canonical_str)
+        })
+        .await,
         id,
         file_num,
         tx,
@@ -998,7 +1390,13 @@ async fn remove_file(path: String, id: i32, file_num: i32, tx: &UnboundedSender<
 #[cfg(not(any(target_os = "ios")))]
 async fn create_dir(path: String, id: i32, tx: &UnboundedSender<Data>) {
     handle_result(
-        spawn_blocking(move || fs::create_dir(&path)).await,
+        spawn_blocking(move || {
+            let path_obj = Path::new(&path);
+            // For create_dir, check parent of the new directory
+            let _canonical_parent = validate_parent_and_canonicalize(&path_obj)?;
+            fs::create_dir(&path)
+        })
+        .await,
         id,
         0,
         tx,
@@ -1009,7 +1407,34 @@ async fn create_dir(path: String, id: i32, tx: &UnboundedSender<Data>) {
 #[cfg(not(any(target_os = "ios")))]
 async fn rename_file(path: String, new_name: String, id: i32, tx: &UnboundedSender<Data>) {
     handle_result(
-        spawn_blocking(move || fs::rename_file(&path, &new_name)).await,
+        spawn_blocking(move || {
+            // Validate that new_name doesn't contain path traversal
+            validate_file_name_no_traversal(&new_name)?;
+
+            let path_obj = Path::new(&path);
+            let canonical = validate_and_canonicalize(&path_obj)?;
+
+            // Also validate that the new path would be in the same directory
+            if let Some(parent) = canonical.parent() {
+                let new_path = parent.join(&new_name);
+                // Ensure new path is still under the same parent directory
+                if let Ok(new_canonical) = new_path.canonicalize() {
+                    if new_canonical.parent() != Some(parent) {
+                        bail!("rename target is not in the same directory");
+                    }
+                } else {
+                    // New path doesn't exist yet, just check the parent remains the same
+                    if let Some(new_parent) = new_path.parent() {
+                        if new_parent != parent {
+                            bail!("rename target is not in the same directory");
+                        }
+                    }
+                }
+            }
+
+            fs::rename_file(&path, &new_name)
+        })
+        .await,
         id,
         0,
         tx,
@@ -1022,10 +1447,11 @@ async fn remove_dir(path: String, id: i32, recursive: bool, tx: &UnboundedSender
     let path = fs::get_path(&path);
     handle_result(
         spawn_blocking(move || {
+            let canonical = validate_and_canonicalize(&path)?;
             if recursive {
-                fs::remove_all_empty_dir(&path)
+                fs::remove_all_empty_dir(&canonical)
             } else {
-                std::fs::remove_dir(&path).map_err(|err| err.into())
+                std::fs::remove_dir(&canonical).map_err(|err| err.into())
             }
         })
         .await,
@@ -1105,4 +1531,253 @@ pub fn quit_cm() {
     log::info!("quit cm");
     CLIENTS.write().unwrap().clear();
     crate::platform::quit_gui();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::ipc::Data;
+    use hbb_common::{
+        message_proto::{FileDirectory, FileResponse, Message},
+        tokio::{runtime::Runtime, sync::mpsc::unbounded_channel},
+    };
+    use std::fs;
+
+    /// On Windows, validate_and_canonicalize (and underlying ACL checks) should
+    /// fail when the parent directory denies list/read access for the current
+    /// user, even if the file itself is otherwise readable.
+    ///
+    /// This test manipulates real ACLs via icacls and relies on USERNAME availability.
+    /// It is skipped if icacls is not available.
+    #[test]
+    #[cfg(windows)]
+    fn validate_and_canonicalize_fails_when_parent_acl_denies_access() {
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        // Check if icacls is available, skip test if not
+        let icacls_check = Command::new("icacls").arg("/?").output();
+        if icacls_check.is_err() {
+            eprintln!("Skipping ACL test: icacls binary not found");
+            return;
+        }
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Prepare temporary directory layout:
+            // base_dir/denied_dir/allowed_file.txt
+            let mut base_dir = std::env::temp_dir();
+            base_dir.push("rustdesk_ui_cm_interface_acl_test");
+            let denied_dir: PathBuf = base_dir.join("denied_dir");
+            let file_path: PathBuf = denied_dir.join("allowed_file.txt");
+
+            let _ = fs::remove_dir_all(&base_dir); // best-effort cleanup
+            fs::create_dir_all(&denied_dir).unwrap();
+            fs::write(&file_path, b"hello").unwrap();
+
+            // Deny read/list access on the parent directory for the current user.
+            // This simulates the ACL-bypass scenario we want to guard against.
+            let username = match std::env::var("USERNAME") {
+                Ok(u) if !u.is_empty() => u,
+                _ => {
+                    // If we can't determine the username, skip the test.
+                    eprintln!("USERNAME env var is not set, skipping ACL test");
+                    return;
+                }
+            };
+
+            let status = Command::new("icacls")
+                .arg(&denied_dir)
+                .arg("/deny")
+                .arg(format!("{}:(RX)", username))
+                .status()
+                .expect("failed to run icacls /deny");
+
+            if !status.success() {
+                eprintln!(
+                    "icacls /deny failed with status {:?}, skipping ACL test",
+                    status
+                );
+                let _ = fs::remove_dir_all(&base_dir);
+                return;
+            }
+
+            // Check opening the file directly still works (it should).
+            let direct_open = fs::File::open(&file_path);
+            assert!(
+                direct_open.is_ok(),
+                "expected direct file open to succeed despite parent ACL"
+            );
+
+            // Now any attempt to access a child under `denied_dir` via directory
+            // listing should fail, and validate_and_canonicalize should surface
+            // an error for the file path.
+            let res = super::validate_and_canonicalize(&file_path);
+            assert!(
+                res.is_err(),
+                "expected ACL validation failure for {:?}",
+                file_path
+            );
+
+            // Best-effort cleanup: remove the deny ACE and test directory.
+            let _ = Command::new("icacls")
+                .arg(&denied_dir)
+                .arg("/remove:d")
+                .arg(&username)
+                .status();
+            let _ = fs::remove_dir_all(&base_dir);
+        });
+    }
+
+    /// read_all_files should return an error result when the target path does not exist.
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn read_all_files_nonexistent_path_returns_error_result() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+            let path = "Z:/this_path_should_not_exist_for_rustdesk_tests";
+            super::read_all_files(path.to_string(), false, 42, 7, &tx).await;
+
+            let data = rx.recv().await.expect("expected AllFilesResult message");
+            match data {
+                Data::AllFilesResult {
+                    id,
+                    conn_id,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(id, 42);
+                    assert_eq!(conn_id, 7);
+                    assert!(result.is_err());
+                    let msg = result.err().unwrap();
+                    // On failure we expect a canonicalize/IO related error message.
+                    assert!(msg.contains("canonicalize failed") || msg.contains("task failed"));
+                }
+                other => panic!("unexpected data: {:?}", other),
+            }
+        });
+    }
+
+    /// read_all_files should succeed for a real, temporary directory and return
+    /// a FileDirectory protobuf with matching id and path.
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn read_all_files_success_for_temp_dir() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+
+            // Create a temporary directory with a single file
+            let mut dir = std::env::temp_dir();
+            dir.push("rustdesk_ui_cm_interface_read_all_files_test");
+            let _ = fs::remove_dir_all(&dir); // best-effort cleanup
+            fs::create_dir_all(&dir).unwrap();
+            let mut file_path = dir.clone();
+            file_path.push("test.txt");
+            fs::write(&file_path, b"hello").unwrap();
+
+            let path_str = dir.to_string_lossy().to_string();
+            super::read_all_files(path_str.clone(), false, 100, 9, &tx).await;
+
+            let data = rx.recv().await.expect("expected AllFilesResult message");
+            match data {
+                Data::AllFilesResult {
+                    id,
+                    conn_id,
+                    path,
+                    result,
+                } => {
+                    assert_eq!(id, 100);
+                    assert_eq!(conn_id, 9);
+                    assert_eq!(path, path_str);
+                    let bytes = result.expect("expected Ok bytes for temp dir");
+                    let fd = FileDirectory::parse_from_bytes(&bytes)
+                        .expect("failed to parse FileDirectory from bytes");
+                    assert_eq!(fd.id, 100);
+                    assert_eq!(fd.path, path_str);
+                    // At least one entry (our test file) should be present.
+                    assert!(!fd.entries.is_empty());
+                }
+                other => panic!("unexpected data: {:?}", other),
+            }
+
+            // best-effort cleanup
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// read_dir should send a FileResponse::dir for a real directory.
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn read_dir_success_for_temp_dir() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+
+            let mut dir = std::env::temp_dir();
+            dir.push("rustdesk_ui_cm_interface_read_dir_test");
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+
+            let path_str = dir.to_string_lossy().to_string();
+            super::read_dir(&path_str, false, &tx).await;
+
+            let data = rx.recv().await.expect("expected RawMessage from read_dir");
+            let bytes = match data {
+                Data::RawMessage(b) => b,
+                other => panic!("unexpected data: {:?}", other),
+            };
+
+            let mut msg = Message::new();
+            msg.merge_from_bytes(&bytes)
+                .expect("failed to parse Message from RawMessage bytes");
+            let file_resp: &FileResponse = msg.file_response();
+            let dir_resp: &FileDirectory = file_resp.dir();
+
+            // Canonicalization might change the path format (e.g., UNC paths on Windows)
+            // so we just check that the path ends with the expected directory name
+            assert!(dir_resp
+                .path
+                .ends_with("rustdesk_ui_cm_interface_read_dir_test"));
+
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Test path traversal and security validation
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_file_name_security() {
+        // Path traversal should be rejected
+        assert!(super::validate_file_name_no_traversal("../etc/passwd").is_err());
+        assert!(super::validate_file_name_no_traversal("foo/../bar").is_err());
+        assert!(super::validate_file_name_no_traversal("..\\Windows\\System32").is_err());
+        assert!(super::validate_file_name_no_traversal("..").is_err());
+
+        // Absolute paths should be rejected
+        assert!(super::validate_file_name_no_traversal("/etc/passwd").is_err());
+        assert!(super::validate_file_name_no_traversal("\\Windows\\System32").is_err());
+        #[cfg(windows)]
+        assert!(super::validate_file_name_no_traversal("C:\\Windows").is_err());
+
+        // Valid relative paths should be accepted
+        assert!(super::validate_file_name_no_traversal("file.txt").is_ok());
+        assert!(super::validate_file_name_no_traversal("subdir/file.txt").is_ok());
+        assert!(super::validate_file_name_no_traversal("").is_ok());
+    }
+
+    /// Test transfer file validation
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_transfer_files_security() {
+        // Valid files should pass
+        let valid = vec![("file.txt".to_string(), 100u64)];
+        assert!(super::validate_transfer_file_names(&valid).is_ok());
+
+        // Path traversal should fail
+        let invalid = vec![("../../../etc/passwd".to_string(), 100u64)];
+        assert!(super::validate_transfer_file_names(&invalid).is_err());
+    }
 }
