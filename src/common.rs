@@ -901,8 +901,8 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    let should_check_update =
-        (!cfg!(target_os = "windows") && is_installed()) || !is_custom_client();
+    let is_windows_installed = cfg!(target_os = "windows") && is_installed();
+    let should_check_update = is_windows_installed || !is_custom_client();
     if !should_check_update {
         return;
     }
@@ -961,7 +961,8 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     //     *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
     // }
 
-    let response_url = "https://github.com/fufesou/rustdesk/releases/tag/test-win-update-2".to_string();
+    let response_url =
+        "https://github.com/fufesou/rustdesk/releases/tag/test-win-update-2".to_string();
     #[cfg(feature = "flutter")]
     {
         let mut m = HashMap::new();
