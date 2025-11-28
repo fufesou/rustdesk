@@ -12,7 +12,8 @@ final _isExtracting = false.obs;
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
   String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  // String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  String version = '1.4.4';
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
@@ -22,6 +23,7 @@ void handleUpdate(String releasePageUrl) {
     return;
   }
   downloadUrl = '$downloadUrl/$downloadFile';
+  debugPrint('========================== downloadUrl: $downloadUrl');
 
   SimpleWrapper downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
