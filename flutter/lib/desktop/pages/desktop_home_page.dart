@@ -449,7 +449,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
       return buildInstallCard(
           "Status",
-          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (1.4.6).",
+          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (1.4.7).",
           btnText,
           onPressed,
           closeButton: true);
