@@ -14,12 +14,13 @@ use hbb_common::{
     fs::is_write_need_confirmation,
     fs::{self, get_string, new_send_confirm, DigestCheckResult},
     log,
-    message_proto::*,
+    message_proto::{FileType, *},
     protobuf::Message as _,
     tokio::{
         self,
         sync::mpsc::{self, UnboundedSender},
         task::spawn_blocking,
+        time::{self, Duration},
     },
 };
 #[cfg(target_os = "windows")]
@@ -351,6 +352,8 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
 
         // for tmp use, without real conn id
         let mut write_jobs: Vec<fs::TransferJob> = Vec::new();
+        let mut read_jobs: Vec<fs::TransferJob> = Vec::new();
+        let mut file_timer = time::interval(Duration::from_secs(30));
 
         #[cfg(target_os = "windows")]
         let is_authorized = self.cm.is_authorized(self.conn_id);
@@ -443,10 +446,13 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
                                         if let Ok(bytes) = self.stream.next_raw().await {
                                             fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
-                                            handle_fs(fs, &mut write_jobs, &self.tx, Some(&tx_log)).await;
+                                            handle_fs(fs, &mut write_jobs, &mut read_jobs, &self.tx, Some(&tx_log)).await;
                                         }
+                                    } else if let ipc::FS::NewRead { .. } = fs {
+                                        handle_fs(fs, &mut write_jobs, &mut read_jobs, &self.tx, Some(&tx_log)).await;
+                                        file_timer = time::interval(Duration::from_millis(1));
                                     } else {
-                                        handle_fs(fs, &mut write_jobs, &self.tx, Some(&tx_log)).await;
+                                        handle_fs(fs, &mut write_jobs, &mut read_jobs, &self.tx, Some(&tx_log)).await;
                                     }
                                     let log = fs::serialize_transfer_jobs(&write_jobs);
                                     self.cm.ui_handler.file_transfer_log("transfer", &log);
@@ -600,6 +606,23 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                 Some(job_log) = rx_log.recv() => {
                     self.cm.ui_handler.file_transfer_log("transfer", &job_log);
                 }
+                _ = file_timer.tick() => {
+                    if !read_jobs.is_empty() {
+                        match handle_read_jobs_cm(&mut read_jobs, &self.tx).await {
+                            Ok(log) => {
+                                if !log.is_empty() {
+                                    self.cm.ui_handler.file_transfer_log("transfer", &log);
+                                }
+                            }
+                            Err(err) => {
+                                log::error!("handle_read_jobs_cm error: {}", err);
+                            }
+                        }
+                        if read_jobs.is_empty() {
+                            file_timer = time::interval(Duration::from_secs(30));
+                        }
+                    }
+                }
             }
         }
     }
@@ -674,6 +697,7 @@ pub async fn start_listen<T: InvokeUiCM>(
 ) {
     let mut current_id = 0;
     let mut write_jobs: Vec<fs::TransferJob> = Vec::new();
+    let mut read_jobs: Vec<fs::TransferJob> = Vec::new();
     loop {
         match rx.recv().await {
             Some(Data::Login {
@@ -720,7 +744,7 @@ pub async fn start_listen<T: InvokeUiCM>(
                 cm.new_message(current_id, text);
             }
             Some(Data::FS(fs)) => {
-                handle_fs(fs, &mut write_jobs, &tx, None).await;
+                handle_fs(fs, &mut write_jobs, &mut read_jobs, &tx, None).await;
             }
             Some(Data::Close) => {
                 break;
@@ -747,6 +771,7 @@ pub async fn start_listen<T: InvokeUiCM>(
 async fn handle_fs(
     fs: ipc::FS,
     write_jobs: &mut Vec<fs::TransferJob>,
+    read_jobs: &mut Vec<fs::TransferJob>,
     tx: &UnboundedSender<Data>,
     tx_log: Option<&UnboundedSender<String>>,
 ) {
@@ -914,7 +939,10 @@ async fn handle_fs(
         }
         ipc::FS::SendConfirm(bytes) => {
             if let Ok(r) = FileTransferSendConfirmRequest::parse_from_bytes(&bytes) {
+                // Try write_jobs first, then read_jobs
                 if let Some(job) = fs::get_job(r.id, write_jobs) {
+                    job.confirm(&r).await;
+                } else if let Some(job) = fs::get_job(r.id, read_jobs) {
                     job.confirm(&r).await;
                 }
             }
@@ -922,8 +950,149 @@ async fn handle_fs(
         ipc::FS::Rename { id, path, new_name } => {
             rename_file(path, new_name, id, tx).await;
         }
+        ipc::FS::NewRead {
+            path,
+            id,
+            file_num,
+            include_hidden,
+            overwrite_detection,
+            conn_id,
+        } => {
+            match fs::TransferJob::new_read(
+                id,
+                fs::JobType::Generic,
+                "".to_string(),
+                fs::DataSource::FilePath(PathBuf::from(&path)),
+                file_num,
+                include_hidden,
+                false,
+                overwrite_detection,
+            ) {
+                Err(err) => {
+                    allow_err!(tx.send(Data::FS(ipc::FS::ReadError {
+                        id,
+                        file_num: 0,
+                        err: err.to_string(),
+                    })));
+                }
+                Ok(mut job) => {
+                    let files: Vec<(String, u64, bool)> = job
+                        .files()
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                f.modified_time,
+                                f.entry_type == FileType::File.into(),
+                            )
+                        })
+                        .collect();
+                    allow_err!(tx.send(Data::FS(ipc::FS::ReadDir2 {
+                        id,
+                        path: path.clone(),
+                        files,
+                    })));
+                    job.is_remote = true;
+                    job.conn_id = conn_id;
+                    read_jobs.push(job);
+                }
+            }
+        }
+        ipc::FS::CancelRead { id } => {
+            if let Some(job) = fs::remove_job(id, read_jobs) {
+                tx_log.map(|tx: &UnboundedSender<String>| {
+                    tx.send(serialize_transfer_job(&job, false, true, ""))
+                });
+            }
+        }
         _ => {}
     }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn handle_read_jobs_cm(
+    jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) -> hbb_common::ResultType<String> {
+    use hbb_common::fs::serialize_transfer_job;
+
+    // Initialize data streams for jobs that need it
+    for job in jobs.iter_mut() {
+        if job.is_last_job {
+            continue;
+        }
+        match job.init_data_stream_cm().await {
+            Ok(Some((id, file_num, file_size, last_modified, is_resume))) => {
+                // Send digest for overwrite detection
+                allow_err!(tx.send(Data::FS(ipc::FS::ReadDigest {
+                    id,
+                    file_num,
+                    file_size,
+                    last_modified,
+                    is_resume,
+                })));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                allow_err!(tx.send(Data::FS(ipc::FS::ReadError {
+                    id: job.id(),
+                    file_num: job.file_num(),
+                    err: err.to_string(),
+                })));
+            }
+        }
+    }
+
+    let mut job_log = Default::default();
+    let mut finished = Vec::new();
+    for job in jobs.iter_mut() {
+        if job.is_last_job {
+            continue;
+        }
+        match job.read().await {
+            Err(err) => {
+                allow_err!(tx.send(Data::FS(ipc::FS::ReadError {
+                    id: job.id(),
+                    file_num: job.file_num(),
+                    err: err.to_string(),
+                })));
+            }
+            Ok(Some(block)) => {
+                allow_err!(tx.send(Data::FS(ipc::FS::ReadBlock {
+                    id: block.id,
+                    file_num: block.file_num,
+                    data: block.data,
+                    compressed: block.compressed,
+                })));
+            }
+            Ok(None) => {
+                if job.job_completed() {
+                    job_log = serialize_transfer_job(job, true, false, "");
+                    finished.push(job.id());
+                    match job.job_error() {
+                        Some(err) => {
+                            job_log = serialize_transfer_job(job, false, false, &err);
+                            allow_err!(tx.send(Data::FS(ipc::FS::ReadError {
+                                id: job.id(),
+                                file_num: job.file_num(),
+                                err,
+                            })));
+                        }
+                        None => {
+                            allow_err!(tx.send(Data::FS(ipc::FS::ReadDone {
+                                id: job.id(),
+                                file_num: job.file_num(),
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for id in finished {
+        fs::remove_job(id, jobs);
+    }
+    Ok(job_log)
 }
 
 #[cfg(not(any(target_os = "ios")))]

@@ -31,7 +31,10 @@ use hbb_common::{
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
-    message_proto::{option_message::BoolOption, permission_info::Permission},
+    message_proto::{
+        option_message::BoolOption, permission_info::Permission, FileTransferBlock,
+        FileTransferDigest, FileType,
+    },
     password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
     sleep, timeout,
@@ -716,6 +719,9 @@ impl Connection {
                             // Notify the peer that we closed the voice call.
                             let msg = new_voice_call_request(false);
                             conn.send(msg).await;
+                        }
+                        ipc::Data::FS(fs) => {
+                            conn.handle_fs_from_cm(fs).await;
                         }
                         _ => {}
                     }
@@ -1783,6 +1789,81 @@ impl Connection {
         self.send_to_cm(ipc::Data::FS(data));
     }
 
+    async fn handle_fs_from_cm(&mut self, fs: ipc::FS) {
+        match fs {
+            ipc::FS::ReadDir2 { id, path, files } => {
+                let file_entries: Vec<FileEntry> = files
+                    .iter()
+                    .map(|(name, modified_time, is_file)| FileEntry {
+                        name: name.clone(),
+                        modified_time: *modified_time,
+                        entry_type: if *is_file {
+                            FileType::File.into()
+                        } else {
+                            FileType::Dir.into()
+                        },
+                        ..Default::default()
+                    })
+                    .collect();
+                // Post file audit with actual files
+                self.post_file_audit(
+                    FileAuditType::RemoteSend,
+                    &path,
+                    Self::get_files_for_audit(fs::JobType::Generic, file_entries.clone()),
+                    json!({}),
+                );
+                self.send(fs::new_dir(id, path, file_entries)).await;
+                self.file_timer = crate::rustdesk_interval(time::interval(MILLI1));
+            }
+            ipc::FS::ReadBlock {
+                id,
+                file_num,
+                data,
+                compressed,
+            } => {
+                let block = FileTransferBlock {
+                    id,
+                    file_num,
+                    data,
+                    compressed,
+                    ..Default::default()
+                };
+                self.send(fs::new_block(block)).await;
+            }
+            ipc::FS::ReadDone { id, file_num } => {
+                self.send(fs::new_done(id, file_num)).await;
+                self.send_to_cm(ipc::Data::FileTransferLog((
+                    "transfer".to_string(),
+                    "".to_string(),
+                )));
+            }
+            ipc::FS::ReadError { id, file_num, err } => {
+                self.send(fs::new_error(id, err, file_num)).await;
+            }
+            ipc::FS::ReadDigest {
+                id,
+                file_num,
+                file_size,
+                last_modified,
+                is_resume,
+            } => {
+                let mut msg = Message::new();
+                let mut resp = FileResponse::new();
+                resp.set_digest(FileTransferDigest {
+                    id,
+                    file_num,
+                    last_modified,
+                    file_size,
+                    is_resume,
+                    ..Default::default()
+                });
+                msg.set_file_response(resp);
+                self.send(msg).await;
+            }
+            _ => {}
+        }
+    }
+
     async fn send_login_error<T: std::string::ToString>(&mut self, err: T) {
         let mut msg_out = Message::new();
         let mut res = LoginResponse::new();
@@ -2683,63 +2764,66 @@ impl Connection {
                                 ));
                                 let path = s.path.clone();
                                 let r#type = JobType::from_proto(s.file_type);
-                                let data_source;
                                 match r#type {
                                     JobType::Generic => {
-                                        data_source =
-                                            fs::DataSource::FilePath(PathBuf::from(&path));
+                                        // Send IPC request to cm to read file
+                                        // Audit will be posted when ReadDir2 is received with actual files
+                                        self.send_fs(ipc::FS::NewRead {
+                                            path: path.clone(),
+                                            id,
+                                            file_num: s.file_num,
+                                            include_hidden: s.include_hidden,
+                                            overwrite_detection: od,
+                                            conn_id: self.inner.id(),
+                                        });
                                     }
                                     JobType::Printer => {
-                                        if let Some((_, _, data)) = self
+                                        // Keep printer file transfer logic as-is (data already in memory)
+                                        let data_source = if let Some((_, _, data)) = self
                                             .printer_data
                                             .iter()
                                             .position(|(_, p, _)| *p == path)
                                             .map(|index| self.printer_data.remove(index))
                                         {
-                                            data_source = fs::DataSource::MemoryCursor(
+                                            fs::DataSource::MemoryCursor(
                                                 std::io::Cursor::new(data),
-                                            );
+                                            )
                                         } else {
                                             // Ignore this message if the printer data is not found
                                             return true;
+                                        };
+                                        match fs::TransferJob::new_read(
+                                            id,
+                                            r#type,
+                                            "".to_string(),
+                                            data_source,
+                                            s.file_num,
+                                            s.include_hidden,
+                                            false,
+                                            od,
+                                        ) {
+                                            Err(err) => {
+                                                self.send(fs::new_error(id, err, 0)).await;
+                                            }
+                                            Ok(mut job) => {
+                                                self.send(fs::new_dir(id, path, job.files().to_vec()))
+                                                    .await;
+                                                let files = job.files().to_owned();
+                                                job.is_remote = true;
+                                                job.conn_id = self.inner.id();
+                                                self.read_jobs.push(job);
+                                                self.file_timer =
+                                                    crate::rustdesk_interval(time::interval(MILLI1));
+                                                self.post_file_audit(
+                                                    FileAuditType::RemoteSend,
+                                                    "Remote print",
+                                                    Self::get_files_for_audit(fs::JobType::Printer, files),
+                                                    json!({}),
+                                                );
+                                            }
                                         }
                                     }
                                 };
-                                match fs::TransferJob::new_read(
-                                    id,
-                                    r#type,
-                                    "".to_string(),
-                                    data_source,
-                                    s.file_num,
-                                    s.include_hidden,
-                                    false,
-                                    od,
-                                ) {
-                                    Err(err) => {
-                                        self.send(fs::new_error(id, err, 0)).await;
-                                    }
-                                    Ok(mut job) => {
-                                        self.send(fs::new_dir(id, path, job.files().to_vec()))
-                                            .await;
-                                        let files = job.files().to_owned();
-                                        job.is_remote = true;
-                                        job.conn_id = self.inner.id();
-                                        let job_type = job.r#type;
-                                        self.read_jobs.push(job);
-                                        self.file_timer =
-                                            crate::rustdesk_interval(time::interval(MILLI1));
-                                        self.post_file_audit(
-                                            FileAuditType::RemoteSend,
-                                            if job_type == fs::JobType::Printer {
-                                                "Remote print"
-                                            } else {
-                                                &s.path
-                                            },
-                                            Self::get_files_for_audit(job_type, files),
-                                            json!({}),
-                                        );
-                                    }
-                                }
                                 self.file_transferred = true;
                             }
                             Some(file_action::Union::Receive(r)) => {
@@ -2805,6 +2889,8 @@ impl Connection {
                             }
                             Some(file_action::Union::Cancel(c)) => {
                                 self.send_fs(ipc::FS::CancelWrite { id: c.id });
+                                self.send_fs(ipc::FS::CancelRead { id: c.id });
+                                // Only Printer type jobs remain in read_jobs here
                                 if let Some(job) = fs::remove_job(c.id, &mut self.read_jobs) {
                                     self.send_to_cm(ipc::Data::FileTransferLog((
                                         "transfer".to_string(),

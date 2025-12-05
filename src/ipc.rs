@@ -112,6 +112,45 @@ pub enum FS {
         path: String,
         new_name: String,
     },
+    // Server to client file transfer (read from server and send to client)
+    NewRead {
+        path: String,
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        overwrite_detection: bool,
+        conn_id: i32,
+    },
+    CancelRead {
+        id: i32,
+    },
+    ReadBlock {
+        id: i32,
+        file_num: i32,
+        data: Bytes,
+        compressed: bool,
+    },
+    ReadDone {
+        id: i32,
+        file_num: i32,
+    },
+    ReadError {
+        id: i32,
+        file_num: i32,
+        err: String,
+    },
+    ReadDir2 {
+        id: i32,
+        path: String,
+        files: Vec<(String, u64, bool)>,
+    },
+    ReadDigest {
+        id: i32,
+        file_num: i32,
+        file_size: u64,
+        last_modified: u64,
+        is_resume: bool,
+    },
 }
 
 #[cfg(target_os = "windows")]
