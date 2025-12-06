@@ -112,6 +112,33 @@ pub enum FS {
         path: String,
         new_name: String,
     },
+    // CM-side file reading operations (Windows only)
+    // These enable Connection Manager to read files and stream them back to Connection
+    ReadFile {
+        path: String,
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        overwrite_detection: bool,
+    },
+    CancelRead {
+        id: i32,
+        conn_id: i32,
+    },
+    SendConfirmForRead {
+        id: i32,
+        file_num: i32,
+        skip: bool,
+        offset_blk: u32,
+        conn_id: i32,
+    },
+    ReadAllFiles {
+        path: String,
+        id: i32,
+        include_hidden: bool,
+        conn_id: i32,
+    },
 }
 
 #[cfg(target_os = "windows")]
@@ -268,6 +295,55 @@ pub enum Data {
     #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
+    // CM-side file reading responses (Windows only)
+    // These are sent from CM back to Connection when CM handles file reading
+    /// Response to ReadFile: contains initial file list or error
+    ReadJobInitResult {
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
+    /// File data block read by CM
+    FileBlockFromCM {
+        id: i32,
+        file_num: i32,
+        data: bytes::Bytes,
+        compressed: bool,
+        conn_id: i32,
+    },
+    /// File read completed successfully
+    FileReadDone {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    /// File read failed with error
+    FileReadError {
+        id: i32,
+        file_num: i32,
+        err: String,
+        conn_id: i32,
+    },
+    /// Digest info from CM for overwrite detection
+    FileDigestFromCM {
+        id: i32,
+        file_num: i32,
+        last_modified: u64,
+        file_size: u64,
+        is_resume: bool,
+        conn_id: i32,
+    },
+    /// Response to ReadAllFiles: recursive directory listing
+    AllFilesResult {
+        id: i32,
+        conn_id: i32,
+        path: String,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
     CheckHwcodec,
     #[cfg(feature = "flutter")]
     VideoConnCount(Option<usize>),

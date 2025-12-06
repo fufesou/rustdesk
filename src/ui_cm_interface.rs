@@ -6,13 +6,14 @@ use crate::ipc::{self, Data};
 use crate::{clipboard::ClipboardSide, ipc::ClipboardNonFile};
 #[cfg(target_os = "windows")]
 use clipboard::ContextSend;
+#[cfg(not(any(target_os = "ios")))]
+use hbb_common::fs::serialize_transfer_job;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::unbounded_channel;
 use hbb_common::{
-    allow_err,
-    config::Config,
-    fs::is_write_need_confirmation,
-    fs::{self, get_string, new_send_confirm, DigestCheckResult},
+    allow_err, bail,
+    config::{keys::OPTION_FILE_TRANSFER_MAX_FILES, Config},
+    fs::{self, get_string, is_write_need_confirmation, new_send_confirm, DigestCheckResult},
     log,
     message_proto::*,
     protobuf::Message as _,
@@ -21,26 +22,99 @@ use hbb_common::{
         sync::mpsc::{self, UnboundedSender},
         task::spawn_blocking,
     },
+    ResultType,
 };
 #[cfg(target_os = "windows")]
 use hbb_common::{
     config::{keys::*, option2bool},
     tokio::sync::Mutex as TokioMutex,
-    ResultType,
 };
 use serde_derive::Serialize;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 use std::iter::FromIterator;
+#[cfg(not(any(target_os = "ios")))]
+use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    path::Path,
     sync::{
         atomic::{AtomicI64, Ordering},
         RwLock,
     },
 };
+
+/// Default maximum number of files allowed per transfer request.
+/// Unit: number of files (not bytes).
+#[cfg(not(any(target_os = "ios")))]
+const DEFAULT_MAX_VALIDATED_FILES: usize = 10_000;
+
+/// Maximum number of files allowed in a single file transfer request.
+///
+/// This limit prevents excessive I/O and memory usage when dealing with
+/// large directories. It applies to:
+/// - CM-side read jobs (server to client file transfers on Windows)
+/// - `AllFiles` recursive directory listing operations
+/// - Connection-side read jobs (non-Windows platforms)
+///
+/// Unit: number of files (not bytes).
+/// Default: 10,000 files.
+/// Configured via: `OPTION_FILE_TRANSFER_MAX_FILES` ("file-transfer-max-files")
+#[cfg(not(any(target_os = "ios")))]
+static MAX_VALIDATED_FILES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Get the maximum number of files allowed per transfer request.
+///
+/// Initializes the value from configuration (`OPTION_FILE_TRANSFER_MAX_FILES`)
+/// on first call. Returns `DEFAULT_MAX_VALIDATED_FILES` (10,000) if not configured
+/// or if the configured value is invalid.
+///
+/// Unit: number of files.
+#[cfg(not(any(target_os = "ios")))]
+#[inline]
+pub fn get_max_validated_files() -> usize {
+    *MAX_VALIDATED_FILES.get_or_init(|| {
+        let c = crate::get_builtin_option(OPTION_FILE_TRANSFER_MAX_FILES)
+            .parse::<usize>()
+            .unwrap_or(DEFAULT_MAX_VALIDATED_FILES);
+        if c < 1 {
+            DEFAULT_MAX_VALIDATED_FILES
+        } else {
+            c
+        }
+    })
+}
+
+/// Check if file count exceeds the maximum allowed limit.
+///
+/// This check is enforced in:
+/// - `start_read_job()` for CM-side read jobs
+/// - `read_all_files()` for recursive directory listings
+/// - `Connection::on_message()` for connection-side read jobs
+///
+/// # Arguments
+/// * `file_count` - Number of files in the transfer request
+///
+/// # Returns
+/// * `Ok(())` if within limit
+/// * `Err(String)` with error message if limit exceeded
+#[cfg(not(any(target_os = "ios")))]
+pub fn check_file_count_limit(file_count: usize) -> Result<(), String> {
+    let max_files = get_max_validated_files();
+    if file_count > max_files {
+        let msg = format!(
+            "file transfer rejected: too many files ({} files exceeds limit of {}). \
+             Adjust '{}' option to increase limit.",
+            file_count, max_files, OPTION_FILE_TRANSFER_MAX_FILES
+        );
+        log::warn!("{}", msg);
+        Err(msg)
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct Client {
@@ -81,6 +155,8 @@ struct IpcTaskRunner<T: InvokeUiCM> {
     file_transfer_enabled: bool,
     #[cfg(target_os = "windows")]
     file_transfer_enabled_peer: bool,
+    /// Read jobs for CM-side file reading (server to client transfers)
+    read_jobs: Vec<fs::TransferJob>,
 }
 
 lazy_static::lazy_static! {
@@ -348,9 +424,16 @@ pub fn switch_back(id: i32) {
 impl<T: InvokeUiCM> IpcTaskRunner<T> {
     async fn run(&mut self) {
         use hbb_common::config::LocalConfig;
+        use hbb_common::tokio::time::{self, Duration, Instant};
+
+        const MILLI5: Duration = Duration::from_millis(5);
+        const SEC30: Duration = Duration::from_secs(30);
 
         // for tmp use, without real conn id
         let mut write_jobs: Vec<fs::TransferJob> = Vec::new();
+        // File timer for processing read_jobs
+        let mut file_timer =
+            crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
 
         #[cfg(target_os = "windows")]
         let is_authorized = self.cm.is_authorized(self.conn_id);
@@ -443,10 +526,16 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
                                         if let Ok(bytes) = self.stream.next_raw().await {
                                             fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
-                                            handle_fs(fs, &mut write_jobs, &self.tx, Some(&tx_log)).await;
+                                            handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
                                         }
                                     } else {
-                                        handle_fs(fs, &mut write_jobs, &self.tx, Some(&tx_log)).await;
+                                        handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
+                                    }
+                                    // Activate fast timer immediately when read jobs exist.
+                                    // This ensures new jobs start processing without waiting for the slow 30s timer.
+                                    // Deactivation (back to 30s) happens in tick handler when jobs are exhausted.
+                                    if !self.read_jobs.is_empty() {
+                                        file_timer = crate::rustdesk_interval(time::interval(MILLI5));
                                     }
                                     let log = fs::serialize_transfer_jobs(&write_jobs);
                                     self.cm.ui_handler.file_transfer_log("transfer", &log);
@@ -600,6 +689,18 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                 Some(job_log) = rx_log.recv() => {
                     self.cm.ui_handler.file_transfer_log("transfer", &job_log);
                 }
+                _ = file_timer.tick() => {
+                    if !self.read_jobs.is_empty() {
+                        let conn_id = self.conn_id;
+                        if let Err(e) = handle_read_jobs_tick(&mut self.read_jobs, &self.tx, conn_id).await {
+                            log::error!("Error processing read jobs: {}", e);
+                        }
+                        let log = fs::serialize_transfer_jobs(&self.read_jobs);
+                        self.cm.ui_handler.file_transfer_log("transfer", &log);
+                    } else {
+                        file_timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
+                    }
+                }
             }
         }
     }
@@ -619,6 +720,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
             file_transfer_enabled: false,
             #[cfg(target_os = "windows")]
             file_transfer_enabled_peer: false,
+            read_jobs: Vec::new(),
         };
 
         while task_runner.running {
@@ -720,7 +822,17 @@ pub async fn start_listen<T: InvokeUiCM>(
                 cm.new_message(current_id, text);
             }
             Some(Data::FS(fs)) => {
-                handle_fs(fs, &mut write_jobs, &tx, None).await;
+                // Android doesn't need CM-side file reading (no need_validate_file_read_access)
+                let mut read_jobs_placeholder: Vec<fs::TransferJob> = Vec::new();
+                handle_fs(
+                    fs,
+                    &mut write_jobs,
+                    &mut read_jobs_placeholder,
+                    &tx,
+                    None,
+                    current_id,
+                )
+                .await;
             }
             Some(Data::Close) => {
                 break;
@@ -747,13 +859,11 @@ pub async fn start_listen<T: InvokeUiCM>(
 async fn handle_fs(
     fs: ipc::FS,
     write_jobs: &mut Vec<fs::TransferJob>,
+    read_jobs: &mut Vec<fs::TransferJob>,
     tx: &UnboundedSender<Data>,
     tx_log: Option<&UnboundedSender<String>>,
+    _conn_id: i32,
 ) {
-    use std::path::PathBuf;
-
-    use hbb_common::fs::serialize_transfer_job;
-
     match fs {
         ipc::FS::ReadEmptyDirs {
             dir,
@@ -789,6 +899,52 @@ async fn handle_fs(
             total_size,
             conn_id,
         } => {
+            // Validate file names to prevent path traversal attacks.
+            // This must be done BEFORE any path operations to ensure attackers cannot
+            // escape the target directory using names like "../../malicious.txt"
+            if let Err(e) = validate_transfer_file_names(&files) {
+                log::warn!("Path traversal attempt detected for {}: {}", path, e);
+                send_raw(fs::new_error(id, e, file_num), tx);
+                return;
+            }
+
+            // Check that the path contains a filename; OS will handle permission and
+            // existence checks when we actually create or write the files.
+            let path_obj = Path::new(&path);
+            let Some(_filename) = path_obj.file_name() else {
+                log::warn!("Write access denied for {}: No filename provided", path);
+                send_raw(
+                    fs::new_error(
+                        id,
+                        "No filename provided in the specified path".to_string(),
+                        file_num,
+                    ),
+                    tx,
+                );
+                return;
+            };
+
+            // Base path for the write operation. Any invalid paths or permission
+            // errors will be reported by the OS when the transfer job runs.
+            let base_path = PathBuf::from(&path);
+
+            // Convert files to FileEntry and validate write paths
+            let file_entries: Vec<FileEntry> = files
+                .drain(..)
+                .map(|f| FileEntry {
+                    name: f.0,
+                    modified_time: f.1,
+                    ..Default::default()
+                })
+                .collect();
+
+            // Validate that all intermediate directories for each file are accessible
+            if let Err(e) = validate_write_paths(&base_path, &file_entries) {
+                log::warn!("Write path validation failed for {}: {}", path, e);
+                send_raw(fs::new_error(id, e, file_num), tx);
+                return;
+            }
+
             // cm has no show_hidden context
             // dummy remote, show_hidden, is_remote
             let mut job = fs::TransferJob::new_write(
@@ -799,14 +955,7 @@ async fn handle_fs(
                 file_num,
                 false,
                 false,
-                files
-                    .drain(..)
-                    .map(|f| FileEntry {
-                        name: f.0,
-                        modified_time: f.1,
-                        ..Default::default()
-                    })
-                    .collect(),
+                file_entries,
                 overwrite_detection,
             );
             job.total_size = total_size;
@@ -922,8 +1071,455 @@ async fn handle_fs(
         ipc::FS::Rename { id, path, new_name } => {
             rename_file(path, new_name, id, tx).await;
         }
+        ipc::FS::ReadFile {
+            path,
+            id,
+            file_num,
+            include_hidden,
+            conn_id,
+            overwrite_detection,
+        } => {
+            start_read_job(
+                path,
+                file_num,
+                include_hidden,
+                id,
+                conn_id,
+                overwrite_detection,
+                read_jobs,
+                tx,
+            )
+            .await;
+        }
+        // Cancel an ongoing read job (file transfer from server to client).
+        // Note: This only cancels jobs in `read_jobs`. It does NOT cancel `ReadAllFiles`
+        // operations, which are one-shot directory scans that complete quickly and don't
+        // have persistent job tracking.
+        ipc::FS::CancelRead { id, conn_id: _ } => {
+            if let Some(job) = fs::remove_job(id, read_jobs) {
+                tx_log.map(|tx: &UnboundedSender<String>| {
+                    allow_err!(tx.send(serialize_transfer_job(&job, false, true, "")));
+                });
+            }
+        }
+        ipc::FS::SendConfirmForRead {
+            id,
+            file_num: _,
+            skip,
+            offset_blk,
+            conn_id: _,
+        } => {
+            if let Some(job) = fs::get_job(id, read_jobs) {
+                let req = FileTransferSendConfirmRequest {
+                    id,
+                    file_num: job.file_num(),
+                    union: if skip {
+                        Some(file_transfer_send_confirm_request::Union::Skip(true))
+                    } else {
+                        Some(file_transfer_send_confirm_request::Union::OffsetBlk(
+                            offset_blk,
+                        ))
+                    },
+                    ..Default::default()
+                };
+                job.confirm(&req).await;
+            }
+        }
+        // Recursively list all files in a directory.
+        // This is a one-shot operation that cannot be cancelled via CancelRead.
+        // The operation typically completes quickly as it only reads directory metadata,
+        // not file contents. File count is limited by `check_file_count_limit()`.
+        ipc::FS::ReadAllFiles {
+            path,
+            id,
+            include_hidden,
+            conn_id,
+        } => {
+            read_all_files(path, include_hidden, id, conn_id, tx).await;
+        }
         _ => {}
     }
+}
+
+/// Validates that a file name does not contain path traversal sequences.
+/// This prevents attackers from escaping the base directory by using names like
+/// "../../../etc/passwd" or "..\\..\\Windows\\System32\\malicious.dll".
+#[cfg(not(any(target_os = "ios")))]
+fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
+    // Check for null bytes which could cause path truncation in some APIs
+    if name.bytes().any(|b| b == 0) {
+        bail!("null bytes not allowed in file name");
+    }
+
+    // Check for path traversal patterns
+    // We check for both Unix and Windows path separators
+    let components: Vec<&str> = name
+        .split(|c| c == '/' || c == '\\')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for component in &components {
+        if *component == ".." {
+            bail!("path traversal detected in file name");
+        }
+    }
+
+    // On Windows, also check for drive letters (e.g., "C:")
+    #[cfg(windows)]
+    {
+        if name.len() >= 2 {
+            let bytes = name.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                bail!("absolute path detected in file name");
+            }
+        }
+    }
+
+    // Check for names starting with path separator (absolute paths on Unix)
+    if name.starts_with('/') || name.starts_with('\\') {
+        bail!("absolute path detected in file name");
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn is_single_file_with_empty_name(files: &[(String, u64)]) -> bool {
+    files.len() == 1 && files[0].0.is_empty()
+}
+
+/// Validates all file names in a transfer request to prevent path traversal attacks.
+/// Returns an error if any file name contains dangerous path components.
+#[cfg(not(any(target_os = "ios")))]
+fn validate_transfer_file_names(files: &[(String, u64)]) -> ResultType<()> {
+    if is_single_file_with_empty_name(files) {
+        // Allow empty name for single file.
+        // The full path is provided in the `path` parameter for single file transfers.
+        return Ok(());
+    }
+
+    for (name, _) in files {
+        validate_file_name_no_traversal(name)?;
+    }
+    Ok(())
+}
+
+/// Validates that all files in a write operation have accessible parent directories.
+/// This prevents writing files to directories where intermediate paths are restricted.
+/// Walks upward from each file path to find the first existing directory and validates
+/// its accessibility. This allows write operations into directories that don't exist yet.
+#[cfg(not(any(target_os = "ios")))]
+fn validate_write_paths(canonical_base: &PathBuf, files: &[FileEntry]) -> ResultType<()> {
+    use std::fs::read_dir;
+
+    for file in files {
+        if file.name.is_empty() {
+            continue;
+        }
+
+        // Start from the full file path and walk upwards to find the first
+        // existing directory. For example, given "base/dir1/dir2/file.txt":
+        //   1. Check base/dir1/dir2/file.txt (target file, won't exist yet)
+        //   2. Check base/dir1/dir2 (parent directory)
+        //   3. Check base/dir1 (grandparent directory)
+        //   4. Check base (great-grandparent directory)
+        // Stop at the first existing directory and validate it.
+        let full_path = canonical_base.join(&file.name);
+        let mut current_path = Some(full_path.as_path());
+        let mut found_existing = None;
+
+        while let Some(path) = current_path {
+            if path.exists() {
+                found_existing = Some(path.to_path_buf());
+                break;
+            }
+            current_path = path.parent();
+        }
+
+        // Validate that the first existing directory is accessible
+        if let Some(existing_path) = found_existing {
+            if existing_path.is_dir() {
+                // Try to read the directory to check access permissions
+                if let Err(e) = read_dir(&existing_path) {
+                    bail!(
+                        "access denied for path '{}': {}",
+                        existing_path.display(),
+                        e
+                    );
+                }
+            }
+            // If it's a file, we'll let the actual write operation handle the error
+        }
+    }
+
+    Ok(())
+}
+
+/// Start a read job in CM for file transfer from server to client (Windows only).
+///
+/// This creates a `TransferJob` using `new_read()`, validates it, and sends the
+/// initial file list back to Connection via IPC.
+///
+/// NOTE: This is the CM-side equivalent of `create_and_start_read_job()` in
+/// `src/server/connection.rs`. On non-Windows platforms, Connection handles
+/// read jobs directly. Both use `TransferJob::new_read()` with similar logic.
+/// When modifying job creation or validation, ensure both paths stay in sync.
+#[cfg(not(any(target_os = "ios")))]
+async fn start_read_job(
+    path: String,
+    file_num: i32,
+    include_hidden: bool,
+    id: i32,
+    conn_id: i32,
+    overwrite_detection: bool,
+    read_jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+) {
+    let path_clone = path.clone();
+    let result = spawn_blocking(move || -> ResultType<fs::TransferJob> {
+        let data_source = fs::DataSource::FilePath(PathBuf::from(&path));
+        fs::TransferJob::new_read(
+            id,
+            fs::JobType::Generic,
+            "".to_string(),
+            data_source,
+            file_num,
+            include_hidden,
+            false,
+            overwrite_detection,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(mut job)) => {
+            // Optional: enforce file count limit for CM-side jobs to avoid
+            // excessive I/O. This is applied on the job's file list produced
+            // by `new_read`, similar to how AllFiles uses the same helper.
+            if let Err(msg) = check_file_count_limit(job.files().len()) {
+                let _ = tx.send(Data::ReadJobInitResult {
+                    id,
+                    file_num,
+                    include_hidden,
+                    conn_id,
+                    result: Err(msg),
+                });
+                return;
+            }
+
+            // Build FileDirectory from the job's file list and serialize
+            let files = job.files().to_owned();
+            let mut dir = FileDirectory::new();
+            dir.id = id;
+            dir.path = path_clone.clone();
+            dir.entries = files.clone().into();
+
+            let dir_bytes = match dir.write_to_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = tx.send(Data::ReadJobInitResult {
+                        id,
+                        file_num,
+                        include_hidden,
+                        conn_id,
+                        result: Err(format!("serialize failed: {}", e)),
+                    });
+                    return;
+                }
+            };
+
+            let _ = tx.send(Data::ReadJobInitResult {
+                id,
+                file_num,
+                include_hidden,
+                conn_id,
+                result: Ok(dir_bytes),
+            });
+
+            // Attach connection id so CM can route read blocks back correctly
+            job.conn_id = conn_id;
+            read_jobs.push(job);
+        }
+        Ok(Err(e)) => {
+            let _ = tx.send(Data::ReadJobInitResult {
+                id,
+                file_num,
+                include_hidden,
+                conn_id,
+                result: Err(format!("validation failed: {}", e)),
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(Data::ReadJobInitResult {
+                id,
+                file_num,
+                include_hidden,
+                conn_id,
+                result: Err(format!("validation task failed: {}", e)),
+            });
+        }
+    }
+}
+
+/// Process read jobs periodically, reading file blocks and sending them via IPC.
+///
+/// NOTE: This is the CM-side equivalent of the read job tick processing in Connection.
+/// See `src/server/connection.rs` where `read_jobs` are processed in the main event loop.
+/// The logic here mirrors that implementation but communicates via IPC instead of direct network.
+/// When modifying job processing logic, ensure both implementations stay in sync.
+#[cfg(not(any(target_os = "ios")))]
+async fn handle_read_jobs_tick(
+    jobs: &mut Vec<fs::TransferJob>,
+    tx: &UnboundedSender<Data>,
+    conn_id: i32,
+) -> ResultType<()> {
+    let mut finished = Vec::new();
+
+    for job in jobs.iter_mut() {
+        if job.is_last_job {
+            continue;
+        }
+
+        // Initialize data stream if needed (opens file, sends digest for overwrite detection)
+        if let Err(err) = init_read_job_for_cm(job, tx, conn_id).await {
+            let _ = tx.send(Data::FileReadError {
+                id: job.id,
+                file_num: job.file_num(),
+                err: format!("{}", err),
+                conn_id,
+            });
+            finished.push(job.id);
+            continue;
+        }
+
+        // Read a block from the file
+        match job.read().await {
+            Err(err) => {
+                let _ = tx.send(Data::FileReadError {
+                    id: job.id,
+                    file_num: job.file_num(),
+                    err: format!("{}", err),
+                    conn_id,
+                });
+                // Mark job as finished to prevent infinite retries.
+                // Connection side will have already removed pending_read_validations
+                // after receiving FileReadError, so continuing would be pointless.
+                finished.push(job.id);
+            }
+            Ok(Some(block)) => {
+                let _ = tx.send(Data::FileBlockFromCM {
+                    id: block.id,
+                    file_num: block.file_num,
+                    data: block.data,
+                    compressed: block.compressed,
+                    conn_id,
+                });
+            }
+            Ok(None) => {
+                if job.job_completed() {
+                    finished.push(job.id);
+                    match job.job_error() {
+                        Some(err) => {
+                            let _ = tx.send(Data::FileReadError {
+                                id: job.id,
+                                file_num: job.file_num(),
+                                err,
+                                conn_id,
+                            });
+                        }
+                        None => {
+                            let _ = tx.send(Data::FileReadDone {
+                                id: job.id,
+                                file_num: job.file_num(),
+                                conn_id,
+                            });
+                        }
+                    }
+                }
+                // else: waiting for confirmation from peer
+            }
+        }
+        // Process one job at a time to avoid blocking
+        break;
+    }
+
+    for id in finished {
+        let _ = fs::remove_job(id, jobs);
+    }
+
+    Ok(())
+}
+
+/// Initialize a read job's data stream and handle digest sending for overwrite detection.
+///
+/// NOTE: This is the CM-side equivalent of `TransferJob::init_data_stream()` in
+/// `libs/hbb_common/src/fs.rs`. It calls `init_data_stream_for_cm()` and sends
+/// digest via IPC instead of direct network stream.
+/// When modifying initialization or digest logic, ensure both paths stay in sync.
+#[cfg(not(any(target_os = "ios")))]
+async fn init_read_job_for_cm(
+    job: &mut fs::TransferJob,
+    tx: &UnboundedSender<Data>,
+    conn_id: i32,
+) -> ResultType<()> {
+    // Initialize data stream and get digest info if overwrite detection is needed
+    match job.init_data_stream_for_cm().await? {
+        Some((last_modified, file_size)) => {
+            // Send digest via IPC for overwrite detection
+            let _ = tx.send(Data::FileDigestFromCM {
+                id: job.id,
+                file_num: job.file_num(),
+                last_modified,
+                file_size,
+                is_resume: job.is_resume,
+                conn_id,
+            });
+        }
+        None => {
+            // Job done or already initialized, nothing to do
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "ios")))]
+async fn read_all_files(
+    path: String,
+    include_hidden: bool,
+    id: i32,
+    conn_id: i32,
+    tx: &UnboundedSender<Data>,
+) {
+    let path_clone = path.clone();
+    let result = spawn_blocking(move || fs::get_recursive_files(&path, include_hidden)).await;
+
+    let result = match result {
+        Ok(Ok(files)) => {
+            // Check file count limit to prevent excessive I/O and resource usage
+            if let Err(msg) = check_file_count_limit(files.len()) {
+                Err(msg)
+            } else {
+                // Serialize FileDirectory to protobuf bytes
+                let mut fd = FileDirectory::new();
+                fd.id = id;
+                fd.path = path_clone.clone();
+                fd.entries = files.into();
+                match fd.write_to_bytes() {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(format!("serialize failed: {}", e)),
+                }
+            }
+        }
+        Ok(Err(e)) => Err(format!("{}", e)),
+        Err(e) => Err(format!("task failed: {}", e)),
+    };
+
+    let _ = tx.send(Data::AllFilesResult {
+        id,
+        conn_id,
+        path: path_clone,
+        result,
+    });
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -1009,7 +1605,12 @@ async fn create_dir(path: String, id: i32, tx: &UnboundedSender<Data>) {
 #[cfg(not(any(target_os = "ios")))]
 async fn rename_file(path: String, new_name: String, id: i32, tx: &UnboundedSender<Data>) {
     handle_result(
-        spawn_blocking(move || fs::rename_file(&path, &new_name)).await,
+        spawn_blocking(move || {
+            // Validate that new_name doesn't contain path traversal
+            validate_file_name_no_traversal(&new_name)?;
+            fs::rename_file(&path, &new_name)
+        })
+        .await,
         id,
         0,
         tx,
@@ -1105,4 +1706,247 @@ pub fn quit_cm() {
     log::info!("quit cm");
     CLIENTS.write().unwrap().clear();
     crate::platform::quit_gui();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::ipc::Data;
+    use hbb_common::{
+        message_proto::{FileDirectory, Message},
+        tokio::{runtime::Runtime, sync::mpsc::unbounded_channel},
+    };
+    use std::fs;
+
+    #[cfg(windows)]
+    fn get_username() -> Option<String> {
+        std::env::var("USERNAME").ok().filter(|u| !u.is_empty())
+    }
+
+    #[cfg(windows)]
+    fn setup_acl_deny(path: &std::path::Path, username: &str) -> bool {
+        use std::process::Command;
+        Command::new("icacls")
+            .arg(path)
+            .arg("/deny")
+            .arg(format!("{}:(RX)", username))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    fn cleanup_acl_deny(path: &std::path::Path, username: &str) {
+        use std::process::Command;
+        let _ = Command::new("icacls")
+            .arg(path)
+            .arg("/remove:d")
+            .arg(username)
+            .status();
+    }
+
+    fn make_file_entry(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            entry_type: FileType::File.into(),
+            size: 100,
+            modified_time: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn read_all_files_success() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+            let dir = std::env::temp_dir().join("rustdesk_read_all_test");
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("test.txt"), b"hello").unwrap();
+
+            let path_str = dir.to_string_lossy().to_string();
+            super::read_all_files(path_str.clone(), false, 1, 2, &tx).await;
+
+            match rx.recv().await.unwrap() {
+                Data::AllFilesResult { result, .. } => {
+                    let bytes = result.unwrap();
+                    let fd = FileDirectory::parse_from_bytes(&bytes).unwrap();
+                    assert!(!fd.entries.is_empty());
+                }
+                _ => panic!("unexpected data"),
+            }
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn read_dir_success() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = unbounded_channel();
+            let dir = std::env::temp_dir().join("rustdesk_read_dir_test");
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+
+            super::read_dir(&dir.to_string_lossy(), false, &tx).await;
+
+            match rx.recv().await.unwrap() {
+                Data::RawMessage(bytes) => {
+                    let mut msg = Message::new();
+                    msg.merge_from_bytes(&bytes).unwrap();
+                    assert!(msg
+                        .file_response()
+                        .dir()
+                        .path
+                        .contains("rustdesk_read_dir_test"));
+                }
+                _ => panic!("unexpected data"),
+            }
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_file_name_security() {
+        // Null byte injection
+        assert!(super::validate_file_name_no_traversal("file\0.txt").is_err());
+        assert!(super::validate_file_name_no_traversal("test\0").is_err());
+
+        // Path traversal
+        assert!(super::validate_file_name_no_traversal("../etc/passwd").is_err());
+        assert!(super::validate_file_name_no_traversal("foo/../bar").is_err());
+        assert!(super::validate_file_name_no_traversal("..").is_err());
+
+        // Absolute paths
+        assert!(super::validate_file_name_no_traversal("/etc/passwd").is_err());
+        assert!(super::validate_file_name_no_traversal("\\Windows").is_err());
+        #[cfg(windows)]
+        assert!(super::validate_file_name_no_traversal("C:\\Windows").is_err());
+
+        // Valid paths
+        assert!(super::validate_file_name_no_traversal("file.txt").is_ok());
+        assert!(super::validate_file_name_no_traversal("subdir/file.txt").is_ok());
+        assert!(super::validate_file_name_no_traversal("").is_ok());
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_transfer_file_names_security() {
+        assert!(super::validate_transfer_file_names(&[("file.txt".into(), 100)]).is_ok());
+        assert!(super::validate_transfer_file_names(&[("../passwd".into(), 100)]).is_err());
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_write_paths_basic() {
+        let base = std::env::temp_dir().join("rustdesk_write_test1");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // Simple file, nested dirs, and empty name
+        let files = vec![
+            make_file_entry("test.txt"),
+            make_file_entry("dir1/dir2/file.txt"),
+            make_file_entry(""),
+        ];
+        assert!(super::validate_write_paths(&base, &files).is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn validate_write_paths_partial_hierarchy() {
+        let base = std::env::temp_dir().join("rustdesk_write_test2");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir(base.join("dir1")).unwrap();
+
+        let files = vec![make_file_entry("dir1/dir2/file.txt")];
+        assert!(super::validate_write_paths(&base, &files).is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_write_paths_acl_denied() {
+        use std::process::Command;
+
+        if Command::new("icacls").arg("/?").output().is_err() {
+            return;
+        }
+
+        let username = match get_username() {
+            Some(u) => u,
+            None => return,
+        };
+
+        let base = std::env::temp_dir().join("rustdesk_write_acl_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let denied = base.join("denied");
+        fs::create_dir(&denied).unwrap();
+
+        if !setup_acl_deny(&denied, &username) {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+
+        let files = vec![make_file_entry("denied/file.txt")];
+        let result = super::validate_write_paths(&base, &files);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("access denied"));
+
+        cleanup_acl_deny(&denied, &username);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Tests that symlink creation works on this platform.
+    /// This is a helper to verify the test environment supports symlinks.
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn test_symlink_creation_works() {
+        let base_dir = std::env::temp_dir().join("rustdesk_symlink_test");
+        let _ = fs::remove_dir_all(&base_dir);
+        fs::create_dir_all(&base_dir).unwrap();
+
+        // Create target file in a subdirectory
+        let target_dir = base_dir.join("target_dir");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("target.txt");
+        fs::write(&target_file, b"content").unwrap();
+
+        // Create symlink in a different directory
+        let link_dir = base_dir.join("link_dir");
+        fs::create_dir_all(&link_dir).unwrap();
+        let link_path = link_dir.join("link.txt");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if symlink(&target_file, &link_path).is_err() {
+                let _ = fs::remove_dir_all(&base_dir);
+                return;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_file;
+            if symlink_file(&target_file, &link_path).is_err() {
+                // Skip if no permission (needs admin or dev mode on Windows)
+                let _ = fs::remove_dir_all(&base_dir);
+                return;
+            }
+        }
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
 }
