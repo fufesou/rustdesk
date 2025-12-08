@@ -251,6 +251,27 @@ const int kMinTrackpadSpeed = 10;
 const int kDefaultTrackpadSpeed = 100;
 const int kMaxTrackpadSpeed = 1000;
 
+// relative mouse mode
+/// Throttle duration (in milliseconds) for updating pointer lock center during
+/// window move/resize events. Lower values provide more responsive updates but
+/// may cause performance issues during rapid window operations.
+const int kDefaultPointerLockCenterThrottleMs = 100;
+
+/// Minimum server version required for relative mouse mode (MOUSE_TYPE_MOVE_RELATIVE).
+/// Servers older than this version will ignore relative mouse events.
+const String kMinVersionForRelativeMouseMode = '1.3.0';
+
+/// Maximum delta value for relative mouse movement.
+/// Large values could cause issues with i32 overflow on server side,
+/// and no reasonable mouse movement should exceed this bound.
+const int kMaxRelativeMouseDelta = 10000;
+
+/// Debounce duration (in milliseconds) for relative mouse mode toggle.
+/// This prevents double-toggle from race condition between Rust rdev grab loop
+/// and Flutter keyboard handling. Value should be small enough to allow
+/// intentional quick toggles but large enough to prevent accidental double-triggers.
+const int kRelativeMouseModeToggleDebounceMs = 150;
+
 // incomming (should be incoming) is kept, because change it will break the previous setting.
 const String kKeyPrinterIncomingJobAction = 'printer-incomming-job-action';
 const String kValuePrinterIncomingJobDismiss = 'dismiss';

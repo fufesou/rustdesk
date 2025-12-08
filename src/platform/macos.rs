@@ -387,6 +387,52 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     */
 }
 
+extern "C" {
+    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+}
+
+pub fn set_cursor_pos(x: i32, y: i32) -> bool {
+    unsafe {
+        CGWarpMouseCursorPosition(CGPoint {
+            x: x as f64,
+            y: y as f64,
+        }) == 0
+    }
+}
+
+/// Show or hide the cursor.
+pub fn show_cursor(show: bool) -> i32 {
+    unsafe {
+        if show {
+            CGDisplayShowCursor(0)
+        } else {
+            CGDisplayHideCursor(0)
+        }
+    }
+}
+
+/// On macOS, cursor clipping is not supported directly like Windows ClipCursor.
+/// Instead, we use CGAssociateMouseAndMouseCursorPosition to dissociate mouse
+/// movement from cursor position, achieving a "pointer lock" effect.
+///
+/// # Arguments
+/// * `enable` - When `true` (Some(_)), dissociates mouse from cursor (enables pointer lock).
+///              When `false` (None), re-associates mouse with cursor (disables pointer lock).
+///
+/// Note: The rect parameter values are ignored on macOS. The parameter signature
+/// matches Windows for API consistency, but macOS only supports enable/disable.
+pub fn clip_cursor(rect: Option<(i32, i32, i32, i32)>) -> bool {
+    let _ = rect; // rect values are ignored on macOS, only Some/None matters
+    unsafe {
+        // connected=0: dissociate (pointer lock on), connected=1: associate (normal)
+        let connected = if rect.is_some() { 0 } else { 1 };
+        CGAssociateMouseAndMouseCursorPosition(connected) == 0
+    }
+}
+
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     autoreleasepool(|| unsafe_get_focused_display(displays))
 }

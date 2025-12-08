@@ -4773,9 +4773,13 @@ impl Retina {
 
     #[inline]
     fn on_mouse_event(&mut self, e: &mut MouseEvent, current: usize) {
-        let evt_type = e.mask & 0x7;
-        if evt_type == crate::input::MOUSE_TYPE_WHEEL {
-            // x and y are always 0, +1 or -1
+        let evt_type = e.mask & crate::input::MOUSE_TYPE_MASK;
+        // Delta-based events do not contain absolute coordinates.
+        // Avoid applying Retina coordinate scaling to them.
+        if evt_type == crate::input::MOUSE_TYPE_WHEEL
+            || evt_type == crate::input::MOUSE_TYPE_TRACKPAD
+            || evt_type == crate::input::MOUSE_TYPE_MOVE_RELATIVE
+        {
             return;
         }
         let Some(d) = self.displays.get(current) else {

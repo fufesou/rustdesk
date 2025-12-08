@@ -20,13 +20,13 @@ use scrap::wayland::pipewire::RDP_SESSION_INFO;
 use std::{
     convert::TryFrom,
     ops::{Deref, DerefMut},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{self, Duration, Instant},
 };
+
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 #[cfg(windows)]
 use winapi::um::winuser::WHEEL_DELTA;
 
@@ -645,7 +645,7 @@ async fn set_uinput_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> Re
 
 pub fn is_left_up(evt: &MouseEvent) -> bool {
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & 0x7;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
     return buttons == 1 && evt_type == 2;
 }
 
@@ -1004,8 +1004,13 @@ pub fn handle_mouse_(
         handle_mouse_simulation_(evt, conn);
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if _show_cursor {
-        handle_mouse_show_cursor_(evt, conn, _username, _argb);
+    {
+        let evt_type = evt.mask & MOUSE_TYPE_MASK;
+        // Skip whiteboard/cursor display for relative mouse events since they contain
+        // delta values, not absolute positions
+        if _show_cursor && evt_type != MOUSE_TYPE_MOVE_RELATIVE {
+            handle_mouse_show_cursor_(evt, conn, _username, _argb);
+        }
     }
 }
 
@@ -1021,7 +1026,7 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & 0x7;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
@@ -1056,6 +1061,22 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
                 x: evt.x,
                 y: evt.y,
             };
+        }
+        // MOUSE_TYPE_MOVE_RELATIVE: Relative mouse movement for gaming/3D applications.
+        // Each client independently decides whether to use relative mode.
+        // Multiple clients can mix absolute and relative movements without conflict,
+        // as the server simply applies the delta to the current cursor position.
+        MOUSE_TYPE_MOVE_RELATIVE => {
+            en.mouse_move_relative(evt.x, evt.y);
+            // Get actual cursor position after relative movement for tracking
+            if let Some((x, y)) = crate::get_cursor_pos() {
+                *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+                    conn,
+                    time: get_time(),
+                    x,
+                    y,
+                };
+            }
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
@@ -1155,7 +1176,7 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn handle_mouse_show_cursor_(evt: &MouseEvent, conn: i32, username: String, argb: u32) {
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & 0x7;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
     match evt_type {
         MOUSE_TYPE_MOVE => {
             whiteboard::update_whiteboard(

@@ -1215,6 +1215,50 @@ pub fn main_set_input_source(session_id: SessionID, value: String) {
     }
 }
 
+/// Set cursor position (for pointer lock re-centering)
+pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(crate::set_cursor_pos(x, y))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (x, y);
+        SyncReturn(false)
+    }
+}
+
+/// Show or hide cursor (for pointer lock)
+pub fn main_show_cursor(show: bool) -> SyncReturn<i32> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(crate::show_cursor(show))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = show;
+        SyncReturn(0)
+    }
+}
+
+/// Clip cursor to a rectangle (for pointer lock) or unclip (pass null)
+pub fn main_clip_cursor(left: i32, top: i32, right: i32, bottom: i32, enable: bool) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let rect = if enable {
+            Some((left, top, right, bottom))
+        } else {
+            None
+        };
+        SyncReturn(crate::clip_cursor(rect))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (left, top, right, bottom, enable);
+        SyncReturn(false)
+    }
+}
+
 pub fn main_get_my_id() -> String {
     get_id()
 }
@@ -1769,6 +1813,7 @@ pub fn session_send_mouse(session_id: SessionID, msg: String) {
                 "up" => MOUSE_TYPE_UP,
                 "wheel" => MOUSE_TYPE_WHEEL,
                 "trackpad" => MOUSE_TYPE_TRACKPAD,
+                "move_relative" => MOUSE_TYPE_MOVE_RELATIVE,
                 _ => 0,
             };
         }

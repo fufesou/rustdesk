@@ -71,6 +71,18 @@ pub mod input {
     pub const MOUSE_TYPE_UP: i32 = 2;
     pub const MOUSE_TYPE_WHEEL: i32 = 3;
     pub const MOUSE_TYPE_TRACKPAD: i32 = 4;
+    /// Relative mouse movement type for gaming/3D applications.
+    /// This type sends delta (dx, dy) values instead of absolute coordinates.
+    /// NOTE: This is only supported by the Flutter client. The Sciter client (deprecated)
+    /// does not support relative mouse mode due to:
+    /// 1. Fixed send_mouse() function signature that doesn't allow type differentiation
+    /// 2. Lack of pointer lock API in Sciter/TIS
+    /// 3. No OS cursor control (hide/show/clip) FFI bindings in Sciter UI
+    pub const MOUSE_TYPE_MOVE_RELATIVE: i32 = 5;
+
+    /// Mask to extract the mouse event type from the mask field.
+    /// The lower 3 bits contain the event type (MOUSE_TYPE_*).
+    pub const MOUSE_TYPE_MASK: i32 = 0x7;
 
     pub const MOUSE_BUTTON_LEFT: i32 = 0x01;
     pub const MOUSE_BUTTON_RIGHT: i32 = 0x02;
@@ -2427,5 +2439,86 @@ mod tests {
         assert!(!is_public("localhost"));
         assert!(!is_public("https://rustdesk.computer.com"));
         assert!(!is_public("rustdesk.comhello.com"));
+    }
+
+    #[test]
+    fn test_mouse_type_constants() {
+        use crate::input::*;
+
+        // Verify MOUSE_TYPE constants are unique and within the mask range
+        let types = [
+            MOUSE_TYPE_MOVE,
+            MOUSE_TYPE_DOWN,
+            MOUSE_TYPE_UP,
+            MOUSE_TYPE_WHEEL,
+            MOUSE_TYPE_TRACKPAD,
+            MOUSE_TYPE_MOVE_RELATIVE,
+        ];
+
+        // All types should be unique
+        let mut seen = std::collections::HashSet::new();
+        for t in types.iter() {
+            assert!(seen.insert(*t), "Duplicate mouse type: {}", t);
+        }
+
+        // All types should fit within the mask
+        for t in types.iter() {
+            assert_eq!(
+                *t & MOUSE_TYPE_MASK,
+                *t,
+                "Mouse type {} exceeds mask {}",
+                t,
+                MOUSE_TYPE_MASK
+            );
+        }
+
+        // Verify the mask covers all defined types
+        assert!(MOUSE_TYPE_MASK >= *types.iter().max().unwrap());
+    }
+
+    #[test]
+    fn test_mouse_button_constants() {
+        use crate::input::*;
+
+        // Verify button constants are powers of 2 (can be combined as flags)
+        let buttons = [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_WHEEL,
+            MOUSE_BUTTON_BACK,
+            MOUSE_BUTTON_FORWARD,
+        ];
+
+        for b in buttons.iter() {
+            assert!((*b as u32).is_power_of_two(), "Button {} is not a power of 2", b);
+        }
+
+        // Verify buttons can be combined without collision
+        let combined = buttons.iter().fold(0, |acc, &b| acc | b);
+        assert_eq!(
+            combined,
+            MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT | MOUSE_BUTTON_WHEEL | MOUSE_BUTTON_BACK | MOUSE_BUTTON_FORWARD
+        );
+    }
+
+    #[test]
+    fn test_mouse_event_mask_layout() {
+        use crate::input::*;
+
+        // The mask layout is: lower 3 bits for type, upper bits for buttons (shifted by 3)
+        // This test verifies that the layout is correct
+
+        // Test type extraction
+        let mask_with_type = MOUSE_TYPE_MOVE_RELATIVE;
+        assert_eq!(mask_with_type & MOUSE_TYPE_MASK, MOUSE_TYPE_MOVE_RELATIVE);
+
+        // Test button extraction (buttons are stored shifted by 3 bits)
+        let mask_with_button = MOUSE_BUTTON_LEFT << 3;
+        assert_eq!(mask_with_button >> 3, MOUSE_BUTTON_LEFT);
+
+        // Test combined mask
+        let combined_mask = MOUSE_TYPE_DOWN | (MOUSE_BUTTON_LEFT << 3);
+        assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
+        assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT);
     }
 }

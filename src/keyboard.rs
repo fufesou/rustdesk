@@ -266,6 +266,39 @@ fn get_keyboard_mode() -> String {
     "legacy".to_string()
 }
 
+/// Check if Ctrl+Shift+G (Windows/Linux) or Cmd+Shift+G (macOS) is pressed.
+/// This is used to toggle relative mouse mode.
+/// Note: This shortcut is only available in Flutter client. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn is_toggle_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
+    if !is_press {
+        return false;
+    }
+    if key != Key::KeyG {
+        return false;
+    }
+    let modifiers = MODIFIERS_STATE.lock().unwrap();
+    let shift = *modifiers.get(&Key::ShiftLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ShiftRight).unwrap_or(&false);
+    #[cfg(target_os = "macos")]
+    let modifier = *modifiers.get(&Key::MetaLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::MetaRight).unwrap_or(&false);
+    #[cfg(not(target_os = "macos"))]
+    let modifier = *modifiers.get(&Key::ControlLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ControlRight).unwrap_or(&false);
+    shift && modifier
+}
+
+/// Notify Flutter to toggle relative mouse mode.
+/// Note: This is Flutter-only. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn notify_toggle_relative_mouse_mode() {
+    let session_id = flutter::get_cur_session_id();
+    flutter::push_session_event(&session_id, "toggle_relative_mouse_mode", vec![]);
+}
+
 fn start_grab_loop() {
     std::env::set_var("KEYBOARD_ONLY", "y");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -278,6 +311,19 @@ fn start_grab_loop() {
 
             let _scan_code = event.position_code;
             let _code = event.platform_code as KeyCode;
+
+            // Check for Ctrl+Shift+G (or Cmd+Shift+G on macOS) to toggle relative mouse mode.
+            // This is handled here in the rdev grab loop to intercept physical keyboard events
+            // before they are sent to the remote. There is also a duplicate check in Flutter's
+            // InputModel.handleKeyEvent() for web-desktop or when rdev grab is not active.
+            // Both checks are necessary to ensure the shortcut works in all scenarios.
+            #[cfg(feature = "flutter")]
+            if KEYBOARD_HOOKED.load(Ordering::SeqCst) && is_toggle_relative_mouse_shortcut(key, is_press) {
+                notify_toggle_relative_mouse_mode();
+                // Block the key event from being sent to remote
+                return None;
+            }
+
             let res = if KEYBOARD_HOOKED.load(Ordering::SeqCst) {
                 client::process_event(&get_keyboard_mode(), &event, None);
                 if is_press {
@@ -337,9 +383,21 @@ fn start_grab_loop() {
     #[cfg(target_os = "linux")]
     if let Err(err) = rdev::start_grab_listen(move |event: Event| match event.event_type {
         EventType::KeyPress(key) | EventType::KeyRelease(key) => {
+            let is_press = matches!(event.event_type, EventType::KeyPress(_));
             if let Key::Unknown(keycode) = key {
                 log::error!("rdev get unknown key, keycode is {:?}", keycode);
             } else {
+                // Check for Ctrl+Shift+G to toggle relative mouse mode (Flutter only).
+                // This is handled here in the rdev grab loop to intercept physical keyboard events
+                // before they are sent to the remote. There is also a duplicate check in Flutter's
+                // InputModel.handleKeyEvent() for web-desktop or when rdev grab is not active.
+                // Both checks are necessary to ensure the shortcut works in all scenarios.
+                #[cfg(feature = "flutter")]
+                if KEYBOARD_HOOKED.load(Ordering::SeqCst) && is_toggle_relative_mouse_shortcut(key, is_press) {
+                    notify_toggle_relative_mouse_mode();
+                    // Block the key event from being sent to remote
+                    return None;
+                }
                 client::process_event(&get_keyboard_mode(), &event, None);
             }
             None

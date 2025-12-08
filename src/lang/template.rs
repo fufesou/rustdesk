@@ -128,6 +128,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Custom", ""),
         ("Show remote cursor", ""),
         ("Show quality monitor", ""),
+        ("Relative Mouse Mode", ""),
         ("Disable clipboard", ""),
         ("Lock after session end", ""),
         ("Insert Ctrl + Alt + Del", ""),

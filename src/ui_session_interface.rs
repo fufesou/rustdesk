@@ -1,6 +1,5 @@
 use crate::{
     common::{get_supported_keyboard_modes, is_keyboard_mode_supported},
-    input::{MOUSE_BUTTON_LEFT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP, MOUSE_TYPE_WHEEL},
     ui_interface::use_texture_render,
 };
 use async_trait::async_trait;
@@ -1249,7 +1248,7 @@ impl<T: InvokeUiSession> Session<T> {
         // to-do: how about ctrl + left from win to macos
         if cfg!(target_os = "macos") {
             let buttons = mask >> 3;
-            let evt_type = mask & 0x7;
+            let evt_type = mask & MOUSE_TYPE_MASK;
             if buttons == MOUSE_BUTTON_LEFT
                 && evt_type == MOUSE_TYPE_DOWN
                 && ctrl

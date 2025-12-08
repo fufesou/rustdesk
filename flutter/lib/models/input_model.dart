@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
+import 'package:flutter_hbb/utils/relative_mouse_accumulator.dart';
 import 'package:get/get.dart';
 
 import '../../models/model.dart';
@@ -352,11 +353,41 @@ class InputModel {
   var _lastScale = 1.0;
 
   bool _pointerMovedAfterEnter = false;
+  bool _pointerInsideImage = false;
 
   // mouse
   final isPhysicalMouse = false.obs;
   int _lastButtons = 0;
   Offset lastMousePos = Offset.zero;
+
+  // Relative mouse mode (for games/3D apps).
+  // This is a client-side feature that affects only this client's input behavior.
+  // Multiple clients can independently enable/disable relative mouse mode without
+  // affecting each other. The server simply processes mouse events as they arrive,
+  // whether absolute (MOUSE_TYPE_MOVE) or relative (MOUSE_TYPE_MOVE_RELATIVE).
+  // Note: This feature is only available in Flutter client. Sciter client does not support this.
+  final relativeMouseMode = false.obs;
+  final RelativeMouseAccumulator _relativeMouseAccumulator =
+      RelativeMouseAccumulator();
+  // Pointer lock center in LOCAL widget coordinates (for delta calculation)
+  Offset? _pointerLockCenterLocal;
+  // Pointer lock center in SCREEN coordinates (for OS cursor re-centering)
+  Offset? _pointerLockCenterScreen;
+  // Pointer region top-left in Flutter view coordinates.
+  // Computed from PointerEvent.position - PointerEvent.localPosition.
+  Offset? _pointerRegionTopLeftGlobal;
+  // Last pointer position in LOCAL widget coordinates (fallback when center is not ready).
+  Offset? _lastPointerLocalPos;
+  // Track how many times we've hidden the OS cursor (for proper reference count management on Windows)
+  // Windows ShowCursor uses a reference counting mechanism - we need to match hide/show calls exactly.
+  int _cursorHideCount = 0;
+  // Size of the remote image widget (for center calculation)
+  Size? _imageWidgetSize;
+  // Debounce timer for relative mouse mode toggle to prevent race conditions
+  // between Rust rdev grab loop and Flutter keyboard handling
+  DateTime? _lastRelativeMouseToggle;
+  // Callback to cancel external throttle timer when relative mouse mode is disabled
+  VoidCallback? onRelativeMouseModeDisabled;
 
   bool _queryOtherWindowCoords = false;
   Rect? _windowRect;
@@ -367,12 +398,20 @@ class InputModel {
   bool get keyboardPerm => parent.target!.ffiModel.keyboard;
   String get id => parent.target?.id ?? '';
   String? get peerPlatform => parent.target?.ffiModel.pi.platform;
+  String get peerVersion => parent.target?.ffiModel.pi.version ?? '';
   bool get isViewOnly => parent.target!.ffiModel.viewOnly;
   bool get showMyCursor => parent.target!.ffiModel.showMyCursor;
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
   bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
   int get trackpadSpeed => _trackpadSpeed;
   bool get useEdgeScroll => parent.target!.canvasModel.scrollStyle == ScrollStyle.scrolledge;
+
+  /// Check if the connected server supports relative mouse mode.
+  /// Returns true if server version >= kMinVersionForRelativeMouseMode (from consts.dart).
+  bool get isRelativeMouseModeSupported {
+    if (peerVersion.isEmpty) return false;
+    return versionCmp(peerVersion, kMinVersionForRelativeMouseMode) >= 0;
+  }
 
   InputModel(this.parent) {
     sessionId = parent.target!.sessionId;
@@ -565,6 +604,20 @@ class InputModel {
       if (e.physicalKey == PhysicalKeyboardKey.metaLeft ||
           e.physicalKey == PhysicalKeyboardKey.metaRight) {
         return KeyEventResult.handled;
+      }
+    }
+
+    // Shortcut: Ctrl+Shift+G (Windows/Linux) or Cmd+Shift+G (macOS) toggles relative mouse mode.
+    // This check handles the shortcut when rdev grab is not active (e.g., Flutter-only keyboard handling).
+    // There is also a duplicate check in Rust's keyboard.rs for the rdev grab loop to intercept physical
+    // keyboard events. Both checks are necessary to ensure the shortcut works in all scenarios.
+    if (e is KeyDownEvent && e.logicalKey == LogicalKeyboardKey.keyG) {
+      if (isDesktop && keyboardPerm && !isViewCamera) {
+        final isModifierPressed = isMacOS ? command : ctrl;
+        if (isModifierPressed && shift) {
+          toggleRelativeMouseMode();
+          return KeyEventResult.handled;
+        }
       }
     }
 
@@ -853,10 +906,22 @@ class InputModel {
     toReleaseKeys.release(handleKeyEvent);
     toReleaseRawKeys.release(handleRawKeyEvent);
     _pointerMovedAfterEnter = false;
+    _pointerInsideImage = enter;
 
     // Fix status
     if (!enter) {
       resetModifiers();
+      // Ensure cursor is shown and unclipped when leaving the image area.
+      if (relativeMouseMode.value) {
+        _showOsCursor();
+        _releaseCursorClip();
+      }
+    } else {
+      // Re-hide cursor and re-establish pointer lock when (re-)entering.
+      if (relativeMouseMode.value) {
+        _hideOsCursor();
+        updatePointerLockCenter().then((_) => _recenterMouse());
+      }
     }
     _flingTimer?.cancel();
     if (!isInputSourceFlutter) {
@@ -878,15 +943,374 @@ class InputModel {
         msg: json.encode(modify({'x': '$x2', 'y': '$y2'})));
   }
 
+  /// Send relative mouse movement event with delta [dx] and [dy].
+  /// Uses fractional accumulator to handle sub-pixel movements.
+  /// Delta values are clamped to [-kMaxRelativeMouseDelta, kMaxRelativeMouseDelta]
+  /// to prevent overflow on server side.
+  Future<void> sendRelativeMouseMove(double dx, double dy) async {
+    if (!keyboardPerm) return;
+    if (isViewCamera) return;
+    // Only available on desktop platforms
+    if (!isDesktop) return;
+
+    final delta = _relativeMouseAccumulator.add(dx, dy,
+        maxDelta: kMaxRelativeMouseDelta);
+    if (delta == null) return;
+
+    await bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: json.encode(modify(
+            {'type': 'move_relative', 'x': '${delta.x}', 'y': '${delta.y}'})));
+
+    // Re-center mouse after movement to prevent hitting screen edges
+    _recenterMouse();
+  }
+
+  /// Re-center the mouse cursor to the stored center position.
+  /// This is used in relative mouse mode to prevent the cursor from hitting screen edges.
+  void _recenterMouse() {
+    if (!relativeMouseMode.value) return;
+    if (!_pointerInsideImage) return;
+    if (_pointerLockCenterScreen != null) {
+      bind.mainSetCursorPosition(
+          x: _pointerLockCenterScreen!.dx.toInt(),
+          y: _pointerLockCenterScreen!.dy.toInt());
+    }
+  }
+
+  /// Update the pointer lock center position based on current window frame.
+  /// Should be called when entering relative mouse mode or when window moves.
+  /// [localCenter] is the center in local widget coordinates (from the remote image widget).
+  ///
+  /// Note: This method requires _imageWidgetSize to be set (via updateImageWidgetSize)
+  /// before relative mouse mode can be properly enabled. The setRelativeMouseMode()
+  /// method enforces this requirement.
+  Future<void> updatePointerLockCenter({Offset? localCenter}) async {
+    if (!isDesktop) return;
+
+    // Null safety check for kWindowId
+    if (kWindowId == null) {
+      debugPrint('updatePointerLockCenter: kWindowId is null, cannot update pointer lock center');
+      return;
+    }
+
+    try {
+      final wc = WindowController.fromWindowId(kWindowId!);
+      final frame = await wc.getFrame();
+
+      // Validate window frame dimensions to prevent invalid center calculation
+      if (frame.width <= 0 || frame.height <= 0) {
+        debugPrint('updatePointerLockCenter: invalid window frame dimensions (${frame.width}x${frame.height})');
+        if (relativeMouseMode.value) {
+          debugPrint('Disabling relative mouse mode due to invalid window frame');
+          _disableRelativeMouseModeWithCleanup();
+        }
+        return;
+      }
+
+      // Store local center for delta calculation
+      if (localCenter != null) {
+        _pointerLockCenterLocal = localCenter;
+      } else if (_imageWidgetSize != null) {
+        // Use the stored image widget size (always available when relative mode is active)
+        _pointerLockCenterLocal = Offset(
+          _imageWidgetSize!.width / 2,
+          _imageWidgetSize!.height / 2,
+        );
+      } else {
+        // This should not happen if setRelativeMouseMode() is called properly,
+        // but handle gracefully by disabling relative mouse mode
+        debugPrint('updatePointerLockCenter: _imageWidgetSize is null, disabling relative mouse mode');
+        if (relativeMouseMode.value) {
+          _disableRelativeMouseModeWithCleanup();
+        }
+        return;
+      }
+
+      // Calculate screen coordinates for OS cursor positioning.
+      // Try to map the local widget center to OS screen coordinates.
+      // If we don't have enough information (e.g., no pointer events yet),
+      // fall back to the window frame center.
+      final scale = ui.window.devicePixelRatio;
+      if (_pointerRegionTopLeftGlobal != null && scale > 0) {
+        // Estimate the client-area top-left in screen coordinates.
+        // On Windows, getFrame() matches GetWindowRect (outer frame), while Flutter events are in
+        // client-area coordinates. We approximate non-client offsets based on the difference between
+        // window frame size and Flutter view physical size.
+        final clientPhysical = ui.window.physicalSize;
+        final extraW = frame.width - clientPhysical.width;
+        final extraH = frame.height - clientPhysical.height;
+        final borderX = extraW > 0 ? extraW / 2 : 0.0;
+        final borderBottom = borderX;
+        final borderTop = extraH > borderBottom ? extraH - borderBottom : 0.0;
+        final clientTopLeftScreen = Offset(frame.left + borderX, frame.top + borderTop);
+
+        final centerInView = _pointerRegionTopLeftGlobal! + _pointerLockCenterLocal!;
+        _pointerLockCenterScreen = Offset(
+          clientTopLeftScreen.dx + centerInView.dx * scale,
+          clientTopLeftScreen.dy + centerInView.dy * scale,
+        );
+      } else {
+        _pointerLockCenterScreen = Offset(
+          frame.left + frame.width / 2,
+          frame.top + frame.height / 2,
+        );
+      }
+
+      // On Windows, when relative mouse mode is active, also clip the OS cursor
+      // to the window rect to better emulate pointer lock.
+      if (relativeMouseMode.value && isWindows) {
+        _applyCursorClipForFrame(frame);
+      }
+    } catch (e) {
+      debugPrint('Failed to get window frame for pointer lock center: $e');
+      // If we can't get the window frame and relative mouse mode is active,
+      // disable it to prevent user getting stuck with hidden cursor.
+      if (relativeMouseMode.value) {
+        debugPrint('Disabling relative mouse mode due to window frame error');
+        _disableRelativeMouseModeWithCleanup();
+      } else {
+        // If not in relative mode, just clear the local state
+        _pointerLockCenterLocal = null;
+        _pointerLockCenterScreen = null;
+      }
+    }
+  }
+
+  /// Reset relative mouse mode state variables.
+  /// This is the common cleanup logic used by multiple methods.
+  void _resetRelativeMouseModeState() {
+    _relativeMouseAccumulator.reset();
+    _pointerLockCenterLocal = null;
+    _pointerLockCenterScreen = null;
+    _pointerRegionTopLeftGlobal = null;
+    _lastPointerLocalPos = null;
+    _pointerInsideImage = false;
+  }
+
+  /// Internal helper to disable relative mouse mode with guaranteed cleanup.
+  /// This method ensures cursor is restored even if normal cleanup fails.
+  void _disableRelativeMouseModeWithCleanup() {
+    // Force restore cursor first to guarantee visibility
+    _forceRestoreCursor();
+    _releaseCursorClip();
+    // Then set the state
+    relativeMouseMode.value = false;
+    _resetRelativeMouseModeState();
+    // Notify listener to cancel any pending throttle timers
+    onRelativeMouseModeDisabled?.call();
+  }
+
+  /// Apply OS-level cursor clipping to the given window frame (Windows only).
+  /// Callers must ensure this is only called on Windows.
+  void _applyCursorClipForFrame(Rect frame) {
+    final left = frame.left.toInt();
+    final top = frame.top.toInt();
+    final right = (frame.left + frame.width).toInt();
+    final bottom = (frame.top + frame.height).toInt();
+    bind.mainClipCursor(
+      left: left,
+      top: top,
+      right: right,
+      bottom: bottom,
+      enable: true,
+    );
+  }
+
+  /// Release any previously applied OS-level cursor clipping (Windows only).
+  void _releaseCursorClip() {
+    if (!isWindows) return;
+    bind.mainClipCursor(
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+      enable: false,
+    );
+  }
+
+  /// Get the current image widget size (for comparison to avoid unnecessary updates).
+  Size? get imageWidgetSize => _imageWidgetSize;
+
+  /// Update the image widget size for center calculation.
+  /// Should be called from the remote page when the widget size changes.
+  void updateImageWidgetSize(Size size) {
+    _imageWidgetSize = size;
+    // If in relative mouse mode, update the center
+    if (relativeMouseMode.value) {
+      _pointerLockCenterLocal = Offset(size.width / 2, size.height / 2);
+    }
+  }
+
+  /// Toggle relative mouse mode on/off.
+  /// Includes debounce protection to prevent race conditions when both
+  /// Rust rdev grab loop and Flutter keyboard handling detect the shortcut.
+  void toggleRelativeMouseMode() {
+    // Debounce: ignore toggles within kRelativeMouseModeToggleDebounceMs
+    // to prevent double-toggle from race condition
+    final now = DateTime.now();
+    if (_lastRelativeMouseToggle != null &&
+        now.difference(_lastRelativeMouseToggle!).inMilliseconds < kRelativeMouseModeToggleDebounceMs) {
+      debugPrint('Ignoring relative mouse mode toggle: debounce protection');
+      return;
+    }
+    _lastRelativeMouseToggle = now;
+    setRelativeMouseMode(!relativeMouseMode.value);
+  }
+
+  /// Set relative mouse mode.
+  /// Returns false if the server doesn't support relative mouse mode or if
+  /// the image widget size is not yet available (required for proper center calculation).
+  bool setRelativeMouseMode(bool enabled) {
+    if (!isDesktop) return false;
+    // Check server version support before enabling
+    if (enabled && !isRelativeMouseModeSupported) {
+      debugPrint('Relative mouse mode not supported by server version: $peerVersion (requires >= $kMinVersionForRelativeMouseMode)');
+      return false;
+    }
+    // Ensure image widget size is available for proper center calculation
+    if (enabled && _imageWidgetSize == null) {
+      debugPrint('Relative mouse mode cannot be enabled: image widget size not yet available');
+      return false;
+    }
+
+    if (enabled) {
+      // Entering relative mode - hide cursor, update center and clip cursor.
+      // Wrap in try-catch to guarantee cleanup on any failure.
+      try {
+        relativeMouseMode.value = true;
+        _hideOsCursor();
+        updatePointerLockCenter().then((_) => _recenterMouse()).catchError((e) {
+          debugPrint('Failed to update pointer lock center: $e');
+          // Cleanup on async failure
+          _disableRelativeMouseModeWithCleanup();
+        });
+      } catch (e) {
+        debugPrint('Failed to enable relative mouse mode: $e');
+        // Ensure cleanup on any synchronous failure
+        _disableRelativeMouseModeWithCleanup();
+        return false;
+      }
+    } else {
+      // Exiting relative mode - show cursor, release clip and reset state.
+      _showOsCursor();
+      _releaseCursorClip();
+      relativeMouseMode.value = false;
+      _resetRelativeMouseModeState();
+      // Notify listener to cancel any pending throttle timers
+      onRelativeMouseModeDisabled?.call();
+    }
+    // Note: relative mouse mode is not persisted to config
+    return true;
+  }
+
+  /// Hide OS cursor (with reference count protection)
+  /// Windows ShowCursor uses reference counting - each hide decrements, each show increments.
+  /// We track our own count to ensure we only show as many times as we've hidden.
+  void _hideOsCursor() {
+    if (_cursorHideCount == 0) {
+      bind.mainShowCursor(show: false);
+      _cursorHideCount = 1;
+    }
+  }
+
+  /// Show OS cursor (with reference count protection)
+  /// Only shows if we previously hid the cursor, preventing reference count imbalance.
+  void _showOsCursor() {
+    if (_cursorHideCount > 0) {
+      bind.mainShowCursor(show: true);
+      _cursorHideCount = 0;
+    }
+  }
+
+  /// Force restore cursor visibility - used during cleanup to ensure cursor is visible.
+  /// This handles edge cases like crashes or unexpected state by resetting to a known good state.
+  void _forceRestoreCursor() {
+    while (_cursorHideCount > 0) {
+      bind.mainShowCursor(show: true);
+      _cursorHideCount--;
+    }
+  }
+
+  /// Dispose resources related to relative mouse mode.
+  /// Called when the session is closed to ensure proper cleanup.
+  void disposeRelativeMouseMode() {
+    // Force restore cursor in case of any state inconsistency
+    _forceRestoreCursor();
+    _releaseCursorClip();
+    _resetRelativeMouseModeState();
+    _imageWidgetSize = null;
+    _lastRelativeMouseToggle = null;
+    // Clear callback to avoid memory leaks and stale references
+    onRelativeMouseModeDisabled = null;
+    relativeMouseMode.value = false;
+  }
+
+  /// Called when the window loses focus.
+  /// Temporarily releases cursor constraints to allow user to interact with other apps.
+  void onWindowBlur() {
+    if (!relativeMouseMode.value) return;
+    _showOsCursor();
+    _releaseCursorClip();
+  }
+
+  /// Called when the window regains focus.
+  /// Restores cursor constraints for relative mouse mode.
+  void onWindowFocus() {
+    if (!relativeMouseMode.value) return;
+    // Guard: image widget size must be available for proper center calculation
+    if (_imageWidgetSize == null) {
+      debugPrint('onWindowFocus: _imageWidgetSize is null, disabling relative mouse mode');
+      _disableRelativeMouseModeWithCleanup();
+      return;
+    }
+    _hideOsCursor();
+    updatePointerLockCenter().then((_) => _recenterMouse());
+  }
+
+  /// Handle relative mouse movement based on current position.
+  /// This is a common method used by both onPointHoverImage and onPointMoveImage.
+  /// Returns true if the event was handled in relative mode, false otherwise.
+  bool _handleRelativeMouseMove(Offset localPosition) {
+    if (!relativeMouseMode.value) return false;
+
+    final lastLocal = _lastPointerLocalPos;
+    _lastPointerLocalPos = localPosition;
+
+    final center = _pointerLockCenterLocal;
+    if (center != null) {
+      // Calculate delta from LOCAL CENTER position, not last position.
+      // This prevents feedback loop when re-centering cursor.
+      final delta = localPosition - center;
+      if (delta.dx != 0 || delta.dy != 0) {
+        sendRelativeMouseMove(delta.dx, delta.dy);
+      }
+    } else if (lastLocal != null) {
+      // Fallback while center is not ready yet.
+      final delta = localPosition - lastLocal;
+      if (delta.dx != 0 || delta.dy != 0) {
+        sendRelativeMouseMove(delta.dx, delta.dy);
+      }
+    }
+    return true;
+  }
+
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
     if (isViewOnly && !showMyCursor) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
+
+    // Keep the pointer region origin in sync for mapping local -> global.
+    _pointerRegionTopLeftGlobal = e.position - e.localPosition;
+
     if (!isPhysicalMouse.value) {
       isPhysicalMouse.value = true;
     }
     if (isPhysicalMouse.value) {
-      handleMouse(_getMouseEvent(e, _kMouseEventMove), e.position, edgeScroll: useEdgeScroll);
+      if (!_handleRelativeMouseMove(e.localPosition)) {
+        handleMouse(_getMouseEvent(e, _kMouseEventMove), e.position,
+            edgeScroll: useEdgeScroll);
+      }
     }
   }
 
@@ -1043,13 +1467,22 @@ class InputModel {
     _windowRect = null;
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
+
+    // Keep the pointer region origin in sync for mapping local -> global.
+    _pointerRegionTopLeftGlobal = e.position - e.localPosition;
+
     if (e.kind != ui.PointerDeviceKind.mouse) {
       if (isPhysicalMouse.value) {
         isPhysicalMouse.value = false;
       }
     }
     if (isPhysicalMouse.value) {
-      handleMouse(_getMouseEvent(e, _kMouseEventDown), e.position);
+      // In relative mouse mode, send button events without position
+      if (relativeMouseMode.value) {
+        _sendRelativeMouseButton(_getMouseEvent(e, _kMouseEventDown));
+      } else {
+        handleMouse(_getMouseEvent(e, _kMouseEventDown), e.position);
+      }
     }
   }
 
@@ -1057,16 +1490,78 @@ class InputModel {
     if (isDesktop) _queryOtherWindowCoords = false;
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
+
+    // Keep the pointer region origin in sync for mapping local -> global.
+    _pointerRegionTopLeftGlobal = e.position - e.localPosition;
+
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isPhysicalMouse.value) {
-      handleMouse(_getMouseEvent(e, _kMouseEventUp), e.position);
+      // In relative mouse mode, send button events without position
+      if (relativeMouseMode.value) {
+        _sendRelativeMouseButton(_getMouseEvent(e, _kMouseEventUp));
+      } else {
+        handleMouse(_getMouseEvent(e, _kMouseEventUp), e.position);
+      }
     }
+  }
+
+  static String _mouseEventTypeToPeer(String type) {
+    switch (type) {
+      case _kMouseEventDown:
+        return kMouseEventTypeDown;
+      case _kMouseEventUp:
+        return kMouseEventTypeUp;
+      default:
+        return '';
+    }
+  }
+
+  static String _mouseButtonsToPeer(int buttons) {
+    // Keep consistent with processEventToPeer() mapping.
+    switch (buttons) {
+      case kPrimaryMouseButton:
+        return 'left';
+      case kSecondaryMouseButton:
+        return 'right';
+      case kMiddleMouseButton:
+        return 'wheel';
+      case kBackMouseButton:
+        return 'back';
+      case kForwardMouseButton:
+        return 'forward';
+      default:
+        return '';
+    }
+  }
+
+  /// Send mouse button event without position (for relative mouse mode)
+  Future<void> _sendRelativeMouseButton(Map<String, dynamic> evt) async {
+    if (!keyboardPerm) return;
+    if (isViewCamera) return;
+
+    final rawType = evt['type'];
+    final rawButtons = evt['buttons'];
+    if (rawType is! String || rawButtons is! int) return;
+
+    final type = _mouseEventTypeToPeer(rawType);
+    if (type.isEmpty) return;
+
+    final buttons = _mouseButtonsToPeer(rawButtons);
+    if (buttons.isEmpty) return;
+
+    await bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: json.encode(modify({'type': type, 'buttons': buttons})));
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
+
+    // Keep the pointer region origin in sync for mapping local -> global.
+    _pointerRegionTopLeftGlobal = e.position - e.localPosition;
+
     if (_queryOtherWindowCoords) {
       Future.delayed(Duration.zero, () async {
         _windowRect = await fillRemoteCoordsAndGetCurFrame(_remoteWindowCoords);
@@ -1074,7 +1569,10 @@ class InputModel {
       _queryOtherWindowCoords = false;
     }
     if (isPhysicalMouse.value) {
-      handleMouse(_getMouseEvent(e, _kMouseEventMove), e.position, edgeScroll: useEdgeScroll);
+      if (!_handleRelativeMouseMove(e.localPosition)) {
+        handleMouse(_getMouseEvent(e, _kMouseEventMove), e.position,
+            edgeScroll: useEdgeScroll);
+      }
     }
   }
 
@@ -1098,6 +1596,11 @@ class InputModel {
     return null;
   }
 
+  /// Handle scroll/wheel events.
+  /// Note: Scroll events intentionally use absolute positioning even in relative mouse mode.
+  /// This is because scroll events don't need relative positioning - they represent
+  /// scroll deltas that are independent of cursor position. Games and 3D applications
+  /// handle scroll events the same way regardless of mouse mode.
   void onPointerSignalImage(PointerSignalEvent e) {
     if (isViewOnly) return;
     if (isViewCamera) return;
@@ -1285,14 +1788,12 @@ class InputModel {
       evt['y'] = '${pos.y.toInt()}';
     }
 
-    Map<int, String> mapButtons = {
-      kPrimaryMouseButton: 'left',
-      kSecondaryMouseButton: 'right',
-      kMiddleMouseButton: 'wheel',
-      kBackMouseButton: 'back',
-      kForwardMouseButton: 'forward'
-    };
-    evt['buttons'] = mapButtons[evt['buttons']] ?? '';
+    final buttons = evt['buttons'];
+    if (buttons is int) {
+      evt['buttons'] = _mouseButtonsToPeer(buttons);
+    } else {
+      evt['buttons'] = '';
+    }
     return evt;
   }
 
