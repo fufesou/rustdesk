@@ -90,6 +90,10 @@ class _RemotePageState extends State<RemotePage>
 
   final FocusNode _rawKeyFocusNode = FocusNode(debugLabel: "rawkeyFocusNode");
 
+  // Throttle timer for pointer lock center updates during window events.
+  // Uses kDefaultPointerLockCenterThrottleMs from consts.dart for the duration.
+  Timer? _pointerLockCenterThrottleTimer;
+
   // We need `_instanceIdOnEnterOrLeaveImage4Toolbar` together with `_onEnterOrLeaveImage4Toolbar`
   // to identify the toolbar instance and its callback function.
   int? _instanceIdOnEnterOrLeaveImage4Toolbar;
@@ -171,6 +175,15 @@ class _RemotePageState extends State<RemotePage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       widget.tabController?.onSelected?.call(widget.id);
     });
+
+    // Register callback to cancel throttle timer when relative mouse mode is disabled
+    _ffi.inputModel.onRelativeMouseModeDisabled = _cancelPointerLockCenterThrottleTimer;
+  }
+
+  /// Cancel the pointer lock center throttle timer
+  void _cancelPointerLockCenterThrottleTimer() {
+    _pointerLockCenterThrottleTimer?.cancel();
+    _pointerLockCenterThrottleTimer = null;
   }
 
   @override
@@ -186,6 +199,13 @@ class _RemotePageState extends State<RemotePage>
       _rawKeyFocusNode.unfocus();
     }
     stateGlobal.isFocused.value = false;
+
+    // When window loses focus, temporarily release relative mouse mode constraints
+    // to allow user to interact with other applications normally.
+    // The cursor will be re-hidden and re-centered when window regains focus.
+    if (_ffi.inputModel.relativeMouseMode.value) {
+      _ffi.inputModel.onWindowBlur();
+    }
   }
 
   @override
@@ -196,6 +216,11 @@ class _RemotePageState extends State<RemotePage>
       _isWindowBlur = false;
     }
     stateGlobal.isFocused.value = true;
+
+    // Restore relative mouse mode constraints when window regains focus.
+    if (_ffi.inputModel.relativeMouseMode.value) {
+      _ffi.inputModel.onWindowFocus();
+    }
   }
 
   @override
@@ -209,6 +234,8 @@ class _RemotePageState extends State<RemotePage>
     if (!isLinux) {
       WakelockPlus.enable();
     }
+    // Update pointer lock center when window is restored
+    _updatePointerLockCenterIfNeeded();
   }
 
   // When the window is unminimized, onWindowMaximize or onWindowRestore can be called when the old state was maximized or not.
@@ -218,6 +245,39 @@ class _RemotePageState extends State<RemotePage>
     if (!isLinux) {
       WakelockPlus.enable();
     }
+    // Update pointer lock center when window is maximized
+    _updatePointerLockCenterIfNeeded();
+  }
+
+  @override
+  void onWindowResize() {
+    super.onWindowResize();
+    // Update pointer lock center when window is resized
+    _updatePointerLockCenterIfNeeded();
+  }
+
+  @override
+  void onWindowMove() {
+    super.onWindowMove();
+    // Update pointer lock center when window is moved
+    _updatePointerLockCenterIfNeeded();
+  }
+
+  /// Update pointer lock center with throttling to avoid excessive updates
+  /// during rapid window move/resize events.
+  void _updatePointerLockCenterIfNeeded() {
+    if (!_ffi.inputModel.relativeMouseMode.value) return;
+
+    // Cancel any pending update and schedule a new one
+    _pointerLockCenterThrottleTimer?.cancel();
+    _pointerLockCenterThrottleTimer = Timer(
+      const Duration(milliseconds: kDefaultPointerLockCenterThrottleMs),
+      () {
+        if (_ffi.inputModel.relativeMouseMode.value) {
+          _ffi.inputModel.updatePointerLockCenter();
+        }
+      },
+    );
   }
 
   @override
@@ -225,6 +285,10 @@ class _RemotePageState extends State<RemotePage>
     super.onWindowMinimize();
     if (!isLinux) {
       WakelockPlus.disable();
+    }
+    // Release cursor constraints when minimized
+    if (_ffi.inputModel.relativeMouseMode.value) {
+      _ffi.inputModel.onWindowBlur();
     }
   }
 
@@ -251,6 +315,12 @@ class _RemotePageState extends State<RemotePage>
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     debugPrint("REMOTE PAGE dispose session $sessionId ${widget.id}");
+    _pointerLockCenterThrottleTimer?.cancel();
+    _pointerLockCenterThrottleTimer = null;
+    // Clear callback reference to prevent memory leaks and stale references
+    _ffi.inputModel.onRelativeMouseModeDisabled = null;
+    // Ensure relative mouse mode is properly cleaned up
+    _ffi.inputModel.disposeRelativeMouseMode();
     _ffi.textureModel.onRemotePageDispose(closeSession);
     if (closeSession) {
       // ensure we leave this session, this is a double check
@@ -425,6 +495,7 @@ class _RemotePageState extends State<RemotePage>
         //
       }
     }
+
     // See [onWindowBlur].
     if (!isWindows) {
       if (!_rawKeyFocusNode.hasFocus) {
@@ -450,6 +521,7 @@ class _RemotePageState extends State<RemotePage>
         //
       }
     }
+
     // See [onWindowBlur].
     if (!isWindows) {
       _ffi.inputModel.enterOrLeave(false);
@@ -511,6 +583,13 @@ class _RemotePageState extends State<RemotePage>
               : Obx(() {
                   widget.toolbarState.initShow(sessionId);
                   _ffi.textureModel.updateCurrentDisplay(peerDisplay.value);
+                  // Update image widget size for relative mouse mode (only if size changed)
+                  final newSize = Size(constraints.maxWidth, constraints.maxHeight);
+                  if (_ffi.inputModel.imageWidgetSize != newSize) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      _ffi.inputModel.updateImageWidgetSize(newSize);
+                    });
+                  }
                   return ImagePaint(
                     id: widget.id,
                     zoomCursor: _zoomCursor,
@@ -616,21 +695,24 @@ class _ImagePaintState extends State<ImagePaint> {
               cursor: cursorOverImage.isTrue
                   ? c.cursorEmbedded
                       ? SystemMouseCursors.none
-                      : keyboardEnabled.isTrue
-                          ? (() {
-                              if (remoteCursorMoved.isTrue) {
-                                _lastRemoteCursorMoved = true;
-                                return SystemMouseCursors.none;
-                              } else {
-                                if (_lastRemoteCursorMoved) {
-                                  _lastRemoteCursorMoved = false;
-                                  _firstEnterImage.value = true;
-                                }
-                                return _buildCustomCursor(
-                                    context, getCursorScale());
-                              }
-                            }())
-                          : _buildDisabledCursor(context, getCursorScale())
+                      // Hide cursor when relative mouse mode is active
+                      : widget.ffi.inputModel.relativeMouseMode.value
+                          ? SystemMouseCursors.none
+                          : keyboardEnabled.isTrue
+                              ? (() {
+                                  if (remoteCursorMoved.isTrue) {
+                                    _lastRemoteCursorMoved = true;
+                                    return SystemMouseCursors.none;
+                                  } else {
+                                    if (_lastRemoteCursorMoved) {
+                                      _lastRemoteCursorMoved = false;
+                                      _firstEnterImage.value = true;
+                                    }
+                                    return _buildCustomCursor(
+                                        context, getCursorScale());
+                                  }
+                                }())
+                              : _buildDisabledCursor(context, getCursorScale())
                   : MouseCursor.defer,
               onHover: (evt) {},
               child: child);

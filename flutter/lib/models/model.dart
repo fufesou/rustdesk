@@ -457,6 +457,13 @@ class FfiModel with ChangeNotifier {
         _handlePrinterRequest(evt, sessionId, peerId);
       } else if (name == 'screenshot') {
         _handleScreenshot(evt, sessionId, peerId);
+      } else if (name == 'toggle_relative_mouse_mode') {
+        // Handle Ctrl+Shift+G (or Cmd+Shift+G on macOS) shortcut from rdev grab
+        parent.target?.inputModel.toggleRelativeMouseMode();
+      } else if (name == 'exit_relative_mouse_mode') {
+        // Handle ESC shortcut from rdev grab.
+        // When relative mouse mode is enabled, ESC exits the mode and must not be sent to the peer.
+        parent.target?.inputModel.setRelativeMouseMode(false);
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -780,6 +787,16 @@ class FfiModel with ChangeNotifier {
       parent.target?.canvasModel
           .updateViewStyle(refreshMousePos: updateCursorPos);
       _updateSessionWidthHeight(sessionId);
+
+      // Keep pointer lock center in sync when using relative mouse mode.
+      try {
+        final inputModel = parent.target?.inputModel;
+        if (inputModel != null && inputModel.relativeMouseMode.value) {
+          inputModel.updatePointerLockCenter();
+        }
+      } catch (e) {
+        // Ignore any errors here, pointer lock is a best-effort feature.
+      }
     }
   }
 
@@ -1183,8 +1200,11 @@ class FfiModel with ChangeNotifier {
 
     _queryAuditGuid(peerId);
 
-    // This call is to ensuer the keyboard mode is updated depending on the peer version.
+    // This call is to ensure the keyboard mode is updated depending on the peer version.
     parent.target?.inputModel.updateKeyboardMode();
+    // Note: Relative mouse mode is NOT auto-enabled on connect.
+    // Users must manually enable it via toolbar or keyboard shortcut (Ctrl+Shift+G / Cmd+Shift+G).
+    // This is intentional to avoid confusing users who expect normal absolute mouse mode.
 
     // Map clone is required here, otherwise "evt" may be changed by other threads through the reference.
     // Because this function is asynchronous, there's an "await" in this function.
@@ -3759,6 +3779,8 @@ class FFI {
     ffiModel.clear();
     canvasModel.clear();
     inputModel.resetModifiers();
+    // Dispose relative mouse mode resources to ensure cursor is restored
+    inputModel.disposeRelativeMouseMode();
     if (closeSession) {
       await bind.sessionClose(sessionId: sessionId);
     }

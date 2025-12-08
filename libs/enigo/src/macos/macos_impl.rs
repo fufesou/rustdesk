@@ -208,42 +208,45 @@ impl MouseControllable for Enigo {
     }
 
     fn mouse_move_to(&mut self, x: i32, y: i32) {
-        let pressed = Self::pressed_buttons();
-
-        let event_type = if pressed & 1 > 0 {
-            CGEventType::LeftMouseDragged
-        } else if pressed & 2 > 0 {
-            CGEventType::RightMouseDragged
-        } else {
-            CGEventType::MouseMoved
-        };
-
-        let dest = CGPoint::new(x as f64, y as f64);
-        if let Some(src) = self.event_source.as_ref() {
-            if let Ok(event) =
-                CGEvent::new_mouse_event(src.clone(), event_type, dest, CGMouseButton::Left)
-            {
-                self.post(event, None);
-            }
-        }
+        // For absolute movement, we don't set delta values
+        // This maintains backward compatibility
+        self.mouse_move_to_impl(x, y, None);
     }
 
     fn mouse_move_relative(&mut self, x: i32, y: i32) {
         let (display_width, display_height) = Self::main_display_size();
         let (current_x, y_inv) = Self::mouse_location_raw_coords();
         let current_y = (display_height as i32) - y_inv;
-        let new_x = current_x + x;
-        let new_y = current_y + y;
+        let mut new_x = current_x + x;
+        let mut new_y = current_y + y;
 
-        if new_x < 0
-            || new_x as usize > display_width
-            || new_y < 0
-            || new_y as usize > display_height
-        {
-            return;
+        // Define screen center and edge margins for cursor reset
+        let center_x = (display_width / 2) as i32;
+        let center_y = (display_height / 2) as i32;
+        let margin = 50; // pixels from edge to trigger reset
+
+        // Check if cursor is approaching screen boundaries
+        let near_edge = new_x < margin
+            || new_x > (display_width as i32 - margin)
+            || new_y < margin
+            || new_y > (display_height as i32 - margin);
+
+        if near_edge {
+            // Reset cursor to screen center to allow continuous movement
+            // The delta values are still passed correctly for games/apps
+            new_x = center_x;
+            new_y = center_y;
         }
 
-        self.mouse_move_to(new_x, new_y);
+        // Clamp to screen bounds as a safety measure
+        new_x = new_x.clamp(0, display_width as i32);
+        new_y = new_y.clamp(0, display_height as i32);
+
+        // Pass delta values for relative movement
+        // This is critical for browser Pointer Lock API support
+        // The delta fields (MOUSE_EVENT_DELTA_X/Y) are used by browsers
+        // to calculate movementX/Y in Pointer Lock mode
+        self.mouse_move_to_impl(new_x, new_y, Some((x, y)));
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> crate::ResultType {
@@ -470,6 +473,39 @@ impl Enigo {
             unsafe { msg_send![ns_event, pressedMouseButtons] }
         } else {
             0
+        }
+    }
+
+    /// Internal implementation for mouse movement with optional delta values.
+    ///
+    /// The `delta` parameter is crucial for browser Pointer Lock API support.
+    /// When a browser enters Pointer Lock mode, it reads mouse delta values
+    /// (MOUSE_EVENT_DELTA_X/Y) directly from CGEvent to calculate movementX/Y.
+    /// Without setting these fields, the browser sees zero movement.
+    fn mouse_move_to_impl(&mut self, x: i32, y: i32, delta: Option<(i32, i32)>) {
+        let pressed = Self::pressed_buttons();
+
+        let event_type = if pressed & 1 > 0 {
+            CGEventType::LeftMouseDragged
+        } else if pressed & 2 > 0 {
+            CGEventType::RightMouseDragged
+        } else {
+            CGEventType::MouseMoved
+        };
+
+        let dest = CGPoint::new(x as f64, y as f64);
+        if let Some(src) = self.event_source.as_ref() {
+            if let Ok(event) =
+                CGEvent::new_mouse_event(src.clone(), event_type, dest, CGMouseButton::Left)
+            {
+                // Set delta fields for relative mouse movement
+                // This is essential for Pointer Lock API in browsers
+                if let Some((dx, dy)) = delta {
+                    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
+                    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                }
+                self.post(event, None);
+            }
         }
     }
 

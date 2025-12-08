@@ -729,5 +729,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("server-oss-not-support-tip", "注意：RustDesk 開源伺服器 (OSS server) 不包含此功能。"),
         ("input note here", "輸入備註"),
         ("note-at-conn-end-tip", "在連接結束時請求備註"),
+        ("Relative Mouse Mode", ""),
+        ("Enable Relative Mouse Shortcut", ""),
+        ("rel-mouse-not-supported-wayland-tip", ""),
+        ("rel-mouse-not-supported-peer-tip", ""),
+        ("rel-mouse-not-ready-tip", ""),
+        ("rel-mouse-lock-failed-tip", ""),
     ].iter().cloned().collect();
 }
