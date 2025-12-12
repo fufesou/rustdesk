@@ -98,7 +98,7 @@ enigo = { path = "libs/enigo", features = [ "with_serde" ] }
 clipboard = { path = "libs/clipboard" }
 ctrlc = "3.2"
 # arboard = { version = "3.4", features = ["wayland-data-control"] }
-arboard = { git = "https://github.com/rustdesk-org/arboard", features = ["wayland-data-control"] }
+arboard = { git = "https://github.com/fufesou/arboard", branch = "exp/clipimg-S2-dedupe-prefer-png-at-source", features = ["wayland-data-control"] }
 clipboard-master = { git = "https://github.com/rustdesk-org/clipboard-master" }
 portable-pty = { git = "https://github.com/rustdesk-org/wezterm", branch = "rustdesk/pty_based_0.8.1", package = "portable-pty" }
 
