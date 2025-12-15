@@ -226,6 +226,10 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
     // Otherwise, we use the logical size for `uinput`.
     if displays.len() == 1 {
         let d = &displays[0];
+        hbb_common::log::info!(
+            "============== get_desktop_rect_for_uinput (single): x_range=({}, {}), y_range=({}, {})",
+            d.x, d.x + d.width, d.y, d.y + d.height
+        );
         return Some((d.x, d.x + d.width, d.y, d.y + d.height));
     }
 
@@ -234,6 +238,10 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
     let mut max_x = i32::MIN;
     let mut max_y = i32::MIN;
     for d in displays.iter() {
+        hbb_common::log::info!(
+            "============== get_desktop_rect_for_uinput display: origin=({}, {}), logical_size={:?}, physical_size=({}, {})",
+            d.x, d.y, d.logical_size, d.width, d.height
+        );
         min_x = min_x.min(d.x);
         min_y = min_y.min(d.y);
         let size = if let Some(logical_size) = d.logical_size {
@@ -252,5 +260,9 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
         max_x = max_x.max(d.x + size.0);
         max_y = max_y.max(d.y + size.1);
     }
+    hbb_common::log::info!(
+        "============== get_desktop_rect_for_uinput FINAL: x_range=({}, {}), y_range=({}, {})",
+        min_x, max_x, min_y, max_y
+    );
     Some((min_x, max_x, min_y, max_y))
 }

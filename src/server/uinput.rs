@@ -622,7 +622,7 @@ pub mod service {
         let rng_y = resolution.1.clone();
         tokio::spawn(async move {
             log::info!(
-                "Create uinput mouce with rng_x: ({}, {}), rng_y: ({}, {})",
+                "============== uinput_device_create: x_range=({}, {}), y_range=({}, {})",
                 rng_x.0,
                 rng_x.1,
                 rng_y.0,
@@ -651,7 +651,7 @@ pub mod service {
                                             let rng_x = resolution.0.clone();
                                             let rng_y = resolution.1.clone();
                                             log::info!(
-                                                "Refresh uinput mouce with rng_x: ({}, {}), rng_y: ({}, {})",
+                                                "============== uinput_device_refresh: x_range=({}, {}), y_range=({}, {})",
                                                 rng_x.0,
                                                 rng_x.1,
                                                 rng_y.0,
@@ -1065,6 +1065,11 @@ mod mouce {
             //self.move_relative(i32::MIN, i32::MIN)?;
             //self.move_relative(x as i32, y as i32)
 
+            static UINPUT_LOG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = UINPUT_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 20 == 0 {
+                hbb_common::log::info!("============== uinput_move_to #{}: x={}, y={}", count, x, y);
+            }
             self.emit(EV_ABS, ABS_X as c_int, x as c_int)?;
             self.emit(EV_ABS, ABS_Y as c_int, y as c_int)?;
             self.syncronize()

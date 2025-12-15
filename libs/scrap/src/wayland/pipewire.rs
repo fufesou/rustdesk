@@ -1126,10 +1126,18 @@ fn try_fill_positions(
         if let crate::Display::WAYLAND(d) = sd {
             let capturable = &mut d.0;
             let mut match_count = 0;
+            hbb_common::log::info!(
+                "============== fill_positions: stream[{}] size={:?}, initial_pos={:?}",
+                i, capturable.physical_size, capturable.position
+            );
             for wd in displays.displays.iter() {
                 if capturable.physical_size.0 == wd.width as usize
                     && capturable.physical_size.1 == wd.height as usize
                 {
+                    hbb_common::log::info!(
+                        "============== fill_positions: stream[{}] MATCHED display '{}' at ({}, {})",
+                        i, wd.name, wd.x, wd.y
+                    );
                     capturable.position = (wd.x, wd.y);
                     if let Some(pw_stream) = streams.get_mut(i) {
                         pw_stream.position = (wd.x, wd.y);

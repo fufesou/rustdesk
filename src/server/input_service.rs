@@ -1049,6 +1049,11 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     }
     match evt_type {
         MOUSE_TYPE_MOVE => {
+            static MOUSE_LOG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = MOUSE_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 20 == 0 {
+                log::info!("============== mouse_from_client #{}: x={}, y={}", count, evt.x, evt.y);
+            }
             en.mouse_move_to(evt.x, evt.y);
             *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                 conn,

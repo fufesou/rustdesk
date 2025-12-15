@@ -312,7 +312,8 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
         && scrap::wayland::display::get_displays().displays.len() > 1;
     let displays = all
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             let display_name = d.name();
             #[allow(unused_assignments)]
             #[allow(unused_mut)]
@@ -332,9 +333,14 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
                 ((d.width() as f64) / scale).round() as usize,
                 (d.height() as f64 / scale).round() as usize,
             );
+            let origin = d.origin();
+            log::info!(
+                "============== DisplayInfo to client: display[{}] origin=({}, {}), size=({}, {}), scale={}",
+                i, origin.0, origin.1, d.width(), d.height(), scale
+            );
             DisplayInfo {
-                x: d.origin().0 as _,
-                y: d.origin().1 as _,
+                x: origin.0 as _,
+                y: origin.1 as _,
                 width: d.width() as _,
                 height: d.height() as _,
                 name: display_name,
