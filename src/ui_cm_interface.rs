@@ -465,6 +465,18 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                         stop, is_stopping_allowed, is_clipboard_enabled, file_transfer_enabled);
                                     if stop {
                                         ContextSend::set_is_stopped();
+                                        // When file transfer is disabled and we receive a FileContentsRequest,
+                                        // send an error response immediately to avoid client timeout
+                                        if let ipc::ClipboardFile::FileContentsRequest { stream_id, .. } = _clip {
+                                            log::debug!("File transfer disabled, sending error response for stream_id {}", stream_id);
+                                            allow_err!(self.tx.send(Data::ClipboardFile(
+                                                ipc::ClipboardFile::FileContentsResponse {
+                                                    msg_flags: 0x2, // CB_RESPONSE_FAIL
+                                                    stream_id,
+                                                    requested_data: vec![],
+                                                }
+                                            )));
+                                        }
                                     } else {
                                         if !is_authorized {
                                             log::debug!("Clipboard message from client peer, but not authorized");

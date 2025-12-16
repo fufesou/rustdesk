@@ -627,6 +627,11 @@ impl Connection {
                                 if !enabled {
                                     conn.try_empty_file_clipboard();
                                 }
+                                #[cfg(target_os = "windows")]
+                                if !enabled {
+                                    // Send TryEmpty to client to clear file clipboard and avoid timeout
+                                    conn.send(clip_2_msg(clipboard::ClipboardFile::TryEmpty)).await;
+                                }
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if let Some(s) = conn.server.upgrade() {
                                     s.write().unwrap().subscribe(
