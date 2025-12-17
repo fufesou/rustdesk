@@ -729,5 +729,12 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("server-oss-not-support-tip", "NOT: RustDesk sunucu OSS'si bu özelliği içermemektedir."),
         ("input note here", "Notu buraya girin"),
         ("note-at-conn-end-tip", "Bağlantı bittiğinde not sorulsun"),
+        ("Relative Mouse Mode", ""),
+        ("Enable Relative Mouse Shortcut", ""),
+        ("rel-mouse-not-supported-wayland-tip", ""),
+        ("rel-mouse-not-supported-peer-tip", ""),
+        ("rel-mouse-not-ready-tip", ""),
+        ("rel-mouse-lock-failed-tip", ""),
+        ("rel-mouse-entered-tip", ""),
     ].iter().cloned().collect();
 }

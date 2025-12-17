@@ -397,7 +397,12 @@ class _RawTouchGestureDetectorRegionState
     if (handleTouch && !_touchModePanStarted) {
       return;
     }
-    await ffi.cursorModel.updatePan(d.delta, d.localPosition, handleTouch);
+    // In relative mouse mode, send delta directly without position tracking.
+    if (inputModel.relativeMouseMode.value) {
+      await inputModel.sendMobileRelativeMouseMove(d.delta.dx, d.delta.dy);
+    } else {
+      await ffi.cursorModel.updatePan(d.delta, d.localPosition, handleTouch);
+    }
   }
 
   onOneFingerPanEnd(DragEndDetails d) async {

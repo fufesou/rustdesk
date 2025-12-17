@@ -233,6 +233,9 @@ List<(String, String)> otherDefaultSettings() {
     ('True color (4:4:4)', kOptionI444),
     ('Reverse mouse wheel', kKeyReverseMouseWheel),
     ('swap-left-right-mouse', kOptionSwapLeftRightMouse),
+    // Relative mouse mode shortcut is desktop-only and not supported on Linux/Wayland
+    if (isDesktop && !(isLinux && bind.mainCurrentIsWayland()))
+      ('Enable Relative Mouse Shortcut', kOptionEnableRelativeMouseShortcut),
     if (isDesktop)
       (
         'Show displays as individual windows',

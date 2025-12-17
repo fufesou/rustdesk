@@ -2020,5 +2020,23 @@ class RustdeskImpl {
     return js.context.callMethod('getByName', ['audit_guid']);
   }
 
+  bool mainSetCursorPosition({required int x, required int y, dynamic hint}) {
+    return false;
+  }
+
+  int mainShowCursor({required bool show, dynamic hint}) {
+    return 0;
+  }
+
+  bool mainClipCursor(
+      {required int left,
+      required int top,
+      required int right,
+      required int bottom,
+      required bool enable,
+      dynamic hint}) {
+    return false;
+  }
+
   void dispose() {}
 }
