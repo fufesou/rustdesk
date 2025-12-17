@@ -20,6 +20,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(feature = "flutter")]
+use std::collections::HashSet;
+
+#[cfg(feature = "flutter")]
+use crate::flutter_ffi::SessionID;
+
 #[cfg(windows)]
 static mut IS_ALT_GR: bool = false;
 
@@ -32,8 +38,20 @@ const OS_LOWER_MACOS: &str = "macos";
 #[allow(dead_code)]
 const OS_LOWER_ANDROID: &str = "android";
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(false);
+
+// Track G key down state for relative mouse mode toggle shortcut.
+// This prevents the toggle from retriggering on OS key-repeat.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+static TOGGLE_SHORTCUT_G_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+
+// Track M key down state for relative mouse mode exit shortcut (Ctrl+Alt+Shift+M).
+// This prevents the exit from retriggering on OS key-repeat.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+static EXIT_SHORTCUT_M_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -53,6 +71,32 @@ lazy_static::lazy_static! {
         m.insert(Key::MetaRight, false);
         Mutex::new(m)
     };
+}
+
+// Track which sessions currently have relative mouse mode enabled (Flutter-only).
+// Used to make Ctrl+Alt+Shift+M exit relative mouse mode in the rdev grab loop.
+#[cfg(feature = "flutter")]
+lazy_static::lazy_static! {
+    static ref RELATIVE_MOUSE_ACTIVE_SESSIONS: Arc<Mutex<HashSet<SessionID>>> = Default::default();
+}
+
+#[cfg(feature = "flutter")]
+pub fn set_relative_mouse_mode_active(session_id: &SessionID, active: bool) {
+    let mut lock = RELATIVE_MOUSE_ACTIVE_SESSIONS.lock().unwrap();
+    if active {
+        lock.insert(*session_id);
+    } else {
+        lock.remove(session_id);
+    }
+}
+
+#[cfg(feature = "flutter")]
+fn is_relative_mouse_mode_active_for_current_session() -> bool {
+    let session_id = flutter::get_cur_session_id();
+    RELATIVE_MOUSE_ACTIVE_SESSIONS
+        .lock()
+        .unwrap()
+        .contains(&session_id)
 }
 
 pub mod client {
@@ -82,7 +126,7 @@ pub mod client {
             GrabState::Run => {
                 #[cfg(windows)]
                 update_grab_get_key_name(keyboard_mode);
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                 KEYBOARD_HOOKED.swap(true, Ordering::SeqCst);
 
                 #[cfg(target_os = "linux")]
@@ -94,7 +138,7 @@ pub mod client {
 
                 release_remote_keys(keyboard_mode);
 
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                 KEYBOARD_HOOKED.swap(false, Ordering::SeqCst);
 
                 #[cfg(target_os = "linux")]
@@ -266,6 +310,159 @@ fn get_keyboard_mode() -> String {
     "legacy".to_string()
 }
 
+/// Check if Ctrl+Shift+G (Windows/Linux) or Cmd+Shift+G (macOS) chord is active.
+/// This is used to toggle relative mouse mode.
+/// Note: This shortcut is only available in Flutter client. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn is_toggle_relative_mouse_shortcut(key: Key) -> bool {
+    if key != Key::KeyG {
+        return false;
+    }
+    let modifiers = MODIFIERS_STATE.lock().unwrap();
+    let shift = *modifiers.get(&Key::ShiftLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ShiftRight).unwrap_or(&false);
+    #[cfg(target_os = "macos")]
+    let modifier = *modifiers.get(&Key::MetaLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::MetaRight).unwrap_or(&false);
+    #[cfg(not(target_os = "macos"))]
+    let modifier = *modifiers.get(&Key::ControlLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ControlRight).unwrap_or(&false);
+    shift && modifier
+}
+
+/// Check if Ctrl+Alt+Shift+M chord is active.
+/// This is used to exit relative mouse mode (all platforms).
+/// Note: This shortcut is only available in Flutter client. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn is_exit_relative_mouse_shortcut(key: Key) -> bool {
+    if key != Key::KeyM {
+        return false;
+    }
+    let modifiers = MODIFIERS_STATE.lock().unwrap();
+    let ctrl = *modifiers.get(&Key::ControlLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ControlRight).unwrap_or(&false);
+    let alt = *modifiers.get(&Key::Alt).unwrap_or(&false)
+        || *modifiers.get(&Key::AltGr).unwrap_or(&false);
+    let shift = *modifiers.get(&Key::ShiftLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ShiftRight).unwrap_or(&false);
+    ctrl && alt && shift
+}
+
+/// Notify Flutter to toggle relative mouse mode.
+/// Note: This is Flutter-only. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn notify_toggle_relative_mouse_mode() {
+    let session_id = flutter::get_cur_session_id();
+    flutter::push_session_event(&session_id, "toggle_relative_mouse_mode", vec![]);
+}
+
+/// Notify Flutter to exit relative mouse mode.
+/// Note: This is Flutter-only. Sciter client does not support relative mouse mode.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn notify_exit_relative_mouse_mode() {
+    let session_id = flutter::get_cur_session_id();
+    flutter::push_session_event(&session_id, "exit_relative_mouse_mode", vec![]);
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const USER_DEFAULT_OPTION_ENABLE_RELATIVE_MOUSE_SHORTCUT: &str = "enable-relative-mouse-shortcut";
+
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[inline]
+fn is_relative_mouse_toggle_shortcut_enabled() -> bool {
+    crate::ui_interface::get_user_default_option(
+        USER_DEFAULT_OPTION_ENABLE_RELATIVE_MOUSE_SHORTCUT.to_owned(),
+    ) == "Y"
+}
+
+/// Handle relative mouse mode shortcuts in the rdev grab loop.
+/// Returns true if the event should be blocked from being sent to the peer.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[inline]
+fn can_toggle_relative_mouse_mode_from_grab_loop() -> bool {
+    let Some(session) = flutter::get_cur_session() else {
+        return false;
+    };
+
+    // Only for remote desktop sessions.
+    if !session.is_default() {
+        return false;
+    }
+
+    // Must have keyboard permission and not be in view-only mode.
+    if !*session.server_keyboard_enabled.read().unwrap() {
+        return false;
+    }
+    let lc = session.lc.read().unwrap();
+    if lc.view_only.v {
+        return false;
+    }
+
+    // Peer must support relative mouse mode.
+    crate::common::is_support_relative_mouse_mode_num(lc.version)
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[inline]
+fn should_block_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
+    if !KEYBOARD_HOOKED.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    // Always clear the G key flag on release, regardless of modifier state.
+    // This prevents the flag from getting stuck if modifiers are released before G.
+    if key == Key::KeyG && !is_press {
+        TOGGLE_SHORTCUT_G_KEY_DOWN.store(false, Ordering::SeqCst);
+    }
+
+    // Block M key up if M key down was blocked (to avoid orphan key up event on remote).
+    // This must be checked before clearing the flag below.
+    if key == Key::KeyM && !is_press && EXIT_SHORTCUT_M_KEY_DOWN.swap(false, Ordering::SeqCst) {
+        return true;
+    }
+
+    // Ctrl+Alt+Shift+M exits relative mouse mode when active.
+    if is_exit_relative_mouse_shortcut(key) && is_relative_mouse_mode_active_for_current_session() {
+        if is_press {
+            // Only trigger exit on transition from "not pressed" to "pressed".
+            // This prevents retriggering on OS key-repeat.
+            if !EXIT_SHORTCUT_M_KEY_DOWN.swap(true, Ordering::SeqCst) {
+                notify_exit_relative_mouse_mode();
+            }
+        }
+        return true;
+    }
+
+    // Ctrl+Shift+G (or Cmd+Shift+G on macOS) toggles relative mouse mode.
+    // Guard it to supported/eligible sessions to avoid blocking the chord unexpectedly.
+    if is_toggle_relative_mouse_shortcut(key) {
+        if !is_relative_mouse_toggle_shortcut_enabled() {
+            return false;
+        }
+        if !can_toggle_relative_mouse_mode_from_grab_loop() {
+            return false;
+        }
+        if is_press {
+            // Only trigger toggle on transition from "not pressed" to "pressed".
+            // This prevents retriggering on OS key-repeat.
+            if !TOGGLE_SHORTCUT_G_KEY_DOWN.swap(true, Ordering::SeqCst) {
+                notify_toggle_relative_mouse_mode();
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
 fn start_grab_loop() {
     std::env::set_var("KEYBOARD_ONLY", "y");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -278,6 +475,12 @@ fn start_grab_loop() {
 
             let _scan_code = event.position_code;
             let _code = event.platform_code as KeyCode;
+
+            #[cfg(feature = "flutter")]
+            if should_block_relative_mouse_shortcut(key, is_press) {
+                return None;
+            }
+
             let res = if KEYBOARD_HOOKED.load(Ordering::SeqCst) {
                 client::process_event(&get_keyboard_mode(), &event, None);
                 if is_press {
@@ -337,9 +540,14 @@ fn start_grab_loop() {
     #[cfg(target_os = "linux")]
     if let Err(err) = rdev::start_grab_listen(move |event: Event| match event.event_type {
         EventType::KeyPress(key) | EventType::KeyRelease(key) => {
+            let is_press = matches!(event.event_type, EventType::KeyPress(_));
             if let Key::Unknown(keycode) = key {
                 log::error!("rdev get unknown key, keycode is {:?}", keycode);
             } else {
+                #[cfg(feature = "flutter")]
+                if should_block_relative_mouse_shortcut(key, is_press) {
+                    return None;
+                }
                 client::process_event(&get_keyboard_mode(), &event, None);
             }
             None

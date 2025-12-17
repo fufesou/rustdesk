@@ -457,6 +457,13 @@ class FfiModel with ChangeNotifier {
         _handlePrinterRequest(evt, sessionId, peerId);
       } else if (name == 'screenshot') {
         _handleScreenshot(evt, sessionId, peerId);
+      } else if (name == 'toggle_relative_mouse_mode') {
+        // Handle Ctrl+Shift+G (or Cmd+Shift+G on macOS) shortcut from rdev grab
+        parent.target?.inputModel.toggleRelativeMouseMode();
+      } else if (name == 'exit_relative_mouse_mode') {
+        // Handle ESC shortcut from rdev grab.
+        // When relative mouse mode is enabled, ESC exits the mode and must not be sent to the peer.
+        parent.target?.inputModel.setRelativeMouseMode(false);
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -780,6 +787,14 @@ class FfiModel with ChangeNotifier {
       parent.target?.canvasModel
           .updateViewStyle(refreshMousePos: updateCursorPos);
       _updateSessionWidthHeight(sessionId);
+
+      // Keep pointer lock center in sync when using relative mouse mode.
+      // Note: updatePointerLockCenter is async-safe (handles errors internally),
+      // so we fire-and-forget here.
+      final inputModel = parent.target?.inputModel;
+      if (inputModel != null && inputModel.relativeMouseMode.value) {
+        inputModel.updatePointerLockCenter();
+      }
     }
   }
 
@@ -863,6 +878,16 @@ class FfiModel with ChangeNotifier {
     final title = evt['title'];
     final text = evt['text'];
     final link = evt['link'];
+
+    // Disable relative mouse mode on connection errors or session-ending messages.
+    // This ensures the cursor is released when the connection is lost.
+    if (title == 'Connection Error' ||
+        type == 'error' ||
+        type == 'restarting' ||
+        (type is String && type.contains('error'))) {
+      parent.target?.inputModel.setRelativeMouseMode(false);
+    }
+
     if (type == 're-input-password') {
       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
     } else if (type == 'input-2fa') {
@@ -967,6 +992,8 @@ class FfiModel with ChangeNotifier {
 
   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
       bool forceRelay) {
+    // Disable relative mouse mode before reconnecting to ensure cursor is released.
+    parent.target?.inputModel.setRelativeMouseMode(false);
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
     dialogManager.dismissAll();
@@ -1192,9 +1219,6 @@ class FfiModel with ChangeNotifier {
 
     _queryAuditGuid(peerId);
 
-    // This call is to ensuer the keyboard mode is updated depending on the peer version.
-    parent.target?.inputModel.updateKeyboardMode();
-
     // Map clone is required here, otherwise "evt" may be changed by other threads through the reference.
     // Because this function is asynchronous, there's an "await" in this function.
     cachedPeerData.peerInfo = {...evt};
@@ -1206,6 +1230,11 @@ class FfiModel with ChangeNotifier {
 
     parent.target?.dialogManager.dismissAll();
     _pi.version = evt['version'];
+    // Update keyboard mode after peer version is set, as sessionGetKeyboardMode
+    // may depend on the peer version to determine the appropriate mode.
+    // Note: Relative mouse mode is NOT auto-enabled on connect.
+    // Users must manually enable it via toolbar or keyboard shortcut (Ctrl+Shift+G / Cmd+Shift+G).
+    parent.target?.inputModel.updateKeyboardMode();
     _pi.isSupportMultiUiSession =
         bind.isSupportMultiUiSession(version: _pi.version);
     _pi.username = evt['username'];
@@ -3768,6 +3797,8 @@ class FFI {
     ffiModel.clear();
     canvasModel.clear();
     inputModel.resetModifiers();
+    // Dispose relative mouse mode resources to ensure cursor is restored
+    inputModel.disposeRelativeMouseMode();
     if (closeSession) {
       await bind.sessionClose(sessionId: sessionId);
     }

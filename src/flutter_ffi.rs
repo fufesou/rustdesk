@@ -261,6 +261,9 @@ pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<boo
 }
 
 pub fn session_close(session_id: SessionID) {
+    // Best-effort cleanup for relative mouse mode state.
+    crate::keyboard::set_relative_mouse_mode_active(&session_id, false);
+
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         // `release_remote_keys` is not required for mobile platforms in common cases.
         // But we still call it to make the code more stable.
@@ -1215,6 +1218,60 @@ pub fn main_set_input_source(session_id: SessionID, value: String) {
     }
 }
 
+/// Set cursor position (for pointer lock re-centering)
+pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(crate::set_cursor_pos(x, y))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (x, y);
+        SyncReturn(false)
+    }
+}
+
+/// Show or hide cursor (for pointer lock)
+pub fn main_show_cursor(show: bool) -> SyncReturn<i32> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        SyncReturn(crate::show_cursor(show))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = show;
+        SyncReturn(0)
+    }
+}
+
+/// Clip cursor to a rectangle (for pointer lock).
+///
+/// When `enable` is true, the cursor is clipped to the rectangle defined by
+/// `left`, `top`, `right`, `bottom`. When `enable` is false, the rectangle
+/// values are ignored and the cursor is unclipped.
+pub fn main_clip_cursor(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    enable: bool,
+) -> SyncReturn<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let rect = if enable {
+            Some((left, top, right, bottom))
+        } else {
+            None
+        };
+        SyncReturn(crate::clip_cursor(rect))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (left, top, right, bottom, enable);
+        SyncReturn(false)
+    }
+}
+
 pub fn main_get_my_id() -> String {
     get_id()
 }
@@ -1748,8 +1805,83 @@ pub fn session_send_pointer(session_id: SessionID, msg: String) {
     super::flutter::session_send_pointer(session_id, msg);
 }
 
+/// Send mouse event from Flutter to the remote peer.
+///
+/// # Relative Mouse Mode Message Contract
+///
+/// When the message contains a `relative_mouse_mode` field, this function handles
+/// activation/deactivation markers for the Rust rdev grab loop (Ctrl+Alt+Shift+M exit behavior).
+///
+/// **Contract (Flutter side MUST adhere to):**
+/// 1. `relative_mouse_mode` field is ONLY present on activation/deactivation marker messages,
+///    NEVER on normal pointer events (move, button, scroll).
+/// 2. Deactivation marker: `{"relative_mouse_mode": "0"}` - local-only, never forwarded.
+/// 3. Activation marker: `{"relative_mouse_mode": "1", "type": "move_relative", "x": "0", "y": "0"}`
+///    - MUST use `type="move_relative"` with `x="0"` and `y="0"` (safe no-op).
+///    - Any other combination is dropped to prevent accidental cursor movement.
+///
+/// If these assumptions are violated (e.g., `relative_mouse_mode` is added to normal events),
+/// legitimate mouse events may be silently dropped by the early-return logic below.
 pub fn session_send_mouse(session_id: SessionID, msg: String) {
     if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&msg) {
+        // Relative mouse mode state updates (Flutter-only).
+        // This is used by the Rust rdev grab loop to decide whether Ctrl+Alt+Shift+M should exit relative mouse mode.
+        // See doc comment above for the message contract.
+        if let Some(v) = m.get("relative_mouse_mode") {
+            let active = matches!(v.as_str(), "1" | "Y" | "on");
+
+            // Disable marker: set state immediately and return (local-only, never forwarded).
+            if !active {
+                crate::keyboard::set_relative_mouse_mode_active(&session_id, false);
+                return;
+            }
+
+            // Enable marker: validate BEFORE setting state to avoid desync.
+            // This ensures we only mark as active if the marker will actually be forwarded.
+
+            // Enable marker is allowed to go through only if it's a safe no-op relative move.
+            // This avoids accidentally moving the remote cursor (e.g. if type/x/y are missing).
+            let msg_type = m.get("type").map(|t| t.as_str());
+            if msg_type != Some("move_relative") {
+                log::warn!(
+                    "relative_mouse_mode activation marker has invalid type: {:?}, expected 'move_relative'. Dropping.",
+                    msg_type
+                );
+                return;
+            }
+            let x_marker = m
+                .get("x")
+                .map(|x| x.parse::<i32>().unwrap_or(0))
+                .unwrap_or(0);
+            let y_marker = m
+                .get("y")
+                .map(|y| y.parse::<i32>().unwrap_or(0))
+                .unwrap_or(0);
+            if x_marker != 0 || y_marker != 0 {
+                log::warn!(
+                    "relative_mouse_mode activation marker has non-zero coordinates: x={}, y={}. Dropping.",
+                    x_marker, y_marker
+                );
+                return;
+            }
+
+            // Guard against unexpected fields that could turn this no-op into a real event.
+            if m.contains_key("buttons")
+                || m.contains_key("alt")
+                || m.contains_key("ctrl")
+                || m.contains_key("shift")
+                || m.contains_key("command")
+            {
+                log::warn!(
+                    "relative_mouse_mode activation marker contains unexpected fields (buttons/alt/ctrl/shift/command). Dropping."
+                );
+                return;
+            }
+
+            // All validation passed - NOW set the active state
+            crate::keyboard::set_relative_mouse_mode_active(&session_id, true);
+        }
+
         let alt = m.get("alt").is_some();
         let ctrl = m.get("ctrl").is_some();
         let shift = m.get("shift").is_some();
@@ -1769,6 +1901,7 @@ pub fn session_send_mouse(session_id: SessionID, msg: String) {
                 "up" => MOUSE_TYPE_UP,
                 "wheel" => MOUSE_TYPE_WHEEL,
                 "trackpad" => MOUSE_TYPE_TRACKPAD,
+                "move_relative" => MOUSE_TYPE_MOVE_RELATIVE,
                 _ => 0,
             };
         }
