@@ -736,6 +736,20 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         },
         child: Text(translate('View Mode'))));
   }
+  // Relative mouse mode (gaming mode).
+  // Only show when server supports MOUSE_TYPE_MOVE_RELATIVE (version >= 1.4.5)
+  // Note: This feature is only available in Flutter client. Sciter client does not support this.
+  // Web client is not supported yet due to Pointer Lock API integration complexity with Flutter's input system.
+  if (isDefaultConn && !isWeb && ffiModel.keyboard && !ffiModel.viewOnly &&
+      ffi.inputModel.isRelativeMouseModeSupported) {
+    v.add(TToggleMenu(
+        value: ffi.inputModel.relativeMouseMode.value,
+        onChanged: (value) {
+          if (value == null) return;
+          ffi.inputModel.setRelativeMouseMode(value);
+        },
+        child: Text(translate('Relative Mouse Mode'))));
+  }
   return v;
 }
 

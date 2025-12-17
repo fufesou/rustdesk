@@ -729,5 +729,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("server-oss-not-support-tip", ""),
         ("input note here", ""),
         ("note-at-conn-end-tip", ""),
+        ("Relative Mouse Mode", ""),
+        ("Enable Relative Mouse Shortcut", ""),
+        ("rel-mouse-not-supported-wayland-tip", ""),
+        ("rel-mouse-not-supported-peer-tip", ""),
+        ("rel-mouse-not-ready-tip", ""),
+        ("rel-mouse-lock-failed-tip", ""),
     ].iter().cloned().collect();
 }

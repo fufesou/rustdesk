@@ -96,6 +96,9 @@ const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 
+/// Maximum iterations for ShowCursor loop to prevent infinite loops.
+const SHOW_CURSOR_GUARD_LIMIT: i32 = 32;
+
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -116,12 +119,69 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
 
 pub fn get_cursor_pos() -> Option<(i32, i32)> {
     unsafe {
-        #[allow(invalid_value)]
-        let mut out = mem::MaybeUninit::uninit().assume_init();
-        if GetCursorPos(&mut out) == FALSE {
+        let mut out = mem::MaybeUninit::<POINT>::uninit();
+        if GetCursorPos(out.as_mut_ptr()) == FALSE {
             return None;
         }
-        return Some((out.x, out.y));
+        let out = out.assume_init();
+        Some((out.x, out.y))
+    }
+}
+
+pub fn set_cursor_pos(x: i32, y: i32) -> bool {
+    unsafe { SetCursorPos(x, y) != FALSE }
+}
+
+/// Show or hide the cursor. Returns the new display counter.
+/// Counter >= 0 means cursor is visible, < 0 means hidden.
+///
+/// Note: Windows uses an internal display counter for cursor visibility.
+/// A single call to ShowCursor(TRUE/FALSE) does not guarantee the final state.
+pub fn show_cursor(show: bool) -> i32 {
+    unsafe {
+        let mut count = ShowCursor(if show { TRUE } else { FALSE });
+        // Fail-safe guard to avoid an infinite loop if something goes wrong.
+        let mut guard = 0;
+        if show {
+            while count < 0 && guard < SHOW_CURSOR_GUARD_LIMIT {
+                count = ShowCursor(TRUE);
+                guard += 1;
+            }
+        } else {
+            while count >= 0 && guard < SHOW_CURSOR_GUARD_LIMIT {
+                count = ShowCursor(FALSE);
+                guard += 1;
+            }
+        }
+        // Log warning if guard limit was reached without achieving desired state
+        let desired_sign_ok = if show { count >= 0 } else { count < 0 };
+        if guard >= SHOW_CURSOR_GUARD_LIMIT && !desired_sign_ok {
+            log::warn!(
+                "show_cursor guard limit reached: show={}, final_count={}, guard={}",
+                show,
+                count,
+                guard
+            );
+        }
+        count
+    }
+}
+
+/// Clip cursor to a rectangle. Pass None to unclip.
+pub fn clip_cursor(rect: Option<(i32, i32, i32, i32)>) -> bool {
+    unsafe {
+        match rect {
+            Some((left, top, right, bottom)) => {
+                let r = RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                ClipCursor(&r) != FALSE
+            }
+            None => ClipCursor(std::ptr::null()) != FALSE,
+        }
     }
 }
 
