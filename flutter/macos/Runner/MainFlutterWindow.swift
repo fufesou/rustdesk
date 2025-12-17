@@ -19,6 +19,19 @@ import window_manager
 import window_size
 import texture_rgba_renderer
 
+// Global state for relative mouse mode
+class RelativeMouseState {
+    static let shared = RelativeMouseState()
+
+    var enabled = false
+    var eventMonitor: Any?
+    var deltaChannel: FlutterMethodChannel?
+    var accumulatedDeltaX: CGFloat = 0
+    var accumulatedDeltaY: CGFloat = 0
+
+    private init() {}
+}
+
 class MainFlutterWindow: NSWindow {
     override func awakeFromNib() {
         rustdesk_core_main();
@@ -62,6 +75,79 @@ class MainFlutterWindow: NSWindow {
     /// Override window theme.
     public func setWindowInterfaceMode(window: NSWindow, themeName: String) {
         window.appearance = NSAppearance(named: themeName == "light" ? .aqua : .darkAqua)
+    }
+
+    private func enableNativeRelativeMouseMode(channel: FlutterMethodChannel) -> Bool {
+        let state = RelativeMouseState.shared
+        if state.enabled { return true }
+
+        // Dissociate mouse from cursor position - this locks the cursor in place
+        // Do this FIRST before setting any state
+        let result = CGAssociateMouseAndMouseCursorPosition(0)
+        if result != CGError.success {
+            NSLog("[RustDesk] Failed to dissociate mouse from cursor position: %d", result.rawValue)
+            return false
+        }
+
+        // Only set state after CG call succeeds
+        state.deltaChannel = channel
+        state.accumulatedDeltaX = 0
+        state.accumulatedDeltaY = 0
+
+        // Add local event monitor to capture mouse delta
+        state.eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { event in
+            let deltaX = event.deltaX
+            let deltaY = event.deltaY
+
+            if deltaX != 0 || deltaY != 0 {
+                // Accumulate delta
+                state.accumulatedDeltaX += deltaX
+                state.accumulatedDeltaY += deltaY
+
+                // Only send if we have integer movement
+                let intX = Int(state.accumulatedDeltaX)
+                let intY = Int(state.accumulatedDeltaY)
+
+                if intX != 0 || intY != 0 {
+                    state.accumulatedDeltaX -= CGFloat(intX)
+                    state.accumulatedDeltaY -= CGFloat(intY)
+
+                    // Send delta to Flutter
+                    DispatchQueue.main.async {
+                        state.deltaChannel?.invokeMethod("onMouseDelta", arguments: ["dx": intX, "dy": intY])
+                    }
+                }
+            }
+
+            return event
+        }
+
+        // Set enabled LAST after everything succeeds
+        state.enabled = true
+        return true
+    }
+
+    private func disableNativeRelativeMouseMode() {
+        let state = RelativeMouseState.shared
+        if !state.enabled { return }
+
+        state.enabled = false
+
+        // Re-associate mouse with cursor position
+        let result = CGAssociateMouseAndMouseCursorPosition(1)
+        if result != CGError.success {
+            NSLog("[RustDesk] Failed to re-associate mouse with cursor position: %d", result.rawValue)
+        }
+
+        // Remove event monitor
+        if let monitor = state.eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            state.eventMonitor = nil
+        }
+
+        state.deltaChannel = nil
+        state.accumulatedDeltaX = 0
+        state.accumulatedDeltaY = 0
     }
 
     public func setMethodHandler(registrar: FlutterPluginRegistrar) {
@@ -150,6 +236,14 @@ class MainFlutterWindow: NSWindow {
                     result(true)
 
                     break
+
+                case "enableNativeRelativeMouseMode":
+                    let success = self.enableNativeRelativeMouseMode(channel: channel)
+                    result(success)
+
+                case "disableNativeRelativeMouseMode":
+                    self.disableNativeRelativeMouseMode()
+                    result(true)
 
                 default:
                     result(FlutterMethodNotImplemented)

@@ -831,6 +831,7 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
   final ffiModel = ffi.ffiModel;
   final pi = ffiModel.pi;
   final sessionId = ffi.sessionId;
+  final isDefaultConn = ffi.connType == ConnType.defaultConn;
   List<TToggleMenu> v = [];
 
   // swap key
@@ -850,6 +851,24 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
         value: value,
         onChanged: enabled ? onChanged : null,
         child: Text(translate('Swap control-command key'))));
+  }
+
+  // Relative mouse mode (gaming mode).
+  // Only show when server supports MOUSE_TYPE_MOVE_RELATIVE (version >= 1.4.5)
+  // Note: This feature is only available in Flutter client. Sciter client does not support this.
+  // Web client is not supported yet due to Pointer Lock API integration complexity with Flutter's input system.
+  if (isDefaultConn &&
+      !isWeb &&
+      ffiModel.keyboard &&
+      !ffiModel.viewOnly &&
+      ffi.inputModel.isRelativeMouseModeSupported) {
+    v.add(TToggleMenu(
+        value: ffi.inputModel.relativeMouseMode.value,
+        onChanged: (value) {
+          if (value == null) return;
+          ffi.inputModel.setRelativeMouseMode(value);
+        },
+        child: Text(translate('Relative Mouse Mode'))));
   }
 
   // reverse mouse wheel
