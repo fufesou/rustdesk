@@ -32,7 +32,11 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
 };
+
+// macOS boolean_t is defined as `int` in <mach/boolean.h>
+type BooleanT = hbb_common::libc::c_int;
 
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
@@ -41,6 +45,11 @@ static mut LATEST_SEED: i32 = 0;
 // Using a fixed temporary directory for updates is preferable to
 // using one that includes the custom client name.
 const UPDATE_TEMP_DIR: &str = "/tmp/.rustdeskupdate";
+
+/// Global mutex to serialize CoreGraphics cursor operations.
+/// This prevents race conditions between cursor visibility (hide depth tracking)
+/// and cursor positioning/clipping operations.
+static CG_CURSOR_MUTEX: Mutex<()> = Mutex::new(());
 
 extern "C" {
     fn CGSCurrentCursorSeed() -> i32;
@@ -64,6 +73,10 @@ extern "C" {
     fn majorVersion() -> u32;
     fn MacGetMode(display: u32, width: *mut u32, height: *mut u32) -> BOOL;
     fn MacSetMode(display: u32, width: u32, height: u32, tryHiDPI: bool) -> BOOL;
+    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
+    fn CGDisplayHideCursor(display: u32) -> CGError;
+    fn CGDisplayShowCursor(display: u32) -> CGError;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
 }
 
 pub fn major_version() -> u32 {
@@ -385,6 +398,52 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     pt.y -= frame.origin.y;
     Some((pt.x as _, pt.y as _))
     */
+}
+
+pub fn set_cursor_pos(x: i32, y: i32) -> bool {
+    let _guard = CG_CURSOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let result = CGWarpMouseCursorPosition(CGPoint {
+            x: x as f64,
+            y: y as f64,
+        });
+        if result != CGError::Success {
+            log::error!(
+                "CGWarpMouseCursorPosition({}, {}) returned error: {:?}",
+                x,
+                y,
+                result
+            );
+        }
+        result == CGError::Success
+    }
+}
+
+/// On macOS, cursor clipping is not supported directly like Windows ClipCursor.
+/// Instead, we use CGAssociateMouseAndMouseCursorPosition to dissociate mouse
+/// movement from cursor position, achieving a "pointer lock" effect.
+///
+/// # Arguments
+/// * `rect` - When `Some(_)`, dissociates mouse from cursor (enables pointer lock).
+///            When `None`, re-associates mouse with cursor (disables pointer lock).
+///            The rect coordinate values are ignored on macOS; only `Some`/`None` matters.
+///            The parameter signature matches Windows for API consistency.
+pub fn clip_cursor(rect: Option<(i32, i32, i32, i32)>) -> bool {
+    let _ = rect; // rect values are ignored on macOS, only Some/None matters
+    let _guard = CG_CURSOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        // connected=0: dissociate (pointer lock on), connected=1: associate (normal)
+        let connected = if rect.is_some() { 0 } else { 1 };
+        let result = CGAssociateMouseAndMouseCursorPosition(connected);
+        if result != CGError::Success {
+            log::warn!(
+                "CGAssociateMouseAndMouseCursorPosition({}) returned error: {:?}",
+                connected,
+                result
+            );
+        }
+        result == CGError::Success
+    }
 }
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
