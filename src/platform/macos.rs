@@ -387,6 +387,89 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     */
 }
 
+// macOS boolean_t is defined as `int` in <mach/boolean.h>
+type BooleanT = hbb_common::libc::c_int;
+
+extern "C" {
+    fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
+    fn CGDisplayHideCursor(display: u32) -> CGError;
+    fn CGDisplayShowCursor(display: u32) -> CGError;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
+}
+
+pub fn set_cursor_pos(x: i32, y: i32) -> bool {
+    unsafe {
+        CGWarpMouseCursorPosition(CGPoint {
+            x: x as f64,
+            y: y as f64,
+        }) == CGError::Success
+    }
+}
+
+/// Show or hide the cursor.
+///
+/// macOS CoreGraphics cursor visibility APIs (CGDisplayHideCursor/CGDisplayShowCursor)
+/// are reference-counted. Track hide depth so repeated hide calls are balanced.
+///
+/// Returns 0 on success, or a CGError code on failure.
+pub fn show_cursor(show: bool) -> i32 {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static CURSOR_HIDE_DEPTH: AtomicI32 = AtomicI32::new(0);
+
+    if show {
+        // Decrease hide depth; only call into CoreGraphics when transitioning
+        // from hidden -> visible.
+        loop {
+            let cur = CURSOR_HIDE_DEPTH.load(Ordering::SeqCst);
+            if cur <= 0 {
+                // Nothing to show (already visible).
+                return 0;
+            }
+            let new = cur - 1;
+            if CURSOR_HIDE_DEPTH
+                .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if new == 0 {
+                    unsafe {
+                        return CGDisplayShowCursor(0) as i32;
+                    }
+                }
+                return 0;
+            }
+        }
+    } else {
+        // Increase hide depth; only call into CoreGraphics when transitioning
+        // from visible -> hidden.
+        let prev = CURSOR_HIDE_DEPTH.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            unsafe {
+                return CGDisplayHideCursor(0) as i32;
+            }
+        }
+        0
+    }
+}
+
+/// On macOS, cursor clipping is not supported directly like Windows ClipCursor.
+/// Instead, we use CGAssociateMouseAndMouseCursorPosition to dissociate mouse
+/// movement from cursor position, achieving a "pointer lock" effect.
+///
+/// # Arguments
+/// * `rect` - When `Some(_)`, dissociates mouse from cursor (enables pointer lock).
+///            When `None`, re-associates mouse with cursor (disables pointer lock).
+///            The rect coordinate values are ignored on macOS; only `Some`/`None` matters.
+///            The parameter signature matches Windows for API consistency.
+pub fn clip_cursor(rect: Option<(i32, i32, i32, i32)>) -> bool {
+    let _ = rect; // rect values are ignored on macOS, only Some/None matters
+    unsafe {
+        // connected=0: dissociate (pointer lock on), connected=1: associate (normal)
+        let connected = if rect.is_some() { 0 } else { 1 };
+        CGAssociateMouseAndMouseCursorPosition(connected) == CGError::Success
+    }
+}
+
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     autoreleasepool(|| unsafe_get_focused_display(displays))
 }

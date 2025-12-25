@@ -1010,13 +1010,15 @@ makeMobileActionsOverlayEntry(VoidCallback? onHide, {FFI? ffi}) {
   });
 }
 
-void showToast(String text, {Duration timeout = const Duration(seconds: 3)}) {
+void showToast(String text,
+    {Duration timeout = const Duration(seconds: 3),
+    Alignment alignment = const Alignment(0.0, 0.8)}) {
   final overlayState = globalKey.currentState?.overlay;
   if (overlayState == null) return;
   final entry = OverlayEntry(builder: (context) {
     return IgnorePointer(
         child: Align(
-            alignment: const Alignment(0.0, 0.8),
+            alignment: alignment,
             child: Container(
               decoration: BoxDecoration(
                 color: MyTheme.color(context).toastBg,
@@ -4024,4 +4026,21 @@ String decode_http_response(http.Response resp) {
 
 bool peerTabShowNote(PeerTabIndex peerTabIndex) {
   return peerTabIndex == PeerTabIndex.ab || peerTabIndex == PeerTabIndex.group;
+}
+
+String mouseButtonsToPeer(int buttons) {
+  switch (buttons) {
+    case kPrimaryMouseButton:
+      return 'left';
+    case kSecondaryMouseButton:
+      return 'right';
+    case kMiddleMouseButton:
+      return 'wheel';
+    case kBackMouseButton:
+      return 'back';
+    case kForwardMouseButton:
+      return 'forward';
+    default:
+      return '';
+  }
 }
