@@ -458,6 +458,9 @@ pub struct TerminalSession {
     // Track if we've already sent the closed message
     closed_message_sent: bool,
     is_opened: bool,
+    // Track if we've written a newline (for Windows cleanup)
+    #[cfg(target_os = "windows")]
+    has_written_newline: Arc<AtomicBool>,
 }
 
 impl TerminalSession {
@@ -479,6 +482,8 @@ impl TerminalSession {
             cols,
             closed_message_sent: false,
             is_opened: false,
+            #[cfg(target_os = "windows")]
+            has_written_newline: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -497,8 +502,21 @@ impl TerminalSession {
             // Send a final newline to ensure the reader can read some data, and then exit.
             // This is required on Windows and Linux.
             // Although `self.pty_pair = None;` is called below, we can still send a final newline here.
-            if let Err(e) = input_tx.send(b"\r\n".to_vec()) {
-                log::warn!("Failed to send final newline to the terminal: {}", e);
+            #[cfg(target_os = "windows")]
+            {
+                // On Windows, only send final newline if we haven't written one yet.
+                // This avoids an extra blank line being shown when closing the terminal.
+                if !self.has_written_newline.load(Ordering::SeqCst) {
+                    if let Err(e) = input_tx.send(b"\r\n".to_vec()) {
+                        log::warn!("Failed to send final newline to the terminal: {}", e);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if let Err(e) = input_tx.send(b"\r\n".to_vec()) {
+                    log::warn!("Failed to send final newline to the terminal: {}", e);
+                }
             }
             drop(input_tx);
         }
@@ -818,20 +836,18 @@ impl TerminalServiceProxy {
 
         // Spawn writer thread
         let terminal_id = open.terminal_id;
+        #[cfg(target_os = "windows")]
+        let has_written_newline = session.has_written_newline.clone();
         let writer_thread = thread::spawn(move || {
             let mut writer = writer;
-            // Write initial carriage return:
-            // 1. Windows requires at least one carriage return for `drop()` to work properly.
-            //    Without this, the reader may fail to read the buffer after `input_tx.send(b"\r\n".to_vec()).ok();`.
-            // 2. This also refreshes the terminal interface on the controlling side (workaround for blank content on connect).
-            if let Err(e) = writer.write_all(b"\r") {
-                log::error!("Terminal {} initial write error: {}", terminal_id, e);
-            } else {
-                if let Err(e) = writer.flush() {
-                    log::error!("Terminal {} initial flush error: {}", terminal_id, e);
-                }
-            }
             while let Ok(data) = input_rx.recv() {
+                #[cfg(target_os = "windows")]
+                {
+                    // Track if we've written a newline for proper cleanup
+                    if data.contains(&b'\n') || data.contains(&b'\r') {
+                        has_written_newline.store(true, Ordering::SeqCst);
+                    }
+                }
                 if let Err(e) = writer.write_all(&data) {
                     log::error!("Terminal {} write error: {}", terminal_id, e);
                     break;
