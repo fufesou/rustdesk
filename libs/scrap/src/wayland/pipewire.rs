@@ -588,6 +588,8 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
 static mut INIT: bool = false;
 const RESTORE_TOKEN: &str = "restore_token";
 const RESTORE_TOKEN_CONF_KEY: &str = "wayland-restore-token";
+// Separate key for remote_desktop_portal to avoid conflicts with screencast_portal
+const RDP_RESTORE_TOKEN_CONF_KEY: &str = "wayland-rdp-restore-token";
 const PIPEWIRE_DISPLAY_OFFSET_CONF_KEY: &str = "wayland-pipewire-display-offset";
 
 pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
@@ -632,10 +634,36 @@ pub fn request_remote_desktop(
         Variant(Box::new("u1".to_string())),
     );
 
+    // Check version for restore_token support
+    // ScreenCast portal: persist_mode added in version 4
+    // RemoteDesktop portal: persist_mode added in version 2
+    //
+    // Historical context (see PR #6742, #6755, #6758):
+    // - 2023-12: PR #6742 attempted to add persist_mode for RemoteDesktop portal
+    // - 2023-12: PR #6755 reverted it because Arch Linux with RemoteDesktop version 2
+    //   failed to establish connections (asked for permission but connection not made)
+    // - Test results at that time:
+    //   - Ubuntu 22.04: RemoteDesktop v1 (too low, no persist_mode support)
+    //   - Fedora 39: RemoteDesktop v2 (worked fine)
+    //   - Arch Linux: RemoteDesktop v2 (version enough but didn't work)
+    // - 2025-12: Discussion #13902 suggests persist_mode now works on KDE Plasma 6.5+,
+    //   and OBS/Firefox are already using it successfully.
+    //
+    // CAUTION: If testing on Arch Linux with RemoteDesktop version 2, verify thoroughly
+    // that persist_mode works correctly. If issues occur, this feature may need to be
+    // conditionally disabled for certain environments.
     let mut is_support_restore_token = false;
-    if let Ok(version) = screencast_portal::version(&portal) {
-        if version >= 4 {
-            is_support_restore_token = true;
+    if is_server_running() {
+        if let Ok(version) = screencast_portal::version(&portal) {
+            if version >= 4 {
+                is_support_restore_token = true;
+            }
+        }
+    } else {
+        if let Ok(version) = remote_desktop_portal::version(&portal) {
+            if version >= 2 {
+                is_support_restore_token = true;
+            }
         }
     }
 
@@ -774,14 +802,25 @@ fn on_create_session_response(
                 failure.clone(),
             )?;
         } else {
-            // TODO: support persist_mode for remote_desktop_portal
+            // Support persist_mode for remote_desktop_portal
             // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html
+            // persist_mode and restore_token were added in version 2 of this interface
 
             args.insert(
                 "handle_token".to_string(),
                 Variant(Box::new("u2".to_string())),
             );
             args.insert("types".to_string(), Variant(Box::new(7u32)));
+
+            // Add persist_mode and restore_token for session persistence
+            if is_support_restore_token {
+                let restore_token = config::LocalConfig::get_option(RDP_RESTORE_TOKEN_CONF_KEY);
+                if !restore_token.is_empty() {
+                    args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
+                }
+                // persist_mode = 2: Permissions persist until explicitly revoked
+                args.insert("persist_mode".to_string(), Variant(Box::new(2u32)));
+            }
 
             let path = portal.select_devices(ses.clone(), args)?;
             handle_response(
@@ -897,16 +936,20 @@ fn on_start_response(
 ) -> Result<(), Box<dyn Error>> {
     move |r: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
-        // See `is_server_running()` to understand the following code.
-        if is_server_running() {
-            if is_support_restore_token {
-                if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
-                    if let Some(restore_token) = restore_token.as_str() {
-                        config::LocalConfig::set_option(
-                            RESTORE_TOKEN_CONF_KEY.to_owned(),
-                            restore_token.to_owned(),
-                        );
-                    }
+        // Save restore_token for both screencast_portal and remote_desktop_portal
+        if is_support_restore_token {
+            if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
+                if let Some(restore_token) = restore_token.as_str() {
+                    // Use different config keys for different portal types
+                    let conf_key = if is_server_running() {
+                        RESTORE_TOKEN_CONF_KEY
+                    } else {
+                        RDP_RESTORE_TOKEN_CONF_KEY
+                    };
+                    config::LocalConfig::set_option(
+                        conf_key.to_owned(),
+                        restore_token.to_owned(),
+                    );
                 }
             }
         }
@@ -975,7 +1018,9 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
 // Otherwise, we have to use remote_desktop_portal's input method.
 //
 // `screencast_portal` supports restore_token and persist_mode if the version is greater than or equal to 4.
-// `remote_desktop_portal` does not support restore_token and persist_mode.
+// `remote_desktop_portal` supports restore_token and persist_mode if the version is greater than or equal to 2.
+// Note: See the detailed historical context comments in `request_remote_desktop()` for potential
+// compatibility issues on certain environments (e.g., Arch Linux with version 2).
 pub(crate) fn is_server_running() -> bool {
     let v = IS_SERVER_RUNNING.load(Ordering::SeqCst);
     if v > 0 {
