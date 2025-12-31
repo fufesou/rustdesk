@@ -774,12 +774,19 @@ impl TerminalServiceProxy {
         #[allow(unused_mut)]
         let mut cmd = CommandBuilder::new(&shell);
 
-        // Set `TERM` environment variable for macOS to ensure proper terminal behavior
-        // This fixes issues with control sequences (e.g., Delete/Backspace keys)
-        // macOS terminfo uses hex naming: '78' = 'x' for xterm entries
+        // macOS-specific terminal configuration
+        // 1. Use login shell (-l) to load user's shell profile (~/.zprofile, ~/.bash_profile)
+        //    This ensures PATH includes Homebrew paths (/opt/homebrew/bin, /usr/local/bin)
+        // 2. Set TERM environment variable for proper terminal behavior
+        //    This fixes issues with control sequences (e.g., Delete/Backspace keys)
+        //    macOS terminfo uses hex naming: '78' = 'x' for xterm entries
         // Note: For Linux, `TERM` is set in src/platform/linux.rs try_start_server_()
         #[cfg(target_os = "macos")]
         {
+            // Start as login shell to load user environment (PATH, etc.)
+            cmd.arg("-l");
+            log::debug!("Added -l flag for macOS login shell");
+
             let term = if std::path::Path::new("/usr/share/terminfo/78/xterm-256color").exists() {
                 "xterm-256color"
             } else {
