@@ -827,17 +827,6 @@ impl TerminalServiceProxy {
         let terminal_id = open.terminal_id;
         let writer_thread = thread::spawn(move || {
             let mut writer = writer;
-            // Write initial carriage return:
-            // 1. Windows requires at least one carriage return for `drop()` to work properly.
-            //    Without this, the reader may fail to read the buffer after `input_tx.send(b"\r\n".to_vec()).ok();`.
-            // 2. This also refreshes the terminal interface on the controlling side (workaround for blank content on connect).
-            if let Err(e) = writer.write_all(b"\r") {
-                log::error!("Terminal {} initial write error: {}", terminal_id, e);
-            } else {
-                if let Err(e) = writer.flush() {
-                    log::error!("Terminal {} initial flush error: {}", terminal_id, e);
-                }
-            }
             while let Ok(data) = input_rx.recv() {
                 if let Err(e) = writer.write_all(&data) {
                     log::error!("Terminal {} write error: {}", terminal_id, e);

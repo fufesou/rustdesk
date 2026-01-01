@@ -399,9 +399,9 @@ fn get_all_term_values(uid: &str) -> Vec<String> {
         return Vec::new();
     };
 
-    // Build regex pattern to match shell processes
-    // Pattern: match process name at start, after '/', or after space, followed by space or end
-    // e.g., "bash", "/bin/bash", "/usr/bin/zsh -l"
+    // Build regex pattern to match shell processes using only argv[0] (the executable path)
+    // Pattern: match process name at start or after '/', followed by space or end
+    // e.g., "bash", "/bin/bash", "/usr/bin/zsh"
     let shell_pattern = SHELL_PROCESSES
         .iter()
         .map(|p| format!(r"(^|/){p}(\s|$)"))
