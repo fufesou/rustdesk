@@ -17,6 +17,128 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "windows")]
+use {
+    std::{
+        ffi::{c_void, OsStr, OsString},
+        fs::File,
+        os::windows::{
+            ffi::{OsStrExt, OsStringExt},
+            io::FromRawHandle,
+            raw::HANDLE as RawHandle,
+        },
+    },
+    windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{
+                CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+                WAIT_OBJECT_0,
+            },
+            Security::{
+                ImpersonateLoggedOnUser, InitializeSecurityDescriptor, RevertToSelf,
+                SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            },
+            Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED},
+            System::{
+                Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+                Pipes::{
+                    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+                    PIPE_WAIT,
+                },
+                Threading::{
+                    CreateEventW, CreateProcessAsUserW, WaitForSingleObject, PROCESS_INFORMATION,
+                    STARTUPINFOW,
+                },
+                IO::{GetOverlappedResult, OVERLAPPED},
+            },
+            UI::Shell::GetUserProfileDirectoryW,
+        },
+    },
+};
+
+// Windows pipe access mode constants (not exported by windows crate)
+#[cfg(target_os = "windows")]
+const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
+#[cfg(target_os = "windows")]
+const PIPE_ACCESS_OUTBOUND: u32 = 0x00000002;
+
+// Named pipe configuration constants
+#[cfg(target_os = "windows")]
+const PIPE_BUFFER_SIZE: u32 = 4096;
+#[cfg(target_os = "windows")]
+const PIPE_DEFAULT_TIMEOUT_MS: u32 = 5000;
+#[cfg(target_os = "windows")]
+const PIPE_CONNECTION_TIMEOUT_MS: u32 = 10000;
+
+/// Wrapper for Windows HANDLE that implements Send + Sync.
+/// This is safe because:
+/// 1. Windows HANDLEs are valid across threads
+/// 2. Access is protected by Mutex in TerminalSession
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct SendableHandle(HANDLE);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendableHandle {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for SendableHandle {}
+
+/// RAII guard for Windows impersonation.
+/// Automatically calls RevertToSelf() when dropped to ensure we always
+/// revert to the original security context, even if the code panics or returns early.
+#[cfg(target_os = "windows")]
+struct ImpersonationGuard {
+    active: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl ImpersonationGuard {
+    fn new(token: &UserToken) -> Self {
+        let result = unsafe { ImpersonateLoggedOnUser(HANDLE(*token as _)) };
+        let active = result.is_ok();
+        if active {
+            log::debug!("Impersonating user for PTY creation");
+        } else {
+            log::warn!("Failed to impersonate user for PTY creation");
+        }
+        Self { active }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = RevertToSelf();
+            }
+            log::debug!("Reverted to original security context");
+        }
+    }
+}
+
+/// Encode a message for the helper protocol.
+/// Format: [type: u8][length: u32 LE][payload: bytes]
+#[cfg(target_os = "windows")]
+fn encode_helper_message(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(super::terminal_helper::MSG_HEADER_SIZE + payload.len());
+    msg.push(msg_type);
+    msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    msg.extend_from_slice(payload);
+    msg
+}
+
+/// Encode a resize message for the helper protocol.
+/// Payload: rows (u16 LE) + cols (u16 LE)
+#[cfg(target_os = "windows")]
+fn encode_resize_message(rows: u16, cols: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4);
+    payload.extend_from_slice(&rows.to_le_bytes());
+    payload.extend_from_slice(&cols.to_le_bytes());
+    encode_helper_message(super::terminal_helper::MSG_TYPE_RESIZE, &payload)
+}
+
 const MAX_OUTPUT_BUFFER_SIZE: usize = 1024 * 1024; // 1MB per terminal
 const MAX_BUFFER_LINES: usize = 10000;
 const MAX_SERVICES: usize = 100; // Maximum number of persistent terminal services
@@ -50,31 +172,298 @@ pub fn generate_service_id() -> String {
     format!("ts_{}", uuid::Uuid::new_v4())
 }
 
+/// Windows: Create a named pipe with NULL DACL for cross-session access.
+/// This allows the helper process running in the user's session to connect to pipes
+/// created by the SYSTEM service in Session 0.
+///
+/// # Security Considerations
+/// This function uses a NULL DACL (Discretionary Access Control List), which grants
+/// unrestricted access to the pipe from any process on the local machine. This is a
+/// deliberate design choice made for the following reasons:
+///
+/// 1. **Cross-session requirement**: The SYSTEM service runs in Session 0, while the
+///    helper process runs in the user's interactive session. A restrictive DACL would
+///    prevent the helper from connecting to the pipe.
+///
+/// 2. **Mitigations in place**:
+///    - Pipe names include a random UUID (e.g., `rustdesk_term_in_{uuid}`), making them
+///      unpredictable and resistant to brute-force discovery.
+///    - Pipes are short-lived: created on-demand and exist only for the terminal session.
+///    - Each terminal session uses unique pipe names.
+///
+/// 3. **Accepted risk**: Local processes with sufficient privileges could theoretically
+///    connect to these pipes if they guess the UUID. However, this requires:
+///    - The attacker to already have local code execution
+///    - Knowledge of the exact pipe naming scheme
+///    - Timing the connection attempt during the brief connection window
+///
+/// An alternative approach using a proper DACL with explicit ACEs for SYSTEM and the
+/// target user would be more secure but significantly more complex to implement correctly.
+///
+/// Returns the pipe handle without waiting for client connection.
+#[cfg(target_os = "windows")]
+fn create_named_pipe_server(pipe_name: &str, for_input: bool) -> Result<HANDLE> {
+    // Allocate buffer for SECURITY_DESCRIPTOR (it's an opaque structure)
+    // SECURITY_DESCRIPTOR_MIN_LENGTH is 40 bytes on x64
+    let mut sd_buffer = [0u8; 64];
+    let sd_ptr = PSECURITY_DESCRIPTOR(sd_buffer.as_mut_ptr() as *mut c_void);
+
+    // Initialize security descriptor
+    unsafe {
+        InitializeSecurityDescriptor(sd_ptr, 1) // SECURITY_DESCRIPTOR_REVISION = 1
+            .map_err(|e| anyhow!("Failed to initialize security descriptor: {}", e))?;
+    }
+
+    // Set NULL DACL (allows all access)
+    unsafe {
+        SetSecurityDescriptorDacl(sd_ptr, true, None, false)
+            .map_err(|e| anyhow!("Failed to set NULL DACL: {}", e))?;
+    }
+
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd_buffer.as_mut_ptr() as *mut c_void,
+        bInheritHandle: false.into(),
+    };
+
+    let wide_name: Vec<u16> = OsStr::new(pipe_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Add FILE_FLAG_OVERLAPPED for asynchronous I/O (needed for timeout support)
+    let access_mode = if for_input {
+        FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED.0) // Service reads from this pipe (output from helper)
+    } else {
+        FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED.0)
+        // Service writes to this pipe (input to helper)
+    };
+
+    log::debug!(
+        "Creating named pipe: {} (for_input={})",
+        pipe_name,
+        for_input
+    );
+
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR::from_raw(wide_name.as_ptr()),
+            access_mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, // max instances
+            PIPE_BUFFER_SIZE,
+            PIPE_BUFFER_SIZE,
+            PIPE_DEFAULT_TIMEOUT_MS,
+            Some(&sa),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(anyhow!(
+            "Failed to create named pipe {}: {}",
+            pipe_name,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    log::debug!("Named pipe created: {}", pipe_name);
+    Ok(handle)
+}
+
+/// Windows: Wait for client to connect to named pipe with timeout
+#[cfg(target_os = "windows")]
+fn wait_for_pipe_connection(handle: HANDLE, pipe_name: &str, timeout_ms: u32) -> Result<File> {
+    log::debug!("Waiting for pipe connection: {}", pipe_name);
+
+    // Create an event for overlapped I/O
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(|e| {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        anyhow!("Failed to create event for pipe connection: {}", e)
+    })?;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event;
+
+    let result = unsafe { ConnectNamedPipe(handle, Some(&mut overlapped)) };
+    if result.is_err() {
+        let err = std::io::Error::last_os_error();
+        let err_code = err.raw_os_error().unwrap_or(0);
+
+        // ERROR_PIPE_CONNECTED means client already connected, which is OK
+        if err_code == ERROR_PIPE_CONNECTED.0 as i32 {
+            log::debug!("Pipe already connected: {}", pipe_name);
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return Ok(unsafe { File::from_raw_handle(handle.0 as RawHandle) });
+        }
+
+        // ERROR_IO_PENDING means we need to wait
+        if err_code == ERROR_IO_PENDING.0 as i32 {
+            log::debug!("Pipe connection pending, waiting with timeout...");
+            let wait_result = unsafe { WaitForSingleObject(event, timeout_ms) };
+
+            if wait_result != WAIT_OBJECT_0 {
+                log::error!("Timeout waiting for pipe connection: {}", pipe_name);
+                unsafe {
+                    let _ = CloseHandle(event);
+                    let _ = CloseHandle(handle);
+                };
+                return Err(anyhow!(
+                    "Timeout waiting for pipe connection: {}",
+                    pipe_name
+                ));
+            }
+
+            // Check if connection was successful
+            let mut bytes_transferred = 0u32;
+            let overlapped_result =
+                unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, false) };
+            if overlapped_result.is_err() {
+                let err = std::io::Error::last_os_error();
+                log::error!("Failed to complete pipe connection {}: {}", pipe_name, err);
+                unsafe {
+                    let _ = CloseHandle(event);
+                    let _ = CloseHandle(handle);
+                };
+                return Err(anyhow!(
+                    "Failed to complete pipe connection {}: {}",
+                    pipe_name,
+                    err
+                ));
+            }
+
+            log::debug!("Pipe connected: {}", pipe_name);
+        } else {
+            log::error!("Failed to connect named pipe {}: {}", pipe_name, err);
+            unsafe {
+                let _ = CloseHandle(event);
+                let _ = CloseHandle(handle);
+            };
+            return Err(anyhow!(
+                "Failed to connect named pipe {}: {}",
+                pipe_name,
+                err
+            ));
+        }
+    } else {
+        log::debug!("Pipe connected immediately: {}", pipe_name);
+    }
+
+    unsafe {
+        let _ = CloseHandle(event);
+    }
+    Ok(unsafe { File::from_raw_handle(handle.0 as RawHandle) })
+}
+
+/// Windows: Launch terminal helper process as the logged-in user using the provided token.
+/// The helper process creates ConPTY and shell, communicating via named pipes.
+/// This uses CreateProcessAsUserW directly with the user token, which works because
+/// the helper process itself doesn't need ConPTY - it creates ConPTY internally.
+///
+/// Returns the process handle so the caller can track and terminate the helper process.
+#[cfg(target_os = "windows")]
+fn launch_terminal_helper_with_token(
+    user_token: UserToken,
+    input_pipe_name: &str,
+    output_pipe_name: &str,
+    terminal_id: i32,
+    rows: u16,
+    cols: u16,
+) -> Result<HANDLE> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_CREATION_FLAGS,
+    };
+
+    let exe_path =
+        std::env::current_exe().map_err(|e| anyhow!("Failed to get current exe path: {}", e))?;
+
+    let cmd = format!(
+        "\"{}\" --terminal-helper {} {} {} {} {}",
+        exe_path.display(),
+        input_pipe_name,
+        output_pipe_name,
+        rows,
+        cols,
+        terminal_id
+    );
+
+    log::debug!("Launching terminal helper for terminal {}", terminal_id);
+
+    let mut cmd_wide: Vec<u16> = OsStr::new(&cmd)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // Create environment block for the user
+    let mut environment: *mut c_void = ptr::null_mut();
+    let env_ok =
+        unsafe { CreateEnvironmentBlock(&mut environment, Some(HANDLE(user_token as _)), true) }
+            .is_ok();
+    if !env_ok {
+        log::warn!("Failed to create environment block, using default");
+    }
+
+    let creation_flags = CREATE_NO_WINDOW
+        | if env_ok {
+            CREATE_UNICODE_ENVIRONMENT
+        } else {
+            PROCESS_CREATION_FLAGS(0)
+        };
+
+    let result = unsafe {
+        CreateProcessAsUserW(
+            Some(HANDLE(user_token as _)),
+            PCWSTR::null(),
+            Some(windows::core::PWSTR::from_raw(cmd_wide.as_mut_ptr())),
+            None,
+            None,
+            false, // Don't inherit handles
+            creation_flags,
+            if env_ok { Some(environment) } else { None },
+            PCWSTR::null(), // Use default current directory
+            &si,
+            &mut pi,
+        )
+    };
+
+    // Clean up environment block
+    if env_ok && !environment.is_null() {
+        unsafe {
+            let _ = DestroyEnvironmentBlock(environment);
+        }
+    }
+
+    if let Err(e) = result {
+        log::error!("CreateProcessAsUserW failed: {}", e);
+        return Err(anyhow!("Failed to launch terminal helper: {}", e));
+    }
+
+    // Close thread handle - we don't need it
+    unsafe {
+        let _ = CloseHandle(pi.hThread);
+    }
+
+    log::debug!("Terminal helper launched with PID {}", pi.dwProcessId);
+    // Return process handle for tracking
+    Ok(pi.hProcess)
+}
+
 fn get_default_shell() -> String {
     #[cfg(target_os = "windows")]
     {
-        // Try PowerShell Core first (cross-platform version)
-        // Common installation paths for PowerShell Core
-        let pwsh_paths = [
-            "pwsh.exe",
-            r"C:\Program Files\PowerShell\7\pwsh.exe",
-            r"C:\Program Files\PowerShell\6\pwsh.exe",
-        ];
-
-        for path in &pwsh_paths {
-            if std::path::Path::new(path).exists() {
-                return path.to_string();
-            }
-        }
-
-        // Try Windows PowerShell (should be available on all Windows systems)
-        let powershell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-        if std::path::Path::new(powershell_path).exists() {
-            return powershell_path.to_string();
-        }
-
-        // Final fallback to cmd.exe
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        // Use shared implementation from terminal_helper
+        super::terminal_helper::get_default_shell()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -458,6 +847,12 @@ pub struct TerminalSession {
     // Track if we've already sent the closed message
     closed_message_sent: bool,
     is_opened: bool,
+    // Helper mode: PTY is managed by helper process, communication via message protocol
+    #[cfg(target_os = "windows")]
+    is_helper_mode: bool,
+    // Handle to helper process for termination when session closes
+    #[cfg(target_os = "windows")]
+    helper_process_handle: Option<SendableHandle>,
 }
 
 impl TerminalSession {
@@ -479,6 +874,10 @@ impl TerminalSession {
             cols,
             closed_message_sent: false,
             is_opened: false,
+            #[cfg(target_os = "windows")]
+            is_helper_mode: false,
+            #[cfg(target_os = "windows")]
+            helper_process_handle: None,
         }
     }
 
@@ -497,7 +896,16 @@ impl TerminalSession {
             // Send a final newline to ensure the reader can read some data, and then exit.
             // This is required on Windows and Linux.
             // Although `self.pty_pair = None;` is called below, we can still send a final newline here.
-            if let Err(e) = input_tx.send(b"\r\n".to_vec()) {
+            #[cfg(target_os = "windows")]
+            let final_msg = if self.is_helper_mode {
+                encode_helper_message(super::terminal_helper::MSG_TYPE_DATA, b"\r\n")
+            } else {
+                b"\r\n".to_vec()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let final_msg = b"\r\n".to_vec();
+
+            if let Err(e) = input_tx.send(final_msg) {
                 log::warn!("Failed to send final newline to the terminal: {}", e);
             }
             drop(input_tx);
@@ -537,6 +945,17 @@ impl TerminalSession {
             // Kill the process
             let _ = child.kill();
             add_to_reaper(child);
+        }
+
+        // Terminate helper process if running (Windows helper mode)
+        #[cfg(target_os = "windows")]
+        if let Some(SendableHandle(handle)) = self.helper_process_handle.take() {
+            use windows::Win32::System::Threading::TerminateProcess;
+            log::debug!("Terminating helper process");
+            unsafe {
+                let _ = TerminateProcess(handle, 0);
+                let _ = CloseHandle(handle);
+            }
         }
     }
 }
@@ -747,6 +1166,15 @@ impl TerminalServiceProxy {
             return Ok(Some(response));
         }
 
+        // Windows with user_token: use helper process to run shell as the logged-in user
+        // This solves the ConPTY + CreateProcessAsUserW incompatibility issue where
+        // vim, Claude Code, and other TUI applications hang when ConPTY is created
+        // by SYSTEM service but shell runs as user via CreateProcessAsUserW.
+        #[cfg(target_os = "windows")]
+        if self.user_token.is_some() {
+            return self.handle_open_with_helper(service, open);
+        }
+
         // Create new terminal session
         log::info!(
             "Creating new terminal {} for service: {}",
@@ -762,6 +1190,13 @@ impl TerminalServiceProxy {
             pixel_width: 0,
             pixel_height: 0,
         };
+
+        // On Windows, impersonate the user before creating ConPTY.
+        // This ensures both ConPTY and child process run in the same security context,
+        // which is required for proper terminal input handling (e.g., vim, claude code).
+        // Use RAII guard to ensure RevertToSelf() is called even on early return or panic.
+        #[cfg(target_os = "windows")]
+        let _impersonation_guard = self.user_token.as_ref().map(ImpersonationGuard::new);
 
         log::debug!("Opening PTY with size: {}x{}", open.rows, open.cols);
         let pty_system = portable_pty::native_pty_system();
@@ -796,16 +1231,68 @@ impl TerminalServiceProxy {
             log::debug!("Set TERM={} for macOS PTY", term);
         }
 
+        // Windows: Set user environment variables when running as SYSTEM service.
+        // Since we use CreateProcessW (not CreateProcessAsUserW) to avoid ConPTY issues,
+        // the child process runs as SYSTEM. We need to manually set user's profile path.
         #[cfg(target_os = "windows")]
         if let Some(token) = &self.user_token {
-            cmd.set_user_token(*token as _);
+            // Get user profile directory
+            let mut len = 0u32;
+            // First call to get required buffer size
+            let _ = unsafe { GetUserProfileDirectoryW(HANDLE(*token as _), None, &mut len) };
+            if len > 0 {
+                let mut buf = vec![0u16; len as usize];
+                let ok = unsafe {
+                    GetUserProfileDirectoryW(
+                        HANDLE(*token as _),
+                        Some(windows::core::PWSTR::from_raw(buf.as_mut_ptr())),
+                        &mut len,
+                    )
+                };
+                if ok.is_ok() {
+                    // Remove null terminator
+                    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    buf.truncate(end);
+                    let profile_path = OsString::from_wide(&buf);
+                    let profile_str = profile_path.to_string_lossy();
+
+                    // Set environment variables for user profile
+                    cmd.env("USERPROFILE", profile_path.clone());
+                    cmd.env("HOME", profile_path.clone());
+
+                    // Extract HOMEDRIVE and HOMEPATH from profile path (e.g., C:\Users\username)
+                    if let Some(colon_pos) = profile_str.find(':') {
+                        let drive = &profile_str[..=colon_pos]; // e.g., "C:"
+                        let path = &profile_str[colon_pos + 1..]; // e.g., "\Users\username"
+                        cmd.env("HOMEDRIVE", drive);
+                        cmd.env("HOMEPATH", path);
+                    }
+
+                    log::debug!("Set user profile environment: {}", profile_str);
+                }
+            }
+            // Note: We intentionally do NOT call cmd.set_user_token() here.
+            // CreateProcessAsUserW has compatibility issues with ConPTY that cause
+            // input handling to fail for complex TUI applications (vim, Claude Code).
+            // The child process will run as SYSTEM but with user's environment variables.
         }
+
+        // Note: We keep impersonation active during spawn so that ConPTY
+        // is created under the user's security context.
 
         log::debug!("Spawning shell process...");
         let child = pty_pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn command")?;
+
+        // Impersonation is automatically reverted when _impersonation_guard is dropped.
+        // ConPTY was created under user context (via impersonation).
+        // Child process runs as SYSTEM (via CreateProcessW) but with user's env vars.
+        // This workaround is needed because CreateProcessAsUserW has compatibility
+        // issues with ConPTY for complex TUI applications like vim and Claude Code.
+        #[cfg(target_os = "windows")]
+        drop(_impersonation_guard);
 
         let writer = pty_pair
             .master
@@ -926,6 +1413,236 @@ impl TerminalServiceProxy {
         Ok(Some(response))
     }
 
+    /// Windows-only: Open terminal using helper process pattern
+    /// This solves the ConPTY + CreateProcessAsUserW incompatibility issue.
+    /// The helper process runs as the logged-in user and creates ConPTY + shell,
+    /// communicating with this service via named pipes.
+    #[cfg(target_os = "windows")]
+    fn handle_open_with_helper(
+        &self,
+        service: &mut PersistentTerminalService,
+        open: &OpenTerminal,
+    ) -> Result<Option<TerminalResponse>> {
+        let mut response = TerminalResponse::new();
+
+        log::info!(
+            "Creating new terminal {} using helper process for service: {}",
+            open.terminal_id,
+            service.service_id
+        );
+
+        let mut session =
+            TerminalSession::new(open.terminal_id, open.rows as u16, open.cols as u16);
+
+        // Generate unique pipe names for this terminal
+        let pipe_id = uuid::Uuid::new_v4();
+        let input_pipe_name = format!(r"\\.\pipe\rustdesk_term_in_{}", pipe_id);
+        let output_pipe_name = format!(r"\\.\pipe\rustdesk_term_out_{}", pipe_id);
+
+        log::debug!(
+            "Creating pipes: input={}, output={}",
+            input_pipe_name,
+            output_pipe_name
+        );
+
+        // Create pipes (server side, don't wait for connection yet)
+        // input_pipe: service WRITES to this, helper READS from this
+        // output_pipe: service READS from this, helper WRITES to this
+        let input_pipe_handle = create_named_pipe_server(&input_pipe_name, false)?;
+        let output_pipe_handle = match create_named_pipe_server(&output_pipe_name, true) {
+            Ok(h) => h,
+            Err(e) => {
+                // Clean up input pipe on failure
+                unsafe {
+                    let _ = CloseHandle(input_pipe_handle);
+                }
+                return Err(e);
+            }
+        };
+
+        // Launch helper process as the logged-in user using the token we already have
+        // This is more reliable than run_exe_in_session which requires explorer.exe
+        let user_token = self
+            .user_token
+            .ok_or_else(|| {
+                // Clean up pipe handles on failure
+                unsafe {
+                    let _ = CloseHandle(input_pipe_handle);
+                    let _ = CloseHandle(output_pipe_handle);
+                }
+                anyhow!("user_token is required for helper mode")
+            })?;
+        let helper_process_handle = match launch_terminal_helper_with_token(
+            user_token,
+            &input_pipe_name,
+            &output_pipe_name,
+            open.terminal_id,
+            open.rows as u16,
+            open.cols as u16,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                // Clean up pipe handles on failure
+                unsafe {
+                    let _ = CloseHandle(input_pipe_handle);
+                    let _ = CloseHandle(output_pipe_handle);
+                }
+                return Err(e);
+            }
+        };
+
+        // Wait for helper to connect to pipes
+        // Note: wait_for_pipe_connection closes the handle on failure, so we only need to
+        // clean up the other handle if one fails.
+        let mut input_pipe = match wait_for_pipe_connection(
+            input_pipe_handle,
+            &input_pipe_name,
+            PIPE_CONNECTION_TIMEOUT_MS,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                // input_pipe_handle is already closed by wait_for_pipe_connection on error
+                unsafe {
+                    let _ = CloseHandle(output_pipe_handle);
+                    let _ = CloseHandle(helper_process_handle);
+                }
+                return Err(e);
+            }
+        };
+        let mut output_pipe = match wait_for_pipe_connection(
+            output_pipe_handle,
+            &output_pipe_name,
+            PIPE_CONNECTION_TIMEOUT_MS,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                // output_pipe_handle is already closed by wait_for_pipe_connection on error
+                // input_pipe will be dropped and closed when it goes out of scope
+                unsafe {
+                    let _ = CloseHandle(helper_process_handle);
+                }
+                return Err(e);
+            }
+        };
+
+        // PID is not easily available from helper, set to 0 for now
+        // The actual shell PID is managed by the helper process
+        session.pid = 0;
+
+        // Create channels for input/output (same as direct PTY mode)
+        let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
+        let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
+
+        // Spawn writer thread: reads from channel, writes to input pipe
+        let terminal_id = open.terminal_id;
+        let writer_thread = thread::spawn(move || {
+            while let Ok(data) = input_rx.recv() {
+                if let Err(e) = input_pipe.write_all(&data) {
+                    log::error!("Terminal {} pipe write error: {}", terminal_id, e);
+                    break;
+                }
+                if let Err(e) = input_pipe.flush() {
+                    log::error!("Terminal {} pipe flush error: {}", terminal_id, e);
+                }
+            }
+            log::debug!(
+                "Terminal {} writer thread (helper mode) exiting",
+                terminal_id
+            );
+        });
+
+        // Spawn reader thread: reads from output pipe, sends to channel
+        // Note: The output pipe was created with FILE_FLAG_OVERLAPPED for timeout support
+        // during ConnectNamedPipe. However, once converted to a File handle, reads are
+        // performed synchronously. The WouldBlock handling below is defensive but may
+        // not be triggered in practice since File::read() blocks until data is available.
+        let exiting = session.exiting.clone();
+        let terminal_id = open.terminal_id;
+        let reader_thread = thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match output_pipe.read(&mut buf) {
+                    Ok(0) => {
+                        // EOF - helper process exited
+                        log::debug!("Terminal {} helper output EOF", terminal_id);
+                        break;
+                    }
+                    Ok(n) => {
+                        if exiting.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let data = buf[..n].to_vec();
+                        match output_tx.try_send(data) {
+                            Ok(_) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                log::debug!(
+                                    "Terminal {} output channel full, dropping data",
+                                    terminal_id
+                                );
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                log::debug!("Terminal {} output channel disconnected", terminal_id);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Defensive: WouldBlock is unlikely with synchronous File::read(),
+                        // but handle it gracefully just in case.
+                        if exiting.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => {
+                        log::error!("Terminal {} pipe read error: {}", terminal_id, e);
+                        break;
+                    }
+                }
+            }
+            log::debug!(
+                "Terminal {} reader thread (helper mode) exiting",
+                terminal_id
+            );
+        });
+
+        // In helper mode, we don't have pty_pair or child - helper manages those
+        session.pty_pair = None;
+        session.child = None;
+        session.input_tx = Some(input_tx);
+        session.output_rx = Some(output_rx);
+        session.reader_thread = Some(reader_thread);
+        session.writer_thread = Some(writer_thread);
+        session.is_opened = true;
+        session.is_helper_mode = true;
+        session.helper_process_handle = Some(SendableHandle(helper_process_handle));
+
+        let mut opened = TerminalOpened::new();
+        opened.terminal_id = open.terminal_id;
+        opened.success = true;
+        opened.message = "Terminal opened (helper mode)".to_string();
+        opened.pid = session.pid;
+        opened.service_id = service.service_id.clone();
+        if service.needs_session_sync {
+            if !service.sessions.is_empty() {
+                opened.persistent_sessions = service.sessions.keys().cloned().collect();
+            }
+            service.needs_session_sync = false;
+        }
+        response.set_opened(opened);
+
+        log::info!(
+            "Terminal {} opened successfully using helper process",
+            open.terminal_id
+        );
+
+        service
+            .sessions
+            .insert(open.terminal_id, Arc::new(Mutex::new(session)));
+
+        Ok(Some(response))
+    }
+
     fn handle_resize(
         &self,
         session: Option<Arc<Mutex<TerminalSession>>>,
@@ -937,6 +1654,7 @@ impl TerminalServiceProxy {
             session.rows = resize.rows as u16;
             session.cols = resize.cols as u16;
 
+            // Direct PTY mode: resize via pty_pair
             if let Some(pty_pair) = &session.pty_pair {
                 pty_pair.master.resize(PtySize {
                     rows: resize.rows as u16,
@@ -944,6 +1662,16 @@ impl TerminalServiceProxy {
                     pixel_width: 0,
                     pixel_height: 0,
                 })?;
+            }
+            // Helper mode: send resize command via message protocol
+            #[cfg(target_os = "windows")]
+            if session.is_helper_mode {
+                if let Some(input_tx) = &session.input_tx {
+                    let msg = encode_resize_message(resize.rows as u16, resize.cols as u16);
+                    if let Err(e) = input_tx.send(msg) {
+                        log::error!("Failed to send resize to helper: {}", e);
+                    }
+                }
             }
         }
         Ok(None)
@@ -958,8 +1686,18 @@ impl TerminalServiceProxy {
             let mut session = session_arc.lock().unwrap();
             session.update_activity();
             if let Some(input_tx) = &session.input_tx {
+                // Encode data for helper mode or send raw for direct PTY mode
+                #[cfg(target_os = "windows")]
+                let msg = if session.is_helper_mode {
+                    encode_helper_message(super::terminal_helper::MSG_TYPE_DATA, &data.data)
+                } else {
+                    data.data.to_vec()
+                };
+                #[cfg(not(target_os = "windows"))]
+                let msg = data.data.to_vec();
+
                 // Send data to writer thread
-                if let Err(e) = input_tx.send(data.data.to_vec()) {
+                if let Err(e) = input_tx.send(msg) {
                     log::error!(
                         "Failed to send data to terminal {}: {}",
                         data.terminal_id,
