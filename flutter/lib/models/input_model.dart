@@ -14,6 +14,7 @@ import 'package:get/get.dart';
 
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
+import '../../models/state_model.dart';
 import 'relative_mouse_model.dart';
 import '../common.dart';
 import '../consts.dart';
@@ -405,6 +406,14 @@ class InputModel {
       setPointerInsideImage: (inside) => _pointerInsideImage = inside,
     );
     _relativeMouse.onDisabled = () => onRelativeMouseModeDisabled?.call();
+
+    // Sync relative mouse mode state to global state for UI components (e.g., tab bar hint).
+    ever(relativeMouseMode, (bool value) {
+      final peerId = id;
+      if (peerId.isNotEmpty) {
+        stateGlobal.relativeMouseModeState[peerId] = value;
+      }
+    });
   }
 
   // This function must be called after the peer info is received.
