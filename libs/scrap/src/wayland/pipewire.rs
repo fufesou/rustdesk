@@ -633,9 +633,19 @@ pub fn request_remote_desktop(
     );
 
     let mut is_support_restore_token = false;
-    if let Ok(version) = screencast_portal::version(&portal) {
-        if version >= 4 {
-            is_support_restore_token = true;
+    if is_server_running() {
+        // screencast_portal supports restore_token since version 4
+        if let Ok(version) = screencast_portal::version(&portal) {
+            if version >= 4 {
+                is_support_restore_token = true;
+            }
+        }
+    } else {
+        // remote_desktop_portal supports restore_token since version 2
+        if let Ok(version) = remote_desktop_portal::version(&portal) {
+            if version >= 2 {
+                is_support_restore_token = true;
+            }
         }
     }
 
@@ -774,8 +784,18 @@ fn on_create_session_response(
                 failure.clone(),
             )?;
         } else {
-            // TODO: support persist_mode for remote_desktop_portal
             // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html
+            // persist_mode and restore_token are supported since RemoteDesktop portal version 2
+            if let Ok(version) = remote_desktop_portal::version(&portal) {
+                if version >= 2 {
+                    let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
+                    if !restore_token.is_empty() {
+                        args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
+                    }
+                    // persist_mode may be configured by the user.
+                    args.insert("persist_mode".to_string(), Variant(Box::new(2u32)));
+                }
+            }
 
             args.insert(
                 "handle_token".to_string(),
@@ -897,16 +917,14 @@ fn on_start_response(
 ) -> Result<(), Box<dyn Error>> {
     move |r: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
-        // See `is_server_running()` to understand the following code.
-        if is_server_running() {
-            if is_support_restore_token {
-                if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
-                    if let Some(restore_token) = restore_token.as_str() {
-                        config::LocalConfig::set_option(
-                            RESTORE_TOKEN_CONF_KEY.to_owned(),
-                            restore_token.to_owned(),
-                        );
-                    }
+        // Save restore_token for both screencast_portal and remote_desktop_portal
+        if is_support_restore_token {
+            if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
+                if let Some(restore_token) = restore_token.as_str() {
+                    config::LocalConfig::set_option(
+                        RESTORE_TOKEN_CONF_KEY.to_owned(),
+                        restore_token.to_owned(),
+                    );
                 }
             }
         }
