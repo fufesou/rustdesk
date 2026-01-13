@@ -10,6 +10,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
@@ -222,7 +223,12 @@ class FfiModel with ChangeNotifier {
     });
     // Only inited at remote page
     if (parent.target?.connType == ConnType.defaultConn) {
-      KeyboardEnabledState.find(id).value = _permissions['keyboard'] != false;
+      final keyboardState = KeyboardEnabledState.find(id);
+      final newKeyboardPerm = _permissions['keyboard'] != false;
+      if (keyboardState.value != newKeyboardPerm) {
+        keyboardState.value = newKeyboardPerm;
+        RendererBinding.instance.mouseTracker.updateAllDevices();
+      }
     }
 
     // If keyboard permission was revoked while relative mouse mode is active,
