@@ -273,8 +273,25 @@ fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), Cliprdr
 #[cfg(target_os = "windows")]
 pub fn send_data_exclude(conn_id: i32, data: ClipboardFile) {
     // Need more tests to see if it's necessary to handle the error.
-    for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
+    let channels = VEC_MSG_CHANNEL.read().unwrap();
+    let all_conn_ids: Vec<i32> = channels.iter().map(|c| c.conn_id).collect();
+    log::info!(
+        "============== CLIPBOARD DEBUG send_data_exclude called, source conn_id: {}, data: {:?}, all_conn_ids: {:?}",
+        conn_id,
+        match &data {
+            ClipboardFile::TryEmpty => "TryEmpty".to_string(),
+            ClipboardFile::FormatList { format_list } => format!("FormatList({:?})", format_list),
+            _ => format!("{:?}", std::mem::discriminant(&data)),
+        },
+        all_conn_ids
+    );
+    for msg_channel in channels.iter() {
         if msg_channel.conn_id != conn_id {
+            log::info!(
+                "============== CLIPBOARD DEBUG send_data_exclude: sending to conn_id {} (excluding source {})",
+                msg_channel.conn_id,
+                conn_id
+            );
             allow_err!(msg_channel.sender.send(data.clone()));
         }
     }

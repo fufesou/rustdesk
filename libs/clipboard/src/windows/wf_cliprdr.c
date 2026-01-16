@@ -137,6 +137,18 @@ typedef struct _FORMAT_IDS FORMAT_IDS;
 
 #define TAG "windows"
 
+// External Rust logging function
+extern void cliprdr_log_info(const char *msg);
+
+// Macro to log through Rust's logging system
+#define CLIPRDR_LOG_INFO(fmt, ...)                              \
+	do                                                          \
+	{                                                           \
+		char _log_buf[1024];                                    \
+		snprintf(_log_buf, sizeof(_log_buf), fmt, ##__VA_ARGS__); \
+		cliprdr_log_info(_log_buf);                             \
+	} while (0)
+
 #ifdef WITH_DEBUG_CLIPRDR
 #define DEBUG_CLIPRDR(fmt, ...)                                                                  \
 	fprintf(stderr, "DEBUG %s[%d] %s() " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
@@ -1498,8 +1510,17 @@ static UINT cliprdr_send_format_list(wfClipboard *clipboard, UINT32 connID)
 	formatList.formats = formats;
 	formatList.msgType = CB_FORMAT_LIST;
 
+	// ============== CLIPBOARD DEBUG Log before sending FormatList to remote
+	CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG cliprdr_send_format_list: sending FormatList to remote, connID=%u, numFormats=%u", connID, numFormats);
+	for (UINT32 i = 0; i < numFormats; i++)
+	{
+		CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG cliprdr_send_format_list: format[%u] id=%u, name=%s",
+			i, formats[i].formatId, formats[i].formatName ? formats[i].formatName : "(null)");
+	}
+
 	// send
 	rc = clipboard->context->ClientFormatList(clipboard->context, &formatList);
+	CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG cliprdr_send_format_list: ClientFormatList returned %u", rc);
 	// No need to check `rc`, `copied` is only used to indicate `Ctrl+C` is pressed.
 	clipboard->copied = TRUE;
 
@@ -1750,7 +1771,11 @@ static LRESULT CALLBACK cliprdr_proc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
 		DEBUG_CLIPRDR("info: WM_CLIPBOARDUPDATE");
 		// if (clipboard->sync)
 		{
-			if (!is_set_by_instance(clipboard))
+			BOOL setByInstance = is_set_by_instance(clipboard);
+			HWND clipOwner = GetClipboardOwner();
+			CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG WM_CLIPBOARDUPDATE: is_set_by_instance=%d, clipboardOwner=0x%p, our_hwnd=0x%p",
+				setByInstance, (void*)clipOwner, (void*)clipboard->hwnd);
+			if (!setByInstance)
 			{
 				if (clipboard->hmem)
 				{
@@ -1758,7 +1783,12 @@ static LRESULT CALLBACK cliprdr_proc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
 					clipboard->hmem = NULL;
 				}
 
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG WM_CLIPBOARDUPDATE: clipboard changed by external app, calling cliprdr_send_format_list");
 				cliprdr_send_format_list(clipboard, 0);
+			}
+			else
+			{
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG WM_CLIPBOARDUPDATE: clipboard set by our instance, skipping send_format_list");
 			}
 		}
 
@@ -1838,25 +1868,42 @@ static LRESULT CALLBACK cliprdr_proc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
 		{
 		case OLE_SETCLIPBOARD:
 			DEBUG_CLIPRDR("info: OLE_SETCLIPBOARD");
+			{
+				UINT32 *p_conn_id = (UINT32 *)lParam;
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: received request to set clipboard from conn_id=%u", p_conn_id ? *p_conn_id : 0);
+			}
 
 			if (WaitForSingleObject(clipboard->data_obj_mutex, INFINITE) != WAIT_OBJECT_0)
 			{
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: failed to acquire mutex");
 				break;
 			}
 
 			if (clipboard->data_obj != NULL)
 			{
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: destroying existing data_obj");
 				wf_destroy_file_obj(clipboard->data_obj);
 				clipboard->data_obj = NULL;
 			}
 			if (wf_create_file_obj((UINT32 *)lParam, clipboard, &clipboard->data_obj))
 			{
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: calling OleSetClipboard to set virtual file object");
 				HRESULT res = OleSetClipboard(clipboard->data_obj);
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: OleSetClipboard returned 0x%lx", res);
 				if (res != S_OK)
 				{
+					CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: OleSetClipboard FAILED, destroying data_obj");
 					wf_destroy_file_obj(clipboard->data_obj);
 					clipboard->data_obj = NULL;
 				}
+				else
+				{
+					CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: SUCCESS - clipboard now has virtual file object from remote");
+				}
+			}
+			else
+			{
+				CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG OLE_SETCLIPBOARD: wf_create_file_obj FAILED");
 			}
 			free((void *)lParam);
 
@@ -3143,10 +3190,12 @@ wf_cliprdr_server_file_contents_response(CliprdrClientContext *context,
 
 BOOL is_set_by_instance(wfClipboard *clipboard)
 {
-	if (GetClipboardOwner() == clipboard->hwnd || S_OK == OleIsCurrentClipboard(clipboard->data_obj)) {
-		return TRUE;
-	}
-	return FALSE;
+	HWND owner = GetClipboardOwner();
+	HRESULT oleResult = OleIsCurrentClipboard(clipboard->data_obj);
+	BOOL result = (owner == clipboard->hwnd || S_OK == oleResult);
+	CLIPRDR_LOG_INFO("============== CLIPBOARD DEBUG is_set_by_instance: owner=0x%p, our_hwnd=0x%p, OleIsCurrentClipboard=%d, result=%d",
+		(void*)owner, (void*)clipboard->hwnd, oleResult, result);
+	return result;
 }
 
 BOOL is_file_descriptor_from_remote()

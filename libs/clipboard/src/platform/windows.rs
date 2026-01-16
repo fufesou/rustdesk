@@ -20,6 +20,19 @@ use std::{
 // only used error code will be recorded here
 /// success
 const CHANNEL_RC_OK: u32 = 0;
+
+/// FFI function for C code to log messages through Rust's logging system
+/// # Safety
+/// The `msg` pointer must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn cliprdr_log_info(msg: *const ::std::os::raw::c_char) {
+    if msg.is_null() {
+        return;
+    }
+    if let Ok(s) = CStr::from_ptr(msg).to_str() {
+        log::info!("{}", s);
+    }
+}
 /// error code from WinError.h
 /// success
 const ERROR_SUCCESS: u32 = 0;
@@ -652,15 +665,23 @@ pub fn server_clip_file(
             );
         }
         ClipboardFile::FormatList { format_list } => {
-            log::debug!(
-                "server_format_list called, conn_id {}, format_list: {:?}",
+            log::info!(
+                "============== CLIPBOARD DEBUG RECEIVED FormatList from REMOTE peer, conn_id {}, format_list: {:?}",
                 conn_id,
                 &format_list
             );
+            log::info!(
+                "============== CLIPBOARD DEBUG About to call send_data_exclude to send TryEmpty to other connections (excluding conn_id {})",
+                conn_id
+            );
             send_data_exclude(conn_id as _, ClipboardFile::TryEmpty);
+            log::info!(
+                "============== CLIPBOARD DEBUG About to call server_format_list to set local clipboard with virtual file object from conn_id {}",
+                conn_id
+            );
             ret = server_format_list(context, conn_id, format_list);
-            log::debug!(
-                "server_format_list called, conn_id {}, return {}",
+            log::info!(
+                "============== CLIPBOARD DEBUG server_format_list completed, conn_id {}, return {}",
                 conn_id,
                 ret
             );
@@ -756,10 +777,13 @@ pub fn server_clip_file(
             );
         }
         ClipboardFile::TryEmpty => {
-            log::debug!("empty_clipboard called");
+            log::info!(
+                "============== CLIPBOARD DEBUG RECEIVED TryEmpty from conn_id {}, about to call empty_clipboard",
+                conn_id
+            );
             let ret = empty_clipboard(context, conn_id);
-            log::debug!(
-                "empty_clipboard called, conn_id {}, return {}",
+            log::info!(
+                "============== CLIPBOARD DEBUG empty_clipboard completed, conn_id {}, return {}",
                 conn_id,
                 ret
             );
@@ -1114,8 +1138,8 @@ extern "C" fn client_format_list(
         }
         conn_id = (*clip_format_list).connID as i32;
     }
-    log::debug!(
-        "client_format_list called, client id: {}, format_list: {:?}",
+    log::info!(
+        "============== CLIPBOARD DEBUG client_format_list called (LOCAL clipboard changed, sending to remote), conn_id: {}, format_list: {:?}",
         conn_id,
         &format_list
     );
@@ -1124,10 +1148,19 @@ extern "C" fn client_format_list(
     if conn_id == 0 {
         // msg_channel is used for debug, VEC_MSG_CHANNEL cannot be inspected by the debugger.
         let msg_channel = VEC_MSG_CHANNEL.read().unwrap();
+        let all_conn_ids: Vec<i32> = msg_channel.iter().map(|c| c.conn_id).collect();
+        log::info!(
+            "============== CLIPBOARD DEBUG client_format_list: conn_id=0, broadcasting to all connections: {:?}",
+            all_conn_ids
+        );
         msg_channel
             .iter()
             .for_each(|msg_channel| allow_err!(msg_channel.sender.send(data.clone())));
     } else {
+        log::info!(
+            "============== CLIPBOARD DEBUG client_format_list: sending to specific conn_id: {}",
+            conn_id
+        );
         match send_data(conn_id, data) {
             Ok(_) => {}
             Err(e) => {
