@@ -530,11 +530,12 @@ pub mod amyuni_idd {
         Ok(())
     }
 
+    // Returns (io_control_success, monitor_count_changed)
     #[inline]
     fn plug_monitor_(
         add: bool,
         wait_timeout: Option<Duration>,
-    ) -> Result<(), win_device::DeviceError> {
+    ) -> Result<bool, win_device::DeviceError> {
         let cmd = if add { 0x10 } else { 0x00 };
         let cmd = [cmd, 0x00, 0x00, 0x00];
         let now = Instant::now();
@@ -542,12 +543,30 @@ pub mod amyuni_idd {
         unsafe {
             win_device::device_io_control(&INTERFACE_GUID, PLUG_MONITOR_IO_CONTROL_CDOE, &cmd, 0)?;
         }
+        let mut count_changed = false;
         if let Some(wait_timeout) = wait_timeout {
             while now.elapsed() < wait_timeout {
-                if get_monitor_count() != c1 {
+                let c2 = get_monitor_count();
+                if c2 != c1 {
+                    count_changed = true;
+                    log::info!(
+                        "Virtual display {} detected, count: {} -> {}, elapsed: {:?}",
+                        if add { "plug-in" } else { "plug-out" },
+                        c1,
+                        c2,
+                        now.elapsed()
+                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(30));
+            }
+            if !count_changed {
+                log::warn!(
+                    "Virtual display {} timeout after {:?}, monitor count unchanged: {}",
+                    if add { "plug-in" } else { "plug-out" },
+                    now.elapsed(),
+                    c1
+                );
             }
         }
         // No need to consider concurrency here.
@@ -562,22 +581,25 @@ pub mod amyuni_idd {
                 VIRTUAL_DISPLAY_COUNT.fetch_sub(1, atomic::Ordering::SeqCst);
             }
         }
-        Ok(())
+        Ok(count_changed)
     }
 
     // `std::thread::sleep()` with a timeout is acceptable here.
     // Because user can wait for a while to plug in a monitor.
+    // Returns true if monitor count changed, false if timeout without change.
     fn plug_in_monitor_(
         add: bool,
         is_driver_async_installed: bool,
         wait_timeout: Option<Duration>,
-    ) -> ResultType<()> {
+    ) -> ResultType<bool> {
         let timeout = Duration::from_secs(3);
         let now = Instant::now();
         let reg_connectivity_old = reg_display_settings::read_reg_connectivity();
+        let mut count_changed = false;
         loop {
             match plug_monitor_(add, wait_timeout) {
-                Ok(_) => {
+                Ok(changed) => {
+                    count_changed = changed;
                     break;
                 }
                 Err(e) => {
@@ -602,7 +624,7 @@ pub mod amyuni_idd {
             });
         }
 
-        Ok(())
+        Ok(count_changed)
     }
 
     fn try_reset_resolution_on_first_plug_in(
@@ -627,9 +649,18 @@ pub mod amyuni_idd {
 
     pub fn plug_in_headless() -> ResultType<()> {
         let mut tm = LAST_PLUG_IN_HEADLESS_TIME.lock().unwrap();
-        if let Some(tm) = &mut *tm {
-            if tm.elapsed() < Duration::from_secs(3) {
-                bail!("Plugging in too frequently.");
+        if let Some(last_tm) = &*tm {
+            let elapsed = last_tm.elapsed();
+            if elapsed < Duration::from_secs(3) {
+                // Wait instead of failing immediately to handle rapid reconnection scenarios
+                let wait_time = Duration::from_secs(3) - elapsed;
+                log::info!(
+                    "plug_in_headless: rate limited, waiting {:?} before retry",
+                    wait_time
+                );
+                drop(tm);
+                std::thread::sleep(wait_time);
+                tm = LAST_PLUG_IN_HEADLESS_TIME.lock().unwrap();
             }
         }
         *tm = Some(Instant::now());
@@ -641,7 +672,12 @@ pub mod amyuni_idd {
             bail!("Failed to install driver.");
         }
 
-        plug_in_monitor_(true, is_async, Some(Duration::from_millis(3_000)))
+        let count_changed =
+            plug_in_monitor_(true, is_async, Some(Duration::from_millis(3_000)))?;
+        if !count_changed {
+            log::warn!("plug_in_headless: io_control succeeded but monitor count did not change");
+        }
+        Ok(())
     }
 
     pub fn plug_in_monitor() -> ResultType<()> {
@@ -655,7 +691,8 @@ pub mod amyuni_idd {
             bail!("There are already {VIRTUAL_DISPLAY_MAX_COUNT} monitors plugged in.");
         }
 
-        plug_in_monitor_(true, is_async, None)
+        let _ = plug_in_monitor_(true, is_async, None)?;
+        Ok(())
     }
 
     // `index` the display index to plug out. -1 means plug out all.

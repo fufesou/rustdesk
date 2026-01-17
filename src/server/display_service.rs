@@ -477,11 +477,34 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
 
     let no_displays_v = no_displays(&displays);
     if no_displays_v {
-        log::debug!("no displays, create virtual display");
+        log::info!(
+            "No displays detected (count={}), attempting to create virtual display",
+            displays.len()
+        );
         if let Err(e) = virtual_display_manager::plug_in_headless() {
-            log::error!("plug in headless failed {}", e);
+            log::error!("plug_in_headless failed: {}", e);
         } else {
+            // Wait a bit for Windows to fully register the new virtual display
+            // before enumerating displays again
+            std::thread::sleep(std::time::Duration::from_millis(500));
             displays = Display::all()?;
+            log::info!(
+                "After plug_in_headless, display count: {}, no_displays: {}",
+                displays.len(),
+                no_displays(&displays)
+            );
+
+            // If still no displays after first attempt, retry with additional wait
+            if no_displays(&displays) {
+                log::warn!("Still no displays after plug_in_headless, retrying with longer wait");
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                displays = Display::all()?;
+                log::info!(
+                    "After retry, display count: {}, no_displays: {}",
+                    displays.len(),
+                    no_displays(&displays)
+                );
+            }
         }
     }
     Ok(displays)
