@@ -791,6 +791,21 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                             });
                           },
                           translate('Enable blocking user input'),
+                        ),
+                      if (isWindows && bind.mainIsInstalled())
+                        buildPermissionIcon(
+                          client.privacyMode,
+                          Icons.visibility_off,
+                          (enabled) {
+                            bind.cmSwitchPermission(
+                                connId: client.id,
+                                name: "privacy_mode",
+                                enabled: enabled);
+                            setState(() {
+                              client.privacyMode = enabled;
+                            });
+                          },
+                          translate('Enable privacy mode'),
                         )
                     ],
             ),

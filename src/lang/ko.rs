@@ -737,5 +737,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-exit-{}-tip", "종료하려면 {}을(를) 누르세요."),
         ("rel-mouse-permission-lost-tip", "키보드 권한이 취소되었습니다. 상대 마우스 모드가 비활성화되었습니다."),
         ("Changelog", ""),
+        ("Enable privacy mode", ""),
     ].iter().cloned().collect();
 }

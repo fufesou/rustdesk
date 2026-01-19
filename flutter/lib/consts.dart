@@ -107,6 +107,7 @@ const String kOptionEnableKeyboard = "enable-keyboard";
 const String kOptionEnableRemotePrinter = "enable-remote-printer";
 const String kOptionEnableClipboard = "enable-clipboard";
 const String kOptionEnableFileTransfer = "enable-file-transfer";
+const String kOptionEnablePrivacyMode = "enable-privacy-mode";
 const String kOptionEnableAudio = "enable-audio";
 const String kOptionEnableCamera = "enable-camera";
 const String kOptionEnableTerminal = "enable-terminal";
