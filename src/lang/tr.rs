@@ -735,7 +735,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-not-ready-tip", "Göreli fare modu henüz hazır değil"),
         ("rel-mouse-lock-failed-tip", "Göreli fare kilitlenemedi"),
         ("rel-mouse-exit-{}-tip", "Göreli fare modundan çıkmak için {}"),
-		("rel-mouse-permission-lost-tip", "Göreli fare izinleri geçerli değil"),
+        ("rel-mouse-permission-lost-tip", "Göreli fare izinleri geçerli değil"),
         ("Changelog", "Değişiklik Günlüğü"),
+        ("Enable privacy mode", ""),
     ].iter().cloned().collect();
 }

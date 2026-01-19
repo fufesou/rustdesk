@@ -65,6 +65,7 @@ class Body: Reactor.Component
                 </div> <div .permissions style="margin-top:8px;" >
                     <div class={!c.recording ? "disabled" : ""} title={translate('Enable recording session')}><icon .recording /></div>
                     <div class={!c.block_input ? "disabled" : ""} title={translate('Enable blocking user input')} style={is_win ? "" : "display:none;"}><icon .block_input /></div>
+                    <div class={!c.privacy_mode ? "disabled" : ""} title={translate('Enable privacy mode')} style={(is_win && handler.is_installed()) ? "" : "display:none;"}><icon .privacy_mode /></div>
                 </div></div>
                 }
                 {c.is_file_transfer ? <div>{translate('Transfer file')}</div> : ""}
@@ -160,6 +161,15 @@ class Body: Reactor.Component
             connection.block_input = !connection.block_input;
             body.update();
             handler.switch_permission(cid, "block_input", connection.block_input);
+        });
+    }
+
+    event click $(icon.privacy_mode) {
+        var { cid, connection } = this;
+        checkClickTime(function() {
+            connection.privacy_mode = !connection.privacy_mode;
+            body.update();
+            handler.switch_permission(cid, "privacy_mode", connection.privacy_mode);
         });
     }
 
@@ -366,7 +376,7 @@ function bring_to_top(idx=-1) {
     }
 }
 
-handler.addConnection = function(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, authorized, keyboard, clipboard, audio, file, restart, recording, block_input) {
+handler.addConnection = function(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, privacy_mode) {
     stdout.println("new connection #" + id + ": " + peer_id);
     var conn;
     connections.map(function(c) {
@@ -388,7 +398,7 @@ handler.addConnection = function(id, is_file_transfer, is_view_camera, is_termin
         name: name, authorized: authorized, time: new Date(), now: new Date(),
         keyboard: keyboard, clipboard: clipboard, msgs: [], unreaded: 0,
         audio: audio, file: file, restart: restart, recording: recording,
-        block_input:block_input,
+        block_input:block_input, privacy_mode:privacy_mode,
         disconnected: false
     };
     if (idx < 0) {

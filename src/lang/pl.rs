@@ -737,5 +737,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-exit-{}-tip", "Aby wyłączyć tryb przechwytywania myszy, naciśnij {}"),
         ("rel-mouse-permission-lost-tip", "Utracono uprawnienia do trybu przechwytywania myszy"),
         ("Changelog", "Dziennik zmian"),
+        ("Enable privacy mode", ""),
     ].iter().cloned().collect();
 }

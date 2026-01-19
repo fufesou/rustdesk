@@ -761,6 +761,11 @@ List<TToggleMenu> toolbarPrivacyMode(
   final pi = ffiModel.pi;
   final sessionId = ffi.sessionId;
 
+  // Check if remote peer has privacy mode permission
+  if (ffi.ffiModel.permissions['privacy_mode'] == false) {
+    return [];  // No permission, don't show options
+  }
+
   getDefaultMenu(Future<void> Function(SessionID sid, String opt) toggleFunc) {
     final enabled = !ffi.ffiModel.viewOnly;
     return TToggleMenu(

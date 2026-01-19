@@ -737,5 +737,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-exit-{}-tip", "Druk op {} om af te sluiten."),
         ("rel-mouse-permission-lost-tip", "De toetsenbordcontrole is uitgeschakeld. De relatieve muismodus is uitgeschakeld."),
         ("Changelog", "Wijzigingenlogboek"),
+        ("Enable privacy mode", ""),
     ].iter().cloned().collect();
 }
