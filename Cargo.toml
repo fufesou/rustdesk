@@ -240,3 +240,8 @@ panic = 'abort'
 strip = true
 #opt-level = 'z' # only have smaller size after strip
 rpath = true
+
+# Patch libxdo-sys to use a stub implementation that doesn't require libxdo
+# This allows building and running on systems without libxdo installed (e.g., Wayland-only)
+[patch.crates-io]
+libxdo-sys = { path = "libs/libxdo-sys-stub" }

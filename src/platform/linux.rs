@@ -12,6 +12,7 @@ use hbb_common::{
     regex::{Captures, Regex},
     users::{get_user_by_name, os::unix::UserExt},
 };
+use libloading::{Library, Symbol};
 use std::{
     cell::RefCell,
     ffi::{OsStr, OsString},
@@ -20,7 +21,7 @@ use std::{
     string::String,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -85,34 +86,80 @@ lazy_static::lazy_static! {
     };
 }
 
-thread_local! {
-    static XDO: RefCell<Xdo> = RefCell::new(unsafe { xdo_new(std::ptr::null()) });
-    static DISPLAY: RefCell<*mut c_void> = RefCell::new(unsafe { XOpenDisplay(std::ptr::null())});
+// Function type definitions for libxdo (dynamic loading)
+type XdoNew = unsafe extern "C" fn(*const c_char) -> Xdo;
+type XdoGetMouseLocation = unsafe extern "C" fn(Xdo, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+type XdoMoveMouse = unsafe extern "C" fn(Xdo, c_int, c_int, c_int) -> c_int;
+type XdoGetActiveWindow = unsafe extern "C" fn(Xdo, *mut *mut c_void) -> c_int;
+type XdoGetWindowLocation = unsafe extern "C" fn(Xdo, *mut c_void, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+type XdoGetWindowSize = unsafe extern "C" fn(Xdo, *mut c_void, *mut c_int, *mut c_int) -> c_int;
+
+/// Holds dynamically loaded libxdo library and function pointers
+struct XdoLib {
+    _lib: Library,
+    xdo_new: XdoNew,
+    xdo_get_mouse_location: XdoGetMouseLocation,
+    xdo_move_mouse: XdoMoveMouse,
+    xdo_get_active_window: XdoGetActiveWindow,
+    xdo_get_window_location: XdoGetWindowLocation,
+    xdo_get_window_size: XdoGetWindowSize,
 }
 
-extern "C" {
-    fn xdo_get_mouse_location(
-        xdo: Xdo,
-        x: *mut c_int,
-        y: *mut c_int,
-        screen_num: *mut c_int,
-    ) -> c_int;
-    fn xdo_move_mouse(xdo: Xdo, x: c_int, y: c_int, screen: c_int) -> c_int;
-    fn xdo_new(display: *const c_char) -> Xdo;
-    fn xdo_get_active_window(xdo: Xdo, window: *mut *mut c_void) -> c_int;
-    fn xdo_get_window_location(
-        xdo: Xdo,
-        window: *mut c_void,
-        x: *mut c_int,
-        y: *mut c_int,
-        screen_num: *mut c_int,
-    ) -> c_int;
-    fn xdo_get_window_size(
-        xdo: Xdo,
-        window: *mut c_void,
-        width: *mut c_int,
-        height: *mut c_int,
-    ) -> c_int;
+impl XdoLib {
+    fn new() -> Option<Self> {
+        unsafe {
+            let lib = Library::new("libxdo.so.3")
+                .or_else(|_| Library::new("libxdo.so"))
+                .ok()?;
+            
+            // Extract all function pointers first to avoid borrow conflicts
+            let f_xdo_new: XdoNew = *lib.get(b"xdo_new").ok()?;
+            let f_xdo_get_mouse_location: XdoGetMouseLocation = *lib.get(b"xdo_get_mouse_location").ok()?;
+            let f_xdo_move_mouse: XdoMoveMouse = *lib.get(b"xdo_move_mouse").ok()?;
+            let f_xdo_get_active_window: XdoGetActiveWindow = *lib.get(b"xdo_get_active_window").ok()?;
+            let f_xdo_get_window_location: XdoGetWindowLocation = *lib.get(b"xdo_get_window_location").ok()?;
+            let f_xdo_get_window_size: XdoGetWindowSize = *lib.get(b"xdo_get_window_size").ok()?;
+
+            Some(Self {
+                _lib: lib,
+                xdo_new: f_xdo_new,
+                xdo_get_mouse_location: f_xdo_get_mouse_location,
+                xdo_move_mouse: f_xdo_move_mouse,
+                xdo_get_active_window: f_xdo_get_active_window,
+                xdo_get_window_location: f_xdo_get_window_location,
+                xdo_get_window_size: f_xdo_get_window_size,
+            })
+        }
+    }
+}
+
+// Use OnceLock for thread-safe lazy initialization
+static XDO_LIB: OnceLock<Option<XdoLib>> = OnceLock::new();
+
+fn get_xdo_lib() -> Option<&'static XdoLib> {
+    XDO_LIB.get_or_init(|| {
+        match XdoLib::new() {
+            Some(lib) => {
+                log::info!("libxdo loaded successfully (platform)");
+                Some(lib)
+            }
+            None => {
+                log::warn!("libxdo not available (platform), xdo functions will be disabled");
+                None
+            }
+        }
+    }).as_ref()
+}
+
+thread_local! {
+    static XDO: RefCell<Xdo> = RefCell::new({
+        if let Some(lib) = get_xdo_lib() {
+            unsafe { (lib.xdo_new)(std::ptr::null()) }
+        } else {
+            std::ptr::null()
+        }
+    });
+    static DISPLAY: RefCell<*mut c_void> = RefCell::new(unsafe { XOpenDisplay(std::ptr::null())});
 }
 
 #[link(name = "X11")]
@@ -158,6 +205,7 @@ fn sleep_millis(millis: u64) {
 }
 
 pub fn get_cursor_pos() -> Option<(i32, i32)> {
+    let lib = get_xdo_lib()?;
     let mut res = None;
     XDO.with(|xdo| {
         if let Ok(xdo) = xdo.try_borrow_mut() {
@@ -167,7 +215,7 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
             let mut x: c_int = 0;
             let mut y: c_int = 0;
             unsafe {
-                xdo_get_mouse_location(*xdo, &mut x as _, &mut y as _, std::ptr::null_mut());
+                (lib.xdo_get_mouse_location)(*xdo, &mut x as _, &mut y as _, std::ptr::null_mut());
             }
             res = Some((x, y));
         }
@@ -176,6 +224,10 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
 }
 
 pub fn set_cursor_pos(x: i32, y: i32) -> bool {
+    let lib = match get_xdo_lib() {
+        Some(lib) => lib,
+        None => return false,
+    };
     let mut res = false;
     XDO.with(|xdo| {
         match xdo.try_borrow_mut() {
@@ -185,7 +237,7 @@ pub fn set_cursor_pos(x: i32, y: i32) -> bool {
                     return;
                 }
                 unsafe {
-                    let ret = xdo_move_mouse(*xdo, x, y, 0);
+                    let ret = (lib.xdo_move_mouse)(*xdo, x, y, 0);
                     if ret != 0 {
                         log::debug!(
                             "set_cursor_pos: xdo_move_mouse failed with code {} for coordinates ({}, {})",
@@ -228,6 +280,7 @@ pub fn clip_cursor(_rect: Option<(i32, i32, i32, i32)>) -> bool {
 pub fn reset_input_cache() {}
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
+    let lib = get_xdo_lib()?;
     let mut res = None;
     XDO.with(|xdo| {
         if let Ok(xdo) = xdo.try_borrow_mut() {
@@ -241,10 +294,10 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
             let mut window: *mut c_void = std::ptr::null_mut();
 
             unsafe {
-                if xdo_get_active_window(*xdo, &mut window) != 0 {
+                if (lib.xdo_get_active_window)(*xdo, &mut window) != 0 {
                     return;
                 }
-                if xdo_get_window_location(
+                if (lib.xdo_get_window_location)(
                     *xdo,
                     window,
                     &mut x as _,
@@ -254,7 +307,7 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
                 {
                     return;
                 }
-                if xdo_get_window_size(*xdo, window, &mut width as _, &mut height as _) != 0 {
+                if (lib.xdo_get_window_size)(*xdo, window, &mut width as _, &mut height as _) != 0 {
                     return;
                 }
                 let center_x = x + width / 2;

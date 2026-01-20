@@ -1,0 +1,10 @@
+[package]
+name = "libxdo-sys"
+version = "0.11.0"
+edition = "2021"
+description = "Dynamic loading wrapper for libxdo-sys that doesn't require libxdo at compile/link time"
+
+[dependencies]
+libc = "0.2"
+x11 = "2.21"
+libloading = "0.8"

@@ -1,49 +1,101 @@
 use crate::{Key, KeyboardControllable, MouseButton, MouseControllable};
 
 use hbb_common::libc::{c_char, c_int, c_void, useconds_t};
-use std::{borrow::Cow, ffi::CString, ptr};
+use libloading::{Library, Symbol};
+use std::{borrow::Cow, ffi::CString, sync::OnceLock};
 
 const CURRENT_WINDOW: c_int = 0;
 const DEFAULT_DELAY: u64 = 12000;
 type Window = c_int;
 type Xdo = *const c_void;
 
-#[link(name = "xdo")]
-extern "C" {
-    fn xdo_free(xdo: Xdo);
-    fn xdo_new(display: *const c_char) -> Xdo;
+// Function type definitions for libxdo
+type XdoNew = unsafe extern "C" fn(*const c_char) -> Xdo;
+type XdoFree = unsafe extern "C" fn(Xdo);
+type XdoClickWindow = unsafe extern "C" fn(Xdo, Window, c_int) -> c_int;
+type XdoMouseDown = unsafe extern "C" fn(Xdo, Window, c_int) -> c_int;
+type XdoMouseUp = unsafe extern "C" fn(Xdo, Window, c_int) -> c_int;
+type XdoMoveMouse = unsafe extern "C" fn(Xdo, c_int, c_int, c_int) -> c_int;
+type XdoMoveMouseRelative = unsafe extern "C" fn(Xdo, c_int, c_int) -> c_int;
+type XdoEnterTextWindow = unsafe extern "C" fn(Xdo, Window, *const c_char, useconds_t) -> c_int;
+type XdoSendKeysequenceWindow = unsafe extern "C" fn(Xdo, Window, *const c_char, useconds_t) -> c_int;
+type XdoSendKeysequenceWindowDown = unsafe extern "C" fn(Xdo, Window, *const c_char, useconds_t) -> c_int;
+type XdoSendKeysequenceWindowUp = unsafe extern "C" fn(Xdo, Window, *const c_char, useconds_t) -> c_int;
+type XdoGetInputState = unsafe extern "C" fn(Xdo) -> u32;
 
-    fn xdo_click_window(xdo: Xdo, window: Window, button: c_int) -> c_int;
-    fn xdo_mouse_down(xdo: Xdo, window: Window, button: c_int) -> c_int;
-    fn xdo_mouse_up(xdo: Xdo, window: Window, button: c_int) -> c_int;
-    fn xdo_move_mouse(xdo: Xdo, x: c_int, y: c_int, screen: c_int) -> c_int;
-    fn xdo_move_mouse_relative(xdo: Xdo, x: c_int, y: c_int) -> c_int;
+/// Holds dynamically loaded libxdo library and function pointers
+struct XdoLib {
+    _lib: Library,
+    xdo_new: XdoNew,
+    xdo_free: XdoFree,
+    xdo_click_window: XdoClickWindow,
+    xdo_mouse_down: XdoMouseDown,
+    xdo_mouse_up: XdoMouseUp,
+    xdo_move_mouse: XdoMoveMouse,
+    xdo_move_mouse_relative: XdoMoveMouseRelative,
+    xdo_enter_text_window: XdoEnterTextWindow,
+    xdo_send_keysequence_window: XdoSendKeysequenceWindow,
+    xdo_send_keysequence_window_down: XdoSendKeysequenceWindowDown,
+    xdo_send_keysequence_window_up: XdoSendKeysequenceWindowUp,
+    xdo_get_input_state: XdoGetInputState,
+}
 
-    fn xdo_enter_text_window(
-        xdo: Xdo,
-        window: Window,
-        string: *const c_char,
-        delay: useconds_t,
-    ) -> c_int;
-    fn xdo_send_keysequence_window(
-        xdo: Xdo,
-        window: Window,
-        string: *const c_char,
-        delay: useconds_t,
-    ) -> c_int;
-    fn xdo_send_keysequence_window_down(
-        xdo: Xdo,
-        window: Window,
-        string: *const c_char,
-        delay: useconds_t,
-    ) -> c_int;
-    fn xdo_send_keysequence_window_up(
-        xdo: Xdo,
-        window: Window,
-        string: *const c_char,
-        delay: useconds_t,
-    ) -> c_int;
-    fn xdo_get_input_state(xdo: Xdo) -> u32;
+impl XdoLib {
+    fn new() -> Option<Self> {
+        unsafe {
+            let lib = Library::new("libxdo.so.3")
+                .or_else(|_| Library::new("libxdo.so"))
+                .ok()?;
+            
+            // Extract all function pointers first to avoid borrow conflicts
+            let f_xdo_new: XdoNew = *lib.get(b"xdo_new").ok()?;
+            let f_xdo_free: XdoFree = *lib.get(b"xdo_free").ok()?;
+            let f_xdo_click_window: XdoClickWindow = *lib.get(b"xdo_click_window").ok()?;
+            let f_xdo_mouse_down: XdoMouseDown = *lib.get(b"xdo_mouse_down").ok()?;
+            let f_xdo_mouse_up: XdoMouseUp = *lib.get(b"xdo_mouse_up").ok()?;
+            let f_xdo_move_mouse: XdoMoveMouse = *lib.get(b"xdo_move_mouse").ok()?;
+            let f_xdo_move_mouse_relative: XdoMoveMouseRelative = *lib.get(b"xdo_move_mouse_relative").ok()?;
+            let f_xdo_enter_text_window: XdoEnterTextWindow = *lib.get(b"xdo_enter_text_window").ok()?;
+            let f_xdo_send_keysequence_window: XdoSendKeysequenceWindow = *lib.get(b"xdo_send_keysequence_window").ok()?;
+            let f_xdo_send_keysequence_window_down: XdoSendKeysequenceWindowDown = *lib.get(b"xdo_send_keysequence_window_down").ok()?;
+            let f_xdo_send_keysequence_window_up: XdoSendKeysequenceWindowUp = *lib.get(b"xdo_send_keysequence_window_up").ok()?;
+            let f_xdo_get_input_state: XdoGetInputState = *lib.get(b"xdo_get_input_state").ok()?;
+
+            Some(Self {
+                _lib: lib,
+                xdo_new: f_xdo_new,
+                xdo_free: f_xdo_free,
+                xdo_click_window: f_xdo_click_window,
+                xdo_mouse_down: f_xdo_mouse_down,
+                xdo_mouse_up: f_xdo_mouse_up,
+                xdo_move_mouse: f_xdo_move_mouse,
+                xdo_move_mouse_relative: f_xdo_move_mouse_relative,
+                xdo_enter_text_window: f_xdo_enter_text_window,
+                xdo_send_keysequence_window: f_xdo_send_keysequence_window,
+                xdo_send_keysequence_window_down: f_xdo_send_keysequence_window_down,
+                xdo_send_keysequence_window_up: f_xdo_send_keysequence_window_up,
+                xdo_get_input_state: f_xdo_get_input_state,
+            })
+        }
+    }
+}
+
+// Use OnceLock for thread-safe lazy initialization
+static XDO_LIB: OnceLock<Option<XdoLib>> = OnceLock::new();
+
+fn get_xdo_lib() -> Option<&'static XdoLib> {
+    XDO_LIB.get_or_init(|| {
+        match XdoLib::new() {
+            Some(lib) => {
+                log::info!("libxdo loaded successfully");
+                Some(lib)
+            }
+            None => {
+                log::warn!("libxdo not available, xdo functions will be disabled");
+                None
+            }
+        }
+    }).as_ref()
 }
 
 fn mousebutton(button: MouseButton) -> c_int {
@@ -72,8 +124,13 @@ unsafe impl Send for EnigoXdo {}
 impl Default for EnigoXdo {
     /// Create a new EnigoXdo instance
     fn default() -> Self {
+        let xdo = if let Some(lib) = get_xdo_lib() {
+            unsafe { (lib.xdo_new)(std::ptr::null()) }
+        } else {
+            std::ptr::null()
+        };
         Self {
-            xdo: unsafe { xdo_new(ptr::null()) },
+            xdo,
             delay: DEFAULT_DELAY,
         }
     }
@@ -96,8 +153,10 @@ impl Drop for EnigoXdo {
         if self.xdo.is_null() {
             return;
         }
-        unsafe {
-            xdo_free(self.xdo);
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_free)(self.xdo);
+            }
         }
     }
 }
@@ -114,24 +173,30 @@ impl MouseControllable for EnigoXdo {
         if self.xdo.is_null() {
             return;
         }
-        unsafe {
-            xdo_move_mouse(self.xdo, x as c_int, y as c_int, 0);
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_move_mouse)(self.xdo, x as c_int, y as c_int, 0);
+            }
         }
     }
     fn mouse_move_relative(&mut self, x: i32, y: i32) {
         if self.xdo.is_null() {
             return;
         }
-        unsafe {
-            xdo_move_mouse_relative(self.xdo, x as c_int, y as c_int);
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_move_mouse_relative)(self.xdo, x as c_int, y as c_int);
+            }
         }
     }
     fn mouse_down(&mut self, button: MouseButton) -> crate::ResultType {
         if self.xdo.is_null() {
             return Ok(());
         }
-        unsafe {
-            xdo_mouse_down(self.xdo, CURRENT_WINDOW, mousebutton(button));
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_mouse_down)(self.xdo, CURRENT_WINDOW, mousebutton(button));
+            }
         }
         Ok(())
     }
@@ -139,16 +204,20 @@ impl MouseControllable for EnigoXdo {
         if self.xdo.is_null() {
             return;
         }
-        unsafe {
-            xdo_mouse_up(self.xdo, CURRENT_WINDOW, mousebutton(button));
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_mouse_up)(self.xdo, CURRENT_WINDOW, mousebutton(button));
+            }
         }
     }
     fn mouse_click(&mut self, button: MouseButton) {
         if self.xdo.is_null() {
             return;
         }
-        unsafe {
-            xdo_click_window(self.xdo, CURRENT_WINDOW, mousebutton(button));
+        if let Some(lib) = get_xdo_lib() {
+            unsafe {
+                (lib.xdo_click_window)(self.xdo, CURRENT_WINDOW, mousebutton(button));
+            }
         }
     }
     fn mouse_scroll_x(&mut self, length: i32) {
@@ -297,6 +366,10 @@ impl KeyboardControllable for EnigoXdo {
         if self.xdo.is_null() {
             return false;
         }
+        let lib = match get_xdo_lib() {
+            Some(lib) => lib,
+            None => return false,
+        };
         /*
         // modifier keys mask
         pub const ShiftMask: c_uint = 0x01;
@@ -314,7 +387,7 @@ impl KeyboardControllable for EnigoXdo {
         let mod_alt = 1 << 3;
         let mod_numlock = 1 << 4;
         let mod_meta = 1 << 6;
-        let mask = unsafe { xdo_get_input_state(self.xdo) };
+        let mask = unsafe { (lib.xdo_get_input_state)(self.xdo) };
         match key {
             Key::Shift => mask & mod_shift != 0,
             Key::CapsLock => mask & mod_lock != 0,
@@ -330,14 +403,16 @@ impl KeyboardControllable for EnigoXdo {
         if self.xdo.is_null() {
             return;
         }
-        if let Ok(string) = CString::new(sequence) {
-            unsafe {
-                xdo_enter_text_window(
-                    self.xdo,
-                    CURRENT_WINDOW,
-                    string.as_ptr(),
-                    self.delay as useconds_t,
-                );
+        if let Some(lib) = get_xdo_lib() {
+            if let Ok(string) = CString::new(sequence) {
+                unsafe {
+                    (lib.xdo_enter_text_window)(
+                        self.xdo,
+                        CURRENT_WINDOW,
+                        string.as_ptr(),
+                        self.delay as useconds_t,
+                    );
+                }
             }
         }
     }
@@ -345,24 +420,10 @@ impl KeyboardControllable for EnigoXdo {
         if self.xdo.is_null() {
             return Ok(());
         }
-        let string = CString::new(&*keysequence(key))?;
-        unsafe {
-            xdo_send_keysequence_window_down(
-                self.xdo,
-                CURRENT_WINDOW,
-                string.as_ptr(),
-                self.delay as useconds_t,
-            );
-        }
-        Ok(())
-    }
-    fn key_up(&mut self, key: Key) {
-        if self.xdo.is_null() {
-            return;
-        }
-        if let Ok(string) = CString::new(&*keysequence(key)) {
+        if let Some(lib) = get_xdo_lib() {
+            let string = CString::new(&*keysequence(key))?;
             unsafe {
-                xdo_send_keysequence_window_up(
+                (lib.xdo_send_keysequence_window_down)(
                     self.xdo,
                     CURRENT_WINDOW,
                     string.as_ptr(),
@@ -370,19 +431,39 @@ impl KeyboardControllable for EnigoXdo {
                 );
             }
         }
+        Ok(())
+    }
+    fn key_up(&mut self, key: Key) {
+        if self.xdo.is_null() {
+            return;
+        }
+        if let Some(lib) = get_xdo_lib() {
+            if let Ok(string) = CString::new(&*keysequence(key)) {
+                unsafe {
+                    (lib.xdo_send_keysequence_window_up)(
+                        self.xdo,
+                        CURRENT_WINDOW,
+                        string.as_ptr(),
+                        self.delay as useconds_t,
+                    );
+                }
+            }
+        }
     }
     fn key_click(&mut self, key: Key) {
         if self.xdo.is_null() {
             return;
         }
-        if let Ok(string) = CString::new(&*keysequence(key)) {
-            unsafe {
-                xdo_send_keysequence_window(
-                    self.xdo,
-                    CURRENT_WINDOW,
-                    string.as_ptr(),
-                    self.delay as useconds_t,
-                );
+        if let Some(lib) = get_xdo_lib() {
+            if let Ok(string) = CString::new(&*keysequence(key)) {
+                unsafe {
+                    (lib.xdo_send_keysequence_window)(
+                        self.xdo,
+                        CURRENT_WINDOW,
+                        string.as_ptr(),
+                        self.delay as useconds_t,
+                    );
+                }
             }
         }
     }
