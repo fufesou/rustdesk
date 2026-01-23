@@ -347,10 +347,14 @@ impl KeyboardControllable for EnigoXdo {
     }
 
     fn key_down(&mut self, key: Key) -> crate::ResultType {
+        log::info!("======================= controlled enigo xdo key_down: key={:?}", key);
         if self.xdo.is_null() {
+            log::info!("======================= controlled enigo xdo key_down: xdo is null, returning Ok");
             return Ok(());
         }
-        let string = CString::new(&*keysequence(key))?;
+        let keyseq = keysequence(key);
+        log::info!("======================= controlled enigo xdo key_down: keysequence='{}'", keyseq);
+        let string = CString::new(&*keyseq)?;
         unsafe {
             libxdo_sys::xdo_send_keysequence_window_down(
                 self.xdo as *const _,
@@ -359,6 +363,7 @@ impl KeyboardControllable for EnigoXdo {
                 self.delay as libxdo_sys::useconds_t,
             );
         }
+        log::info!("======================= controlled enigo xdo key_down: xdo_send_keysequence_window_down completed");
         Ok(())
     }
 

@@ -2528,6 +2528,7 @@ impl Connection {
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 Some(message::Union::KeyEvent(me)) => {
+                    log::info!("======================= controlled connection received KeyEvent: {:?}", &me);
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }

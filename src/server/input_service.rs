@@ -1559,16 +1559,22 @@ fn need_to_uppercase(en: &mut Enigo) -> bool {
 }
 
 fn process_chr(en: &mut Enigo, chr: u32, down: bool) {
+    log::info!("======================= controlled process_chr: chr='{}' (U+{:04X}), down={}", char::from_u32(chr).unwrap_or('\0'), chr, down);
     let key = char_value_to_key(chr);
+    log::info!("======================= controlled process_chr: key={:?}", key);
 
     if down {
-        if en.key_down(key).is_ok() {
+        let key_down_result = en.key_down(key);
+        log::info!("======================= controlled process_chr: key_down result={:?}", key_down_result);
+        if key_down_result.is_ok() {
         } else {
+            log::info!("======================= controlled process_chr: key_down failed, falling back to key_sequence");
             if let Ok(chr) = char::try_from(chr) {
                 let mut s = chr.to_string();
                 if need_to_uppercase(en) {
                     s = s.to_uppercase();
                 }
+                log::info!("======================= controlled process_chr: calling key_sequence with '{}'", s);
                 en.key_sequence(&s);
             };
         }
@@ -1622,6 +1628,7 @@ fn is_function_key(ck: &EnumOrUnknown<ControlKey>) -> bool {
 }
 
 fn legacy_keyboard_mode(evt: &KeyEvent) {
+    log::info!("======================= controlled legacy_keyboard_mode: mode={:?}, union={:?}, down={}, press={}", evt.mode, evt.union, evt.down, evt.press);
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
     let mut to_release: Vec<Key> = Vec::new();
@@ -1821,6 +1828,7 @@ fn is_legacy_mode(evt: &KeyEvent) -> bool {
 }
 
 pub fn handle_key_(evt: &KeyEvent) {
+    log::info!("======================= controlled handle_key_: mode={:?}, union={:?}, down={}, press={}, modifiers={:?}", evt.mode, evt.union, evt.down, evt.press, evt.modifiers);
     if EXITING.load(Ordering::SeqCst) {
         return;
     }

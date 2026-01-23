@@ -247,14 +247,17 @@ impl KeyboardControllable for Enigo {
     }
 
     fn key_down(&mut self, key: Key) -> crate::ResultType {
+        log::info!("======================= controlled enigo key_down (windows): key={:?}", key);
         match &key {
             Key::Layout(c) => {
                 // to-do: dup code
                 // https://github.com/rustdesk/rustdesk/blob/1bc0dd791ed8344997024dc46626bd2ca7df73d2/src/server/input_service.rs#L1348
                 let code = self.get_layoutdependent_keycode(*c);
+                log::info!("======================= controlled enigo key_down (windows): Layout('{}'), get_layoutdependent_keycode returned code=0x{:04X}", c, code);
                 if code as u16 != 0xFFFF {
                     let vk = code & 0x00FF;
                     let flag = code >> 8;
+                    log::info!("======================= controlled enigo key_down (windows): vk=0x{:02X}, flag=0x{:02X}", vk, flag);
                     let modifiers = [Key::Shift, Key::Control, Key::Alt];
                     let mod_len = modifiers.len();
                     for pos in 0..mod_len {
@@ -264,6 +267,7 @@ impl KeyboardControllable for Enigo {
                     }
 
                     let res = keybd_event(0, vk, 0);
+                    log::info!("======================= controlled enigo key_down (windows): keybd_event(vk=0x{:02X}) returned res={}", vk, res);
                     let err = if res == 0 { get_error() } else { "".to_owned() };
 
                     for pos in 0..mod_len {
@@ -277,15 +281,19 @@ impl KeyboardControllable for Enigo {
                         return Err(err.into());
                     }
                 } else {
+                    log::info!("======================= controlled enigo key_down (windows): Failed to get keycode for '{}'", c);
                     return Err(format!("Failed to get keycode of {}", c).into());
                 }
             }
             _ => {
                 let code = self.key_to_keycode(key);
+                log::info!("======================= controlled enigo key_down (windows): key_to_keycode returned code={}", code);
                 if code == 0 || code == 65535 {
+                    log::info!("======================= controlled enigo key_down (windows): invalid keycode, returning error");
                     return Err("".into());
                 }
                 let res = keybd_event(0, code, 0);
+                log::info!("======================= controlled enigo key_down (windows): keybd_event(code={}) returned res={}", code, res);
                 if res == 0 {
                     let err = get_error();
                     if !err.is_empty() {

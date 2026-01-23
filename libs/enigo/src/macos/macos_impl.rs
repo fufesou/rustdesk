@@ -451,12 +451,16 @@ impl KeyboardControllable for Enigo {
     }
 
     fn key_down(&mut self, key: Key) -> crate::ResultType {
+        log::info!("======================= controlled enigo key_down: key={:?}", key);
         let code = self.key_to_keycode(key);
+        log::info!("======================= controlled enigo key_down: keycode={}", code);
         if code == u16::MAX {
+            log::info!("======================= controlled enigo key_down: keycode is MAX, returning error");
             return Err("".into());
         }
         if let Some(src) = self.event_source.as_ref() {
             if let Ok(event) = CGEvent::new_keyboard_event(src.clone(), code, true) {
+                log::info!("======================= controlled enigo key_down: posting keyboard event with code={}", code);
                 self.post(event, Some(code));
             }
         }
@@ -626,10 +630,13 @@ impl Enigo {
 
     #[inline]
     fn map_key_board(&mut self, ch: char) -> CGKeyCode {
+        log::info!("======================= controlled enigo map_key_board: ch='{}' (U+{:04X})", ch, ch as u32);
         // no idea why below char not working with shift, https://github.com/rustdesk/rustdesk/issues/406#issuecomment-1145157327
         // seems related to numpad char
         if ch == '-' || ch == '=' || ch == '.' || ch == '/' || (ch >= '0' && ch <= '9') {
-            return self.map_key_board_en(ch);
+            let code = self.map_key_board_en(ch);
+            log::info!("======================= controlled enigo map_key_board: using ANSI mapping for special char, code={}", code);
+            return code;
         }
         let mut code = u16::MAX;
         unsafe {
@@ -638,14 +645,16 @@ impl Enigo {
                 let name_ref = TISGetInputSourceProperty(keyboard, kTISPropertyInputSourceID);
                 if !name_ref.is_null() {
                     let name = get_string(name_ref as _);
-                    if let Some(name) = name {
-                        if let Some(m) = self.char_to_vkey_map.get(&name) {
+                    if let Some(ref name) = name {
+                        log::info!("======================= controlled enigo map_key_board: keyboard layout='{}'", name);
+                        if let Some(m) = self.char_to_vkey_map.get(name) {
                             code = *m.get(&ch).unwrap_or(&u16::MAX);
                         } else {
                             let m = get_map(&name, layout);
                             code = *m.get(&ch).unwrap_or(&u16::MAX);
                             self.char_to_vkey_map.insert(name.clone(), m);
                         }
+                        log::info!("======================= controlled enigo map_key_board: layout lookup for '{}' => code={}", ch, code);
                     }
                 }
             }
@@ -654,9 +663,12 @@ impl Enigo {
             }
         }
         if code != u16::MAX {
+            log::info!("======================= controlled enigo map_key_board: returning layout-mapped code={}", code);
             return code;
         }
-        self.map_key_board_en(ch)
+        let fallback_code = self.map_key_board_en(ch);
+        log::info!("======================= controlled enigo map_key_board: falling back to ANSI mapping, code={}", fallback_code);
+        fallback_code
     }
 
     #[inline]

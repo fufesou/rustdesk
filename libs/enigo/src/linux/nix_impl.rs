@@ -74,39 +74,52 @@ impl Enigo {
     }
 
     fn tfc_key_down_or_up(&mut self, key: Key, down: bool, up: bool) -> bool {
+        log::info!("======================= controlled enigo tfc_key_down_or_up: key={:?}, down={}, up={}", key, down, up);
         match &mut self.tfc {
-            None => false,
+            None => {
+                log::info!("======================= controlled enigo tfc_key_down_or_up: tfc is None, returning false");
+                false
+            }
             Some(tfc) => {
                 if let Key::Layout(chr) = key {
+                    log::info!("======================= controlled enigo tfc_key_down_or_up: Key::Layout('{}'), using unicode_char", chr);
                     if down {
-                        if let Err(_) = tfc.unicode_char_down(chr) {
+                        if let Err(e) = tfc.unicode_char_down(chr) {
+                            log::info!("======================= controlled enigo tfc_key_down_or_up: unicode_char_down failed: {:?}", e);
                             return false;
                         }
                     }
                     if up {
-                        if let Err(_) = tfc.unicode_char_up(chr) {
+                        if let Err(e) = tfc.unicode_char_up(chr) {
+                            log::info!("======================= controlled enigo tfc_key_down_or_up: unicode_char_up failed: {:?}", e);
                             return false;
                         }
                     }
+                    log::info!("======================= controlled enigo tfc_key_down_or_up: unicode_char success");
                     return true;
                 }
-                let key = match convert_to_tfc_key(key) {
-                    Some(key) => key,
+                let tfc_key = match convert_to_tfc_key(key) {
+                    Some(k) => k,
                     None => {
+                        log::info!("======================= controlled enigo tfc_key_down_or_up: convert_to_tfc_key failed");
                         return false;
                     }
                 };
+                log::info!("======================= controlled enigo tfc_key_down_or_up: tfc_key={:?}", tfc_key);
 
                 if down {
-                    if let Err(_) = tfc.key_down(key) {
+                    if let Err(e) = tfc.key_down(tfc_key) {
+                        log::info!("======================= controlled enigo tfc_key_down_or_up: tfc.key_down failed: {:?}", e);
                         return false;
                     }
                 };
                 if up {
-                    if let Err(_) = tfc.key_up(key) {
+                    if let Err(e) = tfc.key_up(tfc_key) {
+                        log::info!("======================= controlled enigo tfc_key_down_or_up: tfc.key_up failed: {:?}", e);
                         return false;
                     }
                 };
+                log::info!("======================= controlled enigo tfc_key_down_or_up: success");
                 return true;
             }
         }
@@ -266,15 +279,19 @@ impl KeyboardControllable for Enigo {
     }
 
     fn key_down(&mut self, key: Key) -> crate::ResultType {
+        log::info!("======================= controlled enigo key_down (linux): key={:?}, is_x11={}", key, self.is_x11);
         if self.is_x11 {
             let has_down = self.tfc_key_down_or_up(key, true, false);
+            log::info!("======================= controlled enigo key_down (linux): tfc_key_down_or_up returned has_down={}", has_down);
             if !has_down {
+                log::info!("======================= controlled enigo key_down (linux): falling back to xdo.key_down");
                 self.xdo.key_down(key)
             } else {
                 Ok(())
             }
         } else {
             if let Some(keyboard) = &mut self.custom_keyboard {
+                log::info!("======================= controlled enigo key_down (linux): using custom_keyboard");
                 keyboard.key_down(key)
             } else {
                 Ok(())
