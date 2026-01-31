@@ -23,7 +23,7 @@ use gstreamer_app::AppSink;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
-use hbb_common::{bail, config, platform::linux::CMD_SH, serde_json, tokio, ResultType};
+use hbb_common::{log, bail, config, platform::linux::CMD_SH, serde_json, tokio, ResultType};
 
 use super::capturable::PixelProvider;
 use super::capturable::{Capturable, Recorder};
@@ -660,7 +660,10 @@ pub fn request_remote_desktop(
             }
         }
     } else {
-        if let Ok(version) = remote_desktop_portal::version(&portal) {
+        let v = remote_desktop_portal::version(&portal);
+        log::info!("==================================== request remote desktop, version: {:?}", &v);
+        if let Ok(version) = v {
+            log::info!("==================================== remote desktop portal version: {}", version);
             if version >= 2 {
                 is_support_restore_token = true;
             }
@@ -812,6 +815,7 @@ fn on_create_session_response(
             );
             args.insert("types".to_string(), Variant(Box::new(7u32)));
 
+            log::info!("==================================== request remote desktop, is_support_restore_token: {}", is_support_restore_token);
             // Add persist_mode and restore_token for session persistence
             if is_support_restore_token {
                 let restore_token = config::LocalConfig::get_option(RDP_RESTORE_TOKEN_CONF_KEY);
@@ -821,8 +825,10 @@ fn on_create_session_response(
                 // persist_mode = 2: Permissions persist until explicitly revoked
                 args.insert("persist_mode".to_string(), Variant(Box::new(2u32)));
             }
+            log::info!("==================================== request remote desktop, args: {:?}", args);
 
             let path = portal.select_devices(ses.clone(), args)?;
+            log::info!("==================================== select devices");
             handle_response(
                 c,
                 path,
@@ -837,6 +843,7 @@ fn on_create_session_response(
             )?;
         }
 
+        log::info!("==================================== on create session response end");
         Ok(())
     }
 }
@@ -865,8 +872,10 @@ fn on_select_devices_response(
         }
         args.insert("types".into(), Variant(Box::new(1u32))); //| 2u32)));
 
+        log::info!("==================================== on_select_devices_response 11");
         let session = session.clone();
         let path = portal.select_sources(session.clone(), args)?;
+        log::info!("==================================== on_select_devices_response 22");
         handle_response(
             c,
             path,
@@ -903,11 +912,13 @@ fn on_select_sources_response(
             Variant(Box::new("u4".to_string())),
         );
         let path;
+        log::info!("==================================== on_select_sources_response start 11");
         if is_server_running() {
             path = screencast_portal::start(&portal, session.clone(), "", args)?;
         } else {
             path = remote_desktop_portal::start(&portal, session.clone(), "", args)?;
         }
+        log::info!("==================================== on_select_sources_response start 22");
         handle_response(
             c,
             path,
@@ -953,7 +964,7 @@ fn on_start_response(
                 }
             }
         }
-
+        log::info!("==================================== on_start_response 11");
         streams
             .clone()
             .lock()
@@ -963,7 +974,7 @@ fn on_start_response(
             .lock()
             .unwrap()
             .replace(portal.open_pipe_wire_remote(session.clone(), HashMap::new())?);
-
+        log::info!("==================================== on_start_response 22");
         Ok(())
     }
 }
