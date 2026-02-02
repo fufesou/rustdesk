@@ -1861,8 +1861,16 @@ class _KeyboardMenu extends StatelessWidget {
           continue;
         }
 
-        if (pi.isWayland && mode.key != kKeyMapMode) {
-          continue;
+        if (pi.isWayland) {
+          // Legacy mode is not enabled, because dead keys don't work properly on Wayland
+          if (mode.key == kKeyLegacyMode) {
+            continue;
+          }
+          // Translate mode requires server >= 1.4.6.
+          if (mode.key == kKeyTranslateMode &&
+              versionCmp(pi.version, '1.4.6') < 0) {
+            continue;
+          }
         }
 
         var text = translate(mode.menu);
