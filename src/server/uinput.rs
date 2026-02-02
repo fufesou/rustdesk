@@ -90,6 +90,10 @@ pub mod client {
         }
 
         fn key_sequence(&mut self, sequence: &str) {
+            log::trace!(
+                "UInputKeyboard::key_sequence called (len={})",
+                sequence.len()
+            );
             allow_err!(self.send(Data::Keyboard(DataKeyboard::Sequence(sequence.to_string()))));
         }
 
@@ -177,7 +181,11 @@ pub mod client {
 
 pub mod service {
     use super::*;
+    use arboard::{Clipboard, LinuxClipboardKind, SetExtLinux};
     use hbb_common::lazy_static;
+    use scrap::wayland::{
+        pipewire::RDP_SESSION_INFO, remote_desktop_portal::OrgFreedesktopPortalRemoteDesktop,
+    };
     use std::{collections::HashMap, sync::Mutex};
 
     lazy_static::lazy_static! {
@@ -309,6 +317,7 @@ pub mod service {
                 ('/', (evdev::Key::KEY_SLASH, false)),
                 (';', (evdev::Key::KEY_SEMICOLON, false)),
                 ('\'', (evdev::Key::KEY_APOSTROPHE, false)),
+                (' ', (evdev::Key::KEY_SPACE, false)),
 
                 // Shift + key
                 ('A', (evdev::Key::KEY_A, true)),
@@ -364,6 +373,181 @@ pub mod service {
         static ref RESOLUTION: Mutex<((i32, i32), (i32, i32))> = Mutex::new(((0, 0), (0, 0)));
     }
 
+    /// Delay in milliseconds to wait for clipboard to sync on Wayland.
+    /// This is an empirical value — Wayland provides no callback or event to confirm
+    /// clipboard content has been received by the compositor. Under heavy system load,
+    /// this delay may be insufficient, but there is no reliable alternative mechanism.
+    const CLIPBOARD_SYNC_DELAY_MS: u64 = 50;
+
+    /// Internal: Set clipboard content without delay.
+    /// Returns true if clipboard was set successfully.
+    fn set_clipboard_content(text: &str) -> bool {
+        let mut clipboard = match Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                log::error!("set_clipboard_content: failed to create clipboard: {:?}", e);
+                return false;
+            }
+        };
+
+        // Set both CLIPBOARD and PRIMARY selections
+        // Terminal uses PRIMARY for Shift+Insert, GUI apps use CLIPBOARD
+        if let Err(e) = clipboard
+            .set()
+            .clipboard(LinuxClipboardKind::Clipboard)
+            .text(text.to_owned())
+        {
+            log::error!("set_clipboard_content: failed to set CLIPBOARD: {:?}", e);
+            return false;
+        }
+        if let Err(e) = clipboard
+            .set()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text(text.to_owned())
+        {
+            log::warn!("set_clipboard_content: failed to set PRIMARY: {:?}", e);
+            // Continue anyway, CLIPBOARD might work
+        }
+
+        true
+    }
+
+    /// Set clipboard content for paste operation (async version).
+    ///
+    /// Note: The original clipboard content is intentionally NOT restored after paste.
+    /// Restoring clipboard could cause race conditions where subsequent keystrokes
+    /// might accidentally paste the old clipboard content instead of the intended input.
+    /// This trade-off prioritizes input reliability over preserving clipboard state.
+    #[inline]
+    pub async fn set_clipboard_for_paste(text: &str) -> bool {
+        if !set_clipboard_content(text) {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(CLIPBOARD_SYNC_DELAY_MS)).await;
+        true
+    }
+
+    /// Set clipboard content for paste operation (sync version for use in blocking contexts).
+    #[inline]
+    pub fn set_clipboard_for_paste_sync(text: &str) -> bool {
+        if !set_clipboard_content(text) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_SYNC_DELAY_MS));
+        true
+    }
+
+    /// Input text on Wayland using layout-independent methods.
+    /// ASCII chars (0x20-0x7E): Portal keysym or uinput fallback
+    /// Non-ASCII chars: Clipboard + Shift+Insert (Portal keysym unreliable on GNOME)
+    async fn input_text_wayland(text: &str, keyboard: &mut VirtualDevice) {
+        let portal_info = {
+            let session_info = RDP_SESSION_INFO.lock().unwrap();
+            session_info
+                .as_ref()
+                .map(|info| (info.conn.clone(), info.session.clone()))
+        };
+
+        for c in text.chars() {
+            let keysym = char_to_keysym(c);
+            // ASCII printable characters: use Portal keysym
+            if can_input_via_keysym(c, keysym) {
+                if let Some((ref conn, ref session)) = portal_info {
+                    let portal = scrap::wayland::pipewire::get_portal(conn);
+                    let down_result =
+                        portal.notify_keyboard_keysym(session, HashMap::new(), keysym, 1);
+                    if down_result.is_ok() {
+                        let _ = portal.notify_keyboard_keysym(session, HashMap::new(), keysym, 0);
+                        continue;
+                    }
+                }
+                // Portal unavailable or failed, fallback to uinput
+                input_char_via_uinput_keys_with_keyboard(c, keyboard);
+            } else {
+                // Non-ASCII: use clipboard + Shift+Insert
+                // Portal keysym is unreliable for non-ASCII on some compositors (e.g., GNOME)
+                input_text_via_clipboard_with_keyboard(&c.to_string(), keyboard).await;
+            }
+        }
+    }
+
+    /// Input a single character via uinput key simulation.
+    fn input_char_via_uinput_keys_with_keyboard(chr: char, keyboard: &mut VirtualDevice) {
+        let key = enigo::Key::Layout(chr);
+        if let Ok((evdev_key, is_shift)) = map_key(&key) {
+            if is_shift {
+                let down = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
+                allow_err!(keyboard.emit(&[down]));
+            }
+            let down = InputEvent::new(EventType::KEY, evdev_key.code(), 1);
+            let up = InputEvent::new(EventType::KEY, evdev_key.code(), 0);
+            allow_err!(keyboard.emit(&[down, up]));
+            if is_shift {
+                let up = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0);
+                allow_err!(keyboard.emit(&[up]));
+            }
+        }
+    }
+
+    /// Check if character is ASCII printable (0x20-0x7E: space to tilde).
+    #[inline]
+    pub(crate) fn is_ascii_printable(c: char) -> bool {
+        let cp = c as u32;
+        cp >= 0x20 && cp <= 0x7E
+    }
+
+    /// Check if character can be input via keysym (ASCII printable with valid keysym).
+    #[inline]
+    pub(crate) fn can_input_via_keysym(c: char, keysym: i32) -> bool {
+        is_ascii_printable(c) && keysym != 0
+    }
+
+    /// Convert a Unicode character to X11 keysym.
+    pub(crate) fn char_to_keysym(c: char) -> i32 {
+        let codepoint = c as u32;
+        if is_ascii_printable(c) {
+            // Basic Latin: keysym == unicode codepoint
+            codepoint as i32
+        } else if codepoint > 0 {
+            // All non-ASCII Unicode: keysym = 0x01000000 + codepoint
+            // This includes Latin-1 characters like é (U+00E9), ñ (U+00F1), ü (U+00FC), etc.
+            (0x01000000 + codepoint) as i32
+        } else {
+            0
+        }
+    }
+
+    /// Input text via clipboard and Shift+Insert paste using an existing keyboard device.
+    /// This is async and reuses the provided keyboard device.
+    async fn input_text_via_clipboard_with_keyboard(text: &str, keyboard: &mut VirtualDevice) {
+        if !set_clipboard_for_paste(text).await {
+            return;
+        }
+
+        // Simulate Shift+Insert with guaranteed Shift release
+        let shift_down = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
+        let insert_down = InputEvent::new(EventType::KEY, evdev::Key::KEY_INSERT.code(), 1);
+        let insert_up = InputEvent::new(EventType::KEY, evdev::Key::KEY_INSERT.code(), 0);
+        let shift_up = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0);
+
+        allow_err!(keyboard.emit(&[shift_down]));
+
+        // Small delay between key events
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let insert_result = keyboard.emit(&[insert_down, insert_up]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let shift_result = keyboard.emit(&[shift_up]);
+        if let Err(ref e) = shift_result {
+            log::error!("Failed to release Shift key: {:?}", e);
+        }
+
+        if let Err(ref e) = insert_result {
+            log::error!("Failed to send Insert key: {:?}", e);
+        }
+    }
+
     fn create_uinput_keyboard() -> ResultType<VirtualDevice> {
         // TODO: ensure keys here
         let mut keys = AttributeSet::<evdev::Key>::new();
@@ -390,13 +574,13 @@ pub mod service {
 
     pub fn map_key(key: &enigo::Key) -> ResultType<(evdev::Key, bool)> {
         if let Some(k) = KEY_MAP.get(&key) {
-            log::trace!("mapkey {:?}, get {:?}", &key, &k);
+            log::trace!("mapkey matched in KEY_MAP, evdev={:?}", &k);
             return Ok((k.clone(), false));
         } else {
             match key {
                 enigo::Key::Layout(c) => {
                     if let Some((k, is_shift)) = KEY_MAP_LAYOUT.get(&c) {
-                        log::trace!("mapkey {:?}, get {:?}", &key, k);
+                        log::trace!("mapkey Layout matched, evdev={:?}", k);
                         return Ok((k.clone(), is_shift.clone()));
                     }
                 }
@@ -421,10 +605,20 @@ pub mod service {
         keyboard: &mut VirtualDevice,
         data: &DataKeyboard,
     ) {
-        log::trace!("handle_keyboard {:?}", &data);
+        let data_desc = match data {
+            DataKeyboard::Sequence(seq) => format!("Sequence(len={})", seq.len()),
+            DataKeyboard::KeyDown(Key::Layout(_))
+            | DataKeyboard::KeyUp(Key::Layout(_))
+            | DataKeyboard::KeyClick(Key::Layout(_)) => "Layout(<redacted>)".to_string(),
+            _ => format!("{:?}", data),
+        };
+        log::trace!("handle_keyboard received: {}", data_desc);
         match data {
-            DataKeyboard::Sequence(_seq) => {
-                // ignore
+            DataKeyboard::Sequence(seq) => {
+                log::trace!("DataKeyboard::Sequence received (len={})", seq.len());
+                if !seq.is_empty() {
+                    input_text_wayland(seq, keyboard).await;
+                }
             }
             DataKeyboard::KeyDown(enigo::Key::Raw(code)) => {
                 let down_event = InputEvent::new(EventType::KEY, *code - 8, 1);
@@ -435,27 +629,34 @@ pub mod service {
                 allow_err!(keyboard.emit(&[up_event]));
             }
             DataKeyboard::KeyDown(key) => {
-                if let Ok((k, is_shift)) = map_key(key) {
-                    if is_shift {
-                        let down_event =
-                            InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
+                if let Key::Layout(chr) = key {
+                    input_text_wayland(&chr.to_string(), keyboard).await;
+                } else {
+                    if let Ok((k, _is_shift)) = map_key(key) {
+                        let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
                         allow_err!(keyboard.emit(&[down_event]));
                     }
-                    let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
-                    allow_err!(keyboard.emit(&[down_event]));
                 }
             }
             DataKeyboard::KeyUp(key) => {
-                if let Ok((k, _)) = map_key(key) {
-                    let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
-                    allow_err!(keyboard.emit(&[up_event]));
+                if let Key::Layout(_chr) = key {
+                    log::trace!("KeyUp for Layout char, skipping");
+                } else {
+                    if let Ok((k, _)) = map_key(key) {
+                        let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
+                        allow_err!(keyboard.emit(&[up_event]));
+                    }
                 }
             }
             DataKeyboard::KeyClick(key) => {
-                if let Ok((k, _)) = map_key(key) {
-                    let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
-                    let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
-                    allow_err!(keyboard.emit(&[down_event, up_event]));
+                if let Key::Layout(chr) = key {
+                    input_text_wayland(&chr.to_string(), keyboard).await;
+                } else {
+                    if let Ok((k, _is_shift)) = map_key(key) {
+                        let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
+                        let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
+                        allow_err!(keyboard.emit(&[down_event, up_event]));
+                    }
                 }
             }
             DataKeyboard::GetKeyState(key) => {
@@ -580,9 +781,13 @@ pub mod service {
     }
 
     fn spawn_keyboard_handler(mut stream: Connection) {
+        log::debug!("spawn_keyboard_handler: new keyboard handler connection");
         tokio::spawn(async move {
             let mut keyboard = match create_uinput_keyboard() {
-                Ok(keyboard) => keyboard,
+                Ok(keyboard) => {
+                    log::debug!("UInput keyboard device created successfully");
+                    keyboard
+                }
                 Err(e) => {
                     log::error!("Failed to create keyboard {}", e);
                     return;
@@ -602,6 +807,7 @@ pub mod service {
                                         handle_keyboard(&mut stream, &mut keyboard, &data).await;
                                     }
                                     _ => {
+                                        log::warn!("Unexpected data type in keyboard handler");
                                     }
                                 }
                             }
