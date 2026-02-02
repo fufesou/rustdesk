@@ -90,6 +90,13 @@ pub mod client {
         }
 
         fn key_sequence(&mut self, sequence: &str) {
+            // Sequence events are normally handled in the --server process before reaching here.
+            // Forward via IPC as a fallback — input_text_wayland can still handle ASCII chars
+            // via keysym/uinput, though non-ASCII will be skipped (no clipboard in --service).
+            log::debug!(
+                "UInputKeyboard::key_sequence called (len={})",
+                sequence.len()
+            );
             allow_err!(self.send(Data::Keyboard(DataKeyboard::Sequence(sequence.to_string()))));
         }
 
@@ -178,6 +185,9 @@ pub mod client {
 pub mod service {
     use super::*;
     use hbb_common::lazy_static;
+    use scrap::wayland::{
+        pipewire::RDP_SESSION_INFO, remote_desktop_portal::OrgFreedesktopPortalRemoteDesktop,
+    };
     use std::{collections::HashMap, sync::Mutex};
 
     lazy_static::lazy_static! {
@@ -309,6 +319,7 @@ pub mod service {
                 ('/', (evdev::Key::KEY_SLASH, false)),
                 (';', (evdev::Key::KEY_SEMICOLON, false)),
                 ('\'', (evdev::Key::KEY_APOSTROPHE, false)),
+                (' ', (evdev::Key::KEY_SPACE, false)),
 
                 // Shift + key
                 ('A', (evdev::Key::KEY_A, true)),
@@ -364,6 +375,85 @@ pub mod service {
         static ref RESOLUTION: Mutex<((i32, i32), (i32, i32))> = Mutex::new(((0, 0), (0, 0)));
     }
 
+    /// Input text on Wayland using layout-independent methods.
+    /// ASCII chars (0x20-0x7E): Portal keysym or uinput fallback
+    /// Non-ASCII chars: skipped — this runs in the --service (root) process where clipboard
+    /// operations are unreliable (typically no user session environment).
+    /// Non-ASCII input is normally handled by the --server process via input_text_via_clipboard_server.
+    fn input_text_wayland(text: &str, keyboard: &mut VirtualDevice) {
+        let portal_info = {
+            let session_info = RDP_SESSION_INFO.lock().unwrap();
+            session_info
+                .as_ref()
+                .map(|info| (info.conn.clone(), info.session.clone()))
+        };
+
+        for c in text.chars() {
+            let keysym = char_to_keysym(c);
+            // ASCII printable characters: use Portal keysym
+            if can_input_via_keysym(c, keysym) {
+                if let Some((ref conn, ref session)) = portal_info {
+                    let portal = scrap::wayland::pipewire::get_portal(conn);
+                    let down_result =
+                        portal.notify_keyboard_keysym(session, HashMap::new(), keysym, 1);
+                    if down_result.is_ok() {
+                        let _ = portal.notify_keyboard_keysym(session, HashMap::new(), keysym, 0);
+                        continue;
+                    }
+                }
+                // Portal unavailable or failed, fallback to uinput
+                input_char_via_uinput_keys_with_keyboard(c, keyboard);
+            } else {
+                // Non-ASCII characters cannot be reliably input here — this runs in the
+                // --service (root) process where clipboard operations are unreliable.
+                // Non-ASCII input should be routed through the --server process
+                // (input_text_via_clipboard_server) instead.
+                log::debug!("Skipping non-ASCII character in uinput service (no clipboard access)");
+            }
+        }
+    }
+
+    /// Input a single character via uinput key simulation.
+    fn input_char_via_uinput_keys_with_keyboard(chr: char, keyboard: &mut VirtualDevice) {
+        let key = enigo::Key::Layout(chr);
+        if let Ok((evdev_key, is_shift)) = map_key(&key) {
+            if is_shift {
+                let down = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
+                allow_err!(keyboard.emit(&[down]));
+            }
+            let down = InputEvent::new(EventType::KEY, evdev_key.code(), 1);
+            let up = InputEvent::new(EventType::KEY, evdev_key.code(), 0);
+            allow_err!(keyboard.emit(&[down, up]));
+            if is_shift {
+                let up = InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 0);
+                allow_err!(keyboard.emit(&[up]));
+            }
+        }
+    }
+
+    /// Check if character can be input via keysym (ASCII printable with valid keysym).
+    #[inline]
+    pub(crate) fn can_input_via_keysym(c: char, keysym: i32) -> bool {
+        // ASCII printable: 0x20 (space) to 0x7E (tilde)
+        (c as u32 >= 0x20 && c as u32 <= 0x7E) && keysym != 0
+    }
+
+    /// Convert a Unicode character to X11 keysym.
+    pub(crate) fn char_to_keysym(c: char) -> i32 {
+        let codepoint = c as u32;
+        // ASCII printable (0x20-0x7E): keysym == unicode codepoint
+        if codepoint >= 0x20 && codepoint <= 0x7E {
+            // Basic Latin: keysym == unicode codepoint
+            codepoint as i32
+        } else if codepoint > 0 {
+            // All non-ASCII Unicode: keysym = 0x01000000 + codepoint
+            // This includes Latin-1 characters like é (U+00E9), ñ (U+00F1), ü (U+00FC), etc.
+            (0x01000000 + codepoint) as i32
+        } else {
+            0
+        }
+    }
+
     fn create_uinput_keyboard() -> ResultType<VirtualDevice> {
         // TODO: ensure keys here
         let mut keys = AttributeSet::<evdev::Key>::new();
@@ -390,13 +480,13 @@ pub mod service {
 
     pub fn map_key(key: &enigo::Key) -> ResultType<(evdev::Key, bool)> {
         if let Some(k) = KEY_MAP.get(&key) {
-            log::trace!("mapkey {:?}, get {:?}", &key, &k);
+            log::trace!("mapkey matched in KEY_MAP, evdev={:?}", &k);
             return Ok((k.clone(), false));
         } else {
             match key {
                 enigo::Key::Layout(c) => {
                     if let Some((k, is_shift)) = KEY_MAP_LAYOUT.get(&c) {
-                        log::trace!("mapkey {:?}, get {:?}", &key, k);
+                        log::trace!("mapkey Layout matched, evdev={:?}", k);
                         return Ok((k.clone(), is_shift.clone()));
                     }
                 }
@@ -421,10 +511,22 @@ pub mod service {
         keyboard: &mut VirtualDevice,
         data: &DataKeyboard,
     ) {
-        log::trace!("handle_keyboard {:?}", &data);
+        let data_desc = match data {
+            DataKeyboard::Sequence(seq) => format!("Sequence(len={})", seq.len()),
+            DataKeyboard::KeyDown(Key::Layout(_))
+            | DataKeyboard::KeyUp(Key::Layout(_))
+            | DataKeyboard::KeyClick(Key::Layout(_)) => "Layout(<redacted>)".to_string(),
+            _ => format!("{:?}", data),
+        };
+        log::trace!("handle_keyboard received: {}", data_desc);
         match data {
-            DataKeyboard::Sequence(_seq) => {
-                // ignore
+            DataKeyboard::Sequence(seq) => {
+                // Normally handled by --server process (input_text_via_clipboard_server).
+                // Fallback: input_text_wayland handles ASCII via keysym/uinput;
+                // non-ASCII will be skipped (no clipboard access in --service process).
+                if !seq.is_empty() {
+                    input_text_wayland(seq, keyboard);
+                }
             }
             DataKeyboard::KeyDown(enigo::Key::Raw(code)) => {
                 let down_event = InputEvent::new(EventType::KEY, *code - 8, 1);
@@ -435,27 +537,34 @@ pub mod service {
                 allow_err!(keyboard.emit(&[up_event]));
             }
             DataKeyboard::KeyDown(key) => {
-                if let Ok((k, is_shift)) = map_key(key) {
-                    if is_shift {
-                        let down_event =
-                            InputEvent::new(EventType::KEY, evdev::Key::KEY_LEFTSHIFT.code(), 1);
+                if let Key::Layout(chr) = key {
+                    input_text_wayland(&chr.to_string(), keyboard);
+                } else {
+                    if let Ok((k, _is_shift)) = map_key(key) {
+                        let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
                         allow_err!(keyboard.emit(&[down_event]));
                     }
-                    let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
-                    allow_err!(keyboard.emit(&[down_event]));
                 }
             }
             DataKeyboard::KeyUp(key) => {
-                if let Ok((k, _)) = map_key(key) {
-                    let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
-                    allow_err!(keyboard.emit(&[up_event]));
+                if let Key::Layout(_chr) = key {
+                    log::trace!("KeyUp for Layout char, skipping");
+                } else {
+                    if let Ok((k, _)) = map_key(key) {
+                        let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
+                        allow_err!(keyboard.emit(&[up_event]));
+                    }
                 }
             }
             DataKeyboard::KeyClick(key) => {
-                if let Ok((k, _)) = map_key(key) {
-                    let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
-                    let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
-                    allow_err!(keyboard.emit(&[down_event, up_event]));
+                if let Key::Layout(chr) = key {
+                    input_text_wayland(&chr.to_string(), keyboard);
+                } else {
+                    if let Ok((k, _is_shift)) = map_key(key) {
+                        let down_event = InputEvent::new(EventType::KEY, k.code(), 1);
+                        let up_event = InputEvent::new(EventType::KEY, k.code(), 0);
+                        allow_err!(keyboard.emit(&[down_event, up_event]));
+                    }
                 }
             }
             DataKeyboard::GetKeyState(key) => {
@@ -580,9 +689,13 @@ pub mod service {
     }
 
     fn spawn_keyboard_handler(mut stream: Connection) {
+        log::debug!("spawn_keyboard_handler: new keyboard handler connection");
         tokio::spawn(async move {
             let mut keyboard = match create_uinput_keyboard() {
-                Ok(keyboard) => keyboard,
+                Ok(keyboard) => {
+                    log::debug!("UInput keyboard device created successfully");
+                    keyboard
+                }
                 Err(e) => {
                     log::error!("Failed to create keyboard {}", e);
                     return;
@@ -602,6 +715,7 @@ pub mod service {
                                         handle_keyboard(&mut stream, &mut keyboard, &data).await;
                                     }
                                     _ => {
+                                        log::warn!("Unexpected data type in keyboard handler");
                                     }
                                 }
                             }
