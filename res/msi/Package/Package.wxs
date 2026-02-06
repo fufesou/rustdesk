@@ -29,9 +29,7 @@
 			<InstallExecute After="RemoveExistingProducts" />
 
 			<!--Only do InstallValidate if is not Uninstall-->
-			<!--<InstallValidate Condition="NOT (Installed AND REMOVE AND NOT UPGRADINGPRODUCTCODE )" />-->
-			<!--Only do InstallValidate if is Install-->
-			<InstallValidate Condition="NOT Installed" />
+			<InstallValidate Condition="NOT (Installed AND REMOVE AND NOT UPGRADINGPRODUCTCODE )" />
 
 		</InstallExecuteSequence>
 
