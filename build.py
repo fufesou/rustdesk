@@ -292,6 +292,11 @@ def generate_control_file(version):
     control_file_path = "../res/DEBIAN/control"
     system2('/bin/rm -rf %s' % control_file_path)
 
+    # Note: libxdo is not included in dependencies because:
+    # 1. libxdo-sys-stub dynamically loads libxdo at runtime (supports v3, v4, or none)
+    # 2. Different distributions ship different versions (libxdo3 vs libxdo4)
+    # 3. Wayland-only systems don't need libxdo
+    # 4. Application gracefully degrades xdo functionality if library not found
     content = """Package: rustdesk
 Section: net
 Priority: optional
@@ -300,7 +305,7 @@ Architecture: %s
 Maintainer: rustdesk <info@rustdesk.com>
 Homepage: https://rustdesk.com
 Depends: libgtk-3-0, libxcb-randr0, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s
-Recommends: libayatana-appindicator3-1, libxdo3
+Recommends: libayatana-appindicator3-1
 Description: A remote control software.
 
 """ % (version, get_deb_arch(), get_deb_extra_depends())
