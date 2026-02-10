@@ -40,7 +40,6 @@ AppDir:
     - libc6:arm64
     - libgtk-3-0
     - libxcb-randr0
-    - libxdo3
     - libxfixes3
     - libxcb-shape0
     - libxcb-xfixes0
