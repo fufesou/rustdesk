@@ -2550,7 +2550,7 @@ class _WaylandCardState extends State<WaylandCard> {
   //   DeletePermission sss "gnome" "shortcuts-inhibitor" "rustdesk.desktop"
   //
   // We may add it back in the future if needed.
-  final showResetInhibitorPermission = false;
+  final showResetInhibitorPermission = true;
 
   @override
   void initState() {
