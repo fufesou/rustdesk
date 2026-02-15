@@ -1984,6 +1984,21 @@ class RustdeskImpl {
         ]));
   }
 
+  Future<void> sessionRequestTerminalBuffer(
+      {required UuidValue sessionId,
+      required int terminalId,
+      required int maxBytes,
+      dynamic hint}) {
+    return Future(() => js.context.callMethod('setByName', [
+          'request_terminal_buffer',
+          jsonEncode({
+            'session_id': sessionId.toString(),
+            'terminal_id': terminalId,
+            'max_bytes': maxBytes,
+          })
+        ]));
+  }
+
   Future<int?> sessionGetEdgeScrollEdgeThickness(
       {required UuidValue sessionId, dynamic hint}) {
     final thickness = js.context.callMethod(

@@ -833,6 +833,18 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
+    pub fn request_terminal_buffer(&self, terminal_id: i32, max_bytes: u32) {
+        let mut action = TerminalAction::new();
+        action.set_request_buffer(RequestTerminalBuffer {
+            terminal_id,
+            max_bytes,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_terminal_action(action);
+        self.send(Data::Message(msg_out));
+    }
+
     pub fn capture_displays(&self, add: Vec<i32>, sub: Vec<i32>, set: Vec<i32>) {
         let mut misc = Misc::new();
         misc.set_capture_displays(CaptureDisplays {
