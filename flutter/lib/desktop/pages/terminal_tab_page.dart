@@ -329,7 +329,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
   void _addNewTerminal(String peerId, {int? terminalId}) {
     // Find first tab for this peer to get connection parameters
     final firstTab = tabController.state.value.tabs.firstWhere(
-      (tab) => tab.key.startsWith('$peerId\_'),
+      (tab) => tab.key.startsWith('${peerId}_'),
     );
     if (firstTab.page is TerminalPage) {
       final page = firstTab.page as TerminalPage;
@@ -350,11 +350,29 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
 
   void _addNewTerminalForCurrentPeer({int? terminalId}) {
     final currentTab = tabController.state.value.selectedTabInfo;
-    final parts = currentTab.key.split('_');
-    if (parts.isNotEmpty) {
-      final peerId = parts[0];
-      _addNewTerminal(peerId, terminalId: terminalId);
+    final parsed = _parseTabKey(currentTab.key);
+    if (parsed == null) return;
+    final (peerId, _) = parsed;
+    _addNewTerminal(peerId, terminalId: terminalId);
+  }
+
+  /// Parse tabKey (format: "peerId_terminalId") into its components.
+  /// Note: peerId may contain underscores, so we use lastIndexOf('_').
+  /// Returns null if tabKey format is invalid.
+  (String peerId, int terminalId)? _parseTabKey(String tabKey) {
+    final lastUnderscore = tabKey.lastIndexOf('_');
+    if (lastUnderscore <= 0) {
+      debugPrint('[TerminalTabPage] Invalid tabKey format: $tabKey');
+      return null;
     }
+    final terminalIdStr = tabKey.substring(lastUnderscore + 1);
+    final terminalId = int.tryParse(terminalIdStr);
+    if (terminalId == null) {
+      debugPrint('[TerminalTabPage] Invalid terminalId in tabKey: $tabKey');
+      return null;
+    }
+    final peerId = tabKey.substring(0, lastUnderscore);
+    return (peerId, terminalId);
   }
 
   @override
@@ -368,10 +386,9 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
           selectedBorderColor: MyTheme.accent,
           labelGetter: DesktopTab.tablabelGetter,
           tabMenuBuilder: (key) {
-            // Extract peerId from tab key (format: "peerId_terminalId")
-            final parts = key.split('_');
-            if (parts.isEmpty) return Container();
-            final peerId = parts[0];
+            final parsed = _parseTabKey(key);
+            if (parsed == null) return Container();
+            final (peerId, _) = parsed;
             return _tabMenuBuilder(peerId, () {});
           },
         ));
