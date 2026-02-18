@@ -685,6 +685,17 @@ pub fn session_close_terminal(session_id: SessionID, terminal_id: i32) {
     }
 }
 
+pub fn session_request_terminal_buffer(session_id: SessionID, terminal_id: i32, max_bytes: u32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.request_terminal_buffer(terminal_id, max_bytes);
+    } else {
+        log::debug!(
+            "session_request_terminal_buffer: session not found for {:?}",
+            session_id
+        );
+    }
+}
+
 pub fn session_peer_option(session_id: SessionID, name: String, value: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.set_option(name, value);

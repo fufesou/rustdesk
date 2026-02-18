@@ -32,6 +32,8 @@ class TerminalModel with ChangeNotifier {
   // Local buffer limit (characters) - aligned with server's request buffer size.
   // Note: UTF-8 bytes on server vs UTF-16 chars here, but close enough for buffering purposes.
   static const int _kMaxOutputBufferChars = 8 * 1024;
+  // Max bytes to request from server when reconnecting to a persistent session.
+  static const int _kMaxRequestBufferBytes = 8 * 1024;
   // View ready state: true when terminal has valid dimensions, safe to write
   bool _terminalViewReady = false;
 
@@ -218,25 +220,12 @@ class TerminalModel with ChangeNotifier {
     }
   }
 
-  static bool getSuccessFromEvt(Map<String, dynamic> evt) {
-    if (evt.containsKey('success')) {
-      final v = evt['success'];
-      if (v is bool) {
-        // Desktop and mobile
-        return v;
-      } else if (v is String) {
-        // Web
-        return v.toLowerCase() == 'true';
-      } else {
-        // Unexpected type, log and handle gracefully
-        debugPrint(
-            '[TerminalModel] Unexpected success type: ${v.runtimeType}, value: $v. Expected bool or String.');
-        return false;
-      }
-    } else {
-      debugPrint('[TerminalModel] Event does not contain success');
-      return false;
-    }
+  /// Parse a boolean value from event map, handling both bool and String types (for web compatibility).
+  static bool getBoolFromEvt(Map<String, dynamic> evt, String key, {bool defaultValue = false}) {
+    final v = evt[key];
+    if (v is bool) return v;
+    if (v is String) return v.toLowerCase() == 'true';
+    return defaultValue;
   }
 
   void handleTerminalResponse(Map<String, dynamic> evt) {
@@ -267,17 +256,25 @@ class TerminalModel with ChangeNotifier {
   }
 
   void _handleTerminalOpened(Map<String, dynamic> evt) {
-    final bool success = getSuccessFromEvt(evt);
+    final bool success = getBoolFromEvt(evt, 'success');
     final String message = evt['message'] ?? '';
     final String? serviceId = evt['service_id'];
+    final bool reconnected = getBoolFromEvt(evt, 'reconnected');
 
     debugPrint(
-        '[TerminalModel] Terminal opened response: success=$success, message=$message, service_id=$serviceId');
+        '[TerminalModel] Terminal opened response: success=$success, message=$message, service_id=$serviceId, reconnected=$reconnected');
 
     if (success) {
       _terminalOpened = true;
 
       // Service ID is now saved on the Rust side in handle_terminal_response
+
+      // If this is a reconnection to an existing terminal, request the buffer
+      if (reconnected) {
+        debugPrint(
+            '[TerminalModel] Reconnected to existing terminal, requesting buffer');
+        _requestTerminalBuffer();
+      }
 
       // Process any buffered input
       _processBufferedInputAsync().then((_) {
@@ -322,6 +319,7 @@ class TerminalModel with ChangeNotifier {
   /// Mark terminal view as ready and flush any buffered output.
   /// Called on first valid resize when terminal has valid dimensions.
   void _markViewReady() {
+    if (_terminalViewReady) return;
     _terminalViewReady = true;
     // Flush buffered output chunks in order
     if (_pendingOutputChunks.isNotEmpty) {
@@ -332,6 +330,18 @@ class TerminalModel with ChangeNotifier {
       _pendingOutputChunks.clear();
       _pendingOutputSize = 0;
     }
+  }
+
+  /// Request terminal buffer from server (fire-and-forget with error logging).
+  void _requestTerminalBuffer() {
+    if (_disposed) return;
+    bind.sessionRequestTerminalBuffer(
+      sessionId: parent.sessionId,
+      terminalId: terminalId,
+      maxBytes: _kMaxRequestBufferBytes,
+    ).catchError((e) {
+      debugPrint('[TerminalModel] Error requesting terminal buffer: $e');
+    });
   }
 
   void _handleTerminalData(Map<String, dynamic> evt) {
@@ -392,6 +402,10 @@ class TerminalModel with ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    // Clear buffers to free memory
+    _inputBuffer.clear();
+    _pendingOutputChunks.clear();
+    _pendingOutputSize = 0;
     // Terminal cleanup is handled server-side when service closes
     super.dispose();
   }
