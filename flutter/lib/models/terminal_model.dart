@@ -24,6 +24,16 @@ class TerminalModel with ChangeNotifier {
   bool _disposed = false;
 
   final _inputBuffer = <String>[];
+  // Buffer for output data received before terminal view has valid dimensions.
+  // This prevents NaN errors when writing to terminal before layout is complete.
+  // Uses List<String> chunks to avoid truncating ANSI escape sequences mid-stream.
+  final _pendingOutputChunks = <String>[];
+  int _pendingOutputSize = 0;  // in characters (UTF-16 code units)
+  // Local buffer limit (characters) - aligned with server's request buffer size.
+  // Note: UTF-8 bytes on server vs UTF-16 chars here, but close enough for buffering purposes.
+  static const int _kMaxOutputBufferChars = 8 * 1024;
+  // View ready state: true when terminal has valid dimensions, safe to write
+  bool _terminalViewReady = false;
 
   bool get isPeerWindows => parent.ffiModel.pi.platform == kPeerPlatformWindows;
 
@@ -70,6 +80,11 @@ class TerminalModel with ChangeNotifier {
       if (w > 0 && h > 0 && pw > 0 && ph > 0) {
         debugPrint(
             '[TerminalModel] Terminal resized to ${w}x$h (pixel: ${pw}x$ph)');
+
+        // Mark terminal view as ready and flush any buffered output on first valid resize.
+        if (!_terminalViewReady) {
+          _markViewReady();
+        }
 
         // This piece of code must be placed before the conditional check in order to initialize properly.
         onResizeExternal?.call(w, h, pw, ph);
@@ -304,6 +319,21 @@ class TerminalModel with ChangeNotifier {
     }
   }
 
+  /// Mark terminal view as ready and flush any buffered output.
+  /// Called on first valid resize when terminal has valid dimensions.
+  void _markViewReady() {
+    _terminalViewReady = true;
+    // Flush buffered output chunks in order
+    if (_pendingOutputChunks.isNotEmpty) {
+      debugPrint('[TerminalModel] Flushing ${_pendingOutputChunks.length} buffered output chunks ($_pendingOutputSize chars)');
+      for (final chunk in _pendingOutputChunks) {
+        terminal.write(chunk);
+      }
+      _pendingOutputChunks.clear();
+      _pendingOutputSize = 0;
+    }
+  }
+
   void _handleTerminalData(Map<String, dynamic> evt) {
     final data = evt['data'];
 
@@ -324,6 +354,18 @@ class TerminalModel with ChangeNotifier {
           text = utf8.decode(List<int>.from(data), allowMalformed: true);
         } else {
           debugPrint('[TerminalModel] Unknown data type: ${data.runtimeType}');
+          return;
+        }
+
+        // Buffer data if terminal view is not ready yet to avoid NaN errors.
+        if (!_terminalViewReady) {
+          _pendingOutputChunks.add(text);
+          _pendingOutputSize += text.length;
+          // Drop oldest chunks if exceeds limit (whole chunks to preserve ANSI sequences)
+          while (_pendingOutputSize > _kMaxOutputBufferChars && _pendingOutputChunks.length > 1) {
+            final removed = _pendingOutputChunks.removeAt(0);
+            _pendingOutputSize -= removed.length;
+          }
           return;
         }
 
