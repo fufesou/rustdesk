@@ -77,6 +77,7 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
         key: ValueKey(tabKey),
         id: peerId,
         terminalId: terminalId,
+        tabKey: tabKey,
         password: password,
         isSharedPassword: isSharedPassword,
         tabController: tabController,
