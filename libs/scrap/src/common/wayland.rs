@@ -17,6 +17,7 @@ pub fn set_map_err(f: fn(err: String) -> io::Error) {
 }
 
 fn map_err<E: ToString>(err: E) -> io::Error {
+    hbb_common::log::error!("============================ Wayland error: {}", err.to_string());
     if let Some(f) = *MAP_ERR.read().unwrap() {
         f(err.to_string())
     } else {

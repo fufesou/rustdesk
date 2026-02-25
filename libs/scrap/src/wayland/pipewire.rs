@@ -7,6 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
+use hbb_common::log;
 use tracing::{debug, error, trace, warn};
 
 use dbus::{
@@ -267,25 +268,37 @@ impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
         let pipeline = gst::Pipeline::new(None);
 
+        log::info!("======================= new begin");
         let src = gst::ElementFactory::make("pipewiresrc", None)?;
+        log::info!("======================= pipewiresrc");
         src.set_property("fd", &capturable.fd.as_raw_fd())?;
+        log::info!("======================= set fd");
         src.set_property("path", &format!("{}", capturable.path))?;
+        log::info!("======================= set path");
         src.set_property("keepalive_time", &1_000.as_raw_fd())?;
+        log::info!("======================= set keepalive_time");
 
         // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
         // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
         src.set_property("always-copy", &true)?;
+        log::info!("======================= set always-copy");
 
         let sink = gst::ElementFactory::make("appsink", None)?;
+        log::info!("======================= appsink");
         sink.set_property("drop", &true)?;
+        log::info!("======================= set drop");
         sink.set_property("max-buffers", &1u32)?;
+        log::info!("======================= set max-buffers");
 
         pipeline.add_many(&[&src, &sink])?;
+        log::info!("======================= add_many");
         src.link(&sink)?;
+        log::info!("======================= link");
 
         let appsink = sink
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
+        log::info!("======================= dynamic_cast to AppSink");
         let mut caps = gst::Caps::new_empty();
         caps.merge_structure(gst::structure::Structure::new(
             "video/x-raw",
@@ -307,6 +320,7 @@ impl PipeWireRecorder {
             capturable.fd.as_raw_fd()
         );
         pipeline.set_state(gst::State::Playing)?;
+        log::info!("======================= set_state to Playing");
 
         // If `is_server_running()` is false, it means using remote_desktop_portal,
         // which does not use multiple streams, so no need to wait for state change.
@@ -331,6 +345,7 @@ impl PipeWireRecorder {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
 
+        log::info!("======================= new end");
         Ok(Self {
             pipeline,
             appsink,
