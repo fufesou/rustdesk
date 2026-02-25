@@ -134,7 +134,7 @@ fn check_update(manually: bool) -> ResultType<()> {
     } else {
         let download_url = update_url.replace("tag", "download");
         // let version = download_url.split('/').last().unwrap_or_default();
-        let version = "1.4.8".to_string();
+        let version = "1.4.9".to_string();
         #[cfg(target_os = "windows")]
         let download_url = if cfg!(feature = "flutter") {
             format!(
