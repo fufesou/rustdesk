@@ -341,7 +341,6 @@ fn notify_exit_relative_mouse_mode() {
     flutter::push_session_event(&session_id, "exit_relative_mouse_mode", vec![]);
 }
 
-
 /// Handle relative mouse mode shortcuts in the rdev grab loop.
 /// Returns true if the event should be blocked from being sent to the peer.
 #[cfg(feature = "flutter")]
@@ -541,6 +540,11 @@ pub fn is_long_press(event: &Event) -> bool {
 }
 
 pub fn release_remote_keys(keyboard_mode: &str) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        IS_LEFT_OPTION_DOWN = false;
+    }
+
     // todo!: client quit suddenly, how to release keys?
     let to_release = TO_RELEASE.lock().unwrap().clone();
     TO_RELEASE.lock().unwrap().clear();
@@ -1153,6 +1157,113 @@ fn try_fill_unicode(_peer: &str, event: &Event, key_event: &KeyEvent, events: &m
 }
 
 #[cfg(target_os = "windows")]
+#[inline]
+fn has_printable_unicode(event: &Event) -> bool {
+    // Intentionally stricter than try_fill_unicode(name.len() > 0):
+    // this predicate is only for deciding whether to switch from hotkey
+    // handling to text handling in translate mode, so require printable text.
+    event
+        .unicode
+        .as_ref()
+        .and_then(|unicode_info| unicode_info.name.as_ref())
+        .map(|name| !name.is_empty() && name.chars().any(|c| !c.is_control()))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Default)]
+struct ModifierSnapshot {
+    ctrl_left: bool,
+    ctrl_right: bool,
+    alt: bool,
+    alt_gr: bool,
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn modifier_snapshot() -> ModifierSnapshot {
+    let modifiers = MODIFIERS_STATE.lock().unwrap();
+    ModifierSnapshot {
+        ctrl_left: *modifiers.get(&Key::ControlLeft).unwrap_or(&false),
+        ctrl_right: *modifiers.get(&Key::ControlRight).unwrap_or(&false),
+        alt: *modifiers.get(&Key::Alt).unwrap_or(&false),
+        alt_gr: *modifiers.get(&Key::AltGr).unwrap_or(&false),
+    }
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn make_key_release_event(key: Key) -> Option<Event> {
+    let (platform_code, position_code): (u32, u32) = (
+        rdev::win_code_from_key(key)?,
+        rdev::win_scancode_from_key(key)? as u32,
+    );
+
+    Some(Event {
+        time: std::time::SystemTime::now(),
+        unicode: None,
+        platform_code,
+        position_code,
+        event_type: EventType::KeyRelease(key),
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        usb_hid: 0,
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        extra_data: 0,
+    })
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn append_translate_release_key_event(
+    peer: &str,
+    key_event: &KeyEvent,
+    events: &mut Vec<KeyEvent>,
+    key: Key,
+) {
+    if let Some(release_evt) = make_key_release_event(key) {
+        events.append(&mut map_keyboard_mode(
+            peer,
+            &release_evt,
+            key_event.clone(),
+        ));
+    }
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn is_altgr_like_text_input(event: &Event) -> bool {
+    if !is_press(event) || !has_printable_unicode(event) {
+        return false;
+    }
+
+    let m = modifier_snapshot();
+    // AltGr usually behaves as RightAlt (or Ctrl+Alt) and should produce text, not shortcuts.
+    let ctrl = m.ctrl_left || m.ctrl_right;
+    let alt = m.alt || m.alt_gr;
+    return m.alt_gr || (ctrl && alt);
+}
+
+#[inline]
+#[cfg(target_os = "windows")]
+fn release_modifiers_before_unicode(peer: &str, key_event: &KeyEvent, events: &mut Vec<KeyEvent>) {
+    let m = modifier_snapshot();
+
+    // Release Alt/AltGr, then Ctrl to neutralize AltGr-like shortcuts.
+    if m.alt_gr {
+        append_translate_release_key_event(peer, key_event, events, Key::AltGr);
+    }
+    if m.alt {
+        append_translate_release_key_event(peer, key_event, events, Key::Alt);
+    }
+    if m.ctrl_left {
+        append_translate_release_key_event(peer, key_event, events, Key::ControlLeft);
+    }
+    if m.ctrl_right {
+        append_translate_release_key_event(peer, key_event, events, Key::ControlRight);
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn try_fill_win2win_hotkey(
     peer: &str,
     event: &Event,
@@ -1261,7 +1372,17 @@ pub fn translate_keyboard_mode(peer: &str, event: &Event, key_event: KeyEvent) -
     }
 
     #[cfg(target_os = "windows")]
-    try_fill_win2win_hotkey(peer, event, &key_event, &mut events);
+    if events.is_empty() && is_altgr_like_text_input(event) {
+        // If modifiers are being used to produce text in translate mode (AltGr-style),
+        // release them first to avoid the peer interpreting the input as shortcuts.
+        release_modifiers_before_unicode(peer, &key_event, &mut events);
+        try_fill_unicode(peer, event, &key_event, &mut events);
+    }
+
+    #[cfg(target_os = "windows")]
+    if events.is_empty() {
+        try_fill_win2win_hotkey(peer, event, &key_event, &mut events);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if events.is_empty() && is_press(event) {
