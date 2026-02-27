@@ -3374,9 +3374,12 @@ pub fn handle_custom_client_staging_dir_before_update(
 // Used for auto update and manual update in the main window.
 pub fn update_to(file: &str) -> ResultType<()> {
     if file.ends_with(".exe") {
+        let custom_client_staging_dir = get_custom_client_staging_dir();
         if crate::is_custom_client() {
-            let custom_client_staging_dir = get_custom_client_staging_dir();
             handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
+        } else {
+            // Clean up any residual staging directory from previous custom client
+            allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
         }
         if !run_uac(file, "--update")? {
             bail!(
