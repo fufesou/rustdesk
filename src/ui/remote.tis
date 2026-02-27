@@ -252,7 +252,7 @@ function handler.onMouse(evt)
             var dominant = abs_dx > abs_dy ? abs_dx : abs_dy;
             var is_smooth = dominant < 1;
             var accel = 1;
-            if (!is_smooth && dt > 0 && is_win && get_peer_platform() == "Mac OS") {
+            if (!is_smooth && dt > 0 && (is_win || is_linux) && get_peer_platform() == "Mac OS") {
                 var velocity = dominant / dt;
                 if (velocity >= WHEEL_ACCEL_VELOCITY_THRESHOLD) {
                     if (dt < WHEEL_ACCEL_DT_FAST) accel = WHEEL_ACCEL_VALUE_FAST;

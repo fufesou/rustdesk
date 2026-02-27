@@ -1426,7 +1426,7 @@ class InputModel {
       if (!isSmooth &&
           dtUs > 0 &&
           dtUs <= _wheelAccelMediumThresholdUs &&
-          Platform.isWindows &&
+          (isWindows || isLinux) &&
           peerPlatform == kPeerPlatformMacOS) {
         final velocity = dominantDelta / dtUs;
         if (velocity >= _wheelBurstVelocityThreshold) {
