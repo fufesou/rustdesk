@@ -235,6 +235,11 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                     }
                     Some(custom_client_staging_dir)
                 } else {
+                    // Clean up any residual staging directory from previous custom client
+                    let staging_dir = crate::platform::get_custom_client_staging_dir();
+                    hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
+                        &staging_dir
+                    ));
                     None
                 };
                 let update_launched = match crate::platform::launch_privileged_process(
