@@ -243,90 +243,98 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     false
 }
 
-fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync: bool) {
+fn update_daemon_agent(agent_plist_file: String, update_source_dir: String) -> ResultType<()> {
     let update_script_file = "update.scpt";
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
-        return;
+        bail!("missing privileges script: {}", update_script_file);
     };
     let Some(update_script_body) = update_script.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("invalid utf-8 in privileges script: {}", update_script_file);
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
-        return;
+        bail!("missing daemon plist template");
     };
     let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("invalid utf-8 in daemon plist template");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
-        return;
+        bail!("missing agent plist template");
     };
     let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("invalid utf-8 in agent plist template");
     };
-
-    let func = move || {
-        let mut binding = std::process::Command::new("osascript");
-        let cmd = binding
-            .arg("-e")
-            .arg(update_script_body)
-            .arg(daemon_plist_body)
-            .arg(agent_plist_body)
-            .arg(&get_active_username())
-            .arg(std::process::id().to_string())
-            .arg(update_source_dir);
-        match cmd.status() {
-            Err(e) => {
-                log::error!("run osascript failed: {}", e);
-            }
-            _ => {
-                let installed = std::path::Path::new(&agent_plist_file).exists();
-                log::info!("Agent file {} installed: {}", &agent_plist_file, installed);
-                if installed {
-                    // Unload first, or load may not work if already loaded.
-                    // We hope that the load operation can immediately trigger a start.
-                    std::process::Command::new("launchctl")
-                        .args(&["unload", "-w", &agent_plist_file])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .ok();
-                    let status = std::process::Command::new("launchctl")
-                        .args(&["load", "-w", &agent_plist_file])
-                        .status();
-                    log::info!("launch server, status: {:?}", &status);
-                }
-            }
-        }
-    };
-    if sync {
-        func();
-    } else {
-        std::thread::spawn(func);
+    let active_user = get_active_username();
+    let mut binding = std::process::Command::new("osascript");
+    let status = binding
+        .arg("-e")
+        .arg(update_script_body)
+        .arg(daemon_plist_body)
+        .arg(agent_plist_body)
+        .arg(&active_user)
+        .arg(std::process::id().to_string())
+        .arg(update_source_dir)
+        .status()?;
+    if !status.success() {
+        bail!("update script failed with status: {}", status);
     }
+
+    let installed = std::path::Path::new(&agent_plist_file).exists();
+    log::info!("Agent file {} installed: {}", &agent_plist_file, installed);
+    if !installed {
+        log::warn!(
+            "update completed, but agent plist is missing: {}",
+            &agent_plist_file
+        );
+        return Ok(());
+    }
+
+    // Unload first, or load may fail if the agent is still marked as loaded.
+    std::process::Command::new("launchctl")
+        .args(&["unload", "-w", &agent_plist_file])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok();
+
+    // Update is complete at this point. Failing to relaunch the agent should not
+    // be reported as "update failed", but we keep a warning for diagnostics.
+    match std::process::Command::new("launchctl")
+        .args(&["load", "-w", &agent_plist_file])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            log::warn!(
+                "update completed, but launchctl load failed with status: {}",
+                status
+            );
+        }
+        Err(e) => {
+            log::warn!("update completed, but launchctl load failed: {}", e);
+        }
+    }
+    Ok(())
 }
 
 fn correct_app_name(s: &str) -> String {
     let mut s = s.to_owned();
-    if let Some(bundleid) = get_bundle_id() {
-        s = s.replace("com.carriez.rustdesk", &bundleid);
+    const FULL_NAME_PLACEHOLDER: &str = "__RUSTDESK_FULL_NAME_PLACEHOLDER__";
+    const BUNDLE_ID_PLACEHOLDER: &str = "__RUSTDESK_BUNDLE_ID_PLACEHOLDER__";
+    let bundle_id = get_bundle_id();
+
+    s = s.replace("com.carriez.RustDesk", FULL_NAME_PLACEHOLDER);
+    if bundle_id.is_some() {
+        s = s.replace("com.carriez.rustdesk", BUNDLE_ID_PLACEHOLDER);
     }
     s = s.replace("rustdesk", &crate::get_app_name().to_lowercase());
     s = s.replace("RustDesk", &crate::get_app_name());
-    s
-}
-
-fn preauthorize_update(prompt: &str) -> ResultType<()> {
-    let script = format!(
-        r#"do shell script "true" with prompt "{}" with administrator privileges"#,
-        prompt
-    );
-    let status = Command::new("osascript").arg("-e").arg(script).status()?;
-    if !status.success() {
-        bail!("administrator authorization canceled or failed");
+    s = s.replace(FULL_NAME_PLACEHOLDER, &crate::get_full_name());
+    if let Some(bundleid) = bundle_id {
+        s = s.replace(BUNDLE_ID_PLACEHOLDER, &bundleid);
     }
-    Ok(())
+    s
 }
 
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
@@ -863,40 +871,30 @@ pub fn update_me() -> ResultType<()> {
     if is_installed_daemon && !is_service_stopped {
         let agent = format!("{}_server.plist", crate::get_full_name());
         let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
-        preauthorize_update(&format!("{app_name} wants to update itself"))?;
-        std::process::Command::new("launchctl")
-            .args(&["unload", "-w", &agent_plist_file])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok();
-        update_daemon_agent(agent_plist_file, app_dir, true);
+        update_daemon_agent(agent_plist_file, app_dir)?;
     } else {
-        // `kill -9` may not work without "administrator privileges"
-        let update_body = format!(
-            r#"
-do shell script "
-pgrep -x '{app_name}' | grep -v {pid} | xargs kill -9 && rm -rf '/Applications/{app_name}.app' && ditto '{app_dir}' '/Applications/{app_name}.app' && chown -R {user}:staff '/Applications/{app_name}.app' && xattr -r -d com.apple.quarantine '/Applications/{app_name}.app'
-" with prompt "{app_name} wants to update itself" with administrator privileges
-    "#,
-            app_name = app_name,
-            pid = std::process::id(),
-            app_dir = app_dir,
-            user = get_active_username()
-        );
-        match Command::new("osascript")
+        let active_user = get_active_username();
+        let update_body = r#"
+on run {app_name, cur_pid, app_dir, user_name}
+    set app_bundle to "/Applications/" & app_name & ".app"
+
+    set kill_others to "pids=$(pgrep -x " & quoted form of app_name & " | grep -vx " & quoted form of cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
+    set copy_files to "rm -rf " & quoted form of app_bundle & " && ditto " & quoted form of app_dir & " " & quoted form of app_bundle & " && chown -R " & quoted form of user_name & ":staff " & quoted form of app_bundle & " && (xattr -r -d com.apple.quarantine " & quoted form of app_bundle & " || true);"
+    set sh to "set -e;" & kill_others & copy_files
+
+    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
+end run
+        "#;
+        let status = Command::new("osascript")
             .arg("-e")
             .arg(update_body)
-            .status()
-        {
-            Ok(status) if !status.success() => {
-                log::error!("osascript execution failed with status: {}", status);
-            }
-            Err(e) => {
-                log::error!("run osascript failed: {}", e);
-            }
-            _ => {}
+            .arg(app_name.to_string())
+            .arg(std::process::id().to_string())
+            .arg(app_dir)
+            .arg(active_user)
+            .status()?;
+        if !status.success() {
+            bail!("osascript execution failed with status: {}", status);
         }
     }
     std::process::Command::new("open")
