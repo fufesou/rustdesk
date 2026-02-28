@@ -304,7 +304,11 @@ impl Client {
         };
 
         if crate::get_ipv6_punch_enabled() {
-            crate::test_ipv6().await;
+            if let Some(stun_task) = crate::test_ipv6().await {
+                // Wait for STUN so we report the correct (post-NAT6) address.
+                // 2s timeout: if STUN is slow, proceed with local address.
+                let _ = tokio::time::timeout(Duration::from_secs(2), stun_task).await;
+            }
         }
 
         let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
@@ -653,6 +657,7 @@ impl Client {
         &'static str,
     )> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
+        let has_ipv6_punch = udp_socket_v6.is_some();
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
         if is_local || peer_nat_type == NatType::SYMMETRIC {
@@ -682,6 +687,15 @@ impl Client {
             }
             if connect_timeout < MIN {
                 connect_timeout = MIN;
+            }
+        }
+        if has_ipv6_punch && !interface.is_force_relay() {
+            let mut ipv6_timeout = CONNECT_TIMEOUT;
+            if direct_failures > 0 {
+                ipv6_timeout = std::cmp::max(ipv6_timeout, punch_time_used * 6);
+            }
+            if connect_timeout < ipv6_timeout {
+                connect_timeout = ipv6_timeout;
             }
         }
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
@@ -4077,25 +4091,20 @@ async fn test_udp_uat(
     udp_port: Arc<Mutex<u16>>,
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
-    let (tx, mut rx) = oneshot::channel::<_>();
-    tokio::spawn(async {
-        if let Ok(v) = crate::test_nat_ipv4().await {
-            tx.send(v).ok();
-        }
-    });
+    // Do NOT use test_nat_ipv4() (STUN) here. It creates a separate socket with
+    // a different local port, so its external port differs from udp_socket's.
+    // Under cone NAT, using the wrong port causes hole-punch failure.
+    // Only trust the rendezvous server's TestNatResponse for udp_socket's port.
 
     let start = Instant::now();
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_test_nat_request(TestNatRequest {
         ..Default::default()
     });
-    // Adaptive retry strategy that works within TCP RTT constraints
-    // Start with aggressive sending, then back off
-    let mut retry_interval = Duration::from_millis(20); // Start fast
+    let mut retry_interval = Duration::from_millis(20);
     const MAX_INTERVAL: Duration = Duration::from_millis(200);
     let mut packets_sent = 0;
 
-    // Send initial burst to improve reliability
     let data = msg_out.write_to_bytes()?;
     for _ in 0..2 {
         if let Err(e) = udp_socket.send_to(&data, server_addr).await {
@@ -4109,11 +4118,6 @@ async fn test_udp_uat(
 
     loop {
         tokio::select! {
-            Ok((addr, server)) = &mut rx => {
-                *udp_port.lock().unwrap() = addr.port();
-                log::debug!("UDP NAT test received response from {}: {}", addr, server);
-                break;
-            }
             _ = &mut stop_udp_rx => {
                 log::debug!("UDP NAT test received stop signal after {} packets", packets_sent);
                 break;

@@ -92,11 +92,30 @@ pub mod input {
     pub const MOUSE_BUTTON_FORWARD: i32 = 0x10;
 }
 
+/// Stores local and external IPv6 addresses separately to support NAT6.
+/// Under NAT6 the two differ; without NAT they are the same.
+#[derive(Default, Clone)]
+struct Ipv6AddrInfo {
+    /// Address on the local interface – always bindable.
+    local_addr: Option<SocketAddr>,
+    /// Public-facing address as seen by a STUN server.
+    /// `None` means no NAT detected (external == local).
+    external_addr: Option<SocketAddr>,
+    last_test_time: Option<Instant>,
+}
+
+impl Ipv6AddrInfo {
+    /// Return the address that should be reported to remote peers.
+    fn report_addr(&self) -> Option<SocketAddr> {
+        self.external_addr.or(self.local_addr)
+    }
+}
+
 lazy_static::lazy_static! {
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
-    static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
+    static ref PUBLIC_IPV6_ADDR: Arc<Mutex<Ipv6AddrInfo>> = Default::default();
 }
 
 lazy_static::lazy_static! {
@@ -2120,14 +2139,15 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
     if PUBLIC_IPV6_ADDR
         .lock()
         .unwrap()
-        .1
+        .last_test_time
         .map(|x| x.elapsed().as_secs() < 60)
         .unwrap_or(false)
     {
         return None;
     }
-    PUBLIC_IPV6_ADDR.lock().unwrap().1 = Some(Instant::now());
+    PUBLIC_IPV6_ADDR.lock().unwrap().last_test_time = Some(Instant::now());
 
+    // Step 1: Discover local bindable IPv6 address (fast, synchronous).
     match test_bind_ipv6().await {
         Ok(mut addr) => {
             if let std::net::IpAddr::V6(ip) = addr.ip() {
@@ -2137,8 +2157,10 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
                     && (ip.segments()[0] & 0xe000) == 0x2000
                 {
                     addr.set_port(0);
-                    PUBLIC_IPV6_ADDR.lock().unwrap().0 = Some(addr);
-                    log::debug!("Found public IPv6 address locally: {}", addr);
+                    let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
+                    info.local_addr = Some(addr);
+                    info.external_addr = None;
+                    log::debug!("Found local IPv6 address: {}", addr);
                 }
             }
         }
@@ -2146,36 +2168,10 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
             log::warn!("Failed to bind IPv6 socket: {}", e);
         }
     }
-    // Interestingly, on my macOS, sometimes my ipv6 works, sometimes not (test with ping6 or https://test-ipv6.com/).
-    // I checked ifconfig, could not see any difference. Both secure ipv6 and temporary ipv6 are there.
-    // So we can not rely on the local ipv6 address queries with if_addrs.
-    // above test_bind_ipv6 is safer, because it can fail in this case.
-    /*
-    std::thread::spawn(|| {
-        if let Ok(ifaces) = if_addrs::get_if_addrs() {
-            for iface in ifaces {
-                if let if_addrs::IfAddr::V6(v6) = iface.addr {
-                    let ip = v6.ip;
-                    if !ip.is_loopback()
-                        && !ip.is_unspecified()
-                        && !ip.is_multicast()
-                        && !ip.is_unique_local()
-                        && !ip.is_unicast_link_local()
-                        && (ip.segments()[0] & 0xe000) == 0x2000
-                    {
-                        // only use the first one, on mac, the first one is the stable
-                        // one, the last one is the temporary one. The middle ones are deperecated.
-                        *PUBLIC_IPV6_ADDR.lock().unwrap() =
-                            Some((SocketAddr::from((ip, 0)), Instant::now()));
-                        log::debug!("Found public IPv6 address locally: {}", ip);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    */
 
+    // Step 2: Discover external (post-NAT) IPv6 address via STUN.
+    // Callers should await the returned JoinHandle before using get_ipv6_socket()
+    // to ensure the external address is known.
     Some(tokio::spawn(async {
         use hbb_common::futures::future::{select_ok, FutureExt};
         let tests = STUNS_V6
@@ -2186,13 +2182,33 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
         match select_ok(tests).await {
             Ok(res) => {
                 let mut addr = res.0 .0;
-                addr.set_port(0); // Set port to 0 to avoid conflicts
-                PUBLIC_IPV6_ADDR.lock().unwrap().0 = Some(addr);
-                log::debug!(
-                    "Found public IPv6 address via STUN server {}: {}",
-                    res.0 .1,
-                    addr
-                );
+                addr.set_port(0);
+                let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
+                let local = info.local_addr;
+                if let Some(local) = local {
+                    if local.ip() == addr.ip() {
+                        // No NAT6: local == external
+                        info.external_addr = None;
+                        log::debug!(
+                            "STUN confirmed no NAT6: local {} == external {}",
+                            local,
+                            addr
+                        );
+                    } else {
+                        // NAT6 detected: external differs from local
+                        info.external_addr = Some(addr);
+                        log::info!(
+                            "NAT6 detected via STUN {}: local {} != external {}",
+                            res.0 .1,
+                            local,
+                            addr
+                        );
+                    }
+                } else {
+                    // No local address but STUN succeeded - unusual
+                    info.external_addr = Some(addr);
+                    log::warn!("STUN found external IPv6 {} but no local address", addr);
+                }
             }
             Err(e) => {
                 log::error!("Failed to get public IPv6 address: {}", e);
@@ -2263,19 +2279,27 @@ fn test_ipv6_sync() {
 }
 
 pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
-    let Some(addr) = PUBLIC_IPV6_ADDR.lock().unwrap().0 else {
-        return None;
+    let (bind_addr, report_addr) = {
+        let info = PUBLIC_IPV6_ADDR.lock().unwrap();
+        let bind = info.local_addr?;
+        let report = info.report_addr().unwrap_or(bind);
+        (bind, report)
     };
 
-    match UdpSocket::bind(addr).await {
+    match UdpSocket::bind(bind_addr).await {
         Err(err) => {
             log::warn!("Failed to create UDP socket for IPv6: {err}");
         }
         Ok(socket) => {
-            if let Ok(local_addr_v6) = socket.local_addr() {
+            if let Ok(local_addr) = socket.local_addr() {
+                // Combine external IP (for NAT6) with local port.
+                // Under NAT6 the port mapping may differ, but most NAT66/NPTv6
+                // implementations preserve ports, and we have no per-socket STUN
+                // query here to discover the actual external port.
+                let addr_to_report = SocketAddr::new(report_addr.ip(), local_addr.port());
                 return Some((
                     Arc::new(socket),
-                    hbb_common::AddrMangle::encode(local_addr_v6).into(),
+                    hbb_common::AddrMangle::encode(addr_to_report).into(),
                 ));
             }
         }
