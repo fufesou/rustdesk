@@ -317,6 +317,18 @@ fn correct_app_name(s: &str) -> String {
     s
 }
 
+fn preauthorize_update(prompt: &str) -> ResultType<()> {
+    let script = format!(
+        r#"do shell script "true" with prompt "{}" with administrator privileges"#,
+        prompt
+    );
+    let status = Command::new("osascript").arg("-e").arg(script).status()?;
+    if !status.success() {
+        bail!("administrator authorization canceled or failed");
+    }
+    Ok(())
+}
+
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     // to-do: do together with win/linux about refactory start/stop service
     if !is_installed_daemon(false) {
@@ -851,6 +863,7 @@ pub fn update_me() -> ResultType<()> {
     if is_installed_daemon && !is_service_stopped {
         let agent = format!("{}_server.plist", crate::get_full_name());
         let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
+        preauthorize_update(&format!("{app_name} wants to update itself"))?;
         std::process::Command::new("launchctl")
             .args(&["unload", "-w", &agent_plist_file])
             .stdin(Stdio::null())
