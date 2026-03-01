@@ -92,8 +92,23 @@ pub mod input {
     pub const MOUSE_BUTTON_FORWARD: i32 = 0x10;
 }
 
-/// Stores local and external IPv6 addresses separately to support NAT6.
-/// Under NAT6 the two differ; without NAT they are the same.
+/// IPv6 NAT type as detected by multi-server STUN probing.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv6NatType {
+    /// Not yet tested or test failed.
+    #[default]
+    Unknown,
+    /// No NAT – public IPv6 address used directly.
+    NoNat,
+    /// Cone NAT (NAT66) – all STUN servers see the same mapped address.
+    /// Hole punching will work.
+    ConeNat,
+    /// Symmetric NAT66 – different STUN servers see different mapped addresses.
+    /// Hole punching is infeasible.
+    SymmetricNat,
+}
+
+/// Stores local and external IPv6 addresses, NAT type, and STUN completion state.
 #[derive(Default, Clone)]
 struct Ipv6AddrInfo {
     /// Address on the local interface – always bindable.
@@ -102,6 +117,11 @@ struct Ipv6AddrInfo {
     /// `None` means no NAT detected (external == local).
     external_addr: Option<SocketAddr>,
     last_test_time: Option<Instant>,
+    /// IPv6 NAT type as determined by multi-server STUN probing.
+    nat_type: Ipv6NatType,
+    /// Whether the latest STUN probing has completed. If false,
+    /// `get_ipv6_socket()` returns `None` to avoid using stale info.
+    stun_completed: bool,
 }
 
 impl Ipv6AddrInfo {
@@ -109,6 +129,18 @@ impl Ipv6AddrInfo {
     fn report_addr(&self) -> Option<SocketAddr> {
         self.external_addr.or(self.local_addr)
     }
+}
+
+/// Check whether IPv6 hole punching is feasible based on STUN results.
+/// Returns false if STUN hasn't completed or NAT type is symmetric.
+pub fn is_ipv6_hole_punch_feasible() -> bool {
+    let info = PUBLIC_IPV6_ADDR.lock().unwrap();
+    info.stun_completed && !matches!(info.nat_type, Ipv6NatType::SymmetricNat)
+}
+
+/// Return the detected IPv6 NAT type.
+pub fn get_ipv6_nat_type() -> Ipv6NatType {
+    PUBLIC_IPV6_ADDR.lock().unwrap().nat_type
 }
 
 lazy_static::lazy_static! {
@@ -2145,7 +2177,14 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
     {
         return None;
     }
-    PUBLIC_IPV6_ADDR.lock().unwrap().last_test_time = Some(Instant::now());
+    {
+        let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
+        info.last_test_time = Some(Instant::now());
+        info.local_addr = None;
+        info.external_addr = None;
+        info.nat_type = Ipv6NatType::Unknown;
+        info.stun_completed = false; // invalidate until new STUN completes
+    }
 
     // Step 1: Discover local bindable IPv6 address (fast, synchronous).
     match test_bind_ipv6().await {
@@ -2159,7 +2198,8 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
                     addr.set_port(0);
                     let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
                     info.local_addr = Some(addr);
-                    info.external_addr = None;
+                    // external_addr and nat_type will be set by the STUN task;
+                    // stun_completed is already false, preventing stale info usage.
                     log::debug!("Found local IPv6 address: {}", addr);
                 }
             }
@@ -2169,51 +2209,131 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
         }
     }
 
-    // Step 2: Discover external (post-NAT) IPv6 address via STUN.
-    // Callers should await the returned JoinHandle before using get_ipv6_socket()
-    // to ensure the external address is known.
+    // Step 2: Discover external (post-NAT) IPv6 address and detect NAT type
+    // via multi-server STUN probing on a single socket. Comparing mapped
+    // addresses from ≥2 servers distinguishes cone vs symmetric NAT.
     Some(tokio::spawn(async {
-        use hbb_common::futures::future::{select_ok, FutureExt};
-        let tests = STUNS_V6
-            .iter()
-            .map(|&stun| stun_ipv6_test(stun).boxed())
-            .collect::<Vec<_>>();
+        use std::net::ToSocketAddrs;
+        use stunclient::StunClient;
 
-        match select_ok(tests).await {
-            Ok(res) => {
-                let mut addr = res.0 .0;
-                addr.set_port(0);
-                let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
-                let local = info.local_addr;
-                if let Some(local) = local {
-                    if local.ip() == addr.ip() {
-                        // No NAT6: local == external
-                        info.external_addr = None;
-                        log::debug!(
-                            "STUN confirmed no NAT6: local {} == external {}",
-                            local,
-                            addr
-                        );
-                    } else {
-                        // NAT6 detected: external differs from local
-                        info.external_addr = Some(addr);
-                        log::info!(
-                            "NAT6 detected via STUN {}: local {} != external {}",
-                            res.0 .1,
-                            local,
-                            addr
-                        );
-                    }
-                } else {
-                    // No local address but STUN succeeded - unusual
-                    info.external_addr = Some(addr);
-                    log::warn!("STUN found external IPv6 {} but no local address", addr);
+        let Ok(socket) = UdpSocket::bind(SocketAddr::from(([0u16; 8], 0))).await else {
+            log::error!("Failed to bind socket for IPv6 STUN NAT detection");
+            PUBLIC_IPV6_ADDR.lock().unwrap().last_test_time = None;
+            return;
+        };
+
+        let mut mapped_addrs: Vec<SocketAddr> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+
+        for stun_server in STUNS_V6.iter() {
+            if mapped_addrs.len() >= 2 {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                log::debug!(
+                    "IPv6 STUN global deadline reached after {} responses",
+                    mapped_addrs.len()
+                );
+                break;
+            }
+            let per_server = std::cmp::min(remaining, std::time::Duration::from_millis(1500));
+
+            let stun_addr = match stun_server
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.find(|x| x.is_ipv6()))
+            {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let client = StunClient::new(stun_addr);
+            match tokio::time::timeout(per_server, client.query_external_address_async(&socket))
+                .await
+            {
+                Ok(Ok(addr)) if addr.ip().is_ipv6() => {
+                    log::debug!("IPv6 STUN {} → mapped {}", stun_server, addr);
+                    mapped_addrs.push(addr);
+                }
+                Ok(Ok(addr)) => {
+                    log::debug!("IPv6 STUN {} returned non-IPv6: {}", stun_server, addr);
+                }
+                Ok(Err(e)) => {
+                    log::debug!("IPv6 STUN {} failed: {}", stun_server, e);
+                }
+                Err(_) => {
+                    log::debug!("IPv6 STUN {} timed out", stun_server);
                 }
             }
-            Err(e) => {
-                log::error!("Failed to get public IPv6 address: {}", e);
+        }
+
+        let mut info = PUBLIC_IPV6_ADDR.lock().unwrap();
+
+        if mapped_addrs.is_empty() {
+            log::error!("All IPv6 STUN servers failed; cannot detect NAT type");
+            info.last_test_time = None; // allow retry on next attempt
+            return;
+        }
+
+        let first = mapped_addrs[0];
+
+        if mapped_addrs.len() >= 2 {
+            let all_same = mapped_addrs
+                .iter()
+                .all(|a| a.ip() == first.ip() && a.port() == first.port());
+            if all_same {
+                // All servers see the same mapped address → cone or no NAT.
+                if info
+                    .local_addr
+                    .map(|l| l.ip() == first.ip())
+                    .unwrap_or(false)
+                {
+                    info.nat_type = Ipv6NatType::NoNat;
+                    info.external_addr = None;
+                    log::info!("IPv6 NAT type: NoNat (local == mapped)");
+                } else {
+                    info.nat_type = Ipv6NatType::ConeNat;
+                    let mut ext = first;
+                    ext.set_port(0);
+                    info.external_addr = Some(ext);
+                    log::info!("IPv6 NAT type: Cone (mapped: {})", first);
+                }
+            } else {
+                // Different servers see different mapped addresses → symmetric NAT.
+                info.nat_type = Ipv6NatType::SymmetricNat;
+                let mut ext = first;
+                ext.set_port(0);
+                info.external_addr = Some(ext);
+                log::warn!(
+                    "IPv6 NAT type: Symmetric (mapped addrs differ: {:?}) – hole punching disabled",
+                    mapped_addrs
+                );
             }
-        };
+        } else {
+            // Only 1 STUN response; can't fully determine NAT type.
+            if info
+                .local_addr
+                .map(|l| l.ip() == first.ip())
+                .unwrap_or(false)
+            {
+                info.nat_type = Ipv6NatType::NoNat;
+                info.external_addr = None;
+                log::info!("IPv6: single STUN response, local == mapped → NoNat");
+            } else {
+                // NAT detected but type uncertain (need ≥2 servers for cone vs symmetric).
+                info.nat_type = Ipv6NatType::Unknown;
+                let mut ext = first;
+                ext.set_port(0);
+                info.external_addr = Some(ext);
+                log::info!(
+                    "IPv6: single STUN response, NAT detected but type uncertain (mapped: {})",
+                    first
+                );
+            }
+        }
+
+        info.stun_completed = true;
     }))
 }
 
@@ -2278,12 +2398,65 @@ fn test_ipv6_sync() {
     std::thread::spawn(func);
 }
 
+/// Per-socket STUN query to discover the actual external address (including port)
+/// of a specific UDP socket. Necessary for cone NAT where the external port
+/// may differ from the local OS-assigned port.
+async fn stun_query_ipv6_socket(socket: &UdpSocket) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    use stunclient::StunClient;
+
+    for stun_server in STUNS_V6.iter() {
+        let stun_addr = match stun_server
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.find(|x| x.is_ipv6()))
+        {
+            Some(a) => a,
+            None => continue,
+        };
+        let client = StunClient::new(stun_addr);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.query_external_address_async(socket),
+        )
+        .await
+        {
+            Ok(Ok(addr)) if addr.ip().is_ipv6() => {
+                log::debug!("Per-socket IPv6 STUN {} → {}", stun_server, addr);
+                return Some(addr);
+            }
+            Ok(Ok(addr)) => {
+                log::debug!(
+                    "Per-socket IPv6 STUN {} returned non-v6: {}",
+                    stun_server,
+                    addr
+                );
+            }
+            Ok(Err(e)) => {
+                log::debug!("Per-socket IPv6 STUN {} failed: {}", stun_server, e);
+            }
+            Err(_) => {
+                log::debug!("Per-socket IPv6 STUN {} timed out", stun_server);
+            }
+        }
+    }
+    None
+}
+
 pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
-    let (bind_addr, report_addr) = {
+    let (bind_addr, nat_type, report_addr) = {
         let info = PUBLIC_IPV6_ADDR.lock().unwrap();
+        if !info.stun_completed {
+            log::debug!("IPv6 STUN not yet completed, skipping IPv6 socket");
+            return None;
+        }
+        if info.nat_type == Ipv6NatType::SymmetricNat {
+            log::info!("IPv6 symmetric NAT detected, hole punching infeasible");
+            return None;
+        }
         let bind = info.local_addr?;
         let report = info.report_addr().unwrap_or(bind);
-        (bind, report)
+        (bind, info.nat_type, report)
     };
 
     match UdpSocket::bind(bind_addr).await {
@@ -2292,11 +2465,32 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
         }
         Ok(socket) => {
             if let Ok(local_addr) = socket.local_addr() {
-                // Combine external IP (for NAT6) with local port.
-                // Under NAT6 the port mapping may differ, but most NAT66/NPTv6
-                // implementations preserve ports, and we have no per-socket STUN
-                // query here to discover the actual external port.
-                let addr_to_report = SocketAddr::new(report_addr.ip(), local_addr.port());
+                let addr_to_report = if matches!(
+                    nat_type,
+                    Ipv6NatType::ConeNat | Ipv6NatType::Unknown
+                ) {
+                    // Per-socket STUN to discover actual mapped address.
+                    // After connect() is called by the caller, any stale STUN
+                    // responses in the buffer will be filtered by the kernel.
+                    match stun_query_ipv6_socket(&socket).await {
+                        Some(ext) => {
+                            log::debug!("IPv6 per-socket STUN: {} → {}", local_addr, ext);
+                            ext
+                        }
+                        None => {
+                            // Fallback: external IP + local port (assumes port preservation).
+                            let fallback = SocketAddr::new(report_addr.ip(), local_addr.port());
+                            log::warn!(
+                                "Per-socket STUN failed; fallback {} (port may be wrong under NAT66)",
+                                fallback
+                            );
+                            fallback
+                        }
+                    }
+                } else {
+                    // NoNat: local address is the public address.
+                    local_addr
+                };
                 return Some((
                     Arc::new(socket),
                     hbb_common::AddrMangle::encode(addr_to_report).into(),

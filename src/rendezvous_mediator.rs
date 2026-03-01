@@ -849,9 +849,10 @@ async fn start_ipv6(
     server: ServerPtr,
     control_permissions: Option<ControlPermissions>,
 ) -> bytes::Bytes {
-    // Wait for STUN so we report the correct (post-NAT6) address.
+    // Wait for multi-server STUN to detect NAT type and external address.
+    // get_ipv6_socket() returns None if STUN hasn't completed (safe).
     if let Some(stun_task) = crate::test_ipv6().await {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stun_task).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(4), stun_task).await;
     }
     if let Some((socket, local_addr_v6)) = crate::get_ipv6_socket().await {
         let server = server.clone();

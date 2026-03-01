@@ -305,9 +305,10 @@ impl Client {
 
         if crate::get_ipv6_punch_enabled() {
             if let Some(stun_task) = crate::test_ipv6().await {
-                // Wait for STUN so we report the correct (post-NAT6) address.
-                // 2s timeout: if STUN is slow, proceed with local address.
-                let _ = tokio::time::timeout(Duration::from_secs(2), stun_task).await;
+                // Wait for multi-server STUN to detect NAT type and external address.
+                // 4s covers the 3s STUN deadline + margin.
+                // If STUN doesn't finish, get_ipv6_socket() returns None (safe).
+                let _ = tokio::time::timeout(Duration::from_secs(4), stun_task).await;
             }
         }
 
