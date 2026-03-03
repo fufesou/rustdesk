@@ -1366,33 +1366,24 @@ impl Connection {
         match timeout(3000, TcpStream::connect(&addr)).await {
             Ok(Ok(sock)) => {
                 self.port_forward_socket = Some(Framed::new(sock, BytesCodec::new()));
-                true
+                return true;
             }
             Ok(Err(e)) => {
                 log::warn!("Port forward connect failed for {}: {}", addr, e);
-                if is_rdp {
-                    addr = "RDP".to_owned();
-                }
-                self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
-                    addr
-                ))
-                .await;
-                false
             }
             Err(e) => {
                 log::warn!("Port forward connect timed out for {}: {}", addr, e);
-                if is_rdp {
-                    addr = "RDP".to_owned();
-                }
-                self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
-                    addr
-                ))
-                .await;
-                false
             }
         }
+        if is_rdp {
+            addr = "RDP".to_owned();
+        }
+        self.send_login_error(format!(
+            "Failed to access remote {}. Please make sure it is reachable/open.",
+            addr
+        ))
+        .await;
+        false
     }
 
     // Returns whether this connection should be kept alive.
