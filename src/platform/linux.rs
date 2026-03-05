@@ -554,6 +554,11 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
             ));
+            if let Ok(service_postfix) = std::env::var(crate::ipc::ENV_SERVICE_IPC_POSTFIX) {
+                if hbb_common::config::is_service_ipc_postfix(&service_postfix) {
+                    envs.push((crate::ipc::ENV_SERVICE_IPC_POSTFIX, service_postfix));
+                }
+            }
             run_as_user(
                 vec!["--server"],
                 Some((desktop.uid.clone(), desktop.username.clone())),
@@ -700,8 +705,13 @@ pub fn start_os_service() {
     stop_subprocess();
     start_uinput_service();
 
+    let service_ipc_postfix = format!("{}_{}", crate::POSTFIX_SERVICE, Config::get_auto_password(24));
+    std::env::set_var(crate::ipc::ENV_SERVICE_IPC_POSTFIX, &service_ipc_postfix);
+    crate::ipc::set_expected_service_peer_uid(None);
     std::thread::spawn(|| {
-        allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
+        let postfix = std::env::var(crate::ipc::ENV_SERVICE_IPC_POSTFIX)
+            .unwrap_or_else(|_| crate::POSTFIX_SERVICE.to_owned());
+        allow_err!(crate::ipc::start(&postfix));
     });
 
     let running = Arc::new(AtomicBool::new(true));
@@ -722,6 +732,7 @@ pub fn start_os_service() {
     let mut last_restart = Instant::now();
     while running.load(Ordering::SeqCst) {
         desktop.refresh();
+        crate::ipc::set_expected_service_peer_uid(desktop.uid.parse::<u32>().ok());
 
         // Duplicate logic here with should_start_server
         // Login wayland will try to start a headless --server.

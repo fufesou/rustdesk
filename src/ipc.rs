@@ -10,8 +10,13 @@ use parity_tokio_ipc::{
 use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU32, AtomicU64};
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(windows))]
 use std::{fs::File, io::prelude::*};
 
@@ -25,7 +30,7 @@ use hbb_common::{
     bytes_codec::BytesCodec,
     config::{
         self,
-        keys::{self, OPTION_ALLOW_WEBSOCKET},
+        keys::OPTION_ALLOW_WEBSOCKET,
         Config, Config2,
     },
     futures::StreamExt as _,
@@ -43,7 +48,556 @@ use crate::{common::is_server, privacy_mode, rendezvous_mediator::RendezvousMedi
 
 // IPC actions here.
 pub const IPC_ACTION_CLOSE: &str = "close";
+pub const ENV_SERVICE_IPC_POSTFIX: &str = "RUSTDESK_SERVICE_IPC_POSTFIX";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SERVICE_IPC_POSTFIX_META_FILE: &str = "ipc_service_postfix";
+#[cfg(target_os = "linux")]
+const ACTIVE_UID_CACHE_TTL_SECS: u64 = 300;
+#[cfg(target_os = "linux")]
+const ACTIVE_UID_WARN_INTERVAL_SECS: u64 = 60;
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "linux")]
+static LAST_ACTIVE_UID: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "linux")]
+static LAST_ACTIVE_UID_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static LAST_ACTIVE_UID_WARN_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static EXPECTED_SERVICE_PEER_UID: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn normalize_service_ipc_postfix(postfix: String) -> Option<String> {
+    let normalized = postfix.trim().to_owned();
+    let is_safe = normalized
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    if config::is_service_ipc_postfix(&normalized) && is_safe {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn resolve_service_ipc_postfix(
+    env_postfix: Option<String>,
+    metadata_postfix: Option<String>,
+) -> String {
+    let candidates = build_service_ipc_postfix_candidates(env_postfix, metadata_postfix);
+    for candidate in candidates {
+        if service_ipc_socket_exists(&candidate) {
+            return candidate;
+        }
+    }
+    crate::POSTFIX_SERVICE.to_owned()
+}
+
+#[inline]
+fn build_service_ipc_postfix_candidates(
+    env_postfix: Option<String>,
+    metadata_postfix: Option<String>,
+) -> Vec<String> {
+    let env_candidate = env_postfix.and_then(normalize_service_ipc_postfix);
+    let metadata_candidate = metadata_postfix.and_then(normalize_service_ipc_postfix);
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(env) = env_candidate {
+        candidates.push(env);
+    }
+    if let Some(metadata) = metadata_candidate {
+        if !candidates.iter().any(|candidate| candidate == &metadata) {
+            candidates.push(metadata);
+        }
+    }
+    let default_postfix = crate::POSTFIX_SERVICE.to_owned();
+    if !candidates
+        .iter()
+        .any(|candidate| candidate == crate::POSTFIX_SERVICE)
+    {
+        candidates.push(default_postfix);
+    }
+    candidates
+}
+
+#[inline]
+fn service_ipc_postfix_candidates() -> Vec<String> {
+    let env_postfix = std::env::var(ENV_SERVICE_IPC_POSTFIX).ok();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let metadata_postfix = read_service_ipc_postfix_metadata();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let metadata_postfix = None;
+    build_service_ipc_postfix_candidates(env_postfix, metadata_postfix)
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[inline]
+fn is_allowed_service_peer_uid(peer_uid: u32, active_uid: Option<u32>) -> bool {
+    peer_uid == 0 || active_uid.is_some_and(|uid| uid == peer_uid)
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[inline]
+fn resolve_active_uid(reported_uid: Option<u32>, console_uid: Option<u32>) -> Option<u32> {
+    reported_uid.or(console_uid)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn terminal_count_candidate_uids_policy(
+    effective_uid: u32,
+    active_uid: Option<u32>,
+    expected_uid: Option<u32>,
+    discovered_uids: &[u32],
+) -> Vec<u32> {
+    if effective_uid != 0 {
+        return vec![effective_uid];
+    }
+    let mut candidates = Vec::new();
+    push_candidate_uid(&mut candidates, active_uid);
+    push_candidate_uid(&mut candidates, expected_uid);
+    for uid in discovered_uids.iter().copied() {
+        push_candidate_uid(&mut candidates, Some(uid));
+    }
+    candidates.push(0);
+    candidates
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn should_discover_terminal_socket_uids(
+    effective_uid: u32,
+    active_uid: Option<u32>,
+    expected_uid: Option<u32>,
+) -> bool {
+    effective_uid == 0 && active_uid.is_none() && expected_uid.is_none()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn push_candidate_uid(candidates: &mut Vec<u32>, uid: Option<u32>) {
+    if let Some(uid) = uid.filter(|uid| *uid != 0) {
+        if !candidates.iter().any(|candidate| *candidate == uid) {
+            candidates.push(uid);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn terminal_count_candidate_uids(effective_uid: u32, active_uid: Option<u32>) -> Vec<u32> {
+    let expected_uid = expected_service_peer_uid();
+    let discovered_uids = if should_discover_terminal_socket_uids(effective_uid, active_uid, expected_uid)
+    {
+        discover_terminal_socket_uids()
+    } else {
+        Vec::new()
+    };
+    terminal_count_candidate_uids_policy(
+        effective_uid,
+        active_uid,
+        expected_uid,
+        &discovered_uids,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn discover_terminal_socket_uids() -> Vec<u32> {
+    let app_name = hbb_common::config::APP_NAME.read().unwrap().clone();
+    let dir_prefix = format!("{app_name}-");
+    let mut discovered_uids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return discovered_uids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&dir_prefix) {
+            continue;
+        }
+        let uid_str = &name[dir_prefix.len()..];
+        let Ok(uid) = uid_str.parse::<u32>() else {
+            continue;
+        };
+        if uid == 0 {
+            continue;
+        }
+        let ipc_path = entry.path().join("ipc");
+        if ipc_path.exists() {
+            push_candidate_uid(&mut discovered_uids, Some(uid));
+        }
+    }
+    discovered_uids
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn console_owner_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/dev/console").ok().map(|metadata| metadata.uid())
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn active_uid() -> Option<u32> {
+    let reported_uid = crate::platform::macos::get_active_userid().parse::<u32>().ok();
+    resolve_active_uid(reported_uid, console_owner_uid())
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn active_uid_strict() -> Option<u32> {
+    active_uid()
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn active_uid() -> Option<u32> {
+    let reported_uid_raw = crate::platform::linux::get_active_userid();
+    let reported_uid = reported_uid_raw.trim().parse::<u32>().ok();
+    if let Some(uid) = reported_uid {
+        remember_active_uid(uid);
+        return resolve_active_uid(Some(uid), None);
+    }
+    if let Some(uid) = cached_active_uid() {
+        log::debug!(
+            "Falling back to cached active user uid on linux: uid={}, raw='{}'",
+            uid,
+            reported_uid_raw.trim()
+        );
+        return Some(uid);
+    }
+    log_active_uid_resolution_failure(&reported_uid_raw);
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn active_uid_strict() -> Option<u32> {
+    let reported_uid_raw = crate::platform::linux::get_active_userid();
+    let reported_uid = reported_uid_raw.trim().parse::<u32>().ok();
+    if let Some(uid) = reported_uid {
+        remember_active_uid(uid);
+        return resolve_active_uid(Some(uid), None);
+    }
+    log_active_uid_resolution_failure(&reported_uid_raw);
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn remember_active_uid(uid: u32) {
+    if uid == 0 {
+        return;
+    }
+    LAST_ACTIVE_UID.store(uid, Ordering::Relaxed);
+    LAST_ACTIVE_UID_AT.store(unix_now_secs(), Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn cached_active_uid() -> Option<u32> {
+    let uid = LAST_ACTIVE_UID.load(Ordering::Relaxed);
+    if uid == 0 {
+        return None;
+    }
+    let ts = LAST_ACTIVE_UID_AT.load(Ordering::Relaxed);
+    let now = unix_now_secs();
+    if now.saturating_sub(ts) > ACTIVE_UID_CACHE_TTL_SECS {
+        return None;
+    }
+    Some(uid)
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+pub fn set_expected_service_peer_uid(uid: Option<u32>) {
+    let normalized_uid = uid.unwrap_or(0);
+    let previous_uid = EXPECTED_SERVICE_PEER_UID.swap(normalized_uid, Ordering::Relaxed);
+    if previous_uid != normalized_uid {
+        LAST_ACTIVE_UID.store(0, Ordering::Relaxed);
+        LAST_ACTIVE_UID_AT.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn expected_service_peer_uid() -> Option<u32> {
+    match EXPECTED_SERVICE_PEER_UID.load(Ordering::Relaxed) {
+        0 => None,
+        uid => Some(uid),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn resolve_service_auth_active_uid() -> (Option<u32>, bool) {
+    let strict_uid = active_uid_strict();
+    if strict_uid.is_some() {
+        return (strict_uid, false);
+    }
+    let fallback_uid = expected_service_peer_uid().or_else(cached_active_uid);
+    (fallback_uid, fallback_uid.is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn log_active_uid_resolution_failure(raw_uid: &str) {
+    let now = unix_now_secs();
+    let last = LAST_ACTIVE_UID_WARN_AT.load(Ordering::Relaxed);
+    let should_warn = now.saturating_sub(last) >= ACTIVE_UID_WARN_INTERVAL_SECS
+        && LAST_ACTIVE_UID_WARN_AT
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok();
+    let trimmed = raw_uid.trim();
+    if should_warn {
+        if trimmed.is_empty() {
+            log::warn!("Failed to resolve active user uid on linux: active uid is empty");
+        } else {
+            log::warn!("Failed to parse active user uid on linux: '{}'", trimmed);
+        }
+    } else if trimmed.is_empty() {
+        log::debug!("Failed to resolve active user uid on linux: active uid is empty");
+    } else {
+        log::debug!("Failed to parse active user uid on linux: '{}'", trimmed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn linux_ipc_path_for_uid(uid: u32, postfix: &str) -> String {
+    let app_name = hbb_common::config::APP_NAME.read().unwrap().clone();
+    format!("/tmp/{app_name}-{uid}/ipc{postfix}")
+}
+
+#[inline]
+fn service_ipc_socket_exists(postfix: &str) -> bool {
+    let socket_path = Config::ipc_path(postfix);
+    Path::new(&socket_path).exists()
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn ordered_service_ipc_postfix_candidates(candidates: Vec<String>) -> Vec<String> {
+    let mut ready_candidates = Vec::new();
+    let mut stale_candidates = Vec::new();
+    for postfix in candidates {
+        if service_ipc_socket_exists(&postfix) {
+            ready_candidates.push(postfix);
+        } else {
+            stale_candidates.push(postfix);
+        }
+    }
+    ready_candidates.extend(stale_candidates);
+    ready_candidates
+}
+
+#[cfg(windows)]
+#[inline]
+fn ordered_service_ipc_postfix_candidates(candidates: Vec<String>) -> Vec<String> {
+    candidates
+}
+
+#[inline]
+fn connect_service_attempt_timeout(remaining_ms: u64, attempts_left: usize) -> u64 {
+    if remaining_ms == 0 {
+        return 0;
+    }
+    if attempts_left <= 1 {
+        return remaining_ms;
+    }
+    std::cmp::max(1, remaining_ms / attempts_left as u64)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn service_ipc_metadata_path() -> std::path::PathBuf {
+    let mut socket_path = std::path::PathBuf::from(Config::ipc_path(crate::POSTFIX_SERVICE));
+    socket_path.pop();
+    socket_path.push(SERVICE_IPC_POSTFIX_META_FILE);
+    socket_path
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn read_service_ipc_postfix_metadata() -> Option<String> {
+    let metadata_path = service_ipc_metadata_path();
+    let content = std::fs::read_to_string(metadata_path).ok()?;
+    let postfix = normalize_service_ipc_postfix(content)?;
+    let socket_path = Config::ipc_path(&postfix);
+    if std::path::Path::new(&socket_path).exists() {
+        Some(postfix)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_service_ipc_postfix_metadata(postfix: &str) -> ResultType<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::PermissionsExt;
+
+    let normalized = normalize_service_ipc_postfix(postfix.to_owned()).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid service ipc postfix: {postfix}"),
+        )
+    })?;
+    let metadata_path = service_ipc_metadata_path();
+    std::fs::write(&metadata_path, format!("{normalized}\n"))?;
+    std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o0644))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn expected_ipc_parent_mode(postfix: &str) -> u32 {
+    if config::is_service_ipc_postfix(postfix) {
+        0o0711
+    } else {
+        0o0700
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_ipc_parent_exists(parent_dir: &Path, postfix: &str) -> ResultType<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !parent_dir.exists() {
+        std::fs::create_dir_all(parent_dir)?;
+        let mode = expected_ipc_parent_mode(postfix);
+        std::fs::set_permissions(parent_dir, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn ensure_secure_ipc_parent_dir(path: &str, postfix: &str) -> ResultType<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent_dir = Path::new(path)
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("invalid ipc path: {path}")))?;
+    ensure_ipc_parent_exists(parent_dir, postfix)?;
+    let metadata = std::fs::symlink_metadata(parent_dir)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("ipc parent is symlink: {}", parent_dir.display()),
+        )
+        .into());
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("ipc parent is not directory: {}", parent_dir.display()),
+        )
+        .into());
+    }
+
+    let expected_uid = unsafe { hbb_common::libc::geteuid() as u32 };
+    let mut owner_uid = metadata.uid();
+    if owner_uid != expected_uid && expected_uid == 0 && config::is_service_ipc_postfix(postfix) {
+        let parent_c = CString::new(parent_dir.as_os_str().to_string_lossy().as_ref())?;
+        let rc = unsafe {
+            hbb_common::libc::chown(
+                parent_c.as_ptr(),
+                expected_uid,
+                hbb_common::libc::gid_t::MAX,
+            )
+        };
+        if rc == 0 {
+            owner_uid = std::fs::symlink_metadata(parent_dir)?.uid();
+        }
+    }
+    if owner_uid != expected_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "unsafe ipc parent owner, expected uid {expected_uid}, got {owner_uid}: {}",
+                parent_dir.display()
+            ),
+        )
+        .into());
+    }
+
+    let expected_mode = expected_ipc_parent_mode(postfix);
+    let current_mode = metadata.mode() & 0o777;
+    if current_mode != expected_mode {
+        std::fs::set_permissions(parent_dir, std::fs::Permissions::from_mode(expected_mode))?;
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn service_ipc_postfix() -> String {
+    let env_postfix = std::env::var(ENV_SERVICE_IPC_POSTFIX).ok();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let metadata_postfix = read_service_ipc_postfix_metadata();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let metadata_postfix = None;
+    let resolved = resolve_service_ipc_postfix(env_postfix.clone(), metadata_postfix.clone());
+    if env_postfix
+        .as_ref()
+        .and_then(|value| normalize_service_ipc_postfix(value.clone()))
+        .is_some_and(|value| value == resolved)
+    {
+        return resolved;
+    }
+    if metadata_postfix
+        .as_ref()
+        .is_some_and(|value| value.trim() == resolved)
+    {
+        log::debug!("Resolved service ipc postfix from metadata file");
+    }
+    resolved
+}
+
+pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
+    let mut last_err = None;
+    let ordered_candidates = ordered_service_ipc_postfix_candidates(service_ipc_postfix_candidates());
+    if ordered_candidates.is_empty() {
+        bail!("No service ipc postfix candidates available");
+    }
+    let start = std::time::Instant::now();
+    let total_attempts = ordered_candidates.len();
+    for (index, postfix) in ordered_candidates.into_iter().enumerate() {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let remaining_ms = ms_timeout.saturating_sub(elapsed_ms);
+        if remaining_ms == 0 {
+            break;
+        }
+        let attempts_left = total_attempts.saturating_sub(index);
+        let per_attempt_timeout = connect_service_attempt_timeout(remaining_ms, attempts_left);
+        match connect(per_attempt_timeout, &postfix).await {
+            Ok(conn) => return Ok(conn),
+            Err(err) => {
+                log::debug!(
+                    "Failed to connect service ipc with postfix '{}' ({}ms): {}",
+                    postfix,
+                    per_attempt_timeout,
+                    err
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        Err(err)
+    } else {
+        bail!("Timed out while connecting to service ipc candidates");
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
@@ -403,6 +957,20 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                 Ok(stream) => {
                     let mut stream = Connection::new(stream);
                     let postfix = postfix.to_owned();
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    if config::is_service_ipc_postfix(&postfix) {
+                        let (authorized, peer_uid, active_uid) =
+                            stream.service_authorization_status();
+                        if !authorized {
+                            log::warn!(
+                                "Rejected unauthorized connection on protected ipc_service channel: postfix={}, peer_uid={:?}, active_uid={:?}",
+                                postfix,
+                                peer_uid,
+                                active_uid
+                            );
+                            continue;
+                        }
+                    }
                     tokio::spawn(async move {
                         loop {
                             match stream.next().await {
@@ -411,7 +979,7 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                     break;
                                 }
                                 Ok(Some(data)) => {
-                                    handle(data, &mut stream).await;
+                                    handle(data, &mut stream, &postfix).await;
                                 }
                                 _ => {}
                             }
@@ -428,6 +996,8 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
+    #[cfg(not(windows))]
+    ensure_secure_ipc_parent_dir(&path, postfix)?;
     #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
     check_pid(postfix).await;
     let mut endpoint = Endpoint::new(path.clone());
@@ -437,11 +1007,32 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     };
     match endpoint.incoming() {
         Ok(incoming) => {
-            log::info!("Started ipc{} server at path: {}", postfix, &path);
+            if config::is_service_ipc_postfix(postfix) {
+                log::info!("Started protected ipc service server");
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if let Err(err) = write_service_ipc_postfix_metadata(postfix) {
+                    log::error!("Failed to write service ipc postfix metadata: {}", err);
+                    std::fs::remove_file(&path).ok();
+                    return Err(err);
+                }
+            } else {
+                log::info!("Started ipc{} server at path: {}", postfix, &path);
+            }
             #[cfg(not(windows))]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
+                let socket_mode = if config::is_service_ipc_postfix(postfix) {
+                    0o0666
+                } else {
+                    0o0600
+                };
+                if let Err(err) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(socket_mode))
+                {
+                    log::error!("Failed to set permissions on ipc{} socket: {}", postfix, err);
+                    std::fs::remove_file(&path).ok();
+                    return Err(err.into());
+                }
                 write_pid(postfix);
             }
             Ok(incoming)
@@ -516,7 +1107,14 @@ impl Drop for CheckIfRestart {
     }
 }
 
-async fn handle(data: Data, stream: &mut Connection) {
+async fn handle(data: Data, stream: &mut Connection, postfix: &str) {
+    if config::is_service_ipc_postfix(postfix) && !matches!(&data, Data::SyncConfig(_)) {
+        log::warn!(
+            "Rejected non-sync data on protected ipc_service channel: {:?}",
+            std::mem::discriminant(&data)
+        );
+        return;
+    }
     match data {
         Data::SystemInfo(_) => {
             let info = format!(
@@ -1024,7 +1622,7 @@ fn write_pid(postfix: &str) {
     let path = get_pid_file(postfix);
     if let Ok(mut file) = File::create(&path) {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0600)).ok();
         file.write_all(&std::process::id().to_string().into_bytes())
             .ok();
     }
@@ -1149,6 +1747,69 @@ pub fn get_permanent_password() -> String {
         v
     } else {
         Config::get_permanent_password()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<T> ConnectionTmpl<T>
+where
+    T: AsyncRead + AsyncWrite + std::marker::Unpin + std::os::fd::AsRawFd,
+{
+    fn peer_uid(&self) -> Option<u32> {
+        let fd = self.inner.get_ref().as_raw_fd();
+        #[cfg(target_os = "linux")]
+        {
+            let mut cred: hbb_common::libc::ucred = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<hbb_common::libc::ucred>() as hbb_common::libc::socklen_t;
+            let rc = unsafe {
+                hbb_common::libc::getsockopt(
+                    fd,
+                    hbb_common::libc::SOL_SOCKET,
+                    hbb_common::libc::SO_PEERCRED,
+                    &mut cred as *mut _ as *mut hbb_common::libc::c_void,
+                    &mut len,
+                )
+            };
+            if rc == 0 {
+                return Some(cred.uid as u32);
+            }
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+        let mut uid: hbb_common::libc::uid_t = 0;
+        let mut gid: hbb_common::libc::gid_t = 0;
+        if unsafe { hbb_common::libc::getpeereid(fd, &mut uid, &mut gid) } == 0 {
+            Some(uid as u32)
+        } else {
+            None
+        }
+        }
+    }
+
+    fn service_authorization_status(&self) -> (bool, Option<u32>, Option<u32>) {
+        let peer_uid = self.peer_uid();
+        #[cfg(target_os = "linux")]
+        {
+            let (active_uid, used_fallback) = resolve_service_auth_active_uid();
+            if used_fallback {
+                log::debug!(
+                    "Service authorization is using fallback active uid on linux: peer_uid={:?}, active_uid={:?}",
+                    peer_uid,
+                    active_uid
+                );
+            }
+            let authorized =
+                peer_uid.is_some_and(|uid| is_allowed_service_peer_uid(uid, active_uid));
+            return (authorized, peer_uid, active_uid);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let active_uid = active_uid_strict();
+            let authorized =
+                peer_uid.is_some_and(|uid| is_allowed_service_peer_uid(uid, active_uid));
+            (authorized, peer_uid, active_uid)
+        }
     }
 }
 
@@ -1418,7 +2079,7 @@ pub fn close_all_instances() -> ResultType<bool> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
-    let mut stream = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await?;
+    let mut stream = crate::ipc::connect_service(1000).await?;
     timeout(1000, stream.send(&crate::ipc::Data::UserSid(usid))).await??;
     Ok(())
 }
@@ -1544,11 +2205,26 @@ pub async fn update_controlling_session_count(count: usize) -> ResultType<()> {
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 pub async fn get_terminal_session_count() -> ResultType<usize> {
-    let ms_timeout = 1_000;
-    let mut c = connect(ms_timeout, "").await?;
-    c.send(&Data::TerminalSessionCount(0)).await?;
-    if let Some(Data::TerminalSessionCount(c)) = c.next_timeout(ms_timeout).await? {
-        return Ok(c);
+    let timeout_ms = 1_000;
+    let effective_uid = unsafe { hbb_common::libc::geteuid() as u32 };
+    let candidate_uids = terminal_count_candidate_uids(effective_uid, active_uid());
+    for candidate_uid in candidate_uids {
+        let socket_path = linux_ipc_path_for_uid(candidate_uid, "");
+        let Ok(connect_result) = timeout(timeout_ms, Endpoint::connect(&socket_path)).await else {
+            continue;
+        };
+        let Ok(connection) = connect_result else {
+            continue;
+        };
+        let mut ipc_conn = ConnectionTmpl::new(connection);
+        if ipc_conn.send(&Data::TerminalSessionCount(0)).await.is_err() {
+            continue;
+        }
+        if let Ok(Some(Data::TerminalSessionCount(session_count))) =
+            ipc_conn.next_timeout(timeout_ms).await
+        {
+            return Ok(session_count);
+        }
     }
     Ok(0)
 }
@@ -1585,5 +2261,136 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[test]
+    fn test_service_ipc_postfix_compatibility() {
+        assert!(config::is_service_ipc_postfix(crate::POSTFIX_SERVICE));
+        assert!(config::is_service_ipc_postfix("_service_abcdef"));
+        assert!(!config::is_service_ipc_postfix(""));
+        assert!(!config::is_service_ipc_postfix("_services"));
+    }
+
+    #[test]
+    fn test_service_peer_uid_policy() {
+        assert!(is_allowed_service_peer_uid(0, None));
+        assert!(is_allowed_service_peer_uid(501, Some(501)));
+        assert!(!is_allowed_service_peer_uid(502, Some(501)));
+        assert!(!is_allowed_service_peer_uid(501, None));
+    }
+
+    #[test]
+    fn test_terminal_count_candidate_uids_policy() {
+        assert_eq!(
+            terminal_count_candidate_uids_policy(1000, Some(501), Some(700), &[800]),
+            vec![1000]
+        );
+        assert_eq!(
+            terminal_count_candidate_uids_policy(1000, None, None, &[800]),
+            vec![1000]
+        );
+        assert_eq!(
+            terminal_count_candidate_uids_policy(0, Some(501), None, &[]),
+            vec![501, 0]
+        );
+        assert_eq!(
+            terminal_count_candidate_uids_policy(0, None, Some(700), &[]),
+            vec![700, 0]
+        );
+        assert_eq!(
+            terminal_count_candidate_uids_policy(0, Some(0), Some(0), &[]),
+            vec![0]
+        );
+        assert_eq!(
+            terminal_count_candidate_uids_policy(0, Some(501), Some(501), &[501, 700, 700]),
+            vec![501, 700, 0]
+        );
+    }
+
+    #[test]
+    fn test_should_discover_terminal_socket_uids_policy() {
+        assert!(should_discover_terminal_socket_uids(0, None, None));
+        assert!(!should_discover_terminal_socket_uids(1000, None, None));
+        assert!(!should_discover_terminal_socket_uids(0, Some(501), None));
+        assert!(!should_discover_terminal_socket_uids(0, None, Some(501)));
+    }
+
+    #[test]
+    fn test_connect_service_attempt_timeout_policy() {
+        assert_eq!(connect_service_attempt_timeout(0, 3), 0);
+        assert_eq!(connect_service_attempt_timeout(1000, 1), 1000);
+        assert_eq!(connect_service_attempt_timeout(1000, 3), 333);
+        assert_eq!(connect_service_attempt_timeout(2, 3), 1);
+    }
+
+    #[test]
+    fn test_resolve_service_ipc_postfix_policy() {
+        assert_eq!(
+            resolve_service_ipc_postfix(None, Some("_service_meta".to_owned())),
+            crate::POSTFIX_SERVICE.to_owned()
+        );
+        assert_eq!(
+            resolve_service_ipc_postfix(
+                Some("invalid".to_owned()),
+                Some("_service_meta".to_owned())
+            ),
+            crate::POSTFIX_SERVICE.to_owned()
+        );
+        assert_eq!(
+            resolve_service_ipc_postfix(Some("invalid".to_owned()), None),
+            crate::POSTFIX_SERVICE.to_owned()
+        );
+        assert_eq!(
+            resolve_service_ipc_postfix(Some("_service_../../tmp".to_owned()), None),
+            crate::POSTFIX_SERVICE.to_owned()
+        );
+    }
+
+    #[test]
+    fn test_service_ipc_postfix_candidates_policy() {
+        assert_eq!(
+            build_service_ipc_postfix_candidates(
+                Some("_service_abcd".to_owned()),
+                Some("_service_abcd".to_owned())
+            ),
+            vec!["_service_abcd".to_owned(), crate::POSTFIX_SERVICE.to_owned()]
+        );
+        assert_eq!(
+            build_service_ipc_postfix_candidates(
+                Some("_service_env".to_owned()),
+                Some("_service_meta".to_owned())
+            ),
+            vec![
+                "_service_env".to_owned(),
+                "_service_meta".to_owned(),
+                crate::POSTFIX_SERVICE.to_owned()
+            ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_ensure_secure_ipc_parent_dir_rejects_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let unique = format!(
+            "rustdesk-ipc-secure-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(unique);
+        let real_dir = base.join("real");
+        let link_dir = base.join("link");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+        let ipc_path = link_dir.join("ipc_service");
+        let res = ensure_secure_ipc_parent_dir(ipc_path.to_string_lossy().as_ref(), "_service");
+        assert!(res.is_err());
+        std::fs::remove_file(&link_dir).ok();
+        std::fs::remove_dir_all(&real_dir).ok();
+        std::fs::remove_dir_all(&base).ok();
     }
 }
