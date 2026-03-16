@@ -472,14 +472,22 @@ class ServerModel with ChangeNotifier {
   }
 
   Future<bool> setPermanentPassword(String newPW) async {
-    await bind.mainSetPermanentPassword(password: newPW);
-    await Future.delayed(Duration(milliseconds: 500));
-    final pw = await bind.mainGetPermanentPassword();
-    if (newPW == pw) {
-      return true;
-    } else {
+    final ok = await bind.mainSetPermanentPasswordWithResult(password: newPW);
+    if (!ok) {
       return false;
     }
+    // Avoid reading back any secret. Wait (bounded) until the expected state is observed.
+    final expected = newPW.isNotEmpty;
+    const maxTries = 10;
+    const pollDelay = Duration(milliseconds: 100);
+    for (var i = 0; i < maxTries; i++) {
+      final hasPw = await bind.mainIsPermanentPasswordSet();
+      if (hasPw == expected) {
+        return true;
+      }
+      await Future.delayed(pollDelay);
+    }
+    return false;
   }
 
   fetchID() async {

@@ -633,7 +633,30 @@ async fn handle(data: Data, stream: &mut Connection) {
                 } else if name == "temporary-password" {
                     value = Some(password::temporary_password());
                 } else if name == "permanent-password" {
-                    value = Some(Config::get_permanent_password());
+                    value = Some(if Config::has_permanent_password() {
+                        "<set>".to_owned()
+                    } else {
+                        String::new()
+                    });
+                } else if name == "permanent-password-set" {
+                    value = Some(if Config::has_permanent_password() {
+                        "Y".to_owned()
+                    } else {
+                        "N".to_owned()
+                    });
+                } else if name == "permanent-password-is-preset" {
+                    let hard = config::HARD_SETTINGS
+                        .read()
+                        .unwrap()
+                        .get("password")
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_preset = !hard.is_empty() && Config::verify_permanent_password(&hard);
+                    value = Some(if is_preset {
+                        "Y".to_owned()
+                    } else {
+                        "N".to_owned()
+                    });
                 } else if name == "salt" {
                     value = Some(Config::get_salt());
                 } else if name == "rendezvous_server" {
@@ -669,13 +692,25 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Config((name, value))).await);
             }
             Some(value) => {
+                let mut updated = true;
                 if name == "id" {
                     Config::set_key_confirmed(false);
                     Config::set_id(&value);
                 } else if name == "temporary-password" {
                     password::update_temporary_password();
                 } else if name == "permanent-password" {
-                    Config::set_permanent_password(&value);
+                    // Guard against older clients that may round-trip a UI sentinel value
+                    // back into the service, which would overwrite the real password.
+                    // Do not trim here: treat passwords as exact strings.
+                    // We only reject the exact sentinel literal to prevent old clients from
+                    // overwriting the password with the UI marker.
+                    if value == "<set>" {
+                        log::error!("Refusing to set permanent password to sentinel value");
+                        updated = false;
+                    } else {
+                        // Do not trim before storing to preserve exact password semantics.
+                        Config::set_permanent_password(&value);
+                    }
                 } else if name == "salt" {
                     Config::set_salt(&value);
                 } else if name == "voice-call-input" {
@@ -685,7 +720,9 @@ async fn handle(data: Data, stream: &mut Connection) {
                 } else {
                     return;
                 }
-                log::info!("{} updated", name);
+                if updated {
+                    log::info!("{} updated", name);
+                }
             }
         },
         Data::Options(value) => match value {
@@ -1106,6 +1143,11 @@ pub async fn get_config(name: &str) -> ResultType<Option<String>> {
     get_config_async(name, 1_000).await
 }
 
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_config_short_timeout(name: &str) -> ResultType<Option<String>> {
+    get_config_async(name, 100).await
+}
+
 async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<String>> {
     let mut c = connect(ms_timeout, "").await?;
     c.send(&Data::Config((name.to_owned(), None))).await?;
@@ -1144,12 +1186,31 @@ pub fn update_temporary_password() -> ResultType<()> {
 }
 
 pub fn get_permanent_password() -> String {
-    if let Ok(Some(v)) = get_config("permanent-password") {
-        Config::set_permanent_password(&v);
-        v
+    if is_permanent_password_set() {
+        "<set>".to_owned()
     } else {
-        Config::get_permanent_password()
+        String::new()
     }
+}
+
+pub fn is_permanent_password_set() -> bool {
+    if let Ok(Some(v)) = get_config_short_timeout("permanent-password-set") {
+        let v = v.trim();
+        return v == "Y" || v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    // Fallback for older services: any non-empty value means "set" in practice.
+    if let Ok(Some(v)) = get_config_short_timeout("permanent-password") {
+        return !v.is_empty();
+    }
+    Config::has_permanent_password()
+}
+
+pub fn is_permanent_password_preset() -> bool {
+    if let Ok(Some(v)) = get_config("permanent-password-is-preset") {
+        let v = v.trim();
+        return v == "Y" || v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    false
 }
 
 pub fn get_fingerprint() -> String {
@@ -1159,7 +1220,9 @@ pub fn get_fingerprint() -> String {
 }
 
 pub fn set_permanent_password(v: String) -> ResultType<()> {
-    Config::set_permanent_password(&v);
+    if Config::is_disable_change_permanent_password() {
+        bail!("Changing permanent password is disabled");
+    }
     set_config("permanent-password", v)
 }
 

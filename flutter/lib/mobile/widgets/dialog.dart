@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/common/widgets/custom_password.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
 import 'package:get/get.dart';
@@ -17,12 +18,30 @@ void _showError() {
 }
 
 void setPermanentPasswordDialog(OverlayDialogManager dialogManager) async {
-  final pw = await bind.mainGetPermanentPassword();
-  final p0 = TextEditingController(text: pw);
-  final p1 = TextEditingController(text: pw);
-  var validateLength = false;
-  var validateSame = false;
+  final p0 = TextEditingController(text: "");
+  final p1 = TextEditingController(text: "");
+  final formKey = GlobalKey<FormState>();
+  final rules = [
+    DigitValidationRule(),
+    UppercaseValidationRule(),
+    LowercaseValidationRule(),
+    MinCharactersValidationRule(8),
+  ];
   dialogManager.show((setState, close, context) {
+    bool canSubmit() {
+      final a = p0.text;
+      final b = p1.text;
+      if (a.isEmpty && b.isEmpty) {
+        // Allow clearing the permanent password.
+        return true;
+      }
+      if (a != b) {
+        return false;
+      }
+      final Iterable violations = rules.where((r) => !r.validate(a));
+      return violations.isEmpty;
+    }
+
     submit() async {
       close();
       dialogManager.showLoading(translate("Waiting"));
@@ -44,6 +63,7 @@ void setPermanentPasswordDialog(OverlayDialogManager dialogManager) async {
         ],
       ),
       content: Form(
+          key: formKey,
           autovalidateMode: AutovalidateMode.onUserInteraction,
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             TextFormField(
@@ -54,17 +74,21 @@ void setPermanentPasswordDialog(OverlayDialogManager dialogManager) async {
                 labelText: translate('Password'),
               ),
               controller: p0,
+              onChanged: (_) {
+                setState(() {});
+                // Revalidate confirmation field when primary password changes.
+                formKey.currentState?.validate();
+              },
               validator: (v) {
                 if (v == null) return null;
-                final val = v.trim().length > 5;
-                if (validateLength != val) {
-                  // use delay to make setState success
-                  Future.delayed(Duration(microseconds: 1),
-                      () => setState(() => validateLength = val));
+                if (v.isEmpty) {
+                  return null;
                 }
-                return val
-                    ? null
-                    : translate('Too short, at least 6 characters.');
+                final Iterable violations = rules.where((r) => !r.validate(v));
+                if (violations.isNotEmpty) {
+                  return '${translate('Prompt')}: ${violations.map((r) => r.name).join(', ')}';
+                }
+                return null;
               },
             ).workaroundFreezeLinuxMint(),
             TextFormField(
@@ -74,21 +98,21 @@ void setPermanentPasswordDialog(OverlayDialogManager dialogManager) async {
                 labelText: translate('Confirmation'),
               ),
               controller: p1,
+              onChanged: (_) {
+                setState(() {});
+                formKey.currentState?.validate();
+              },
               validator: (v) {
                 if (v == null) return null;
-                final val = p0.text == v;
-                if (validateSame != val) {
-                  Future.delayed(Duration(microseconds: 1),
-                      () => setState(() => validateSame = val));
-                }
-                return val
+                final ok = p0.text == v;
+                return ok
                     ? null
                     : translate('The confirmation is not identical.');
               },
             ).workaroundFreezeLinuxMint(),
           ])),
       onCancel: close,
-      onSubmit: (validateLength && validateSame) ? submit : null,
+      onSubmit: canSubmit() ? submit : null,
       actions: [
         dialogButton(
           'Cancel',
@@ -99,7 +123,7 @@ void setPermanentPasswordDialog(OverlayDialogManager dialogManager) async {
         dialogButton(
           'OK',
           icon: Icon(Icons.done_rounded),
-          onPressed: (validateLength && validateSame) ? submit : null,
+          onPressed: canSubmit() ? submit : null,
         ),
       ],
     );

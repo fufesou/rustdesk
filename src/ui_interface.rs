@@ -610,18 +610,35 @@ pub fn update_temporary_password() {
 
 #[inline]
 pub fn permanent_password() -> String {
+    // Returns a sentinel ("<set>"/empty), not the plaintext password.
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    return Config::get_permanent_password();
+    return if Config::has_permanent_password() {
+        "<set>".to_owned()
+    } else {
+        String::new()
+    };
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     return ipc::get_permanent_password();
 }
 
 #[inline]
 pub fn set_permanent_password(password: String) {
+    if Config::is_disable_change_permanent_password() {
+        log::warn!("Changing permanent password is disabled");
+        return;
+    }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     Config::set_permanent_password(&password);
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     allow_err!(ipc::set_permanent_password(password));
+}
+
+#[inline]
+pub fn is_permanent_password_set() -> bool {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    return Config::has_permanent_password();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return ipc::is_permanent_password_set();
 }
 
 #[inline]

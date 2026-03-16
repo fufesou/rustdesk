@@ -1697,6 +1697,25 @@ pub fn main_get_permanent_password() -> String {
     ui_interface::permanent_password()
 }
 
+pub fn main_is_permanent_password_set() -> bool {
+    ui_interface::is_permanent_password_set()
+}
+
+pub fn main_set_permanent_password_with_result(password: String) -> bool {
+    if config::Config::is_disable_change_permanent_password() {
+        return false;
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        config::Config::set_permanent_password(&password);
+        return true;
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        crate::ipc::set_permanent_password(password).is_ok()
+    }
+}
+
 pub fn main_get_fingerprint() -> String {
     get_fingerprint()
 }
@@ -2073,7 +2092,11 @@ pub fn main_update_temporary_password() {
 }
 
 pub fn main_set_permanent_password(password: String) {
-    set_permanent_password(password);
+    // Keep legacy signature, but route through the unified setter contract.
+    // This avoids duplicating policy enforcement and backend write paths.
+    if !main_set_permanent_password_with_result(password) {
+        log::warn!("Failed to set permanent password (may be disabled by policy)");
+    }
 }
 
 pub fn main_check_super_user_permission() -> bool {
@@ -2423,16 +2446,23 @@ pub fn is_disable_installation() -> SyncReturn<bool> {
 }
 
 pub fn is_preset_password() -> bool {
-    config::HARD_SETTINGS
+    let hard = config::HARD_SETTINGS
         .read()
         .unwrap()
         .get("password")
-        .map_or(false, |p| {
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            return p == &crate::ipc::get_permanent_password();
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            return p == &config::Config::get_permanent_password();
-        })
+        .cloned()
+        .unwrap_or_default();
+    if hard.is_empty() {
+        return false;
+    }
+
+    // On desktop, service owns the authoritative config; query it via IPC and return only a boolean.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return crate::ipc::is_permanent_password_preset();
+
+    // On mobile, we have no service IPC; verify against local storage.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    return config::Config::verify_permanent_password(&hard);
 }
 
 // Don't call this function for desktop version.

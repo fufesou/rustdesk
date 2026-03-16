@@ -27,6 +27,7 @@ use hbb_common::platform::linux::run_cmds;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
+    config::decode_permanent_password_h1_from_storage,
     config::{self, keys, Config, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
@@ -75,6 +76,18 @@ lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // Avoid data-dependent early exits.
+    let mut x: u8 = 0;
+    for i in 0..a.len() {
+        x |= a[i] ^ b[i];
+    }
+    x == 0
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1969,23 +1982,47 @@ impl Connection {
         self.tx_input.send(MessageInput::Key((msg, press))).ok();
     }
 
-    fn validate_one_password(&self, password: String) -> bool {
-        if password.len() == 0 {
+    fn verify_h1(&self, h1: &[u8]) -> bool {
+        let mut hasher2 = Sha256::new();
+        hasher2.update(h1);
+        hasher2.update(self.hash.challenge.as_bytes());
+        constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
+    }
+
+    fn validate_password_plaintext(&self, password: &str) -> bool {
+        if password.is_empty() {
             return false;
         }
+
         let mut hasher = Sha256::new();
-        hasher.update(password);
-        hasher.update(&self.hash.salt);
-        let mut hasher2 = Sha256::new();
-        hasher2.update(&hasher.finalize()[..]);
-        hasher2.update(&self.hash.challenge);
-        hasher2.finalize()[..] == self.lr.password[..]
+        hasher.update(password.as_bytes());
+        hasher.update(self.hash.salt.as_bytes());
+        let h1_plain = hasher.finalize();
+        self.verify_h1(&h1_plain[..])
+    }
+
+    fn validate_password_storage(&self, storage: &str) -> bool {
+        if storage.is_empty() {
+            return false;
+        }
+
+        // For hashed-verifier storage, verify only via decoded H1. Never treat the storage
+        // string itself as a plaintext password.
+        if storage.starts_with("01") {
+            if let Some(h1) = decode_permanent_password_h1_from_storage(storage) {
+                return self.verify_h1(&h1[..]);
+            }
+            log::error!("Invalid hashed permanent password storage");
+            return false;
+        }
+        // Legacy plaintext storage path.
+        self.validate_password_plaintext(storage)
     }
 
     fn validate_password(&mut self) -> bool {
         if password::temporary_enabled() {
             let password = password::temporary_password();
-            if self.validate_one_password(password.clone()) {
+            if self.validate_password_plaintext(&password) {
                 raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
                     Some(password),
@@ -1995,7 +2032,8 @@ impl Connection {
             }
         }
         if password::permanent_enabled() {
-            if self.validate_one_password(Config::get_permanent_password()) {
+            let stored = Config::get_permanent_password();
+            if self.validate_password_storage(&stored) {
                 return true;
             }
         }
@@ -2016,7 +2054,7 @@ impl Connection {
         if let Some(session) = session {
             if !self.lr.password.is_empty()
                 && (tfa && session.tfa
-                    || !tfa && self.validate_one_password(session.random_password.clone()))
+                    || !tfa && self.validate_password_plaintext(&session.random_password))
             {
                 log::info!("is recent session");
                 return true;
