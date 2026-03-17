@@ -2022,8 +2022,56 @@ pub fn get_license_from_exe_name() -> ResultType<CustomServer> {
     get_custom_server_from_string(&exe)
 }
 
-// We can't directly use `RegKey::set_value` to update the registry value, because it will fail with `ERROR_ACCESS_DENIED`
-// So we have to use `run_cmds` to update the registry value.
+// Update install options via registry API with strict input validation.
+#[inline]
+fn normalize_install_option_key(key: &str) -> ResultType<&'static str> {
+    match key {
+        REG_NAME_INSTALL_DESKTOPSHORTCUTS => Ok(REG_NAME_INSTALL_DESKTOPSHORTCUTS),
+        REG_NAME_INSTALL_STARTMENUSHORTCUTS => Ok(REG_NAME_INSTALL_STARTMENUSHORTCUTS),
+        REG_NAME_INSTALL_PRINTER => Ok(REG_NAME_INSTALL_PRINTER),
+        _ => bail!("Unsupported install option key: {}", key),
+    }
+}
+
+#[inline]
+fn normalize_install_option_value(value: &str) -> ResultType<&'static str> {
+    match value {
+        "0" => Ok("0"),
+        "1" => Ok("1"),
+        _ => bail!("Unsupported install option value: {}", value),
+    }
+}
+
+#[inline]
+fn normalize_install_option_ext(ext: &str) -> ResultType<&str> {
+    if ext.is_empty() {
+        bail!("Unsupported install option extension: empty");
+    }
+    if !ext
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        bail!("Unsupported install option extension: {}", ext);
+    }
+    Ok(ext)
+}
+
+#[inline]
+fn normalize_install_option_inputs(
+    ext: &str,
+    key: &str,
+    value: &str,
+) -> ResultType<(String, &'static str, &'static str)> {
+    let normalized_ext = normalize_install_option_ext(ext)?;
+    let normalized_key = normalize_install_option_key(key)?;
+    let normalized_value = normalize_install_option_value(value)?;
+    Ok((
+        format!(".{}", normalized_ext),
+        normalized_key,
+        normalized_value,
+    ))
+}
+
 pub fn update_install_option(k: &str, v: &str) -> ResultType<()> {
     // Don't update registry if not installed or not server process.
     if !is_installed() || !crate::is_server() {
@@ -2031,9 +2079,10 @@ pub fn update_install_option(k: &str, v: &str) -> ResultType<()> {
     }
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
-    let cmds =
-        format!("chcp 65001 && reg add HKEY_CLASSES_ROOT\\.{ext} /f /v {k} /t REG_SZ /d \"{v}\"");
-    run_cmds(cmds, false, "update_install_option")?;
+    let (subkey, key, value) = normalize_install_option_inputs(&ext, k, v)?;
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    let (subkey_handle, _) = hkcr.create_subkey(subkey)?;
+    subkey_handle.set_value(key, &value)?;
     Ok(())
 }
 
