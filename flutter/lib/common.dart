@@ -2367,8 +2367,12 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
     if (isAndroid || isIOS) {
       final config = uri.path.substring("/".length);
       // add a timer to make showToast work
-      Timer(Duration(seconds: 1), () {
-        importConfig(null, null, config);
+      Timer(Duration(seconds: 1), () async {
+        await _runProtectedDeepLinkAction(
+          confirmMessage: 'external-link-import-config-tip',
+          dialogTag: 'deeplink-config-import-confirm',
+          onAllowed: () async => importConfig(null, null, config),
+        );
       });
     }
     return null;
@@ -2377,9 +2381,17 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
       final password = uri.path.substring("/".length);
       if (password.isNotEmpty) {
         Timer(Duration(seconds: 1), () async {
-          final ok =
-              await bind.mainSetPermanentPasswordWithResult(password: password);
-          showToast(translate(ok ? 'Successful' : 'Failed'));
+          final success = await _runProtectedDeepLinkAction(
+              confirmMessage: 'external-link-set-permanent-password-tip',
+              dialogTag: 'deeplink-password-change-confirm',
+              onAllowed: () async {
+                final ok = await bind.mainSetPermanentPasswordWithResult(
+                    password: password);
+                showToast(translate(ok ? 'Successful' : 'Failed'));
+              });
+          if (success) {
+            showToast(translate('Successful'));
+          }
         });
       }
     }
@@ -3047,11 +3059,65 @@ void onCopyFingerprint(String value) {
 }
 
 Future<bool> callMainCheckSuperUserPermission() async {
+  // On Android/iOS, `mainCheckSuperUserPermission` currently returns true.
+  // Keep this check for parity with desktop flow and future hardening.
   bool checked = await bind.mainCheckSuperUserPermission();
   if (isMacOS) {
     await windowManager.show();
   }
   return checked;
+}
+
+Future<bool> _confirmDeepLinkAction({
+  required String confirmMessage,
+  required String dialogTag,
+}) async {
+  try {
+    final confirmed = await gFFI.dialogManager.show<bool>(
+      (setState, close, context) => CustomAlertDialog(
+        title: Text(
+          translate('Warning'),
+          style: TextStyle(fontSize: 21),
+        ),
+        content: SelectionArea(
+          child: Text(
+            translate(confirmMessage),
+          ),
+        ),
+        actions: [
+          dialogButton('Cancel',
+              onPressed: () => close(false), isOutline: true),
+          dialogButton('OK', onPressed: () => close(true)),
+        ],
+        onCancel: () => close(false),
+      ),
+      tag: dialogTag,
+      useAnimation: false,
+      forceGlobal: true,
+    );
+    return confirmed == true;
+  } catch (e) {
+    debugPrint('Failed to show confirmation dialog: $e');
+    return false;
+  }
+}
+
+Future<bool> _runProtectedDeepLinkAction({
+  required String confirmMessage,
+  required String dialogTag,
+  required Future<void> Function() onAllowed,
+}) async {
+  final hasSuperUserPermission = await callMainCheckSuperUserPermission();
+  final userConfirmed = await _confirmDeepLinkAction(
+    confirmMessage: confirmMessage,
+    dialogTag: dialogTag,
+  );
+  if (!(hasSuperUserPermission && userConfirmed)) {
+    showToast(translate('Failed'));
+    return false;
+  }
+  await onAllowed();
+  return true;
 }
 
 Future<void> start_service(bool is_start) async {
@@ -4154,8 +4220,7 @@ Widget? buildAvatarWidget({
       width: size,
       height: size,
       fit: BoxFit.cover,
-      errorBuilder: (_, __, ___) =>
-          fallback ?? SizedBox.shrink(),
+      errorBuilder: (_, __, ___) => fallback ?? SizedBox.shrink(),
     ),
   );
 }

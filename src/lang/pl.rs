@@ -743,5 +743,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Display Name", ""),
         ("password-hidden-tip", ""),
         ("preset-password-in-use-tip", ""),
+        ("external-link-import-config-tip", ""),
+        ("external-link-set-permanent-password-tip", ""),
     ].iter().cloned().collect();
 }
