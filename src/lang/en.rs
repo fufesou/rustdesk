@@ -272,5 +272,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-permission-lost-tip", "Keyboard permission was revoked. Relative Mouse Mode has been disabled."),
         ("keep-awake-during-outgoing-sessions-label", "Keep screen awake during outgoing sessions"),
         ("keep-awake-during-incoming-sessions-label", "Keep screen awake during incoming sessions"),
+        ("external-link-import-config-tip", "An external link is trying to import server configuration. Continue?"),
+        ("external-link-set-permanent-password-tip", "An external link is trying to set a permanent password. Continue?"),
     ].iter().cloned().collect();
 }
