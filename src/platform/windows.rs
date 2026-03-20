@@ -669,6 +669,16 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     };
                     let (authorized, peer_pid, peer_session_id, peer_is_system) =
                         stream.service_authorization_status_for_session(expected_active_session_id);
+                    log::info!(
+                        "====================== IPC peer connected: postfix={}, peer_session_id={:?}, peer_pid={:?}, peer_exe='{}', current_exe='{}', expected_active_session_id={:?}, peer_is_system={:?}",
+                        crate::POSTFIX_SERVICE,
+                        peer_session_id,
+                        peer_pid,
+                        ipc::format_peer_exe_for_debug_log_by_pid(peer_pid),
+                        ipc::format_current_exe_for_debug_log(),
+                        expected_active_session_id,
+                        peer_is_system
+                    );
                     if !authorized {
                         ipc::log_rejected_windows_ipc_connection(
                             crate::POSTFIX_SERVICE,
@@ -678,6 +688,19 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             peer_is_system,
                         );
                         continue;
+                    }
+                    if crate::platform::is_installed() {
+                        if let Err(err) = stream
+                            .ensure_peer_executable_path_matches_current(crate::POSTFIX_SERVICE)
+                        {
+                            log::warn!(
+                                "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                                crate::POSTFIX_SERVICE,
+                                peer_pid,
+                                err
+                            );
+                            continue;
+                        }
                     }
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
                         match data {
@@ -2528,6 +2551,42 @@ pub fn is_process_running_as_system(process_id: DWORD) -> ResultType<bool> {
         }
         let _ = WinCloseHandle(process);
         result
+    }
+}
+
+pub fn get_process_executable_path(process_id: DWORD) -> ResultType<PathBuf> {
+    use hbb_common::platform::windows::RAIIHandle;
+
+    const PROCESS_IMAGE_PATH_BUFFER_LEN: usize = 32 * 1024;
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+        if process == NULL {
+            bail!(
+                "Failed to open process {}, error {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        let _process = RAIIHandle(process);
+
+        let mut buffer = vec![0u16; PROCESS_IMAGE_PATH_BUFFER_LEN];
+        let mut length: DWORD = PROCESS_IMAGE_PATH_BUFFER_LEN as DWORD;
+        if QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) == FALSE {
+            bail!(
+                "Failed to query process {} image path, error {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        if length == 0 {
+            bail!(
+                "Failed to query process {} image path: empty result",
+                process_id
+            );
+        }
+        buffer.truncate(length as usize);
+        Ok(PathBuf::from(OsString::from_wide(&buffer)))
     }
 }
 

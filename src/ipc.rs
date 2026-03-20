@@ -9,7 +9,7 @@ use crate::{
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use clipboard::ClipboardFile;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use hbb_common::anyhow;
 use hbb_common::{
     allow_err, bail, bytes,
@@ -182,6 +182,183 @@ pub(crate) fn peer_uid_from_fd(fd: std::os::unix::io::RawFd) -> Option<u32> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn peer_pid_from_fd(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: hbb_common::libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<hbb_common::libc::ucred>() as hbb_common::libc::socklen_t;
+        let rc = unsafe {
+            hbb_common::libc::getsockopt(
+                fd,
+                hbb_common::libc::SOL_SOCKET,
+                hbb_common::libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut hbb_common::libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 && cred.pid > 0 {
+            return Some(cred.pid as u32);
+        }
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: hbb_common::libc::pid_t = 0;
+        let mut len = std::mem::size_of::<hbb_common::libc::pid_t>() as hbb_common::libc::socklen_t;
+        let rc = unsafe {
+            hbb_common::libc::getsockopt(
+                fd,
+                hbb_common::libc::SOL_LOCAL,
+                hbb_common::libc::LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut hbb_common::libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 && pid > 0 {
+            Some(pid as u32)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[inline]
+fn current_exe_canonical_path() -> ResultType<std::path::PathBuf> {
+    let current = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("Failed to resolve current executable path: {}", err))?;
+    std::fs::canonicalize(&current).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to canonicalize current executable path '{}': {}",
+            current.display(),
+            err
+        )
+        .into()
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<std::path::PathBuf> {
+    let proc_exe = std::path::PathBuf::from(format!("/proc/{peer_pid}/exe"));
+    let peer_exe = std::fs::read_link(&proc_exe).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to read peer executable link '{}': {}",
+            proc_exe.display(),
+            err
+        )
+    })?;
+    std::fs::canonicalize(&peer_exe).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to canonicalize peer executable path '{}': {}",
+            peer_exe.display(),
+            err
+        )
+        .into()
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<std::path::PathBuf> {
+    const PROC_PIDPATH_BUF_SIZE: usize = hbb_common::libc::PROC_PIDPATHINFO_MAXSIZE as usize;
+    let mut buffer = vec![0u8; PROC_PIDPATH_BUF_SIZE];
+    let length = unsafe {
+        hbb_common::libc::proc_pidpath(
+            peer_pid as hbb_common::libc::c_int,
+            buffer.as_mut_ptr() as *mut hbb_common::libc::c_void,
+            PROC_PIDPATH_BUF_SIZE as u32,
+        )
+    };
+    if length <= 0 {
+        bail!("Failed to query peer process path from pid {}", peer_pid);
+    }
+    buffer.truncate(length as usize);
+    let path = std::path::PathBuf::from(String::from_utf8_lossy(&buffer).to_string());
+    std::fs::canonicalize(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to canonicalize peer executable path '{}': {}",
+            path.display(),
+            err
+        )
+        .into()
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<std::path::PathBuf> {
+    let path = crate::platform::windows::get_process_executable_path(peer_pid)?;
+    std::fs::canonicalize(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to canonicalize peer executable path '{}': {}",
+            path.display(),
+            err
+        )
+        .into()
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[inline]
+fn executable_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        fn normalize(path: &std::path::Path) -> String {
+            let mut normalized = path.to_string_lossy().replace('/', "\\");
+            if let Some(stripped) = normalized.strip_prefix(r"\\?\") {
+                normalized = stripped.to_owned();
+            }
+            normalized.to_ascii_lowercase()
+        }
+        return normalize(left) == normalize(right);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[inline]
+fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -> ResultType<()> {
+    let peer_exe = peer_exe_canonical_path_by_pid(peer_pid)?;
+    let current_exe = current_exe_canonical_path()?;
+    if executable_paths_match(&peer_exe, &current_exe) {
+        return Ok(());
+    }
+    bail!(
+        "Peer executable path mismatch on ipc channel '{}': peer_pid={}, peer_exe='{}', current_exe='{}'",
+        postfix,
+        peer_pid,
+        peer_exe.display(),
+        current_exe.display()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[inline]
+pub(crate) fn format_current_exe_for_debug_log() -> String {
+    match current_exe_canonical_path() {
+        Ok(path) => path.display().to_string(),
+        Err(err) => format!("<unavailable: {}>", err),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[inline]
+pub(crate) fn format_peer_exe_for_debug_log_by_pid(peer_pid: Option<u32>) -> String {
+    match peer_pid {
+        Some(pid) => match peer_exe_canonical_path_by_pid(pid) {
+            Ok(path) => path.display().to_string(),
+            Err(err) => format!("<unavailable: {}>", err),
+        },
+        None => "<unavailable: missing-pid>".to_owned(),
     }
 }
 
@@ -888,11 +1065,33 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                     let postfix = postfix.to_owned();
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if config::is_service_ipc_postfix(&postfix) {
+                        let peer_pid = stream.peer_pid();
+                        log::info!(
+                            "====================== IPC peer connected: postfix={}, peer_session_id={:?}, peer_pid={:?}, peer_exe='{}', current_exe='{}'",
+                            postfix,
+                            Option::<u32>::None,
+                            peer_pid,
+                            format_peer_exe_for_debug_log_by_pid(peer_pid),
+                            format_current_exe_for_debug_log()
+                        );
                         let (authorized, peer_uid, active_uid) =
                             stream.service_authorization_status();
                         if !authorized {
                             log_rejected_service_connection(&postfix, peer_uid, active_uid);
                             continue;
+                        }
+                        if crate::platform::is_installed() {
+                            if let Err(err) =
+                                stream.ensure_peer_executable_path_matches_current(&postfix)
+                            {
+                                log::warn!(
+                                    "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                                    postfix,
+                                    stream.peer_pid(),
+                                    err
+                                );
+                                continue;
+                            }
                         }
                     }
                     #[cfg(windows)]
@@ -904,6 +1103,16 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                             server_session_id,
                             peer_is_system,
                         ) = stream.server_authorization_status();
+                        log::info!(
+                            "====================== IPC peer connected: postfix={}, peer_session_id={:?}, peer_pid={:?}, peer_exe='{}', current_exe='{}', server_session_id={:?}, peer_is_system={:?}",
+                            postfix,
+                            peer_session_id,
+                            peer_pid,
+                            format_peer_exe_for_debug_log_by_pid(peer_pid),
+                            format_current_exe_for_debug_log(),
+                            server_session_id,
+                            peer_is_system
+                        );
                         if !authorized {
                             log_rejected_windows_ipc_connection(
                                 &postfix,
@@ -913,6 +1122,19 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                 peer_is_system,
                             );
                             continue;
+                        }
+                        if crate::platform::is_installed() {
+                            if let Err(err) =
+                                stream.ensure_peer_executable_path_matches_current(&postfix)
+                            {
+                                log::warn!(
+                                    "Rejected unauthorized connection on ipc channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                                    postfix,
+                                    peer_pid,
+                                    err
+                                );
+                                continue;
+                            }
                         }
                     }
                     tokio::spawn(async move {
@@ -1750,6 +1972,20 @@ where
         let authorized = peer_uid.is_some_and(|uid| is_allowed_service_peer_uid(uid, active_uid));
         (authorized, peer_uid, active_uid)
     }
+
+    fn peer_pid(&self) -> Option<u32> {
+        peer_pid_from_fd(self.inner.get_ref().as_raw_fd())
+    }
+
+    pub(crate) fn ensure_peer_executable_path_matches_current(
+        &self,
+        postfix: &str,
+    ) -> ResultType<()> {
+        let peer_pid = self.peer_pid().ok_or_else(|| {
+            anyhow::anyhow!("Failed to resolve peer pid on ipc channel '{}'", postfix)
+        })?;
+        ensure_peer_executable_matches_current_by_pid(peer_pid, postfix)
+    }
 }
 
 #[cfg(windows)]
@@ -1840,6 +2076,16 @@ impl ConnectionTmpl<Conn> {
             }
         }
         (authorized, peer_pid, peer_session_id, peer_is_system)
+    }
+
+    pub(crate) fn ensure_peer_executable_path_matches_current(
+        &self,
+        postfix: &str,
+    ) -> ResultType<()> {
+        let peer_pid = self.peer_pid().ok_or_else(|| {
+            anyhow::anyhow!("Failed to resolve peer pid on ipc channel '{}'", postfix)
+        })?;
+        ensure_peer_executable_matches_current_by_pid(peer_pid, postfix)
     }
 }
 
@@ -2368,6 +2614,24 @@ mod test {
         assert!(is_allowed_windows_service_peer(false, Some(1), Some(1)));
         assert!(!is_allowed_windows_service_peer(false, Some(1), Some(2)));
         assert!(!is_allowed_windows_service_peer(false, None, Some(1)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_executable_paths_match_windows_normalization() {
+        let left = std::path::PathBuf::from(r"\\?\C:\Program Files\RustDesk\RustDesk.exe");
+        let right = std::path::PathBuf::from(r"c:\program files\rustdesk\rustdesk.exe");
+        assert!(executable_paths_match(&left, &right));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_executable_paths_match_unix_exact() {
+        let left = std::path::PathBuf::from("/opt/rustdesk/rustdesk");
+        let right = std::path::PathBuf::from("/opt/rustdesk/rustdesk");
+        let other = std::path::PathBuf::from("/opt/rustdesk/rustdesk-helper");
+        assert!(executable_paths_match(&left, &right));
+        assert!(!executable_paths_match(&left, &other));
     }
 
     #[cfg(unix)]
