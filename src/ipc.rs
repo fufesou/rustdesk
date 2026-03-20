@@ -1,9 +1,17 @@
+#[path = "ipc/auth.rs"]
+mod ipc_auth;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "ipc/fs.rs"]
+mod ipc_fs;
+
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::plugin::ipc::Plugin;
 use crate::{
-    common::CheckTestNatType,
+    common::{is_server, CheckTestNatType},
+    privacy_mode,
     privacy_mode::PrivacyModeState,
+    rendezvous_mediator::RendezvousMediator,
     ui_interface::{get_local_option, set_local_option},
 };
 use bytes::Bytes;
@@ -25,503 +33,40 @@ use hbb_common::{
     tokio_util::codec::Framed,
     ResultType,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ipc_auth::authorize_service_scoped_ipc_connection;
+#[cfg(windows)]
+pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
+#[cfg(target_os = "linux")]
+pub(crate) use ipc_auth::{
+    active_uid, ensure_peer_executable_matches_current_by_fd, is_allowed_service_peer_uid,
+    log_rejected_uinput_connection, peer_uid_from_fd,
+};
+#[cfg(windows)]
+use ipc_auth::{authorize_windows_main_ipc_connection, should_allow_everyone_create_on_windows};
+#[cfg(target_os = "windows")]
+pub(crate) use ipc_auth::{format_current_exe_for_debug_log, format_peer_exe_for_debug_log_by_pid};
+#[cfg(target_os = "linux")]
+use ipc_fs::terminal_count_candidate_uids;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ipc_fs::{
+    check_pid, ensure_secure_ipc_parent_dir, scrub_secure_ipc_parent_dir,
+    should_scrub_parent_entries_after_check_pid, write_pid,
+};
 use parity_tokio_ipc::{
     Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
 };
 use serde_derive::{Deserialize, Serialize};
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
-#[cfg(unix)]
-use std::{
-    ffi::CString,
-    fs::File,
-    io::{prelude::*, Error, ErrorKind},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
-    },
-    path::Path,
-};
-#[cfg(windows)]
-use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProcessId};
-
-use crate::{common::is_server, privacy_mode, rendezvous_mediator::RendezvousMediator};
 
 // IPC actions here.
 pub const IPC_ACTION_CLOSE: &str = "close";
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
-
-#[cfg(windows)]
-#[inline]
-fn is_allowed_windows_server_peer(
-    client_is_system: bool,
-    client_session_id: Option<u32>,
-    server_session_id: Option<u32>,
-) -> bool {
-    client_is_system || (client_session_id.is_some() && client_session_id == server_session_id)
-}
-
-#[cfg(windows)]
-#[inline]
-fn is_allowed_windows_service_peer(
-    client_is_system: bool,
-    client_session_id: Option<u32>,
-    expected_active_session_id: Option<u32>,
-) -> bool {
-    client_is_system
-        || (expected_active_session_id.is_some()
-            && client_session_id.is_some()
-            && client_session_id == expected_active_session_id)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[inline]
-pub(crate) fn is_allowed_service_peer_uid(peer_uid: u32, active_uid: Option<u32>) -> bool {
-    peer_uid == 0 || active_uid.is_some_and(|uid| uid == peer_uid)
-}
-
-#[cfg(target_os = "macos")]
-#[inline]
-fn console_owner_uid() -> Option<u32> {
-    std::fs::metadata("/dev/console")
-        .ok()
-        .map(|metadata| metadata.uid())
-}
-
-#[cfg(target_os = "macos")]
-#[inline]
-fn active_uid_strict() -> Option<u32> {
-    // Prefer the filesystem metadata over parsing external command output.
-    console_owner_uid()
-}
-
-#[cfg(target_os = "linux")]
-#[inline]
-fn active_uid_strict() -> Option<u32> {
-    let reported_uid_raw = crate::platform::linux::get_active_userid();
-    let trimmed = reported_uid_raw.trim();
-    if let Ok(uid) = trimmed.parse::<u32>() {
-        return Some(uid);
-    }
-    if trimmed.is_empty() {
-        log::debug!("Failed to resolve active user uid on linux: active uid is empty");
-    } else {
-        log::warn!("Failed to parse active user uid on linux: '{}'", trimmed);
-    }
-    None
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const ACTIVE_UID_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Clone, Copy)]
-struct ActiveUidCacheEntry {
-    uid: Option<u32>,
-    cached_at: std::time::Instant,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[inline]
-pub(crate) fn active_uid_cached() -> Option<u32> {
-    static ACTIVE_UID_CACHE: OnceLock<Mutex<Option<ActiveUidCacheEntry>>> = OnceLock::new();
-    let cache = ACTIVE_UID_CACHE.get_or_init(|| Mutex::new(None));
-    let now = std::time::Instant::now();
-    match cache.lock() {
-        Ok(mut cache) => {
-            if let Some(entry) = *cache {
-                if now.saturating_duration_since(entry.cached_at) < ACTIVE_UID_CACHE_TTL {
-                    return entry.uid;
-                }
-            }
-            let uid = active_uid_strict();
-            *cache = Some(ActiveUidCacheEntry {
-                uid,
-                cached_at: now,
-            });
-            uid
-        }
-        Err(_) => active_uid_strict(),
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[inline]
-pub(crate) fn peer_uid_from_fd(fd: std::os::unix::io::RawFd) -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred: hbb_common::libc::ucred = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<hbb_common::libc::ucred>() as hbb_common::libc::socklen_t;
-        let rc = unsafe {
-            hbb_common::libc::getsockopt(
-                fd,
-                hbb_common::libc::SOL_SOCKET,
-                hbb_common::libc::SO_PEERCRED,
-                &mut cred as *mut _ as *mut hbb_common::libc::c_void,
-                &mut len,
-            )
-        };
-        if rc == 0 {
-            return Some(cred.uid as u32);
-        }
-        return None;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut uid: hbb_common::libc::uid_t = 0;
-        let mut gid: hbb_common::libc::gid_t = 0;
-        if unsafe { hbb_common::libc::getpeereid(fd, &mut uid, &mut gid) } == 0 {
-            Some(uid as u32)
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-const UNAUTHORIZED_IPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-#[derive(Default)]
-struct UnauthorizedIpcLogThrottle {
-    last_log_at: Option<std::time::Instant>,
-    suppressed: u64,
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-impl UnauthorizedIpcLogThrottle {
-    #[inline]
-    fn on_reject(&mut self, now: std::time::Instant) -> Option<u64> {
-        if let Some(last) = self.last_log_at {
-            if now.saturating_duration_since(last) < UNAUTHORIZED_IPC_LOG_INTERVAL {
-                self.suppressed += 1;
-                return None;
-            }
-        }
-        self.last_log_at = Some(now);
-        Some(std::mem::take(&mut self.suppressed))
-    }
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-#[inline]
-fn throttled_unauthorized_ipc_log(
-    throttle_cell: &OnceLock<Mutex<UnauthorizedIpcLogThrottle>>,
-    emit: impl FnOnce(u64),
-) {
-    let throttle = throttle_cell.get_or_init(|| Mutex::new(UnauthorizedIpcLogThrottle::default()));
-    let should_log = match throttle.lock() {
-        Ok(mut throttle) => throttle.on_reject(std::time::Instant::now()),
-        Err(_) => Some(0),
-    };
-    if let Some(suppressed) = should_log {
-        emit(suppressed);
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[inline]
-fn log_rejected_service_connection(postfix: &str, peer_uid: Option<u32>, active_uid: Option<u32>) {
-    static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
-    throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
-        if suppressed > 0 {
-            log::warn!(
-                "Rejected unauthorized connection on protected service-scoped IPC channel: postfix={}, peer_uid={:?}, active_uid={:?} (suppressed {} similar events)",
-                postfix,
-                peer_uid,
-                active_uid,
-                suppressed
-            );
-        } else {
-            log::warn!(
-                "Rejected unauthorized connection on protected service-scoped IPC channel: postfix={}, peer_uid={:?}, active_uid={:?}",
-                postfix,
-                peer_uid,
-                active_uid
-            );
-        }
-    });
-}
-
-#[cfg(target_os = "linux")]
-#[inline]
-pub(crate) fn log_rejected_uinput_connection(
-    postfix: &str,
-    peer_uid: Option<u32>,
-    active_uid: Option<u32>,
-) {
-    static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
-    throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
-        if suppressed > 0 {
-            log::warn!(
-                "Rejected unauthorized connection on uinput ipc channel: postfix={}, peer_uid={:?}, active_uid={:?} (suppressed {} similar events)",
-                postfix,
-                peer_uid,
-                active_uid,
-                suppressed
-            );
-        } else {
-            log::warn!(
-                "Rejected unauthorized connection on uinput ipc channel: postfix={}, peer_uid={:?}, active_uid={:?}",
-                postfix,
-                peer_uid,
-                active_uid
-            );
-        }
-    });
-}
-
-#[cfg(windows)]
-#[inline]
-pub(crate) fn log_rejected_windows_ipc_connection(
-    postfix: &str,
-    peer_pid: Option<u32>,
-    peer_session_id: Option<u32>,
-    expected_session_id: Option<u32>,
-    peer_is_system: Option<bool>,
-) {
-    static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
-    throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
-        if suppressed > 0 {
-            log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?} (suppressed {} similar events)",
-                postfix,
-                peer_pid,
-                peer_session_id,
-                expected_session_id,
-                peer_is_system,
-                suppressed
-            );
-        } else {
-            log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}",
-                postfix,
-                peer_pid,
-                peer_session_id,
-                expected_session_id,
-                peer_is_system
-            );
-        }
-    });
-}
-
-#[cfg(target_os = "linux")]
-#[inline]
-fn terminal_count_candidate_uids(effective_uid: u32) -> Vec<u32> {
-    if effective_uid != 0 {
-        return vec![effective_uid];
-    }
-    let mut candidates = Vec::with_capacity(2);
-    if let Some(uid) = active_uid_cached().filter(|uid| *uid != 0) {
-        candidates.push(uid);
-    }
-    candidates.push(0);
-    candidates
-}
-
-#[cfg(unix)]
-#[inline]
-fn expected_ipc_parent_mode(postfix: &str) -> u32 {
-    if config::is_service_ipc_postfix(postfix) {
-        0o0711
-    } else {
-        0o0700
-    }
-}
-
-#[cfg(unix)]
-fn open_ipc_parent_dir_fd(parent_c: &CString) -> std::io::Result<i32> {
-    let fd = unsafe {
-        hbb_common::libc::open(
-            parent_c.as_ptr(),
-            hbb_common::libc::O_RDONLY
-                | hbb_common::libc::O_DIRECTORY
-                | hbb_common::libc::O_CLOEXEC
-                | hbb_common::libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(fd)
-    }
-}
-
-#[cfg(unix)]
-fn ensure_secure_ipc_parent_dir(path: &str, postfix: &str) -> ResultType<()> {
-    let parent_dir = Path::new(path)
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("invalid ipc path: {path}")))?;
-    // Harden against common TOCTOU by opening the parent directory with O_NOFOLLOW (so the parent
-    // itself cannot be a symlink) and then operating on its FD (fstat/fchown/fchmod). This ensures
-    // we mutate the inode we opened, though it does not protect against symlinks in ancestor path
-    // components.
-    let parent_c = CString::new(parent_dir.as_os_str().as_bytes().to_vec())?;
-    let fd = match open_ipc_parent_dir_fd(&parent_c) {
-        Ok(fd) => fd,
-        Err(open_err) => {
-            // If the directory doesn't exist yet, create it with the expected mode. The parent
-            // dir is intended to be a single-level /tmp path, so mkdir is sufficient here.
-            if open_err.raw_os_error() == Some(hbb_common::libc::ENOENT) {
-                let expected_mode = expected_ipc_parent_mode(postfix);
-                let rc = unsafe {
-                    hbb_common::libc::mkdir(
-                        parent_c.as_ptr(),
-                        expected_mode as hbb_common::libc::mode_t,
-                    )
-                };
-                if rc != 0 {
-                    let mkdir_err = std::io::Error::last_os_error();
-                    // Handle a race where another process created the directory first.
-                    if mkdir_err.raw_os_error() != Some(hbb_common::libc::EEXIST) {
-                        return Err(Error::new(
-                            mkdir_err.kind(),
-                            format!(
-                                "failed to mkdir ipc parent dir: postfix={}, parent={}, err={}",
-                                postfix,
-                                parent_dir.display(),
-                                mkdir_err
-                            ),
-                        )
-                        .into());
-                    }
-                }
-                match open_ipc_parent_dir_fd(&parent_c) {
-                    Ok(fd) => fd,
-                    Err(err) => {
-                        return Err(Error::new(
-                            err.kind(),
-                            format!(
-                                "failed to open ipc parent dir (no-follow): postfix={}, parent={}, err={}",
-                                postfix,
-                                parent_dir.display(),
-                                err
-                            ),
-                        )
-                        .into());
-                    }
-                }
-            } else {
-                return Err(Error::new(
-                    open_err.kind(),
-                    format!(
-                        "failed to open ipc parent dir (no-follow): postfix={}, parent={}, err={}",
-                        postfix,
-                        parent_dir.display(),
-                        open_err
-                    ),
-                )
-                .into());
-            }
-        }
-    };
-    struct FdGuard(i32);
-    impl Drop for FdGuard {
-        fn drop(&mut self) {
-            unsafe {
-                hbb_common::libc::close(self.0);
-            }
-        }
-    }
-    let _fd_guard = FdGuard(fd);
-
-    let mut st: hbb_common::libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { hbb_common::libc::fstat(fd, &mut st as *mut _) } != 0 {
-        let os_err = std::io::Error::last_os_error();
-        return Err(Error::new(
-            os_err.kind(),
-            format!(
-                "failed to stat ipc parent dir: postfix={}, parent={}, err={}",
-                postfix,
-                parent_dir.display(),
-                os_err
-            ),
-        )
-        .into());
-    }
-    let mode = st.st_mode as u32;
-    let is_dir = (mode & (hbb_common::libc::S_IFMT as u32)) == (hbb_common::libc::S_IFDIR as u32);
-    if !is_dir {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "ipc parent is not directory: postfix={}, parent={}",
-                postfix,
-                parent_dir.display()
-            ),
-        )
-        .into());
-    }
-
-    let expected_uid = unsafe { hbb_common::libc::geteuid() as u32 };
-    let mut owner_uid = st.st_uid as u32;
-    if owner_uid != expected_uid && expected_uid == 0 && config::is_service_ipc_postfix(postfix) {
-        let rc = unsafe {
-            hbb_common::libc::fchown(
-                fd,
-                expected_uid as hbb_common::libc::uid_t,
-                hbb_common::libc::gid_t::MAX,
-            )
-        };
-        if rc == 0 {
-            let mut st2: hbb_common::libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { hbb_common::libc::fstat(fd, &mut st2 as *mut _) } == 0 {
-                owner_uid = st2.st_uid as u32;
-                st = st2;
-            }
-        } else {
-            // Keep behavior unchanged; capture errno to ease diagnosing why chown failed.
-            let err = std::io::Error::last_os_error();
-            log::warn!(
-                "Failed to chown ipc parent dir, parent={}, postfix={}, expected_uid={}, rc={}, err={:?}",
-                parent_dir.display(),
-                postfix,
-                expected_uid,
-                rc,
-                err
-            );
-        }
-    }
-    if owner_uid != expected_uid {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "unsafe ipc parent owner, postfix={}, expected uid {expected_uid}, got {owner_uid}: {}",
-                postfix,
-                parent_dir.display()
-            ),
-        )
-        .into());
-    }
-
-    let expected_mode = expected_ipc_parent_mode(postfix);
-    // Include special bits (setuid/setgid/sticky) to ensure the directory is hardened to the exact
-    // expected mode.
-    let current_mode = (st.st_mode as u32) & 0o7777;
-    if current_mode != expected_mode {
-        if unsafe { hbb_common::libc::fchmod(fd, expected_mode as hbb_common::libc::mode_t) } != 0 {
-            let os_err = std::io::Error::last_os_error();
-            return Err(Error::new(
-                os_err.kind(),
-                format!(
-                    "failed to chmod ipc parent dir: postfix={}, parent={}, err={}",
-                    postfix,
-                    parent_dir.display(),
-                    os_err
-                ),
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
 
 #[inline]
 pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
@@ -888,30 +433,13 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                     let postfix = postfix.to_owned();
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if config::is_service_ipc_postfix(&postfix) {
-                        let (authorized, peer_uid, active_uid) =
-                            stream.service_authorization_status();
-                        if !authorized {
-                            log_rejected_service_connection(&postfix, peer_uid, active_uid);
+                        if !authorize_service_scoped_ipc_connection(&stream, &postfix) {
                             continue;
                         }
                     }
                     #[cfg(windows)]
                     if postfix.is_empty() {
-                        let (
-                            authorized,
-                            peer_pid,
-                            peer_session_id,
-                            server_session_id,
-                            peer_is_system,
-                        ) = stream.server_authorization_status();
-                        if !authorized {
-                            log_rejected_windows_ipc_connection(
-                                &postfix,
-                                peer_pid,
-                                peer_session_id,
-                                server_session_id,
-                                peer_is_system,
-                            );
+                        if !authorize_windows_main_ipc_connection(&stream, &postfix) {
                             continue;
                         }
                     }
@@ -925,8 +453,15 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                 Ok(Some(data)) => {
                                     // On Linux/macOS, the protected `_service` channel is used only for
                                     // syncing config between root service and the active user process.
-                                    // Enforce a strict message allowlist here to keep the exposed surface
-                                    // minimal, even though we already authorize the peer at accept-time.
+                                    //
+                                    // NOTE: `is_service_ipc_postfix()` also includes `_uinput_*`, but those
+                                    // channels are handled by the dedicated uinput listener/protocol in
+                                    // `src/server/uinput.rs` and therefore do not share this Data enum
+                                    // allowlist. The SyncConfig allowlist here is intentionally scoped to the
+                                    // `_service` channel only.
+                                    //
+                                    // Keep this explicit branch to avoid policy drift between `_service` and
+                                    // uinput IPC paths while still minimizing exposed message surface here.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     if postfix == crate::POSTFIX_SERVICE {
                                         if matches!(&data, Data::SyncConfig(_)) {
@@ -946,7 +481,20 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                     }
                                     handle(data, &mut stream).await;
                                 }
-                                _ => {}
+                                Ok(None) => {
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    {
+                                        if postfix == crate::POSTFIX_SERVICE {
+                                            log::warn!(
+                                                "======================= Rejected malformed data on protected _service IPC channel: postfix={}, peer_uid={:?}, peer_pid={:?}",
+                                                postfix,
+                                                stream.peer_uid(),
+                                                stream.peer_pid()
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
@@ -961,12 +509,33 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
-    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
-    ensure_secure_ipc_parent_dir(&path, postfix)?;
-    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
-    check_pid(postfix).await;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let should_scrub_parent_entries = ensure_secure_ipc_parent_dir(&path, postfix)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let existing_listener_alive = check_pid(postfix).await;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if should_scrub_parent_entries_after_check_pid(
+        should_scrub_parent_entries,
+        existing_listener_alive,
+    ) {
+        scrub_secure_ipc_parent_dir(&path, postfix)?;
+    }
     let mut endpoint = Endpoint::new(path.clone());
-    match SecurityAttributes::allow_everyone_create() {
+    let security_attrs = {
+        #[cfg(windows)]
+        {
+            if should_allow_everyone_create_on_windows(postfix) {
+                SecurityAttributes::allow_everyone_create()
+            } else {
+                Ok(SecurityAttributes::empty())
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            SecurityAttributes::allow_everyone_create()
+        }
+    };
+    match security_attrs {
         Ok(attr) => endpoint.set_security_attributes(attr),
         Err(err) => log::error!("Failed to set ipc{} security: {}", postfix, err),
     };
@@ -977,25 +546,15 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
             } else {
                 log::info!("Started ipc{} server at path: {}", postfix, &path);
             }
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 // NOTE: On Linux/macOS, some IPC sockets are intentionally world-connectable
                 // (0666) so the active (non-root) user process can connect. Authorization is
                 // enforced at accept-time for these channels, and the protected `_service`
                 // channel is further restricted by an explicit message allowlist (SyncConfig
-                // only). On other Unix targets, permissions are kept at 0600 unless equivalent
-                // authorization is implemented.
+                // only).
                 let socket_mode = if config::is_service_ipc_postfix(postfix) {
-                    // Align permission behavior with the platforms that enforce accept-time peer
-                    // authorization for the protected service channel.
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    {
-                        0o0666
-                    }
-                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                    {
-                        0o0600
-                    }
+                    0o0666
                 } else {
                     0o0600
                 };
@@ -1600,53 +1159,6 @@ pub async fn start_pa() {
     }
 }
 
-#[inline]
-#[cfg(unix)]
-fn get_pid_file(postfix: &str) -> String {
-    let path = Config::ipc_path(postfix);
-    format!("{}.pid", path)
-}
-
-#[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
-async fn check_pid(postfix: &str) {
-    let pid_file = get_pid_file(postfix);
-    if let Ok(mut file) = File::open(&pid_file) {
-        let mut content = String::new();
-        file.read_to_string(&mut content).ok();
-        let pid = content.parse::<usize>().unwrap_or(0);
-        if pid > 0 {
-            use hbb_common::sysinfo::System;
-            let mut sys = System::new();
-            sys.refresh_processes();
-            if let Some(p) = sys.process(pid.into()) {
-                if let Some(current) = sys.process((std::process::id() as usize).into()) {
-                    if current.name() == p.name() {
-                        // double check with connect
-                        if connect(1000, postfix).await.is_ok() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // if not remove old ipc file, the new ipc creation will fail
-    // if we remove a ipc file, but the old ipc process is still running,
-    // new connection to the ipc will connect to new ipc, old connection to old ipc still keep alive
-    std::fs::remove_file(&Config::ipc_path(postfix)).ok();
-}
-
-#[inline]
-#[cfg(unix)]
-fn write_pid(postfix: &str) {
-    let path = get_pid_file(postfix);
-    if let Ok(mut file) = File::create(&path) {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0600)).ok();
-        file.write_all(&std::process::id().to_string().into_bytes())
-            .ok();
-    }
-}
-
 pub struct ConnectionTmpl<T> {
     inner: Framed<T, BytesCodec>,
 }
@@ -1811,114 +1323,6 @@ pub fn is_permanent_password_preset() -> bool {
         return v == "Y";
     }
     false
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl<T> ConnectionTmpl<T>
-where
-    T: AsyncRead + AsyncWrite + std::marker::Unpin + std::os::unix::io::AsRawFd,
-{
-    fn peer_uid(&self) -> Option<u32> {
-        peer_uid_from_fd(self.inner.get_ref().as_raw_fd())
-    }
-
-    fn service_authorization_status(&self) -> (bool, Option<u32>, Option<u32>) {
-        let peer_uid = self.peer_uid();
-        let active_uid = active_uid_cached();
-        let authorized = peer_uid.is_some_and(|uid| is_allowed_service_peer_uid(uid, active_uid));
-        (authorized, peer_uid, active_uid)
-    }
-}
-
-#[cfg(windows)]
-impl ConnectionTmpl<Conn> {
-    fn peer_pid(&self) -> Option<u32> {
-        let pipe_handle = self.inner.get_ref().as_raw_handle();
-        if pipe_handle.is_null() {
-            return None;
-        }
-        let mut pid = 0u32;
-        let ok = unsafe { GetNamedPipeClientProcessId(HANDLE(pipe_handle), &mut pid as *mut u32) }
-            .is_ok();
-        if ok && pid != 0 {
-            Some(pid)
-        } else {
-            None
-        }
-    }
-
-    fn server_authorization_status(
-        &self,
-    ) -> (bool, Option<u32>, Option<u32>, Option<u32>, Option<bool>) {
-        let peer_pid = self.peer_pid();
-        let server_session_id = crate::platform::windows::get_current_process_session_id();
-        let peer_session_id =
-            peer_pid.and_then(crate::platform::windows::get_session_id_of_process);
-        let peer_is_system_result =
-            peer_pid.map(crate::platform::windows::is_process_running_as_system);
-        let peer_is_system = peer_is_system_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok().copied());
-        if server_session_id.is_none() && !peer_is_system.unwrap_or(false) {
-            // When the server session id cannot be determined, the session-id allow-path is
-            // disabled and only SYSTEM peers can be authorized.
-            log::debug!(
-                "IPC authorization: server session id unavailable; rejecting non-SYSTEM peer, peer_pid={:?}, peer_session_id={:?}",
-                peer_pid,
-                peer_session_id
-            );
-        }
-        let authorized = is_allowed_windows_server_peer(
-            peer_is_system.unwrap_or(false),
-            peer_session_id,
-            server_session_id,
-        );
-        if !authorized {
-            if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_system_result.as_ref()) {
-                log::debug!(
-                    "Failed to determine whether peer process is SYSTEM, pid={}, err={}",
-                    pid,
-                    err
-                );
-            }
-        }
-        (
-            authorized,
-            peer_pid,
-            peer_session_id,
-            server_session_id,
-            peer_is_system,
-        )
-    }
-
-    pub(crate) fn service_authorization_status_for_session(
-        &self,
-        expected_active_session_id: Option<u32>,
-    ) -> (bool, Option<u32>, Option<u32>, Option<bool>) {
-        let peer_pid = self.peer_pid();
-        let peer_session_id =
-            peer_pid.and_then(crate::platform::windows::get_session_id_of_process);
-        let peer_is_system_result =
-            peer_pid.map(crate::platform::windows::is_process_running_as_system);
-        let peer_is_system = peer_is_system_result
-            .as_ref()
-            .and_then(|r| r.as_ref().ok().copied());
-        let authorized = is_allowed_windows_service_peer(
-            peer_is_system.unwrap_or(false),
-            peer_session_id,
-            expected_active_session_id,
-        );
-        if !authorized {
-            if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_system_result.as_ref()) {
-                log::debug!(
-                    "Failed to determine whether peer process is SYSTEM, pid={}, err={}",
-                    pid,
-                    err
-                );
-            }
-        }
-        (authorized, peer_pid, peer_session_id, peer_is_system)
-    }
 }
 
 pub fn get_fingerprint() -> String {
@@ -2452,103 +1856,6 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
-    }
-
-    #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn test_service_peer_uid_policy() {
-        assert!(is_allowed_service_peer_uid(0, None));
-        assert!(is_allowed_service_peer_uid(501, Some(501)));
-        assert!(!is_allowed_service_peer_uid(502, Some(501)));
-        assert!(!is_allowed_service_peer_uid(501, None));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_windows_server_peer_policy() {
-        assert!(is_allowed_windows_server_peer(true, None, None));
-        assert!(is_allowed_windows_server_peer(false, Some(1), Some(1)));
-        assert!(!is_allowed_windows_server_peer(false, Some(1), Some(2)));
-        assert!(!is_allowed_windows_server_peer(false, None, Some(1)));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_windows_service_peer_policy() {
-        assert!(is_allowed_windows_service_peer(true, None, None));
-        assert!(is_allowed_windows_service_peer(false, Some(1), Some(1)));
-        assert!(!is_allowed_windows_service_peer(false, Some(1), Some(2)));
-        assert!(!is_allowed_windows_service_peer(false, None, Some(1)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_ensure_secure_ipc_parent_dir_rejects_symlink_parent() {
-        use std::os::unix::fs::symlink;
-
-        let unique = format!(
-            "rustdesk-ipc-secure-dir-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let base = std::env::temp_dir().join(unique);
-        let real_dir = base.join("real");
-        let link_dir = base.join("link");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        symlink(&real_dir, &link_dir).unwrap();
-        let ipc_path = link_dir.join("ipc_service");
-        let res = ensure_secure_ipc_parent_dir(ipc_path.to_string_lossy().as_ref(), "_service");
-        assert!(res.is_err());
-        std::fs::remove_file(&link_dir).ok();
-        std::fs::remove_dir_all(&real_dir).ok();
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_ensure_secure_ipc_parent_dir_creates_parent_with_expected_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let unique = format!(
-            "rustdesk-ipc-secure-dir-create-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let base = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&base).unwrap();
-
-        // Intentionally choose a parent that does not exist to exercise the ENOENT -> mkdir branch.
-        let parent_dir = base.join("parent");
-        assert!(!parent_dir.exists());
-        let ipc_path = parent_dir.join("ipc");
-
-        let res = ensure_secure_ipc_parent_dir(ipc_path.to_string_lossy().as_ref(), "");
-        assert!(res.is_ok());
-
-        let md = std::fs::metadata(&parent_dir).unwrap();
-        assert!(md.is_dir());
-        let mode = md.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o0700);
-
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_console_owner_uid_matches_get_active_userid() {
-        let console_uid = console_owner_uid().expect("/dev/console must have a resolvable uid");
-        let raw_uid = crate::platform::macos::get_active_userid();
-        let parsed_uid: u32 = raw_uid
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("failed to parse get_active_userid() output: '{raw_uid}'"));
-        assert_eq!(parsed_uid, console_uid);
     }
 
     #[cfg(target_os = "linux")]
