@@ -219,16 +219,42 @@ fn do_update_clipboard_(mut to_update_data: Vec<ClipboardData>, side: ClipboardS
         }
     }
     if let Some(ctx) = ctx.as_mut() {
-        to_update_data.push(ClipboardData::Special((
-            RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
-            side.get_owner_data(),
-        )));
+        to_update_data = append_owner_marker(to_update_data, side);
         if let Err(e) = ctx.set(&to_update_data) {
             log::debug!("Failed to set clipboard: {}", e);
         } else {
             log::debug!("{} updated on {}", CLIPBOARD_NAME, side);
         }
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn append_owner_marker(mut data: Vec<ClipboardData>, side: ClipboardSide) -> Vec<ClipboardData> {
+    data.push(ClipboardData::Special((
+        RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
+        side.get_owner_data(),
+    )));
+    data
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_text_clipboard_with_owner_sync(text: &str, side: ClipboardSide) -> ResultType<()> {
+    use arboard::{Clipboard, ClipboardData, LinuxClipboardKind, SetExtLinux};
+
+    let mut clipboard = Clipboard::new()?;
+    let data = append_owner_marker(vec![ClipboardData::Text(text.to_owned())], side);
+    clipboard
+        .set()
+        .clipboard(LinuxClipboardKind::Clipboard)
+        .formats(&data)?;
+    if let Err(e) = clipboard
+        .set()
+        .clipboard(LinuxClipboardKind::Primary)
+        .formats(&data)
+    {
+        log::warn!("Failed to set PRIMARY clipboard with owner marker: {}", e);
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "android"))]

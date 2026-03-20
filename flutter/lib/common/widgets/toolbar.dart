@@ -15,6 +15,37 @@ import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 
 bool isEditOsPassword = false;
+const String _kPeerOptionAllowWaylandKeyboard = 'allow-wayland-keyboard';
+const String _kWaylandKeyboardIssueUrl =
+    'https://github.com/rustdesk/rustdesk/issues/14586';
+final Set<String> _waylandKeyboardPromptSuppressedPeerIds = <String>{};
+
+bool isWaylandKeyboardPromptSuppressedForConnection(String peerId) {
+  return _waylandKeyboardPromptSuppressedPeerIds.contains(peerId);
+}
+
+void setWaylandKeyboardPromptSuppressedForConnection(
+    String peerId, bool suppressed) {
+  if (suppressed) {
+    _waylandKeyboardPromptSuppressedPeerIds.add(peerId);
+  } else {
+    _waylandKeyboardPromptSuppressedPeerIds.remove(peerId);
+  }
+}
+
+void clearWaylandKeyboardPromptSuppressedForConnection(String peerId) {
+  _waylandKeyboardPromptSuppressedPeerIds.remove(peerId);
+}
+
+bool shouldShowWaylandKeyboardPrompt({
+  required String peerId,
+  required bool isWaylandPeer,
+  required bool allowWaylandKeyboardRemembered,
+}) {
+  return isWaylandPeer &&
+      !allowWaylandKeyboardRemembered &&
+      !isWaylandKeyboardPromptSuppressedForConnection(peerId);
+}
 
 class TTextMenu {
   final Widget child;
@@ -87,12 +118,84 @@ handleOsPasswordAction(
   }
 }
 
+void _showWaylandKeyboardInputWarningDialog(
+    {required String id,
+    required FFI ffi,
+    required Future<void> Function() onEnable}) {
+  bool remember = false;
+  bool dontAskAgainForConnection = false;
+  ffi.dialogManager.show((setState, close, context) {
+    Future<void> enableAndContinue() async {
+      ffi.inputModel.keyboardInputAllowed = true;
+      if (remember) {
+        await bind.mainSetPeerOption(
+            id: id,
+            key: _kPeerOptionAllowWaylandKeyboard,
+            value: bool2option(_kPeerOptionAllowWaylandKeyboard, true));
+      }
+      if (dontAskAgainForConnection) {
+        setWaylandKeyboardPromptSuppressedForConnection(id, true);
+      }
+      close();
+      await onEnable();
+    }
+
+    void cancel() {
+      close();
+    }
+
+    return CustomAlertDialog(
+      title: null,
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          msgboxContent(
+            'warning',
+            'wayland-keyboard-input-disabled-tip',
+            'wayland-keyboard-input-consent-tip',
+          ),
+          const SizedBox(height: 6),
+          createDialogContent(_kWaylandKeyboardIssueUrl).marginOnly(bottom: 6),
+          CheckboxListTile(
+            value: dontAskAgainForConnection,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: Text(translate('dont-ask-again-for-this-connection-tip')),
+            onChanged: (v) {
+              setState(() => dontAskAgainForConnection = v == true);
+            },
+          ),
+          CheckboxListTile(
+            value: remember,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: Text(translate('remember-wayland-keyboard-choice-tip')),
+            onChanged: (v) {
+              setState(() => remember = v == true);
+            },
+          ),
+        ],
+      ),
+      actions: [
+        dialogButton('Cancel', onPressed: cancel, isOutline: true),
+        dialogButton('Enable', onPressed: () => unawaited(enableAndContinue())),
+      ],
+      onCancel: cancel,
+      onSubmit: () => unawaited(enableAndContinue()),
+    );
+  }, clickMaskDismiss: false, backDismiss: false);
+}
+
 List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   final ffiModel = ffi.ffiModel;
   final pi = ffiModel.pi;
   final perms = ffiModel.permissions;
   final sessionId = ffi.sessionId;
   final isDefaultConn = ffi.connType == ConnType.defaultConn;
+  final isWaylandPeer = pi.platform == kPeerPlatformLinux && pi.isWayland;
 
   List<TTextMenu> v = [];
   // elevation
@@ -142,11 +245,30 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     v.add(TTextMenu(
         child: Text(translate('Send clipboard keystrokes')),
         onPressed: () async {
-          ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
-          if (data != null && data.text != null) {
-            bind.sessionInputString(
-                sessionId: sessionId, value: data.text ?? "");
+          Future<void> sendClipboardKeystrokes() async {
+            ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
+            if (data != null && data.text != null) {
+              bind.sessionInputString(
+                  sessionId: sessionId, value: data.text ?? "");
+            }
           }
+
+          final allowWaylandKeyboard =
+              mainGetPeerBoolOptionSync(id, _kPeerOptionAllowWaylandKeyboard);
+          if (shouldShowWaylandKeyboardPrompt(
+            peerId: id,
+            isWaylandPeer: isWaylandPeer,
+            allowWaylandKeyboardRemembered: allowWaylandKeyboard,
+          )) {
+            ffi.inputModel.keyboardInputAllowed = false;
+            _showWaylandKeyboardInputWarningDialog(
+              id: id,
+              ffi: ffi,
+              onEnable: sendClipboardKeystrokes,
+            );
+            return;
+          }
+          await sendClipboardKeystrokes();
         }));
   }
   // reset canvas
@@ -154,6 +276,22 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     v.add(TTextMenu(
         child: Text(translate('Reset canvas')),
         onPressed: () => ffi.cursorModel.reset()));
+  }
+  if (isDefaultConn && isWaylandPeer) {
+    v.add(TTextMenu(
+        child: Text(translate('wayland-keyboard-input-reset-remembered-tip')),
+        onPressed: () async {
+          await bind.mainSetPeerOption(
+              id: id,
+              key: _kPeerOptionAllowWaylandKeyboard,
+              value: bool2option(_kPeerOptionAllowWaylandKeyboard, false));
+          clearWaylandKeyboardPromptSuppressedForConnection(id);
+          ffi.inputModel.keyboardInputAllowed = false;
+          if (isMobile) {
+            await ffi.invokeMethod("enable_soft_keyboard", false);
+          }
+          showToast(translate('Successful'));
+        }));
   }
 
   // https://github.com/rustdesk/rustdesk/pull/9731

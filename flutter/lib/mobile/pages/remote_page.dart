@@ -75,6 +75,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
 
+  Worker? _waylandKeyboardGateWorker;
+  bool _waylandKeyboardGateInitialized = false;
+
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
 
@@ -121,6 +124,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           isKeyboardVisible: keyboardVisibilityController.isVisible);
     });
     WidgetsBinding.instance.addObserver(this);
+
+    // Wayland sessions may use clipboard-based text input on the controlled side.
+    // Require explicit user confirmation before allowing any keyboard input.
+    _waylandKeyboardGateWorker = ever(gFFI.ffiModel.pi.isSet, (bool isSet) {
+      if (isSet) {
+        _initWaylandKeyboardGateIfNeeded();
+      }
+    });
   }
 
   @override
@@ -138,6 +149,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     await gFFI.close();
     _timer?.cancel();
     _iosKeyboardWorkaroundTimer?.cancel();
+    _waylandKeyboardGateWorker?.dispose();
+    clearWaylandKeyboardPromptSuppressedForConnection(widget.id);
     gFFI.dialogManager.dismissAll();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
@@ -161,6 +174,116 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   // When swithing from other app to this app, try to sync clipboard.
   void trySyncClipboard() {
     gFFI.invokeMethod("try_sync_clipboard");
+  }
+
+  static const String _kPeerOptionAllowWaylandKeyboard =
+      'allow-wayland-keyboard';
+  static const String _kWaylandKeyboardIssueUrl =
+      'https://github.com/rustdesk/rustdesk/issues/14586';
+
+  bool _shouldGateKeyboardForWayland() {
+    if (!(isAndroid || isIOS)) return false;
+    final pi = gFFI.ffiModel.pi;
+    return pi.platform == kPeerPlatformLinux && pi.isWayland;
+  }
+
+  void _initWaylandKeyboardGateIfNeeded() {
+    if (!mounted) return;
+    if (_waylandKeyboardGateInitialized) return;
+    if (!_shouldGateKeyboardForWayland()) return;
+
+    _waylandKeyboardGateInitialized = true;
+
+    final allowWaylandKeyboard =
+        mainGetPeerBoolOptionSync(widget.id, _kPeerOptionAllowWaylandKeyboard);
+    if (!shouldShowWaylandKeyboardPrompt(
+      peerId: widget.id,
+      isWaylandPeer: _shouldGateKeyboardForWayland(),
+      allowWaylandKeyboardRemembered: allowWaylandKeyboard,
+    )) {
+      inputModel.keyboardInputAllowed = true;
+      return;
+    }
+
+    inputModel.keyboardInputAllowed = false;
+
+    // Ensure soft keyboard is not active before user confirms.
+    _showEdit = false;
+    gFFI.invokeMethod("enable_soft_keyboard", false);
+    _mobileFocusNode.unfocus();
+    _physicalFocusNode.requestFocus();
+    setState(() {});
+  }
+
+  void _showWaylandKeyboardGateDialog() {
+    if (!mounted) return;
+    bool remember = false;
+    bool dontAskAgainForConnection = false;
+    gFFI.dialogManager.show((setState, close, context) {
+      void cancel() {
+        close();
+      }
+
+      Future<void> enableKeyboard() async {
+        inputModel.keyboardInputAllowed = true;
+        if (remember) {
+          await bind.mainSetPeerOption(
+            id: widget.id,
+            key: _kPeerOptionAllowWaylandKeyboard,
+            value: bool2option(_kPeerOptionAllowWaylandKeyboard, true),
+          );
+        }
+        if (dontAskAgainForConnection) {
+          setWaylandKeyboardPromptSuppressedForConnection(widget.id, true);
+        }
+        close();
+        openKeyboard();
+      }
+
+      return CustomAlertDialog(
+        title: null,
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            msgboxContent(
+              'warning',
+              'wayland-keyboard-input-disabled-tip',
+              'wayland-keyboard-input-consent-tip',
+            ),
+            const SizedBox(height: 6),
+            createDialogContent(_kWaylandKeyboardIssueUrl)
+                .marginOnly(bottom: 6),
+            CheckboxListTile(
+              value: dontAskAgainForConnection,
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              title: Text(translate('dont-ask-again-for-this-connection-tip')),
+              onChanged: (v) {
+                setState(() => dontAskAgainForConnection = v == true);
+              },
+            ),
+            CheckboxListTile(
+              value: remember,
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              title: Text(translate('remember-wayland-keyboard-choice-tip')),
+              onChanged: (v) {
+                setState(() => remember = v == true);
+              },
+            ),
+          ],
+        ),
+        actions: [
+          dialogButton('Cancel', onPressed: cancel, isOutline: true),
+          dialogButton('Enable', onPressed: () => unawaited(enableKeyboard())),
+        ],
+        onCancel: cancel,
+        onSubmit: () => unawaited(enableKeyboard()),
+      );
+    }, clickMaskDismiss: false, backDismiss: false);
   }
 
   // to-do: It should be better to use transparent color instead of the bgColor.
@@ -306,6 +429,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   // handle mobile virtual keyboard
   void handleSoftKeyboardInput(String newValue) {
+    if (!inputModel.keyboardInputAllowed) {
+      return;
+    }
     if (isIOS) {
       _handleIOSSoftKeyboardInput(newValue);
     } else {
@@ -314,6 +440,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void inputChar(String char) {
+    if (!inputModel.keyboardInputAllowed) {
+      return;
+    }
     if (char == '\n') {
       char = 'VK_RETURN';
     } else if (char == ' ') {
@@ -323,6 +452,18 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void openKeyboard() {
+    final allowWaylandKeyboard =
+        mainGetPeerBoolOptionSync(widget.id, _kPeerOptionAllowWaylandKeyboard);
+    if (shouldShowWaylandKeyboardPrompt(
+      peerId: widget.id,
+      isWaylandPeer: _shouldGateKeyboardForWayland(),
+      allowWaylandKeyboardRemembered: allowWaylandKeyboard,
+    )) {
+      inputModel.keyboardInputAllowed = false;
+      _showWaylandKeyboardGateDialog();
+      return;
+    }
+    inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
     _value = initText;

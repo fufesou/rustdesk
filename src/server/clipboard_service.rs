@@ -109,6 +109,37 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn decode_text_clipboard(clipboard: &Clipboard) -> Option<String> {
+    if clipboard.format.enum_value() != Ok(ClipboardFormat::Text) {
+        return None;
+    }
+    let bytes = if clipboard.compress {
+        hbb_common::compress::decompress(&clipboard.content)
+    } else {
+        clipboard.content.to_vec()
+    };
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn should_skip_wayland_clipboard_sync(msg: &Message) -> bool {
+    let is_recent_wayland_input = |clipboard: &Clipboard| -> bool {
+        let Some(text) = decode_text_clipboard(clipboard) else {
+            return false;
+        };
+        super::input_service::is_recent_wayland_clipboard_input(&text)
+    };
+
+    match &msg.union {
+        Some(message::Union::Clipboard(clipboard)) => is_recent_wayland_input(clipboard),
+        Some(message::Union::MultiClipboards(multi_clipboards)) => {
+            multi_clipboards.clipboards.iter().any(is_recent_wayland_input)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 impl Handler {
     #[cfg(feature = "unix-file-copy-paste")]
@@ -172,7 +203,13 @@ impl Handler {
             }
         }
 
-        check_clipboard(&mut self.ctx, ClipboardSide::Host, false)
+        let msg = check_clipboard(&mut self.ctx, ClipboardSide::Host, false)?;
+        #[cfg(target_os = "linux")]
+        if should_skip_wayland_clipboard_sync(&msg) {
+            log::debug!("Skip clipboard sync for recent Wayland keyboard injection");
+            return None;
+        }
+        Some(msg)
     }
 
     // Read clipboard data from cm using ipc.

@@ -272,5 +272,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("rel-mouse-permission-lost-tip", "Keyboard permission was revoked. Relative Mouse Mode has been disabled."),
         ("keep-awake-during-outgoing-sessions-label", "Keep screen awake during outgoing sessions"),
         ("keep-awake-during-incoming-sessions-label", "Keep screen awake during incoming sessions"),
+        ("wayland-keyboard-input-disabled-tip", "Keyboard input disabled"),
+        ("wayland-keyboard-input-consent-tip", "This remote session uses Wayland. For on-screen keyboard input, RustDesk may write text to the remote clipboard and paste it. This may expose what you type to clipboard history or other apps. If you continue, keyboard input will be enabled. See issue:"),
+        ("wayland-keyboard-input-reset-remembered-tip", "Reset remembered Wayland keyboard choice"),
+        ("dont-ask-again-for-this-connection-tip", "Don't ask again for this connection"),
+        ("remember-wayland-keyboard-choice-tip", "Remember this choice on this device"),
     ].iter().cloned().collect();
 }
