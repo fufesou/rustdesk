@@ -920,18 +920,55 @@ pub mod service {
     }
 
     #[cfg(target_os = "linux")]
+    #[inline]
+    fn should_enforce_executable_match_for_service_scoped_postfix(postfix: &str) -> bool {
+        hbb_common::config::is_service_ipc_postfix(postfix)
+    }
+
+    #[cfg(target_os = "linux")]
     fn authorize_uinput_peer(postfix: &str, stream: &RawIpcConnection) -> bool {
         if !hbb_common::config::is_service_ipc_postfix(postfix) {
             return true;
         }
         let peer_uid = ipc::peer_uid_from_fd(stream.as_raw_fd());
-        let active_uid = ipc::active_uid_cached();
+        let active_uid = ipc::active_uid();
         let authorized =
             peer_uid.is_some_and(|uid| ipc::is_allowed_service_peer_uid(uid, active_uid));
         if !authorized {
             crate::ipc::log_rejected_uinput_connection(postfix, peer_uid, active_uid);
+            return false;
         }
-        authorized
+        if should_enforce_executable_match_for_service_scoped_postfix(postfix) {
+            if let Err(err) =
+                ipc::ensure_peer_executable_matches_current_by_fd(stream.as_raw_fd(), postfix)
+            {
+                log::warn!(
+                    "Rejected unauthorized connection on protected uinput ipc channel due to executable mismatch: postfix={}, err={}",
+                    postfix,
+                    err
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::should_enforce_executable_match_for_service_scoped_postfix;
+
+        #[test]
+        fn test_should_enforce_executable_match_for_service_scoped_postfix() {
+            assert!(should_enforce_executable_match_for_service_scoped_postfix(
+                "_uinput_keyboard"
+            ));
+            assert!(should_enforce_executable_match_for_service_scoped_postfix(
+                "_service"
+            ));
+            assert!(!should_enforce_executable_match_for_service_scoped_postfix(
+                ""
+            ));
+        }
     }
 
     /// Start uinput service.

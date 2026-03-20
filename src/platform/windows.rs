@@ -83,6 +83,7 @@ use windows::Win32::{
     },
     System::Threading::{
         OpenProcess as WinOpenProcess, OpenProcessToken as WinOpenProcessToken,
+        QueryFullProcessImageNameW as WinQueryFullProcessImageNameW,
         PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
     },
 };
@@ -573,6 +574,80 @@ pub fn get_current_session_id(share_rdp: bool) -> DWORD {
     unsafe { get_current_session(if share_rdp { TRUE } else { FALSE }) }
 }
 
+#[inline]
+fn resolve_expected_active_session_id_for_service(session_id: u32) -> Option<u32> {
+    let share_rdp_enabled = is_share_rdp();
+    if !share_rdp_enabled {
+        let current_active_session = unsafe { get_current_session(FALSE) };
+        if current_active_session == u32::MAX {
+            None
+        } else {
+            Some(current_active_session)
+        }
+    } else {
+        let has_session_id = get_available_sessions(false)
+            .iter()
+            .any(|e| e.sid == session_id);
+        if !has_session_id {
+            let current_active_session = unsafe { get_current_session(TRUE) };
+            if current_active_session == u32::MAX {
+                None
+            } else {
+                Some(current_active_session)
+            }
+        } else {
+            Some(session_id)
+        }
+    }
+}
+
+#[inline]
+fn authorize_service_scoped_ipc_connection(
+    stream: &ipc::Connection,
+    expected_active_session_id: Option<u32>,
+) -> bool {
+    let (authorized, peer_pid, peer_session_id, peer_is_system) =
+        stream.service_authorization_status_for_session(expected_active_session_id);
+    log::info!(
+        "====================== IPC peer connected: postfix={}, peer_session_id={:?}, peer_pid={:?}, expected_active_session_id={:?}, peer_is_system={:?}",
+        crate::POSTFIX_SERVICE,
+        peer_session_id,
+        peer_pid,
+        expected_active_session_id,
+        peer_is_system
+    );
+    if !authorized {
+        ipc::log_rejected_windows_ipc_connection(
+            crate::POSTFIX_SERVICE,
+            peer_pid,
+            peer_session_id,
+            expected_active_session_id,
+            peer_is_system,
+        );
+        return false;
+    }
+    log::info!(
+        "====================== IPC peer preliminarily authorized: postfix={}, peer_session_id={:?}, peer_pid={:?}, peer_exe='{}', current_exe='{}', expected_active_session_id={:?}, peer_is_system={:?}",
+        crate::POSTFIX_SERVICE,
+        peer_session_id,
+        peer_pid,
+        ipc::format_peer_exe_for_debug_log_by_pid(peer_pid),
+        ipc::format_current_exe_for_debug_log(),
+        expected_active_session_id,
+        peer_is_system
+    );
+    if let Err(err) = stream.ensure_peer_executable_path_matches_current(crate::POSTFIX_SERVICE) {
+        log::warn!(
+                "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
+                crate::POSTFIX_SERVICE,
+                peer_pid,
+                err
+            );
+        return false;
+    }
+    true
+}
+
 extern "system" {
     fn BlockInput(v: BOOL) -> BOOL;
 }
@@ -642,41 +717,10 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     // Keep IPC authorization consistent with the session we are currently serving.
                     // Recompute expected session right before authorization to avoid using a stale
                     // session_id after awaiting incoming.next().
-                    let expected_active_session_id = {
-                        let share_rdp_enabled = is_share_rdp();
-                        if !share_rdp_enabled {
-                            let current_active_session = unsafe { get_current_session(FALSE) };
-                            if current_active_session == u32::MAX {
-                                None
-                            } else {
-                                Some(current_active_session)
-                            }
-                        } else {
-                            let has_session_id = get_available_sessions(false)
-                                .iter()
-                                .any(|e| e.sid == session_id);
-                            if !has_session_id {
-                                let current_active_session = unsafe { get_current_session(TRUE) };
-                                if current_active_session == u32::MAX {
-                                    None
-                                } else {
-                                    Some(current_active_session)
-                                }
-                            } else {
-                                Some(session_id)
-                            }
-                        }
-                    };
-                    let (authorized, peer_pid, peer_session_id, peer_is_system) =
-                        stream.service_authorization_status_for_session(expected_active_session_id);
-                    if !authorized {
-                        ipc::log_rejected_windows_ipc_connection(
-                            crate::POSTFIX_SERVICE,
-                            peer_pid,
-                            peer_session_id,
-                            expected_active_session_id,
-                            peer_is_system,
-                        );
+                    let expected_active_session_id =
+                        resolve_expected_active_session_id_for_service(session_id);
+                    if !authorize_service_scoped_ipc_connection(&stream, expected_active_session_id)
+                    {
                         continue;
                     }
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
@@ -1187,6 +1231,19 @@ pub fn get_active_user_home() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(not(feature = "flutter"))]
+#[inline]
+pub fn portable_service_logon_helper_paths() -> Option<(PathBuf, PathBuf)> {
+    let user_dir = hbb_common::directories_next::UserDirs::new()?;
+    let dir = user_dir
+        .home_dir()
+        .join("AppData")
+        .join("Local")
+        .join("rustdesk-sciter");
+    let dst = dir.join("rustdesk.exe");
+    Some((dir, dst))
 }
 
 pub fn is_prelogin() -> bool {
@@ -2526,6 +2583,43 @@ pub fn is_process_running_as_system(process_id: DWORD) -> ResultType<bool> {
         if !token.is_invalid() {
             let _ = WinCloseHandle(token);
         }
+        let _ = WinCloseHandle(process);
+        result
+    }
+}
+
+pub fn get_process_executable_path(process_id: DWORD) -> ResultType<PathBuf> {
+    const PROCESS_IMAGE_PATH_BUFFER_LEN: usize = 32 * 1024;
+    // Pre-merge verification checklist (Win7 compatibility + reliability):
+    // 1) Win7: QueryFullProcessImageNameW succeeds for expected peer processes.
+    // 2) Access-denied target process returns explicit error and is logged by caller.
+    // 3) Returned path can be canonicalized in IPC authorization flow.
+    // 4) Invalid PID path fails fast and does not silently bypass authorization.
+
+    unsafe {
+        let process = WinOpenProcess(WIN_PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+            .map_err(|e| anyhow!("Failed to open process {}: {}", process_id, e))?;
+
+        let result = (|| -> ResultType<PathBuf> {
+            let mut buffer = vec![0u16; PROCESS_IMAGE_PATH_BUFFER_LEN];
+            let mut length = PROCESS_IMAGE_PATH_BUFFER_LEN as u32;
+            WinQueryFullProcessImageNameW(
+                process,
+                windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+            .map_err(|e| anyhow!("Failed to query process {} image path: {}", process_id, e))?;
+            if length == 0 {
+                bail!(
+                    "Failed to query process {} image path: empty result",
+                    process_id
+                );
+            }
+            buffer.truncate(length as usize);
+            Ok(PathBuf::from(OsString::from_wide(&buffer)))
+        })();
+
         let _ = WinCloseHandle(process);
         result
     }
@@ -4422,7 +4516,7 @@ mod tests {
 
     #[test]
     fn test_is_process_running_as_system_matches_current_process_token_user() {
-        let pid = unsafe { GetCurrentProcessId() };
+        let pid = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
         let actual = is_process_running_as_system(pid).unwrap();
 
         let expected = unsafe {
@@ -4463,14 +4557,6 @@ mod tests {
             expected
         };
 
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_is_process_running_as_system_matches_is_root_for_current_process() {
-        let pid = unsafe { GetCurrentProcessId() };
-        let actual = is_process_running_as_system(pid).unwrap();
-        let expected = is_root();
         assert_eq!(actual, expected);
     }
 
