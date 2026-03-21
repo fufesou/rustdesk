@@ -767,7 +767,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
     bool isChattyMethod(String methodName) {
       switch (methodName) {
-        case kWindowBumpMouse: return true;
+        case kWindowBumpMouse:
+          return true;
       }
 
       return false;
@@ -776,7 +777,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
       if (!isChattyMethod(call.method)) {
         debugPrint(
-          "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
+            "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
       }
       if (call.method == kWindowMainWindowOnTop) {
         windowOnTop(null);
@@ -811,9 +812,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           connToken: call.arguments['connToken'],
         );
       } else if (call.method == kWindowBumpMouse) {
-        return RdPlatformChannel.instance.bumpMouse(
-          dx: call.arguments['dx'],
-          dy: call.arguments['dy']);
+        return RdPlatformChannel.instance
+            .bumpMouse(dx: call.arguments['dx'], dy: call.arguments['dy']);
       } else if (call.method == kWindowEventMoveTabToNewWindow) {
         final args = call.arguments.split(',');
         int? windowId;
@@ -908,12 +908,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 }
 
 void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
-  final pw = await bind.mainGetPermanentPassword();
-  final p0 = TextEditingController(text: pw);
-  final p1 = TextEditingController(text: pw);
+  final p0 = TextEditingController(text: "");
+  final p1 = TextEditingController(text: "");
   var errMsg0 = "";
   var errMsg1 = "";
-  final RxString rxPass = pw.trim().obs;
+  var localPasswordSet =
+      (await bind.mainGetCommon(key: "local-permanent-password-set")) == "true";
+  var canSubmit = false;
+  final RxString rxPass = "".obs;
   final rules = [
     DigitValidationRule(),
     UppercaseValidationRule(),
@@ -924,7 +926,10 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
   final maxLength = bind.mainMaxEncryptLen();
 
   gFFI.dialogManager.show((setState, close, context) {
-    submit() {
+    submit() async {
+      if (!canSubmit) {
+        return;
+      }
       setState(() {
         errMsg0 = "";
         errMsg1 = "";
@@ -947,7 +952,13 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
         });
         return;
       }
-      bind.mainSetPermanentPassword(password: pass);
+      final ok = await bind.mainSetPermanentPasswordWithResult(password: pass);
+      if (!ok) {
+        setState(() {
+          errMsg0 = '${translate('Prompt')}: ${translate("Failed")}';
+        });
+        return;
+      }
       if (pass.isNotEmpty) {
         notEmptyCallback?.call();
       }
@@ -971,6 +982,33 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
                     obscureText: true,
                     decoration: InputDecoration(
                         labelText: translate('Password'),
+                        hintText: localPasswordSet
+                            ? translate('password-hidden-tip')
+                            : null,
+                        suffixIcon: (p0.text.isNotEmpty || localPasswordSet)
+                            ? Focus(
+                                skipTraversal: true,
+                                canRequestFocus: false,
+                                descendantsAreFocusable: false,
+                                child: IconButton(
+                                  icon: const Icon(Icons.clear),
+                                  tooltip: translate("Clear"),
+                                  onPressed: () {
+                                    final hadText = p0.text.isNotEmpty;
+                                    final hadPlaceholder = localPasswordSet;
+                                    p0.clear();
+                                    rxPass.value = "";
+                                    setState(() {
+                                      errMsg0 = '';
+                                      localPasswordSet = false;
+                                      if (hadText || hadPlaceholder) {
+                                        canSubmit = true;
+                                      }
+                                    });
+                                  },
+                                ),
+                              )
+                            : null,
                         errorText: errMsg0.isNotEmpty ? errMsg0 : null),
                     controller: p0,
                     autofocus: true,
@@ -978,6 +1016,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
                       rxPass.value = value.trim();
                       setState(() {
                         errMsg0 = '';
+                        canSubmit = true;
                       });
                     },
                     maxLength: maxLength,
@@ -1038,9 +1077,9 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
       ),
       actions: [
         dialogButton("Cancel", onPressed: close, isOutline: true),
-        dialogButton("OK", onPressed: submit),
+        dialogButton("OK", onPressed: canSubmit ? submit : null),
       ],
-      onSubmit: submit,
+      onSubmit: canSubmit ? submit : null,
       onCancel: close,
     );
   });
