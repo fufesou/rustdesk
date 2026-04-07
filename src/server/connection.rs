@@ -1,3 +1,7 @@
+use super::login_failure_check::{
+    clear_terminal_failure_state, evaluate_terminal_policy, record_terminal_failure,
+    try_acquire_terminal_os_login_gate, FailureScope,
+};
 use super::{input_service::*, *};
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::clipboard::try_empty_clipboard_files;
@@ -83,6 +87,8 @@ lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
     static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
 }
+
+const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Terminal login failed.";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -1499,6 +1505,9 @@ impl Connection {
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
+        if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
+            return keep_alive;
+        }
         if !self.connect_port_forward_if_needed().await {
             return false;
         }
@@ -2378,33 +2387,6 @@ impl Connection {
                             o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
                     }
                     self.terminal_service_id = terminal.service_id;
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if let Some(msg) =
-                        self.fill_terminal_user_token(&lr.os_login.username, &lr.os_login.password)
-                    {
-                        self.send_login_error(msg).await;
-                        sleep(1.).await;
-                        return false;
-                    }
-
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if let Some(is_user) =
-                        terminal_service::is_service_specified_user(&self.terminal_service_id)
-                    {
-                        if let Some(user_token) = &self.terminal_user_token {
-                            let has_service_token =
-                                user_token.to_terminal_service_token().is_some();
-                            if is_user != has_service_token {
-                                // This occurs when the service id (in the configuration) is manually changed by the user, causing a mismatch in validation.
-                                log::error!("Terminal service user mismatch detected. The service ID may have been manually changed in the configuration, causing validation to fail.");
-                                // No need to translate the following message, because it is in an abnormal case.
-                                self.send_login_error("Terminal service user mismatch detected.")
-                                    .await;
-                                sleep(1.).await;
-                                return false;
-                            }
-                        }
-                    }
                 }
                 Some(login_request::Union::PortForward(mut pf)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
@@ -2423,7 +2405,13 @@ impl Connection {
             }
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            self.try_start_cm_ipc();
+            {
+                let should_delay_terminal_cm_ipc =
+                    self.terminal && !lr.os_login.username.trim().is_empty();
+                if !should_delay_terminal_cm_ipc {
+                    self.try_start_cm_ipc();
+                }
+            }
 
             #[cfg(not(target_os = "linux"))]
             let err_msg = "".to_owned();
@@ -2489,7 +2477,9 @@ impl Connection {
                     if !self.send_logon_response_and_keep_alive().await {
                         return false;
                     }
-                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                    if self.authorized || self.require_2fa.is_some() {
+                        self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                    }
                 } else {
                     self.send_login_error(err_msg).await;
                 }
@@ -2528,7 +2518,9 @@ impl Connection {
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
                         }
-                        self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
+                        if self.authorized || self.require_2fa.is_some() {
+                            self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
+                        }
                     } else {
                         self.send_login_error(err_msg).await;
                     }
@@ -2548,11 +2540,13 @@ impl Connection {
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
                         }
-                        self.try_start_cm(
-                            self.lr.my_id.to_owned(),
-                            self.lr.my_name.to_owned(),
-                            self.authorized,
-                        );
+                        if self.authorized || self.require_2fa.is_some() {
+                            self.try_start_cm(
+                                self.lr.my_id.to_owned(),
+                                self.lr.my_name.to_owned(),
+                                self.authorized,
+                            );
+                        }
                         if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
                             Config::add_trusted_device(TrustedDevice {
                                 hwid: tfa.hwid,
@@ -2602,13 +2596,21 @@ impl Connection {
                             if !self.send_logon_response_and_keep_alive().await {
                                 return false;
                             }
-                            self.try_start_cm(
-                                lr.my_id.clone(),
-                                lr.my_name.clone(),
-                                self.authorized,
-                            );
+                            if self.authorized || self.require_2fa.is_some() {
+                                self.try_start_cm(
+                                    lr.my_id.clone(),
+                                    lr.my_name.clone(),
+                                    self.authorized,
+                                );
+                            }
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            self.try_start_cm_ipc();
+                            {
+                                let should_delay_terminal_cm_ipc =
+                                    self.terminal && !self.lr.os_login.username.trim().is_empty();
+                                if !should_delay_terminal_cm_ipc {
+                                    self.try_start_cm_ipc();
+                                }
+                            }
                         }
                     }
                 }
@@ -3486,16 +3488,16 @@ impl Connection {
                     self.terminal_user_token = Some(TerminalUserToken::SelfUser);
                     None
                 } else {
-                    Some("The user is not an administrator.")
+                    Some(TERMINAL_OS_LOGIN_FAILED_MSG)
                 }
             }
             Ok(Err(e)) => {
                 log::error!("Failed to check if the user is an administrator: {}", e);
-                Some("Failed to check if the user is an administrator.")
+                Some(TERMINAL_OS_LOGIN_FAILED_MSG)
             }
             Err(e) => {
                 log::error!("Failed to get logon user token: {}", e);
-                Some("Incorrect username or password.")
+                Some(TERMINAL_OS_LOGIN_FAILED_MSG)
             }
         }
     }
@@ -3531,6 +3533,118 @@ impl Connection {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    async fn prepare_terminal_login_for_authorization(&mut self) -> Option<bool> {
+        if !self.terminal || self.terminal_user_token.is_some() {
+            return None;
+        }
+
+        let is_terminal_os_login = !self.lr.os_login.username.trim().is_empty();
+        let failure_scope = if is_terminal_os_login {
+            FailureScope::TerminalOsLogin
+        } else {
+            FailureScope::Default
+        };
+        let mut terminal_failure = None;
+        if is_terminal_os_login {
+            let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
+            if !res {
+                // Rate-limit blocks should keep the connection alive for retries.
+                log::warn!(
+                    "Terminal OS login blocked by failure policy: ip={} conn_id={} scope={:?}",
+                    self.ip,
+                    self.inner.id(),
+                    failure_scope
+                );
+                return Some(true);
+            }
+            terminal_failure = Some(failure);
+        }
+
+        #[cfg(target_os = "windows")]
+        let _os_login_concurrency_guard = if !self.lr.os_login.username.trim().is_empty() {
+            let guard = try_acquire_terminal_os_login_gate();
+            if guard.is_err() {
+                if let Some(failure) = terminal_failure {
+                    self.update_failure_with_scope(failure, false, 0, failure_scope);
+                }
+                log::warn!(
+                    "Terminal OS login blocked by concurrency gate: ip={} conn_id={} scope={:?}",
+                    self.ip,
+                    self.inner.id(),
+                    failure_scope
+                );
+                self.send_login_error("Please try 1 minute later").await;
+                Self::post_alarm_audit(
+                    AlarmAuditType::TerminalOsLoginConcurrency,
+                    json!({
+                        "ip": self.ip,
+                        "id": self.lr.my_id.clone(),
+                        "name": self.lr.my_name.clone(),
+                    }),
+                );
+                return Some(true);
+            }
+            guard.ok()
+        } else {
+            None
+        };
+
+        let username = self.lr.os_login.username.clone();
+        let password = self.lr.os_login.password.clone();
+        if let Some(msg) = self.fill_terminal_user_token(&username, &password) {
+            if let Some(failure) = terminal_failure {
+                self.update_failure_with_scope(failure, false, 0, failure_scope);
+            }
+            log::warn!(
+                "Terminal OS login verification failed: ip={} conn_id={} scope={:?} msg='{}'",
+                self.ip,
+                self.inner.id(),
+                failure_scope,
+                msg
+            );
+            self.send_login_error(msg).await;
+            sleep(1.).await;
+            return Some(false);
+        }
+        if is_terminal_os_login {
+            clear_terminal_failure_state();
+        }
+
+        if let Some(is_user) =
+            terminal_service::is_service_specified_user(&self.terminal_service_id)
+        {
+            if let Some(user_token) = &self.terminal_user_token {
+                let has_service_token = user_token.to_terminal_service_token().is_some();
+                if is_user != has_service_token {
+                    log::warn!(
+                        "Terminal service user mismatch: ip={} conn_id={} service_is_user={} has_service_token={}",
+                        self.ip,
+                        self.inner.id(),
+                        is_user,
+                        has_service_token
+                    );
+                    // This occurs when the service id (in the configuration) is manually changed by the user, causing a mismatch in validation.
+                    log::error!("Terminal service user mismatch detected. The service ID may have been manually changed in the configuration, causing validation to fail.");
+                    // No need to translate the following message, because it is in an abnormal case.
+                    self.send_login_error("Terminal service user mismatch detected.")
+                        .await;
+                    sleep(1.).await;
+                    return Some(false);
+                }
+            }
+        }
+        if is_terminal_os_login {
+            self.try_start_cm_ipc();
+        }
+        None
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    async fn prepare_terminal_login_for_authorization(&mut self) -> Option<bool> {
+        None
+    }
+
     // Try to parse connection IP as IPv6 address, returning /64, /56, and /48 prefixes.
     // Parsing an IPv4 address just returns None.
     // note: we specifically don't use hbb_common::is_ipv6_str to avoid divergence issues
@@ -3557,18 +3671,30 @@ impl Connection {
         Some((p64, p56, p48))
     }
 
-    fn update_failure(&self, (failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
-        fn bump(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
-            if cur.0 == time {
-                cur.1 += 1;
-                cur.2 += 1;
-            } else {
-                cur.0 = time;
-                cur.1 = 1;
-                cur.2 += 1;
-            }
-            cur
+    fn bump_failure_entry(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
+        if cur.0 == time {
+            cur.1 += 1;
+            cur.2 += 1;
+        } else {
+            cur.0 = time;
+            cur.1 = 1;
+            cur.2 += 1;
         }
+        cur
+    }
+
+    fn update_failure(&self, failure: ((i32, i32, i32), i32), remove: bool, i: usize) {
+        self.update_failure_with_scope(failure, remove, i, FailureScope::Default);
+    }
+
+    fn update_failure_with_scope(
+        &self,
+        (failure, time): ((i32, i32, i32), i32),
+        remove: bool,
+        i: usize,
+        scope: FailureScope,
+    ) {
+        let terminal_scope = scope == FailureScope::TerminalOsLogin;
         let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
@@ -3582,6 +3708,9 @@ impl Connection {
                     map_mutex.lock().unwrap().remove(&self.ip);
                 }
             }
+            if terminal_scope {
+                clear_terminal_failure_state();
+            }
             return;
         }
         // Bump the prefixes, fetching existing values
@@ -3589,14 +3718,17 @@ impl Connection {
             let mut m = map_mutex.lock().unwrap();
             for key in [p64, p56, p48] {
                 let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
-                m.insert(key, bump(cur, time));
+                m.insert(key, Self::bump_failure_entry(cur, time));
             }
-            // Update full IP: bump from the *original* passed-in failure
-            m.insert(self.ip.clone(), bump(failure, time));
+            m.insert(self.ip.clone(), Self::bump_failure_entry(failure, time));
         } else {
             // Update full IP: bump from the *original* passed-in failure
             let mut m = map_mutex.lock().unwrap();
-            m.insert(self.ip.clone(), bump(failure, time));
+            m.insert(self.ip.clone(), Self::bump_failure_entry(failure, time));
+        }
+
+        if terminal_scope {
+            record_terminal_failure();
         }
     }
 
@@ -3636,6 +3768,15 @@ impl Connection {
     }
 
     async fn check_failure(&mut self, i: usize) -> (((i32, i32, i32), i32), bool) {
+        self.check_failure_with_scope(i, FailureScope::Default)
+            .await
+    }
+
+    async fn check_failure_with_scope(
+        &mut self,
+        i: usize,
+        scope: FailureScope,
+    ) -> (((i32, i32, i32), i32), bool) {
         let time = (get_time() / 60_000) as i32;
 
         // IPv6 addresses are cheap to make so we check prefix/netblock as well
@@ -3681,6 +3822,34 @@ impl Connection {
                 }),
             );
             false
+        } else if scope == FailureScope::TerminalOsLogin {
+            let decision = evaluate_terminal_policy(get_time());
+            if decision.allowed {
+                true
+            } else {
+                log::warn!(
+                    "Terminal OS login blocked by policy: ip={} conn_id={} i={} msg='{}'",
+                    self.ip,
+                    self.inner.id(),
+                    i,
+                    decision.login_error.as_deref().unwrap_or("")
+                );
+                if let Some(login_error) = decision.login_error {
+                    // Rare branch and currently temporary response copy; translation can be added later if needed.
+                    self.send_login_error(login_error).await;
+                }
+                if let Some(audit) = decision.audit {
+                    Self::post_alarm_audit(
+                        audit,
+                        json!({
+                                    "ip": self.ip,
+                                    "id": self.lr.my_id.clone(),
+                                    "name": self.lr.my_name.clone(),
+                        }),
+                    );
+                }
+                false
+            }
         } else {
             true
         };
@@ -5161,6 +5330,8 @@ pub enum AlarmAuditType {
     // MultipleLoginsAttemptsWithinOneMinute = 4,
     // MultipleLoginsAttemptsWithinOneHour = 5,
     ExceedIPv6PrefixAttempts = 6,
+    TerminalOsLoginBackoff = 7,
+    TerminalOsLoginConcurrency = 8,
 }
 
 pub enum FileAuditType {
