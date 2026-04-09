@@ -1,6 +1,7 @@
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use super::login_failure_check::try_acquire_os_credential_login_gate;
 use super::login_failure_check::{
-    clear_terminal_failure_state, evaluate_terminal_policy, record_terminal_failure,
-    try_acquire_terminal_os_login_gate, FailureScope,
+    evaluate_os_credential_policy, record_os_credential_failure, FailureScope,
 };
 use super::{input_service::*, *};
 #[cfg(feature = "unix-file-copy-paste")]
@@ -88,7 +89,8 @@ lazy_static::lazy_static! {
     static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
 }
 
-const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Terminal login failed.";
+#[cfg(target_os = "windows")]
+const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -1505,6 +1507,10 @@ impl Connection {
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(keep_alive) = self.prepare_linux_headless_login_for_authorization().await {
+            return keep_alive;
+        }
         if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
             return keep_alive;
         }
@@ -2329,6 +2335,97 @@ impl Connection {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    async fn prepare_linux_headless_login(&mut self, lr: &LoginRequest) -> String {
+        let normalized_username = lr.os_login.username.trim().to_owned();
+        let is_headless_allowed = self.linux_headless_handle.is_headless_allowed;
+        // For OS credential login, defer PAM auth / desktop start until after primary auth(+2FA).
+        if is_headless_allowed && normalized_username.is_empty() {
+            let username = "".to_owned();
+            let password = lr.os_login.password.clone();
+            match hbb_common::tokio::task::spawn_blocking(move || {
+                linux_desktop_manager::try_start_desktop(&username, &password)
+            })
+            .await
+            {
+                Ok(message) => message,
+                Err(e) => {
+                    log::error!("Failed to join linux headless desktop start task: {}", e);
+                    crate::client::LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned()
+                }
+            }
+        } else {
+            "".to_owned()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prepare_linux_headless_login_for_authorization(&mut self) -> Option<bool> {
+        let normalized_username = self.lr.os_login.username.trim().to_owned();
+        if !self.linux_headless_handle.is_headless_allowed || normalized_username.is_empty() {
+            return None;
+        }
+
+        let failure_scope = FailureScope::LinuxHeadlessOsLogin;
+        let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
+        if !res {
+            return Some(true);
+        }
+
+        let guard = try_acquire_os_credential_login_gate();
+        if guard.is_err() {
+            log::warn!(
+                "Linux headless OS login blocked by concurrency gate: ip={} conn_id={}",
+                self.ip,
+                self.inner.id(),
+            );
+            self.send_login_error("Please try 1 minute later").await;
+            sleep(1.).await;
+            Self::post_alarm_audit(
+                AlarmAuditType::LinuxHeadlessOsLoginConcurrency,
+                json!({
+                    "ip": self.ip,
+                    "id": self.lr.my_id.clone(),
+                    "name": self.lr.my_name.clone(),
+                }),
+            );
+            return Some(true);
+        }
+        let linux_headless_os_login_concurrency_guard = guard.ok();
+
+        let password = self.lr.os_login.password.clone();
+        let desktop_start_result = match hbb_common::tokio::task::spawn_blocking(move || {
+            linux_desktop_manager::try_start_desktop_with_auth_result(
+                &normalized_username,
+                &password,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("Failed to join linux headless desktop start task: {}", e);
+                linux_desktop_manager::DesktopStartResult {
+                    message: crate::client::LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned(),
+                    auth_failed: false,
+                }
+            }
+        };
+
+        drop(linux_headless_os_login_concurrency_guard);
+        if !desktop_start_result.message.is_empty() {
+            if desktop_start_result.auth_failed {
+                self.update_failure_with_scope(failure, false, 0, failure_scope);
+            }
+            self.send_login_error(desktop_start_result.message).await;
+            return Some(true);
+        }
+
+        self.update_failure_with_scope(failure, true, 0, failure_scope);
+        self.linux_headless_handle.wait_desktop_cm_ready().await;
+        None
+    }
+
     async fn on_message(&mut self, msg: Message) -> bool {
         if let Some(message::Union::Misc(misc)) = &msg.union {
             // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
@@ -2346,7 +2443,7 @@ impl Connection {
                 return true;
             }
             match lr.union {
-                Some(login_request::Union::FileTransfer(ft)) => {
+                Some(login_request::Union::FileTransfer(ref ft)) => {
                     if !Self::permission(
                         keys::OPTION_ENABLE_FILE_TRANSFER,
                         &self.control_permissions,
@@ -2356,9 +2453,9 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
-                    self.file_transfer = Some((ft.dir, ft.show_hidden));
+                    self.file_transfer = Some((ft.dir.clone(), ft.show_hidden));
                 }
-                Some(login_request::Union::ViewCamera(_vc)) => {
+                Some(login_request::Union::ViewCamera(ref _vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
                         self.send_login_error("No permission of viewing camera")
                             .await;
@@ -2367,14 +2464,14 @@ impl Connection {
                     }
                     self.view_camera = true;
                 }
-                Some(login_request::Union::Terminal(terminal)) => {
+                Some(login_request::Union::Terminal(ref terminal)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
                         self.send_login_error("No permission of terminal").await;
                         sleep(1.).await;
                         return false;
                     }
                     #[cfg(target_os = "windows")]
-                    if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
+                    if !lr.os_login.username.trim().is_empty() && !crate::platform::is_installed() {
                         self.send_login_error("Supported only in the installed version.")
                             .await;
                         sleep(1.).await;
@@ -2386,14 +2483,15 @@ impl Connection {
                         self.terminal_persistent =
                             o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
                     }
-                    self.terminal_service_id = terminal.service_id;
+                    self.terminal_service_id = terminal.service_id.clone();
                 }
-                Some(login_request::Union::PortForward(mut pf)) => {
+                Some(login_request::Union::PortForward(ref pf)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
                         self.send_login_error("No permission of IP tunneling").await;
                         sleep(1.).await;
                         return false;
                     }
+                    let mut pf = pf.clone();
                     let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
                     self.port_forward_address = addr;
                 }
@@ -2405,20 +2503,12 @@ impl Connection {
             }
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            {
-                let should_delay_terminal_cm_ipc =
-                    self.terminal && !lr.os_login.username.trim().is_empty();
-                if !should_delay_terminal_cm_ipc {
-                    self.try_start_cm_ipc();
-                }
-            }
+            self.try_start_cm_ipc();
 
             #[cfg(not(target_os = "linux"))]
             let err_msg = "".to_owned();
             #[cfg(target_os = "linux")]
-            let err_msg = self
-                .linux_headless_handle
-                .try_start_desktop(lr.os_login.as_ref());
+            let err_msg = self.prepare_linux_headless_login(&lr).await;
 
             // If err is LOGIN_MSG_DESKTOP_SESSION_NOT_READY, just keep this msg and go on checking password.
             if !err_msg.is_empty() && err_msg != crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY
@@ -2472,8 +2562,6 @@ impl Connection {
                 return true;
             } else if self.is_recent_session(false) {
                 if err_msg.is_empty() {
-                    #[cfg(target_os = "linux")]
-                    self.linux_headless_handle.wait_desktop_cm_ready().await;
                     if !self.send_logon_response_and_keep_alive().await {
                         return false;
                     }
@@ -2498,7 +2586,7 @@ impl Connection {
                     return true;
                 }
                 if !self.validate_password(allow_logon_screen_password) {
-                    self.update_failure(failure, false, 0);
+                    self.update_failure_with_scope(failure, false, 0, FailureScope::Default);
                     self.check_update_temporary_password(false);
                     if err_msg.is_empty() {
                         self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
@@ -2511,10 +2599,8 @@ impl Connection {
                         .await;
                     }
                 } else {
-                    self.update_failure(failure, true, 0);
+                    self.update_failure_with_scope(failure, true, 0, FailureScope::Default);
                     if err_msg.is_empty() {
-                        #[cfg(target_os = "linux")]
-                        self.linux_headless_handle.wait_desktop_cm_ready().await;
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
                         }
@@ -2604,13 +2690,7 @@ impl Connection {
                                 );
                             }
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            {
-                                let should_delay_terminal_cm_ipc =
-                                    self.terminal && !self.lr.os_login.username.trim().is_empty();
-                                if !should_delay_terminal_cm_ipc {
-                                    self.try_start_cm_ipc();
-                                }
-                            }
+                            self.try_start_cm_ipc();
                         }
                     }
                 }
@@ -3539,65 +3619,86 @@ impl Connection {
             return None;
         }
 
-        let is_terminal_os_login = !self.lr.os_login.username.trim().is_empty();
-        let failure_scope = if is_terminal_os_login {
-            FailureScope::TerminalOsLogin
+        #[derive(Copy, Clone)]
+        enum TerminalAuthorizationMode {
+            OsLogin {
+                failure: ((i32, i32, i32), i32),
+                scope: FailureScope,
+            },
+            SessionUser,
+        }
+
+        let normalized_username = self.lr.os_login.username.trim().to_owned();
+        let auth_mode = if normalized_username.is_empty() {
+            TerminalAuthorizationMode::SessionUser
         } else {
-            FailureScope::Default
-        };
-        let mut terminal_failure = None;
-        if is_terminal_os_login {
+            let failure_scope = FailureScope::TerminalOsLogin;
             let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
             if !res {
                 // Rate-limit blocks should keep the connection alive for retries.
                 log::warn!(
-                    "Terminal OS login blocked by failure policy: ip={} conn_id={} scope={:?}",
+                    "OS credential login blocked by failure policy: ip={} conn_id={} scope={:?}",
                     self.ip,
                     self.inner.id(),
                     failure_scope
                 );
                 return Some(true);
             }
-            terminal_failure = Some(failure);
-        }
-
-        #[cfg(target_os = "windows")]
-        let _os_login_concurrency_guard = if !self.lr.os_login.username.trim().is_empty() {
-            let guard = try_acquire_terminal_os_login_gate();
-            if guard.is_err() {
-                if let Some(failure) = terminal_failure {
-                    self.update_failure_with_scope(failure, false, 0, failure_scope);
-                }
-                log::warn!(
-                    "Terminal OS login blocked by concurrency gate: ip={} conn_id={} scope={:?}",
-                    self.ip,
-                    self.inner.id(),
-                    failure_scope
-                );
-                self.send_login_error("Please try 1 minute later").await;
-                Self::post_alarm_audit(
-                    AlarmAuditType::TerminalOsLoginConcurrency,
-                    json!({
-                        "ip": self.ip,
-                        "id": self.lr.my_id.clone(),
-                        "name": self.lr.my_name.clone(),
-                    }),
-                );
-                return Some(true);
+            TerminalAuthorizationMode::OsLogin {
+                failure,
+                scope: failure_scope,
             }
-            guard.ok()
-        } else {
-            None
         };
 
-        let username = self.lr.os_login.username.clone();
+        let is_terminal_os_login = matches!(auth_mode, TerminalAuthorizationMode::OsLogin { .. });
+        let failure_scope = match auth_mode {
+            TerminalAuthorizationMode::OsLogin { scope, .. } => scope,
+            TerminalAuthorizationMode::SessionUser => FailureScope::Default,
+        };
+
+        let username = normalized_username;
         let password = self.lr.os_login.password.clone();
-        if let Some(msg) = self.fill_terminal_user_token(&username, &password) {
-            if let Some(failure) = terminal_failure {
-                self.update_failure_with_scope(failure, false, 0, failure_scope);
+        let terminal_login_error = {
+            #[cfg(target_os = "windows")]
+            {
+                let _os_login_concurrency_guard = if is_terminal_os_login {
+                    let guard = try_acquire_os_credential_login_gate();
+                    if guard.is_err() {
+                        log::warn!(
+                            "OS credential login blocked by concurrency gate: ip={} conn_id={} scope={:?}",
+                            self.ip,
+                            self.inner.id(),
+                            failure_scope
+                        );
+                        self.send_login_error("Please try 1 minute later").await;
+                        sleep(1.).await;
+                        Self::post_alarm_audit(
+                            AlarmAuditType::TerminalOsLoginConcurrency,
+                            json!({
+                                "ip": self.ip,
+                                "id": self.lr.my_id.clone(),
+                                "name": self.lr.my_name.clone(),
+                            }),
+                        );
+                        return Some(true);
+                    }
+                    guard.ok()
+                } else {
+                    None
+                };
+                self.fill_terminal_user_token(&username, &password)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.fill_terminal_user_token(&username, &password)
+            }
+        };
+        if let Some(msg) = terminal_login_error {
+            if let TerminalAuthorizationMode::OsLogin { failure, scope } = auth_mode {
+                self.update_failure_with_scope(failure, false, 0, scope);
             }
             log::warn!(
-                "Terminal OS login verification failed: ip={} conn_id={} scope={:?} msg='{}'",
+                "OS credential login verification failed: ip={} conn_id={} scope={:?} msg='{}'",
                 self.ip,
                 self.inner.id(),
                 failure_scope,
@@ -3607,8 +3708,8 @@ impl Connection {
             sleep(1.).await;
             return Some(false);
         }
-        if is_terminal_os_login {
-            clear_terminal_failure_state();
+        if let TerminalAuthorizationMode::OsLogin { failure, scope } = auth_mode {
+            self.update_failure_with_scope(failure, true, 0, scope);
         }
 
         if let Some(is_user) =
@@ -3694,7 +3795,10 @@ impl Connection {
         i: usize,
         scope: FailureScope,
     ) {
-        let terminal_scope = scope == FailureScope::TerminalOsLogin;
+        let os_credential_scope = matches!(
+            scope,
+            FailureScope::TerminalOsLogin | FailureScope::LinuxHeadlessOsLogin
+        );
         let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
@@ -3708,9 +3812,9 @@ impl Connection {
                     map_mutex.lock().unwrap().remove(&self.ip);
                 }
             }
-            if terminal_scope {
-                clear_terminal_failure_state();
-            }
+            // Intentionally keep OS-credential backoff state as global.
+            // Reason: if one successful login cleared this state, an attacker could use
+            // intermittent successes to repeatedly reset throttling.
             return;
         }
         // Bump the prefixes, fetching existing values
@@ -3727,8 +3831,8 @@ impl Connection {
             m.insert(self.ip.clone(), Self::bump_failure_entry(failure, time));
         }
 
-        if terminal_scope {
-            record_terminal_failure();
+        if os_credential_scope {
+            record_os_credential_failure(scope);
         }
     }
 
@@ -3822,13 +3926,16 @@ impl Connection {
                 }),
             );
             false
-        } else if scope == FailureScope::TerminalOsLogin {
-            let decision = evaluate_terminal_policy(get_time());
+        } else if matches!(
+            scope,
+            FailureScope::TerminalOsLogin | FailureScope::LinuxHeadlessOsLogin
+        ) {
+            let decision = evaluate_os_credential_policy(scope, get_time());
             if decision.allowed {
                 true
             } else {
                 log::warn!(
-                    "Terminal OS login blocked by policy: ip={} conn_id={} i={} msg='{}'",
+                    "OS credential login blocked by policy: ip={} conn_id={} i={} msg='{}'",
                     self.ip,
                     self.inner.id(),
                     i,
@@ -3839,6 +3946,8 @@ impl Connection {
                     self.send_login_error(login_error).await;
                 }
                 if let Some(audit) = decision.audit {
+                    // For OS blocked/backoff events, we currently emit one alarm report per blocked attempt.
+                    // TODO: Add unified cumulative/aggregation fields across alarm producers.
                     Self::post_alarm_audit(
                         audit,
                         json!({
@@ -5332,6 +5441,8 @@ pub enum AlarmAuditType {
     ExceedIPv6PrefixAttempts = 6,
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
+    LinuxHeadlessOsLoginBackoff = 9,
+    LinuxHeadlessOsLoginConcurrency = 10,
 }
 
 pub enum FileAuditType {
@@ -5580,19 +5691,6 @@ impl LinuxHeadlessHandle {
             wait_ipc_timeout: 10_000,
             rx_cm_stream_ready,
             tx_desktop_ready,
-        }
-    }
-
-    pub fn try_start_desktop(&mut self, os_login: Option<&OSLogin>) -> String {
-        if self.is_headless_allowed {
-            match os_login {
-                Some(os_login) => {
-                    linux_desktop_manager::try_start_desktop(&os_login.username, &os_login.password)
-                }
-                None => linux_desktop_manager::try_start_desktop("", ""),
-            }
-        } else {
-            "".to_string()
         }
     }
 

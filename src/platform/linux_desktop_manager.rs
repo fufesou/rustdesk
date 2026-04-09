@@ -29,6 +29,19 @@ lazy_static::lazy_static! {
     static ref DESKTOP_MANAGER: Arc<Mutex<Option<DesktopManager>>> = Arc::new(Mutex::new(None));
 }
 
+const DESKTOP_LOGIN_MIN_FAILURE_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct DesktopLoginAuthFailed;
+
+impl std::fmt::Display for DesktopLoginAuthFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("desktop login auth failed")
+    }
+}
+
+impl std::error::Error for DesktopLoginAuthFailed {}
+
 #[derive(Debug)]
 struct DesktopManager {
     seat0_username: String,
@@ -94,11 +107,24 @@ fn detect_headless() -> Option<&'static str> {
     None
 }
 
-pub fn try_start_desktop(_username: &str, _passsword: &str) -> String {
+pub fn try_start_desktop(_username: &str, _password: &str) -> String {
+    try_start_desktop_with_auth_result(_username, _password).message
+}
+
+pub(crate) struct DesktopStartResult {
+    pub message: String,
+    pub auth_failed: bool,
+}
+
+pub(crate) fn try_start_desktop_with_auth_result(
+    _username: &str,
+    _password: &str,
+) -> DesktopStartResult {
     debug_assert!(crate::is_server());
-    if _username.is_empty() {
+    let normalized_username = _username.trim();
+    if normalized_username.is_empty() {
         let username = get_username();
-        if username.is_empty() {
+        let message = if username.is_empty() {
             if let Some(msg) = detect_headless() {
                 msg
             } else {
@@ -107,61 +133,99 @@ pub fn try_start_desktop(_username: &str, _passsword: &str) -> String {
         } else {
             ""
         }
-        .to_owned()
+        .to_owned();
+        DesktopStartResult {
+            message,
+            auth_failed: false,
+        }
     } else {
         let username = get_username();
-        if username == _username {
+        if username == normalized_username {
             // No need to verify password here.
-            return "".to_owned();
+            return DesktopStartResult {
+                message: "".to_owned(),
+                auth_failed: false,
+            };
         }
         if !username.is_empty() {
             // Another user is logged in. No need to start a new xsession.
-            return "".to_owned();
+            return DesktopStartResult {
+                message: "".to_owned(),
+                auth_failed: false,
+            };
         }
 
         if let Some(msg) = detect_headless() {
-            return msg.to_owned();
+            return DesktopStartResult {
+                message: msg.to_owned(),
+                auth_failed: false,
+            };
         }
 
-        match try_start_x_session(_username, _passsword) {
+        match try_start_x_session(normalized_username, _password) {
             Ok((username, x11_ready)) => {
-                if x11_ready {
-                    if _username != username {
+                let message = if x11_ready {
+                    if normalized_username != username {
                         LOGIN_MSG_DESKTOP_SESSION_ANOTHER_USER.to_owned()
                     } else {
                         "".to_owned()
                     }
                 } else {
                     LOGIN_MSG_DESKTOP_SESSION_NOT_READY.to_owned()
+                };
+                DesktopStartResult {
+                    message,
+                    auth_failed: false,
                 }
             }
             Err(e) => {
-                log::error!("Failed to start xsession {}", e);
-                LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned()
+                let auth_failed = e.downcast_ref::<DesktopLoginAuthFailed>().is_some();
+                if !auth_failed {
+                    log::error!("Failed to start xsession {}", e);
+                }
+                DesktopStartResult {
+                    message: LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned(),
+                    auth_failed,
+                }
             }
         }
     }
 }
 
 fn try_start_x_session(username: &str, password: &str) -> ResultType<(String, bool)> {
-    let mut desktop_manager = DESKTOP_MANAGER.lock().unwrap();
-    if let Some(desktop_manager) = &mut (*desktop_manager) {
-        if let Some(seat0_username) = desktop_manager.get_supported_display_seat0_username() {
-            return Ok((seat0_username, true));
+    let started_at = Instant::now();
+    let result: ResultType<(String, bool)> = {
+        let mut desktop_manager = DESKTOP_MANAGER.lock().unwrap();
+        if let Some(desktop_manager) = &mut (*desktop_manager) {
+            if let Some(seat0_username) = desktop_manager.get_supported_display_seat0_username() {
+                Ok((seat0_username, true))
+            } else {
+                let _ = desktop_manager.try_start_x_session(username, password)?;
+                log::debug!(
+                    "try_start_x_session, username: {}, {:?}",
+                    &username,
+                    &desktop_manager
+                );
+                Ok((
+                    desktop_manager.child_username.clone(),
+                    desktop_manager.is_running(),
+                ))
+            }
+        } else {
+            bail!(crate::client::LOGIN_MSG_DESKTOP_NOT_INITED);
         }
-
-        let _ = desktop_manager.try_start_x_session(username, password)?;
-        log::debug!(
-            "try_start_x_session, username: {}, {:?}",
-            &username,
-            &desktop_manager
-        );
-        Ok((
-            desktop_manager.child_username.clone(),
-            desktop_manager.is_running(),
-        ))
-    } else {
-        bail!(crate::client::LOGIN_MSG_DESKTOP_NOT_INITED);
+    };
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if e.downcast_ref::<DesktopLoginAuthFailed>().is_some() {
+                let elapsed = started_at.elapsed();
+                if elapsed < DESKTOP_LOGIN_MIN_FAILURE_DELAY {
+                    std::thread::sleep(DESKTOP_LOGIN_MIN_FAILURE_DELAY - elapsed);
+                }
+            }
+            Err(e)
+        }
     }
 }
 
@@ -272,12 +336,14 @@ impl DesktopManager {
                         }
                     }
                     Err(e) => {
-                        bail!("failed to check user pass for {}, {}", username, e);
+                        log::warn!("PAM authenticate failed for '{}': {}", username, e);
+                        bail!(DesktopLoginAuthFailed);
                     }
                 }
             }
             None => {
-                bail!("failed to get userinfo of {}", username);
+                log::warn!("Desktop login username not found: '{}'", username);
+                bail!(DesktopLoginAuthFailed);
             }
         }
     }
