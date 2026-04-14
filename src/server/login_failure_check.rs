@@ -1,9 +1,10 @@
 use crate::AlarmAuditType;
-use hbb_common::{
-    get_time,
-    tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard},
-};
-use std::sync::{Arc, Mutex};
+use hbb_common::get_time;
+#[cfg(target_os = "windows")]
+use hbb_common::tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+use std::sync::Mutex;
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
 
 const OS_CREDENTIAL_LOGIN_TOTAL_IDLE_RESET_MS: i64 = 120 * 60 * 1_000;
 const OS_CREDENTIAL_LOGIN_BACKOFF_BASE_SECONDS: i64 = 15;
@@ -13,8 +14,6 @@ const OS_CREDENTIAL_LOGIN_BACKOFF_MAX_SECONDS: i64 = 30 * 60;
 pub(crate) enum FailureScope {
     Default,
     TerminalOsLogin,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    LinuxHeadlessOsLogin,
 }
 
 pub(crate) struct OsCredentialPolicyDecision {
@@ -33,14 +32,15 @@ struct OsCredentialFailureState {
 lazy_static::lazy_static! {
     static ref OS_CREDENTIAL_LOGIN_FAILURE_STATE: Mutex<OsCredentialFailureState> =
         Mutex::new(OsCredentialFailureState::default());
+}
+
+#[cfg(target_os = "windows")]
+lazy_static::lazy_static! {
     static ref OS_CREDENTIAL_LOGIN_MUTEX: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
 }
 
 fn is_os_credential_scope(scope: FailureScope) -> bool {
-    matches!(
-        scope,
-        FailureScope::TerminalOsLogin | FailureScope::LinuxHeadlessOsLogin
-    )
+    matches!(scope, FailureScope::TerminalOsLogin)
 }
 
 fn state_for_os_credential_scope(
@@ -56,7 +56,6 @@ fn state_for_os_credential_scope(
 fn backoff_audit_type_for_scope(scope: FailureScope) -> Option<AlarmAuditType> {
     match scope {
         FailureScope::TerminalOsLogin => Some(AlarmAuditType::TerminalOsLoginBackoff),
-        FailureScope::LinuxHeadlessOsLogin => Some(AlarmAuditType::LinuxHeadlessOsLoginBackoff),
         FailureScope::Default => None,
     }
 }
@@ -124,8 +123,16 @@ pub(crate) fn evaluate_os_credential_policy(
     if let Some(until_ms) = state.backoff_until_ms {
         let remaining_ms = (until_ms - now_ms).max(0);
         let remaining_seconds = ((remaining_ms + 999) / 1_000).max(1);
+        let seconds_label = if remaining_seconds == 1 {
+            "second"
+        } else {
+            "seconds"
+        };
         block_decision(
-            format!("Please try {} seconds later", remaining_seconds),
+            format!(
+                "Please try again in {} {}.",
+                remaining_seconds, seconds_label
+            ),
             backoff_audit_type_for_scope(scope),
         )
     } else {
@@ -152,6 +159,7 @@ pub(crate) fn record_os_credential_failure(scope: FailureScope) {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn try_acquire_os_credential_login_gate() -> Result<OwnedMutexGuard<()>, ()> {
     OS_CREDENTIAL_LOGIN_MUTEX
         .clone()
@@ -200,29 +208,6 @@ mod tests {
         let allowed = evaluate_os_credential_policy(FailureScope::TerminalOsLogin, after_idle_ms);
         assert!(allowed.allowed);
         clear_os_credential_failure_state(FailureScope::TerminalOsLogin);
-    }
-
-    #[test]
-    fn os_credential_policy_scopes_share_global_state() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        clear_os_credential_failure_state(FailureScope::TerminalOsLogin);
-        clear_os_credential_failure_state(FailureScope::LinuxHeadlessOsLogin);
-
-        for _ in 0..3 {
-            record_os_credential_failure(FailureScope::LinuxHeadlessOsLogin);
-        }
-
-        let now_ms = get_time();
-        let terminal = evaluate_os_credential_policy(FailureScope::TerminalOsLogin, now_ms);
-        let linux =
-            evaluate_os_credential_policy(FailureScope::LinuxHeadlessOsLogin, now_ms + 1_000);
-        assert!(!terminal.allowed);
-        assert!(!linux.allowed);
-        assert!(terminal.audit.is_some());
-        assert!(linux.audit.is_some());
-
-        clear_os_credential_failure_state(FailureScope::TerminalOsLogin);
-        clear_os_credential_failure_state(FailureScope::LinuxHeadlessOsLogin);
     }
 
     #[test]

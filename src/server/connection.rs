@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(target_os = "windows")]
 use super::login_failure_check::try_acquire_os_credential_login_gate;
 use super::login_failure_check::{
     evaluate_os_credential_policy, record_os_credential_failure, FailureScope,
@@ -102,6 +102,35 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         x |= a[i] ^ b[i];
     }
     x == 0
+}
+
+#[cfg(target_os = "linux")]
+fn should_check_linux_headless_os_auth_before_desktop_start(
+    is_headless_allowed: bool,
+    username: &str,
+) -> bool {
+    is_headless_allowed
+        && !username.trim().is_empty()
+        && linux_desktop_manager::get_username().is_empty()
+}
+
+#[cfg(target_os = "linux")]
+fn should_record_linux_headless_os_auth_failure(
+    is_headless_allowed: bool,
+    username: &str,
+    err_msg: &str,
+) -> bool {
+    is_headless_allowed
+        && !username.trim().is_empty()
+        && err_msg == crate::client::LOGIN_MSG_PASSWORD_WRONG
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn should_defer_cm_ipc_until_terminal_authorization(
+    is_terminal: bool,
+    os_login_username: &str,
+) -> bool {
+    is_terminal && !os_login_username.trim().is_empty()
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1507,10 +1536,6 @@ impl Connection {
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(keep_alive) = self.prepare_linux_headless_login_for_authorization().await {
-            return keep_alive;
-        }
         if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
             return keep_alive;
         }
@@ -2335,97 +2360,6 @@ impl Connection {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    async fn prepare_linux_headless_login(&mut self, lr: &LoginRequest) -> String {
-        let normalized_username = lr.os_login.username.trim().to_owned();
-        let is_headless_allowed = self.linux_headless_handle.is_headless_allowed;
-        // For OS credential login, defer PAM auth / desktop start until after primary auth(+2FA).
-        if is_headless_allowed && normalized_username.is_empty() {
-            let username = "".to_owned();
-            let password = lr.os_login.password.clone();
-            match hbb_common::tokio::task::spawn_blocking(move || {
-                linux_desktop_manager::try_start_desktop(&username, &password)
-            })
-            .await
-            {
-                Ok(message) => message,
-                Err(e) => {
-                    log::error!("Failed to join linux headless desktop start task: {}", e);
-                    crate::client::LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned()
-                }
-            }
-        } else {
-            "".to_owned()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn prepare_linux_headless_login_for_authorization(&mut self) -> Option<bool> {
-        let normalized_username = self.lr.os_login.username.trim().to_owned();
-        if !self.linux_headless_handle.is_headless_allowed || normalized_username.is_empty() {
-            return None;
-        }
-
-        let failure_scope = FailureScope::LinuxHeadlessOsLogin;
-        let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
-        if !res {
-            return Some(true);
-        }
-
-        let guard = try_acquire_os_credential_login_gate();
-        if guard.is_err() {
-            log::warn!(
-                "Linux headless OS login blocked by concurrency gate: ip={} conn_id={}",
-                self.ip,
-                self.inner.id(),
-            );
-            self.send_login_error("Please try 1 minute later").await;
-            sleep(1.).await;
-            Self::post_alarm_audit(
-                AlarmAuditType::LinuxHeadlessOsLoginConcurrency,
-                json!({
-                    "ip": self.ip,
-                    "id": self.lr.my_id.clone(),
-                    "name": self.lr.my_name.clone(),
-                }),
-            );
-            return Some(true);
-        }
-        let linux_headless_os_login_concurrency_guard = guard.ok();
-
-        let password = self.lr.os_login.password.clone();
-        let desktop_start_result = match hbb_common::tokio::task::spawn_blocking(move || {
-            linux_desktop_manager::try_start_desktop_with_auth_result(
-                &normalized_username,
-                &password,
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                log::error!("Failed to join linux headless desktop start task: {}", e);
-                linux_desktop_manager::DesktopStartResult {
-                    message: crate::client::LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned(),
-                    auth_failed: false,
-                }
-            }
-        };
-
-        drop(linux_headless_os_login_concurrency_guard);
-        if !desktop_start_result.message.is_empty() {
-            if desktop_start_result.auth_failed {
-                self.update_failure_with_scope(failure, false, 0, failure_scope);
-            }
-            self.send_login_error(desktop_start_result.message).await;
-            return Some(true);
-        }
-
-        self.update_failure_with_scope(failure, true, 0, failure_scope);
-        self.linux_headless_handle.wait_desktop_cm_ready().await;
-        None
-    }
-
     async fn on_message(&mut self, msg: Message) -> bool {
         if let Some(message::Union::Misc(misc)) = &msg.union {
             // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
@@ -2443,7 +2377,7 @@ impl Connection {
                 return true;
             }
             match lr.union {
-                Some(login_request::Union::FileTransfer(ref ft)) => {
+                Some(login_request::Union::FileTransfer(ft)) => {
                     if !Self::permission(
                         keys::OPTION_ENABLE_FILE_TRANSFER,
                         &self.control_permissions,
@@ -2453,9 +2387,9 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
-                    self.file_transfer = Some((ft.dir.clone(), ft.show_hidden));
+                    self.file_transfer = Some((ft.dir, ft.show_hidden));
                 }
-                Some(login_request::Union::ViewCamera(ref _vc)) => {
+                Some(login_request::Union::ViewCamera(_vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
                         self.send_login_error("No permission of viewing camera")
                             .await;
@@ -2464,14 +2398,14 @@ impl Connection {
                     }
                     self.view_camera = true;
                 }
-                Some(login_request::Union::Terminal(ref terminal)) => {
+                Some(login_request::Union::Terminal(terminal)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
                         self.send_login_error("No permission of terminal").await;
                         sleep(1.).await;
                         return false;
                     }
                     #[cfg(target_os = "windows")]
-                    if !lr.os_login.username.trim().is_empty() && !crate::platform::is_installed() {
+                    if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
                         self.send_login_error("Supported only in the installed version.")
                             .await;
                         sleep(1.).await;
@@ -2483,15 +2417,14 @@ impl Connection {
                         self.terminal_persistent =
                             o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
                     }
-                    self.terminal_service_id = terminal.service_id.clone();
+                    self.terminal_service_id = terminal.service_id;
                 }
-                Some(login_request::Union::PortForward(ref pf)) => {
+                Some(login_request::Union::PortForward(mut pf)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
                         self.send_login_error("No permission of IP tunneling").await;
                         sleep(1.).await;
                         return false;
                     }
-                    let mut pf = pf.clone();
                     let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
                     self.port_forward_address = addr;
                 }
@@ -2502,17 +2435,56 @@ impl Connection {
                 }
             }
 
+            if !hbb_common::is_ip_str(&lr.username)
+                && !hbb_common::is_domain_port_str(&lr.username)
+                && lr.username != Config::get_id()
+            {
+                self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
+                    .await;
+                return false;
+            }
+
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            self.try_start_cm_ipc();
+            if !should_defer_cm_ipc_until_terminal_authorization(
+                self.terminal,
+                &lr.os_login.username,
+            ) {
+                self.try_start_cm_ipc();
+            }
+
+            #[cfg(target_os = "linux")]
+            if should_check_linux_headless_os_auth_before_desktop_start(
+                self.linux_headless_handle.is_headless_allowed,
+                &lr.os_login.username,
+            ) {
+                let (_failure, res) = self.check_failure(0).await;
+                if !res {
+                    return true;
+                }
+            }
 
             #[cfg(not(target_os = "linux"))]
             let err_msg = "".to_owned();
             #[cfg(target_os = "linux")]
-            let err_msg = self.prepare_linux_headless_login(&lr).await;
+            let err_msg = self
+                .linux_headless_handle
+                .try_start_desktop(lr.os_login.as_ref());
 
             // If err is LOGIN_MSG_DESKTOP_SESSION_NOT_READY, just keep this msg and go on checking password.
             if !err_msg.is_empty() && err_msg != crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY
             {
+                #[cfg(target_os = "linux")]
+                if should_record_linux_headless_os_auth_failure(
+                    self.linux_headless_handle.is_headless_allowed,
+                    &lr.os_login.username,
+                    &err_msg,
+                ) {
+                    let (failure, res) = self.check_failure(0).await;
+                    if !res {
+                        return true;
+                    }
+                    self.update_failure(failure, false, 0);
+                }
                 self.send_login_error(err_msg).await;
                 return true;
             }
@@ -2541,14 +2513,7 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if !hbb_common::is_ip_str(&lr.username)
-                && !hbb_common::is_domain_port_str(&lr.username)
-                && lr.username != Config::get_id()
-            {
-                self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
-                    .await;
-                return false;
-            } else if (password::approve_mode() == ApproveMode::Click
+            if (password::approve_mode() == ApproveMode::Click
                 && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
@@ -2562,12 +2527,12 @@ impl Connection {
                 return true;
             } else if self.is_recent_session(false) {
                 if err_msg.is_empty() {
+                    #[cfg(target_os = "linux")]
+                    self.linux_headless_handle.wait_desktop_cm_ready().await;
                     if !self.send_logon_response_and_keep_alive().await {
                         return false;
                     }
-                    if self.authorized || self.require_2fa.is_some() {
-                        self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
-                    }
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
                 } else {
                     self.send_login_error(err_msg).await;
                 }
@@ -2601,12 +2566,12 @@ impl Connection {
                 } else {
                     self.update_failure_with_scope(failure, true, 0, FailureScope::Default);
                     if err_msg.is_empty() {
+                        #[cfg(target_os = "linux")]
+                        self.linux_headless_handle.wait_desktop_cm_ready().await;
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
                         }
-                        if self.authorized || self.require_2fa.is_some() {
-                            self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
-                        }
+                        self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
                     } else {
                         self.send_login_error(err_msg).await;
                     }
@@ -2626,13 +2591,11 @@ impl Connection {
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
                         }
-                        if self.authorized || self.require_2fa.is_some() {
-                            self.try_start_cm(
-                                self.lr.my_id.to_owned(),
-                                self.lr.my_name.to_owned(),
-                                self.authorized,
-                            );
-                        }
+                        self.try_start_cm(
+                            self.lr.my_id.to_owned(),
+                            self.lr.my_name.to_owned(),
+                            self.authorized,
+                        );
                         if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
                             Config::add_trusted_device(TrustedDevice {
                                 hwid: tfa.hwid,
@@ -2682,13 +2645,11 @@ impl Connection {
                             if !self.send_logon_response_and_keep_alive().await {
                                 return false;
                             }
-                            if self.authorized || self.require_2fa.is_some() {
-                                self.try_start_cm(
-                                    lr.my_id.clone(),
-                                    lr.my_name.clone(),
-                                    self.authorized,
-                                );
-                            }
+                            self.try_start_cm(
+                                lr.my_id.clone(),
+                                lr.my_name.clone(),
+                                self.authorized,
+                            );
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
                             self.try_start_cm_ipc();
                         }
@@ -3632,17 +3593,19 @@ impl Connection {
         let auth_mode = if normalized_username.is_empty() {
             TerminalAuthorizationMode::SessionUser
         } else {
+            // Check failure state
             let failure_scope = FailureScope::TerminalOsLogin;
             let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
             if !res {
-                // Rate-limit blocks should keep the connection alive for retries.
                 log::warn!(
                     "OS credential login blocked by failure policy: ip={} conn_id={} scope={:?}",
                     self.ip,
                     self.inner.id(),
                     failure_scope
                 );
-                return Some(true);
+                // Terminal OS login is sensitive. Close this connection instead of keeping it
+                // alive for retries on the same socket after a rate-limit block.
+                return Some(false);
             }
             TerminalAuthorizationMode::OsLogin {
                 failure,
@@ -3661,6 +3624,7 @@ impl Connection {
         let terminal_login_error = {
             #[cfg(target_os = "windows")]
             {
+                // Concurrency gate for terminal OS login with credentials, to prevent brute-force attacks.
                 let _os_login_concurrency_guard = if is_terminal_os_login {
                     let guard = try_acquire_os_credential_login_gate();
                     if guard.is_err() {
@@ -3680,7 +3644,7 @@ impl Connection {
                                 "name": self.lr.my_name.clone(),
                             }),
                         );
-                        return Some(true);
+                        return Some(false);
                     }
                     guard.ok()
                 } else {
@@ -3718,15 +3682,13 @@ impl Connection {
             if let Some(user_token) = &self.terminal_user_token {
                 let has_service_token = user_token.to_terminal_service_token().is_some();
                 if is_user != has_service_token {
-                    log::warn!(
-                        "Terminal service user mismatch: ip={} conn_id={} service_is_user={} has_service_token={}",
+                    log::error!(
+                        "Terminal service user mismatch: ip={} conn_id={} service_is_user={} has_service_token={}. The service ID may have been manually changed in the configuration, causing validation to fail.",
                         self.ip,
                         self.inner.id(),
                         is_user,
                         has_service_token
                     );
-                    // This occurs when the service id (in the configuration) is manually changed by the user, causing a mismatch in validation.
-                    log::error!("Terminal service user mismatch detected. The service ID may have been manually changed in the configuration, causing validation to fail.");
                     // No need to translate the following message, because it is in an abnormal case.
                     self.send_login_error("Terminal service user mismatch detected.")
                         .await;
@@ -3795,10 +3757,7 @@ impl Connection {
         i: usize,
         scope: FailureScope,
     ) {
-        let os_credential_scope = matches!(
-            scope,
-            FailureScope::TerminalOsLogin | FailureScope::LinuxHeadlessOsLogin
-        );
+        let os_credential_scope = matches!(scope, FailureScope::TerminalOsLogin);
         let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
@@ -3926,10 +3885,7 @@ impl Connection {
                 }),
             );
             false
-        } else if matches!(
-            scope,
-            FailureScope::TerminalOsLogin | FailureScope::LinuxHeadlessOsLogin
-        ) {
+        } else if matches!(scope, FailureScope::TerminalOsLogin) {
             let decision = evaluate_os_credential_policy(scope, get_time());
             if decision.allowed {
                 true
@@ -5441,8 +5397,6 @@ pub enum AlarmAuditType {
     ExceedIPv6PrefixAttempts = 6,
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
-    LinuxHeadlessOsLoginBackoff = 9,
-    LinuxHeadlessOsLoginConcurrency = 10,
 }
 
 pub enum FileAuditType {
@@ -5691,6 +5645,19 @@ impl LinuxHeadlessHandle {
             wait_ipc_timeout: 10_000,
             rx_cm_stream_ready,
             tx_desktop_ready,
+        }
+    }
+
+    pub fn try_start_desktop(&mut self, os_login: Option<&OSLogin>) -> String {
+        if self.is_headless_allowed {
+            match os_login {
+                Some(os_login) => {
+                    linux_desktop_manager::try_start_desktop(&os_login.username, &os_login.password)
+                }
+                None => linux_desktop_manager::try_start_desktop("", ""),
+            }
+        } else {
+            "".to_string()
         }
     }
 
