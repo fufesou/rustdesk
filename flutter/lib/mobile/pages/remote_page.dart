@@ -59,6 +59,7 @@ class RemotePage extends StatefulWidget {
 }
 
 class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
+  static const bool _showKeyEventDebugOverlay = true;
   Timer? _timer;
   bool _showBar = !isWebDesktop;
   bool _showGestureHelp = false;
@@ -257,6 +258,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
     // Input the new string.
     if (newStr.length > 1) {
+      debugSendStringToRemote(newStr);
       bind.sessionInputString(sessionId: sessionId, value: newStr);
     } else {
       inputChar(newStr);
@@ -293,10 +295,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 content == '（）' ||
                 content == '【】')) {
           // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
+          debugSendStringToRemote(content);
           bind.sessionInputString(sessionId: sessionId, value: content);
           openKeyboard();
           return;
         }
+        debugSendStringToRemote(content);
         bind.sessionInputString(sessionId: sessionId, value: content);
       } else {
         inputChar(content);
@@ -320,6 +324,72 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       char = 'VK_SPACE';
     }
     inputModel.inputKey(char);
+  }
+
+  String _escapeControlChars(String text) {
+    return text
+        .replaceAll('\n', r'\n')
+        .replaceAll('\r', r'\r')
+        .replaceAll('\t', r'\t');
+  }
+
+  void debugSendStringToRemote(String value) {
+    inputModel.debugInputFlow(
+      'txString',
+      'len=${value.length} value=${_escapeControlChars(value)}',
+    );
+  }
+
+  Widget _buildKeyEventDebugOverlay() {
+    if (!_showKeyEventDebugOverlay) {
+      return Offstage();
+    }
+    return Positioned(
+      top: 10,
+      left: 10,
+      child: IgnorePointer(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: 420),
+          child: Obx(() {
+            final lines = inputModel.keyEventDebugLines;
+            if (lines.isEmpty) {
+              return Offstage();
+            }
+            return Container(
+              padding: EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.72),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.white24, width: 1),
+              ),
+              child: SizedBox(
+                width: 420,
+                height: 280,
+                child: ListView.builder(
+                  reverse: true,
+                  itemCount: lines.length,
+                  itemBuilder: (context, index) {
+                    final line = lines[lines.length - 1 - index];
+                    return Text(
+                      line,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      softWrap: false,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                        height: 1.2,
+                      ),
+                    );
+                  },
+                ),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
   }
 
   void openKeyboard() {
@@ -570,6 +640,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         child: Stack(children: () {
           final paints = [
             ImagePaint(ffiModel: gFFI.ffiModel),
+            _buildKeyEventDebugOverlay(),
             Positioned(
               top: 10,
               right: 10,

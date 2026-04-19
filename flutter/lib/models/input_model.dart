@@ -327,6 +327,7 @@ class ToReleaseKeys {
 }
 
 class InputModel {
+  static const int _kKeyEventDebugMaxLines = 80;
   final WeakReference<FFI> parent;
   String keyboardMode = '';
 
@@ -335,6 +336,8 @@ class InputModel {
   var ctrl = false;
   var alt = false;
   var command = false;
+  final RxList<String> keyEventDebugLines = <String>[].obs;
+  int _keyEventDebugSeq = 0;
 
   final ToReleaseRawKeys toReleaseRawKeys = ToReleaseRawKeys();
   final ToReleaseKeys toReleaseKeys = ToReleaseKeys();
@@ -407,6 +410,41 @@ class InputModel {
   int get trackpadSpeed => _trackpadSpeed;
   bool get useEdgeScroll =>
       parent.target!.canvasModel.scrollStyle == ScrollStyle.scrolledge;
+
+  String _modifierStateText() {
+    return 'S:${shift ? 1 : 0} C:${ctrl ? 1 : 0} A:${alt ? 1 : 0} M:${command ? 1 : 0}';
+  }
+
+  String _debugNow() {
+    final now = DateTime.now();
+    final hh = now.hour.toString().padLeft(2, '0');
+    final mm = now.minute.toString().padLeft(2, '0');
+    final ss = now.second.toString().padLeft(2, '0');
+    final ms = now.millisecond.toString().padLeft(3, '0');
+    return '$hh:$mm:$ss.$ms';
+  }
+
+  String _ellipsize(String text, {int maxLength = 20}) {
+    if (text.length <= maxLength) {
+      return text;
+    }
+    return '${text.substring(0, maxLength)}...';
+  }
+
+  void _appendKeyEventDebugLine(String line) {
+    keyEventDebugLines.add(line);
+    final overflow = keyEventDebugLines.length - _kKeyEventDebugMaxLines;
+    if (overflow > 0) {
+      keyEventDebugLines.removeRange(0, overflow);
+    }
+  }
+
+  void debugInputFlow(String source, String detail) {
+    _keyEventDebugSeq += 1;
+    _appendKeyEventDebugLine(
+      '#${_keyEventDebugSeq} $detail',
+    );
+  }
 
   /// Check if the connected server supports relative mouse mode.
   bool get isRelativeMouseModeSupported => _relativeMouse.isSupported;
@@ -641,6 +679,7 @@ class InputModel {
     }
 
     final key = e.logicalKey;
+    final before = _modifierStateText();
     if (e is RawKeyDownEvent) {
       if (!e.repeat) {
         if (e.isAltPressed && !alt) {
@@ -674,12 +713,19 @@ class InputModel {
       toReleaseRawKeys.updateKeyUp(key, e);
     }
 
+    final after = _modifierStateText();
+
     // * Currently mobile does not enable map mode
-    if ((isDesktop || isWebDesktop) && keyboardMode == kKeyMapMode) {
+    final useMapMode = (isDesktop || isWebDesktop) && keyboardMode == kKeyMapMode;
+    if (useMapMode) {
       mapKeyboardModeRaw(e, iosCapsLock);
     } else {
       legacyKeyboardModeRaw(e);
     }
+    debugInputFlow(
+      'handleRawKeyEvent',
+      '${e.runtimeType} key=${key.keyLabel} char=${_ellipsize(e.character ?? "-")} ${e.isShiftPressed ? "shift" : ""}',
+    );
 
     return KeyEventResult.handled;
   }
@@ -717,11 +763,13 @@ class InputModel {
       iosCapsLock = _getIosCapsFromCharacter(e);
     }
 
+    final before = _modifierStateText();
     if (e is KeyUpEvent) {
       handleKeyUpEventModifiers(e);
     } else if (e is KeyDownEvent) {
       handleKeyDownEventModifiers(e);
     }
+    final after = _modifierStateText();
 
     bool isMobileAndMapMode = false;
     if (isMobile) {
@@ -756,7 +804,8 @@ class InputModel {
     }
     final isDesktopAndMapMode =
         isDesktop || (isWebDesktop && keyboardMode == kKeyMapMode);
-    if (isMobileAndMapMode || isDesktopAndMapMode) {
+    final useMapMode = isMobileAndMapMode || isDesktopAndMapMode;
+    if (useMapMode) {
       // FIXME: e.character is wrong for dead keys, eg: ^ in de
       newKeyboardMode(
           e.character ?? '',
@@ -767,6 +816,10 @@ class InputModel {
     } else {
       legacyKeyboardMode(e);
     }
+    debugInputFlow(
+      'handleKeyEvent',
+      '${e.runtimeType} key=${e.logicalKey.keyLabel} char=${_ellipsize(e.character ?? "-")} ${HardwareKeyboard.instance.isShiftPressed ? "shift" : ""}',
+    );
 
     return KeyEventResult.handled;
   }
@@ -781,6 +834,10 @@ class InputModel {
         usbHid: usbHid,
         lockModes: lockModes,
         downOrUp: down);
+    debugInputFlow(
+      'txFlutterKey',
+      'char=${_ellipsize(character)} down=${down ? 1 : 0} lock=0x${lockModes.toRadixString(16)}',
+    );
   }
 
   void mapKeyboardModeRaw(RawKeyEvent e, bool iosCapsLock) {
@@ -829,6 +886,10 @@ class InputModel {
         positionCode: positionCode,
         lockModes: lockModes,
         downOrUp: down);
+    debugInputFlow(
+      'txFlutterRawKey',
+      'name=${_ellipsize(name)} platform=$platformCode position=$positionCode down=${down ? 1 : 0} lock=0x${lockModes.toRadixString(16)}',
+    );
   }
 
   void legacyKeyboardModeRaw(RawKeyEvent e) {
@@ -876,15 +937,21 @@ class InputModel {
   void inputKey(String name, {bool? down, bool? press}) {
     if (!keyboardPerm) return;
     if (isViewCamera) return;
+    final d = down ?? false;
+    final p = press ?? true;
     bind.sessionInputKey(
         sessionId: sessionId,
         name: name,
-        down: down ?? false,
-        press: press ?? true,
+        down: d,
+        press: p,
         alt: alt,
         ctrl: ctrl,
         shift: shift,
         command: command);
+    debugInputFlow(
+      'txKey',
+      'name=${_ellipsize(name)} down=${d ? 1 : 0} press=${p ? 1 : 0} ${_modifierStateText()}',
+    );
   }
 
   static Map<String, dynamic> getMouseEventMove() => {
