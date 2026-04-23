@@ -352,12 +352,26 @@ impl Subscriber for ConnInner {
 }
 
 const TEST_DELAY_TIMEOUT: Duration = Duration::from_secs(1);
+const TEST_DELAY_RESEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SEC30: Duration = Duration::from_secs(30);
 const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn should_send_test_delay(
+    last_test_delay: Option<Instant>,
+    suppress_test_delay: bool,
+) -> bool {
+    if suppress_test_delay {
+        return false;
+    }
+    match last_test_delay {
+        None => true,
+        Some(last_test_delay) => last_test_delay.elapsed() >= TEST_DELAY_RESEND_TIMEOUT,
+    }
+}
 
 impl Connection {
     pub async fn start(
@@ -940,7 +954,8 @@ impl Connection {
                         break;
                     }
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
-                    if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
+                    let suppress_test_delay = conn.port_forward_socket.is_some() && conn.authorized;
+                    if should_send_test_delay(conn.last_test_delay, suppress_test_delay) {
                         conn.last_test_delay = Some(Instant::now());
                         let mut msg_out = Message::new();
                         msg_out.set_test_delay(TestDelay{
@@ -5717,4 +5732,5 @@ mod test {
         assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
         assert!(Ipv6Addr::from_str("0").is_err());
     }
+
 }
