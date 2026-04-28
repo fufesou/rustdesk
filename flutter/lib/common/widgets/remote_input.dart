@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -10,6 +11,7 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/input_model.dart';
+import 'package:flutter_hbb/utils/canvas_lock.dart';
 
 import './gestures.dart';
 
@@ -92,6 +94,7 @@ class _RawTouchGestureDetectorRegionState
   int _cacheLongPressPositionTs = 0;
   double _mouseScrollIntegral = 0; // mouse scroll speed controller
   double _scale = 1;
+  bool _canvasLockLoaded = !isMobile;
 
   // Workaround tap down event when two fingers are used to scale(mobile)
   TapDownDetails? _lastTapDownDetails;
@@ -115,6 +118,43 @@ class _RawTouchGestureDetectorRegionState
   InputModel get inputModel => widget.inputModel;
   bool get handleTouch => (isDesktop || isWebDesktop) || ffiModel.touchMode;
   SessionID get sessionId => ffi.sessionId;
+  String get sessionKey => sessionId.toString();
+
+  @override
+  void initState() {
+    super.initState();
+    if (isMobile && !widget.isCamera) {
+      _canvasLockLoaded = false;
+      unawaited(_loadCachedCanvasLock().then((_) {
+        if (!mounted) return;
+        _canvasLockLoaded = true;
+      }).catchError((Object e, StackTrace s) {
+        debugPrint('Failed to load canvas lock option: $e');
+        debugPrintStack(stackTrace: s);
+        if (!mounted) return;
+        _canvasLockLoaded = true;
+      }));
+    }
+  }
+
+  @override
+  void dispose() {
+    if (isMobile && !widget.isCamera) {
+      clearCachedCanvasLockValue(sessionKey);
+    }
+    super.dispose();
+  }
+
+  Future<void> _loadCachedCanvasLock() async {
+    final revision = canvasLockRevision(sessionKey);
+    final lockValue = await bind.sessionGetFlutterOption(
+        sessionId: sessionId, k: kLockCanvasOptionKey);
+    if (!mounted) {
+      return;
+    }
+    setInitialCachedCanvasLockValue(
+        sessionKey, isCanvasLockEnabled(lockValue), revision);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -485,6 +525,13 @@ class _RawTouchGestureDetectorRegionState
       }
     } else {
       // mobile
+      final isCanvasLocked = cachedCanvasLockValue(sessionKey);
+      if (!widget.isCamera &&
+          (isCanvasLocked ||
+              (!_canvasLockLoaded && !hasCachedCanvasLockValue(sessionKey)))) {
+        _scale = d.scale;
+        return;
+      }
       ffi.canvasModel.updateScale(d.scale / _scale, d.focalPoint);
       _scale = d.scale;
       ffi.canvasModel.panX(d.focalPointDelta.dx);

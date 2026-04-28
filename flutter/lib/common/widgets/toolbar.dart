@@ -11,6 +11,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:flutter_hbb/utils/canvas_lock.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 
@@ -592,13 +593,58 @@ Future<List<TToggleMenu>> toolbarCursor(
 }
 
 Future<List<TToggleMenu>> toolbarDisplayToggle(
-    BuildContext context, String id, FFI ffi) async {
+    BuildContext context, String id, FFI ffi,
+    {bool supportsCanvasLock = true}) async {
   List<TToggleMenu> v = [];
   final ffiModel = ffi.ffiModel;
   final pi = ffiModel.pi;
   final perms = ffiModel.permissions;
   final sessionId = ffi.sessionId;
+  final sessionKey = sessionId.toString();
   final isDefaultConn = ffi.connType == ConnType.defaultConn;
+
+  if (supportsCanvasLock && isMobile && isDefaultConn) {
+    var initialLockValue = cachedCanvasLockValue(sessionKey);
+    final initialRevision = canvasLockRevision(sessionKey);
+    try {
+      final lockValue = await bind.sessionGetFlutterOption(
+          sessionId: sessionId, k: kLockCanvasOptionKey);
+      final resolvedLockValue = isCanvasLockEnabled(lockValue);
+      initialLockValue = resolvedLockValue;
+      if (canvasLockRevision(sessionKey) == initialRevision) {
+        syncCachedCanvasLockValue(sessionKey, resolvedLockValue);
+      }
+    } catch (e, stack) {
+      debugPrint('Failed to read lock canvas option: $e');
+      debugPrintStack(stackTrace: stack);
+    }
+    var committedLockValue = initialLockValue;
+    var lockWriteEpoch = 0;
+    v.add(TToggleMenu(
+        value: initialLockValue,
+        onChanged: (value) async {
+          if (value == null) return;
+          final epoch = ++lockWriteEpoch;
+          final previous = committedLockValue;
+          setCachedCanvasLockValue(sessionKey, value);
+          try {
+            await bind.sessionSetFlutterOption(
+                sessionId: sessionId,
+                k: kLockCanvasOptionKey,
+                v: canvasLockValue(value));
+            if (epoch == lockWriteEpoch) {
+              committedLockValue = value;
+            }
+          } catch (e, stack) {
+            if (epoch == lockWriteEpoch) {
+              setCachedCanvasLockValue(sessionKey, previous);
+            }
+            debugPrint('Failed to persist lock canvas option: $e');
+            debugPrintStack(stackTrace: stack);
+          }
+        },
+        child: Text(translate('Lock canvas'))));
+  }
 
   // show quality monitor
   final option = 'show-quality-monitor';

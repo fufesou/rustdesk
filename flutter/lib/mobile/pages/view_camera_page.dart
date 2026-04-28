@@ -630,7 +630,7 @@ void showOptions(
       await toolbarImageQuality(context, id, gFFI);
   List<TRadioMenu<String>> codecRadios = await toolbarCodec(context, id, gFFI);
   List<TToggleMenu> displayToggles =
-      await toolbarDisplayToggle(context, id, gFFI);
+      await toolbarDisplayToggle(context, id, gFFI, supportsCanvasLock: false);
 
   dialogManager.show((setState, close, context) {
     var viewStyle =
