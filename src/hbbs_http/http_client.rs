@@ -120,19 +120,23 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
     url
 }
 
-pub fn create_http_client_with_url(url: &str) -> SyncClient {
+pub fn create_http_client_with_url(
+    url: &str,
+    tls_danger_accept_invalid_cert: Option<bool>,
+) -> SyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_type_cached = tls_type.is_some();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let tls_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let danger_accept_invalid_cert =
+        tls_danger_accept_invalid_cert.or_else(|| get_cached_tls_accept_invalid_cert(tls_url));
     create_http_client_with_url_(
         url,
         tls_url,
         tls_type,
         is_tls_type_cached,
-        tls_danger_accept_invalid_cert,
+        danger_accept_invalid_cert,
         tls_danger_accept_invalid_cert,
     )
 }
@@ -229,20 +233,24 @@ fn create_http_client_with_url_(
     client
 }
 
-pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
+pub async fn create_http_client_async_with_url(
+    url: &str,
+    tls_danger_accept_invalid_cert: Option<bool>,
+) -> AsyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_type_cached = tls_type.is_some();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let danger_accept_invalid_cert =
+        tls_danger_accept_invalid_cert.or_else(|| get_cached_tls_accept_invalid_cert(tls_url));
     create_http_client_async_with_url_(
         url,
         tls_url,
         tls_type,
         is_tls_type_cached,
         danger_accept_invalid_cert,
-        danger_accept_invalid_cert,
+        tls_danger_accept_invalid_cert,
     )
     .await
 }
