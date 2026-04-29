@@ -1,8 +1,8 @@
 use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
-    io::Write,
-    path::PathBuf,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{channel, Receiver, Sender},
@@ -146,10 +146,11 @@ fn check_update(manually: bool) -> ResultType<()> {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
         };
         log::debug!("New version available: {}", &version);
-        let client = create_http_client_with_url(&download_url);
+        let client = create_http_client_with_url(&download_url, Some(false));
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
+        let expected_sha256 = fetch_github_asset_sha256(&update_url, &download_url)?;
         let mut is_file_exists = false;
         if file_path.exists() {
             // Check if the file size is the same as the server file size
@@ -168,7 +169,13 @@ fn check_update(manually: bool) -> ResultType<()> {
                 bail!("Failed to get content length");
             };
             if file_size == total_size {
-                is_file_exists = true;
+                match verify_file_sha256(&file_path, &expected_sha256) {
+                    Ok(()) => is_file_exists = true,
+                    Err(e) => {
+                        log::warn!("Removing cached update file with invalid SHA256: {}", e);
+                        std::fs::remove_file(&file_path)?;
+                    }
+                }
             } else {
                 std::fs::remove_file(&file_path)?;
             }
@@ -182,22 +189,21 @@ fn check_update(manually: bool) -> ResultType<()> {
                 );
             }
             let file_data = response.bytes()?;
-            let mut file = std::fs::File::create(&file_path)?;
-            file.write_all(&file_data)?;
+            write_verified_download(&file_path, &file_data, &expected_sha256)?;
         }
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
         // before the download, but not empty after the download.
         if has_no_active_conns() {
             #[cfg(target_os = "windows")]
-            update_new_version(update_msi, &version, &file_path);
+            update_new_version(update_msi, &version, &file_path, &expected_sha256);
         }
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
+fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expected_sha256: &str) {
     log::debug!(
         "New version is downloaded, update begin, update msi: {update_msi}, version: {version}, file: {:?}",
         file_path.to_str()
@@ -205,7 +211,26 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
     if let Some(p) = file_path.to_str() {
         if let Some(session_id) = crate::platform::get_current_process_session_id() {
             if update_msi {
-                match crate::platform::update_me_msi(p, true) {
+                let update_file = match crate::platform::verify_update_file_signature_and_sha256(
+                    p,
+                    expected_sha256,
+                ) {
+                    Ok(update_file) => update_file,
+                    Err(e) => {
+                        log::error!("Refusing to update from untrusted msi: {}", e);
+                        std::fs::remove_file(&file_path).ok();
+                        return;
+                    }
+                };
+                let update_path = match update_file.path_str() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        log::error!("Failed to get verified msi path: {}", e);
+                        std::fs::remove_file(&file_path).ok();
+                        return;
+                    }
+                };
+                match crate::platform::update_me_msi(update_path, true) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);
                     }
@@ -219,6 +244,25 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                     }
                 }
             } else {
+                let update_file = match crate::platform::verify_update_file_signature_and_sha256(
+                    p,
+                    expected_sha256,
+                ) {
+                    Ok(update_file) => update_file,
+                    Err(e) => {
+                        log::error!("Refusing to update from untrusted exe: {}", e);
+                        std::fs::remove_file(&file_path).ok();
+                        return;
+                    }
+                };
+                let update_path = match update_file.path_str() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        log::error!("Failed to get verified exe path: {}", e);
+                        std::fs::remove_file(&file_path).ok();
+                        return;
+                    }
+                };
                 let custom_client_staging_dir = if crate::is_custom_client() {
                     let custom_client_staging_dir =
                         crate::platform::get_custom_client_staging_dir();
@@ -243,7 +287,7 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                 };
                 let update_launched = match crate::platform::launch_privileged_process(
                     session_id,
-                    &format!("{} --update", p),
+                    &format!("\"{}\" --update", update_path),
                 ) {
                     Ok(h) => {
                         if h.is_null() {
@@ -287,4 +331,420 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     let filename = url.split('/').last()?;
     Some(std::env::temp_dir().join(filename))
+}
+
+fn create_download_temp_file(final_path: &Path) -> ResultType<(std::fs::File, PathBuf)> {
+    let Some(download_dir) = final_path.parent() else {
+        bail!(
+            "Update file has no parent directory: {}",
+            final_path.display()
+        );
+    };
+    let Some(file_name) = final_path.file_name() else {
+        bail!("Update file has no file name: {}", final_path.display());
+    };
+    let file_name = file_name.to_string_lossy();
+    for _ in 0..16 {
+        let temp_path = download_dir.join(format!(
+            ".{}.{}.{}.download",
+            file_name,
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((file, temp_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("Failed to create temporary update file");
+}
+
+fn install_verified_download(temp_path: &Path, final_path: &Path) -> ResultType<()> {
+    if std::fs::symlink_metadata(final_path).is_ok() {
+        std::fs::remove_file(final_path)?;
+    }
+    if let Err(e) = std::fs::rename(temp_path, final_path) {
+        std::fs::remove_file(temp_path).ok();
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn write_and_verify_download_file(
+    file: &mut std::fs::File,
+    temp_path: &Path,
+    file_data: &[u8],
+    expected_sha256: &str,
+) -> ResultType<()> {
+    file.write_all(file_data)?;
+    file.flush()?;
+    verify_file_sha256(temp_path, expected_sha256)
+}
+
+fn write_verified_download(
+    final_path: &Path,
+    file_data: &[u8],
+    expected_sha256: &str,
+) -> ResultType<()> {
+    let (mut file, temp_path) = create_download_temp_file(final_path)?;
+    if let Err(e) =
+        write_and_verify_download_file(&mut file, &temp_path, file_data, expected_sha256)
+    {
+        std::fs::remove_file(temp_path).ok();
+        return Err(e);
+    }
+    if let Err(e) = install_verified_download(&temp_path, final_path) {
+        std::fs::remove_file(temp_path).ok();
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    digest: Option<String>,
+}
+
+fn fetch_github_asset_sha256(update_url: &str, download_url: &str) -> ResultType<String> {
+    let api_url = github_release_api_url(update_url)?;
+    let asset_name = download_asset_name(download_url)?;
+    let metadata = fetch_github_release_metadata(&api_url)?;
+    github_release_asset_sha256(&metadata, &asset_name)
+}
+
+fn fetch_github_release_metadata(api_url: &str) -> ResultType<String> {
+    let client = create_http_client_with_url(&api_url, Some(false));
+    let response = client
+        .get(api_url)
+        .header(reqwest::header::USER_AGENT, "rustdesk-updater")
+        .send()?;
+    if !response.status().is_success() {
+        bail!(
+            "Failed to get GitHub release metadata: {}",
+            response.status()
+        );
+    }
+    Ok(response.text()?)
+}
+
+pub fn download_file_expected_sha256(download_url: &str) -> ResultType<String> {
+    fetch_github_asset_sha256(download_url, download_url)
+}
+
+fn github_release_api_url(update_url: &str) -> ResultType<String> {
+    let url = reqwest::Url::parse(update_url)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        bail!(
+            "Update URL is not a GitHub HTTPS release URL: {}",
+            update_url
+        );
+    }
+
+    let Some(mut segments) = url.path_segments() else {
+        bail!("GitHub update URL has no path: {}", update_url);
+    };
+    let Some(owner) = segments.next() else {
+        bail!("GitHub update URL has no owner: {}", update_url);
+    };
+    let Some(repo) = segments.next() else {
+        bail!("GitHub update URL has no repo: {}", update_url);
+    };
+    if owner != "rustdesk" || repo != "rustdesk" {
+        bail!(
+            "GitHub update URL is not a RustDesk release URL: {}",
+            update_url
+        );
+    }
+    if segments.next() != Some("releases") {
+        bail!("GitHub update URL is not a release URL: {}", update_url);
+    }
+
+    let tag = match segments.next() {
+        Some("tag") => segments.collect::<Vec<_>>().join("/"),
+        Some("download") => {
+            let Some(tag) = segments.next() else {
+                bail!("GitHub update URL has no release tag: {}", update_url);
+            };
+            if segments.next().is_none() {
+                bail!("GitHub update URL has no release asset: {}", update_url);
+            }
+            tag.to_owned()
+        }
+        _ => bail!(
+            "GitHub update URL is not a release tag or download URL: {}",
+            update_url
+        ),
+    };
+    if tag.is_empty() {
+        bail!("GitHub update URL has no release tag: {}", update_url);
+    }
+
+    Ok(format!(
+        "https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+    ))
+}
+
+fn download_asset_name(download_url: &str) -> ResultType<String> {
+    let Some(asset_name) = download_url.split('/').last() else {
+        bail!("Download URL has no asset name: {}", download_url);
+    };
+    if asset_name.is_empty() {
+        bail!("Download URL has empty asset name: {}", download_url);
+    }
+    Ok(asset_name.to_owned())
+}
+
+fn github_release_asset_sha256(release_json: &str, asset_name: &str) -> ResultType<String> {
+    let release: GithubRelease = serde_json::from_str(release_json)?;
+    let Some(asset) = release.assets.iter().find(|asset| asset.name == asset_name) else {
+        bail!("GitHub release asset not found: {}", asset_name);
+    };
+    let Some(digest) = asset.digest.as_deref() else {
+        bail!("GitHub release asset has no digest: {}", asset_name);
+    };
+    parse_sha256_digest(digest)
+}
+
+fn parse_sha256_digest(digest: &str) -> ResultType<String> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        bail!("GitHub release asset digest is not SHA256: {}", digest);
+    };
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "GitHub release asset SHA256 digest is malformed: {}",
+            digest
+        );
+    }
+    Ok(hex.to_lowercase())
+}
+
+fn verify_file_sha256(path: &Path, expected_sha256: &str) -> ResultType<()> {
+    let actual_sha256 = sha256_file_hex(path)?;
+    if actual_sha256 != expected_sha256 {
+        bail!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_sha256,
+            actual_sha256
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file_hex(path: &Path) -> ResultType<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::default();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buffer[..count]);
+    }
+    Ok(format!("{:x}", sha2::Digest::finalize(hasher)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_release_api_url_accepts_tag_url() {
+        let api_url =
+            github_release_api_url("https://github.com/rustdesk/rustdesk/releases/tag/1.4.3")
+                .unwrap();
+
+        assert_eq!(
+            api_url,
+            "https://api.github.com/repos/rustdesk/rustdesk/releases/tags/1.4.3"
+        );
+    }
+
+    #[test]
+    fn github_release_api_url_accepts_download_url() {
+        let api_url = github_release_api_url(
+            "https://github.com/rustdesk/rustdesk/releases/download/1.4.3/rustdesk-1.4.3-x86_64.exe",
+        )
+        .unwrap();
+
+        assert_eq!(
+            api_url,
+            "https://api.github.com/repos/rustdesk/rustdesk/releases/tags/1.4.3"
+        );
+    }
+
+    #[test]
+    fn github_release_api_url_rejects_non_release_download_url() {
+        assert!(github_release_api_url(
+            "https://github.com/rustdesk/rustdesk/archive/refs/tags/1.4.3.zip"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn github_release_api_url_rejects_non_github_url() {
+        assert!(github_release_api_url("https://example.com/rustdesk/releases/tag/1.4.3").is_err());
+    }
+
+    #[test]
+    fn github_release_api_url_rejects_non_rustdesk_repo() {
+        assert!(
+            github_release_api_url("https://github.com/other/rustdesk/releases/tag/1.4.3").is_err()
+        );
+        assert!(
+            github_release_api_url("https://github.com/rustdesk/other/releases/tag/1.4.3").is_err()
+        );
+    }
+
+    #[test]
+    fn github_release_digest_requires_exact_asset_name_and_sha256_digest() {
+        let json = r#"{
+            "assets": [
+                {"name": "rustdesk-1.4.3-x86_64.exe", "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                {"name": "rustdesk-1.4.3-x86_64.msi", "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+            ]
+        }"#;
+
+        let digest = github_release_asset_sha256(json, "rustdesk-1.4.3-x86_64.exe").unwrap();
+
+        assert_eq!(
+            digest,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn github_release_digest_rejects_missing_or_malformed_digest() {
+        let missing = r#"{"assets": [{"name": "rustdesk.exe"}]}"#;
+        let malformed = r#"{"assets": [{"name": "rustdesk.exe", "digest": "sha1:abcd"}]}"#;
+
+        assert!(github_release_asset_sha256(missing, "rustdesk.exe").is_err());
+        assert!(github_release_asset_sha256(malformed, "rustdesk.exe").is_err());
+    }
+
+    #[test]
+    fn verify_file_sha256_rejects_mismatched_file() {
+        let file_path = std::env::temp_dir().join(format!(
+            "rustdesk-updater-sha256-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, b"rustdesk").unwrap();
+
+        let result = verify_file_sha256(
+            &file_path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        std::fs::remove_file(&file_path).unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_download_temp_file_uses_random_sibling_path() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-temp-file-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+
+        let (file, temp_path) = create_download_temp_file(&final_path).unwrap();
+
+        drop(file);
+        let temp_file_name = temp_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert_ne!(temp_path, final_path);
+        assert_eq!(temp_path.parent(), Some(test_dir.as_path()));
+        assert!(temp_file_name.starts_with(".rustdesk-update.exe."));
+        assert!(temp_file_name.ends_with(".download"));
+        assert!(temp_path.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn write_verified_download_removes_temp_file_on_sha256_error() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+
+        let result = write_verified_download(
+            &final_path,
+            b"update",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+
+        assert!(result.is_err());
+        assert!(!final_path.exists());
+        assert!(std::fs::read_dir(&test_dir).unwrap().next().is_none());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn write_verified_download_removes_temp_file_on_install_error() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-install-error-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+        std::fs::create_dir(&final_path).unwrap();
+
+        let result = write_verified_download(
+            &final_path,
+            b"update",
+            "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4",
+        );
+
+        assert!(result.is_err());
+        assert!(final_path.is_dir());
+        assert_eq!(std::fs::read_dir(&test_dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_verified_download_replaces_symlink_without_touching_target() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+        let temp_path = test_dir.join(".rustdesk-update.exe.tmp");
+        let victim_path = test_dir.join("victim");
+        std::fs::write(&victim_path, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim_path, &final_path).unwrap();
+        std::fs::write(&temp_path, b"update").unwrap();
+
+        install_verified_download(&temp_path, &final_path).unwrap();
+
+        assert_eq!(std::fs::read(&victim_path).unwrap(), b"victim");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"update");
+        assert!(!std::fs::symlink_metadata(&final_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
 }
