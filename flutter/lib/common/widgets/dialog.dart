@@ -2310,7 +2310,7 @@ void enter2FaDialog(
         content: Column(
           children: [
             codeField,
-            if (bind.sessionGetEnableTrustedDevices(sessionId: sessionId))
+            if (bind.sessionGetTrustedDeviceV2Supported(sessionId: sessionId))
               trustField,
           ],
         ),

@@ -868,6 +868,7 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::ClearTrustedDevices => {
             Config::clear_trusted_devices();
+            allow_err!(Config::clear_trusted_devices_v2());
         }
         Data::InstallOption(opt) => match opt {
             Some((_k, _v)) => {
@@ -1334,6 +1335,7 @@ pub fn remove_trusted_devices(hwids: Vec<Bytes>) {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn clear_trusted_devices() {
     Config::clear_trusted_devices();
+    allow_err!(Config::clear_trusted_devices_v2());
     allow_err!(set_data(&Data::ClearTrustedDevices));
 }
 

@@ -256,6 +256,15 @@ pub fn session_get_enable_trusted_devices(session_id: SessionID) -> SyncReturn<b
     SyncReturn(v)
 }
 
+pub fn session_get_trusted_device_v2_supported(session_id: SessionID) -> SyncReturn<bool> {
+    let v = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.get_trusted_device_v2_supported()
+    } else {
+        false
+    };
+    SyncReturn(v)
+}
+
 pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<bool> {
     SyncReturn(sessions::would_remove_peer_by_session_id(&session_id))
 }

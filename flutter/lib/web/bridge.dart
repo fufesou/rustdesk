@@ -1799,6 +1799,13 @@ class RustdeskImpl {
         'Y';
   }
 
+  bool sessionGetTrustedDeviceV2Supported(
+      {required UuidValue sessionId, dynamic hint}) {
+    return js.context
+            .callMethod('getByName', ['trusted_device_v2_supported']) ==
+        'Y';
+  }
+
   Future<String> mainGetTrustedDevices({dynamic hint}) {
     throw UnimplementedError("mainGetTrustedDevices");
   }
@@ -2034,7 +2041,9 @@ class RustdeskImpl {
   }
 
   String mainResolveAvatarUrl({required String avatar, dynamic hint}) {
-    return js.context.callMethod('getByName', ['resolve_avatar_url', avatar])?.toString() ?? avatar;
+    return js.context.callMethod(
+            'getByName', ['resolve_avatar_url', avatar])?.toString() ??
+        avatar;
   }
 
   void dispose() {}

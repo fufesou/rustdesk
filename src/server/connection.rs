@@ -28,7 +28,7 @@ use hbb_common::platform::linux::run_cmds;
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
     config::decode_permanent_password_h1_from_storage,
-    config::{self, keys, Config, TrustedDevice},
+    config::{self, keys, Config, TrustedDeviceV2},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
@@ -270,6 +270,8 @@ pub struct Connection {
     server_audit_conn: String,
     server_audit_file: String,
     lr: LoginRequest,
+    trusted_device_auth_credential: Option<TrustedDeviceAuthCredential>,
+    trusted_device_v2_enrollment_token: Option<Bytes>,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
@@ -359,6 +361,32 @@ const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const TRUSTED_DEVICE_V2_MIN_CLIENT_VERSION: &str = "1.4.7";
+const TRUSTED_DEVICE_V2_ENROLLMENT_ERROR: &str = "Trusted device enrollment failed";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TrustedDeviceAuthCredential {
+    LocalPermanent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TrustedDeviceCredentialResult {
+    PasswordRejected,
+    Temporary,
+    V2Unavailable,
+    LocalPermanent,
+}
+
+enum TrustedDeviceIssueResult {
+    NotRequested,
+    UnsupportedCredential,
+    Issued(Bytes),
+}
+
+enum TrustedDeviceValidationResult {
+    Invalid,
+    Valid,
+}
 
 impl Connection {
     pub async fn start(
@@ -454,6 +482,8 @@ impl Connection {
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             lr: Default::default(),
+            trusted_device_auth_credential: None,
+            trusted_device_v2_enrollment_token: None,
             peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
@@ -1453,6 +1483,15 @@ impl Connection {
         }
     }
 
+    fn attach_trusted_device_v2_token(&mut self, res: &mut LoginResponse) {
+        if !matches!(res.union, Some(login_response::Union::PeerInfo(_))) {
+            return;
+        }
+        if let Some(token) = self.trusted_device_v2_enrollment_token.take() {
+            res.trusted_device_token = token;
+        }
+    }
+
     // Returns whether this connection should be kept alive.
     // `true` does not necessarily mean authorization succeeded (e.g. REQUIRE_2FA case).
     async fn send_logon_response_and_keep_alive(&mut self) -> bool {
@@ -1613,6 +1652,7 @@ impl Connection {
         if self.port_forward_socket.is_some() {
             let mut msg_out = Message::new();
             res.set_peer_info(pi);
+            self.attach_trusted_device_v2_token(&mut res);
             msg_out.set_login_response(res);
             self.send(msg_out).await;
             return true;
@@ -1761,6 +1801,7 @@ impl Connection {
             self.on_remote_authorized();
         }
         let mut msg_out = Message::new();
+        self.attach_trusted_device_v2_token(&mut res);
         msg_out.set_login_response(res);
         self.send(msg_out).await;
         if let Some(o) = self.options_in_login.take() {
@@ -1963,9 +2004,14 @@ impl Connection {
     async fn send_login_error<T: std::string::ToString>(&mut self, err: T) {
         let mut msg_out = Message::new();
         let mut res = LoginResponse::new();
-        res.set_error(err.to_string());
-        if err.to_string() == crate::client::REQUIRE_2FA {
+        let err = err.to_string();
+        res.set_error(err.clone());
+        if err == crate::client::REQUIRE_2FA {
             res.enable_trusted_devices = Self::enable_trusted_devices();
+            res.trusted_device_v2_supported =
+                self.trusted_device_v2_supported_for_current_attempt();
+        } else {
+            self.clear_trusted_device_v2_login_state();
         }
         msg_out.set_login_response(res);
         self.send(msg_out).await;
@@ -2066,6 +2112,74 @@ impl Connection {
         self.validate_password_plain(storage)
     }
 
+    fn trusted_device_v2_client_supported(&self) -> bool {
+        get_version_number(&self.lr.version)
+            >= get_version_number(TRUSTED_DEVICE_V2_MIN_CLIENT_VERSION)
+    }
+
+    fn trusted_device_v2_supported_for_current_attempt(&self) -> bool {
+        self.trusted_device_v2_client_supported()
+            && matches!(
+                self.trusted_device_auth_credential,
+                Some(TrustedDeviceAuthCredential::LocalPermanent)
+            )
+    }
+
+    fn clear_trusted_device_v2_login_state(&mut self) {
+        self.trusted_device_auth_credential = None;
+        self.trusted_device_v2_enrollment_token = None;
+    }
+
+    fn trusted_device_v2_record_unexpired(created_at: i64) -> bool {
+        let Some(expires_at) = created_at.checked_add(config::TRUSTED_DEVICE_V2_LIFETIME_MILLIS)
+        else {
+            return false;
+        };
+        get_time() <= expires_at
+    }
+
+    fn validate_trusted_device_v2(
+        &self,
+        token: &[u8],
+        credential: &TrustedDeviceAuthCredential,
+    ) -> ResultType<TrustedDeviceValidationResult> {
+        if token.is_empty() {
+            return Ok(TrustedDeviceValidationResult::Invalid);
+        }
+        if !matches!(credential, TrustedDeviceAuthCredential::LocalPermanent) {
+            return Ok(TrustedDeviceValidationResult::Invalid);
+        }
+
+        let matched = Config::get_trusted_devices_v2().iter().any(|device| {
+            Self::trusted_device_v2_record_unexpired(device.created_at)
+                && Config::verify_trusted_device_token(token, &device.token_hash)
+        });
+        if matched {
+            Ok(TrustedDeviceValidationResult::Valid)
+        } else {
+            Ok(TrustedDeviceValidationResult::Invalid)
+        }
+    }
+
+    fn issue_trusted_device_v2(
+        &self,
+        trust_this_device: bool,
+    ) -> ResultType<TrustedDeviceIssueResult> {
+        if !trust_this_device {
+            return Ok(TrustedDeviceIssueResult::NotRequested);
+        }
+        if !self.trusted_device_v2_supported_for_current_attempt() {
+            return Ok(TrustedDeviceIssueResult::UnsupportedCredential);
+        }
+
+        let token = Config::generate_trusted_device_token()?;
+        Config::add_trusted_device_v2(TrustedDeviceV2 {
+            token_hash: Config::hash_trusted_device_token(&token),
+            created_at: get_time(),
+        })?;
+        Ok(TrustedDeviceIssueResult::Issued(token))
+    }
+
     // This is coarse brute-force protection for the current temporary password value.
     // We only care whether the active temporary password itself was presented correctly,
     // not whether later authorization steps succeed. A successful temporary-password
@@ -2118,7 +2232,11 @@ impl Connection {
         state.failures = 0;
     }
 
-    fn validate_password(&mut self, allow_permanent_password: bool) -> bool {
+    fn validate_password(
+        &mut self,
+        allow_permanent_password: bool,
+    ) -> TrustedDeviceCredentialResult {
+        self.trusted_device_auth_credential = None;
         if password::temporary_enabled() {
             let password = password::temporary_password();
             if self.validate_password_plain(&password) {
@@ -2128,7 +2246,7 @@ impl Connection {
                     Some(false),
                 );
                 self.check_update_temporary_password(true);
-                return true;
+                return TrustedDeviceCredentialResult::Temporary;
             }
         }
         if password::permanent_enabled() || allow_permanent_password {
@@ -2144,7 +2262,9 @@ impl Connection {
             if !local_storage.is_empty() {
                 if self.validate_password_storage(&local_storage) {
                     print_fallback();
-                    return true;
+                    self.trusted_device_auth_credential =
+                        Some(TrustedDeviceAuthCredential::LocalPermanent);
+                    return TrustedDeviceCredentialResult::LocalPermanent;
                 }
             } else {
                 let hard = config::HARD_SETTINGS
@@ -2155,11 +2275,11 @@ impl Connection {
                     .unwrap_or_default();
                 if !hard.is_empty() && self.validate_password_plain(&hard) {
                     print_fallback();
-                    return true;
+                    return TrustedDeviceCredentialResult::V2Unavailable;
                 }
             }
         }
-        false
+        TrustedDeviceCredentialResult::PasswordRejected
     }
 
     fn is_recent_session(&mut self, tfa: bool) -> bool {
@@ -2257,23 +2377,11 @@ impl Connection {
     }
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
+        self.clear_trusted_device_v2_login_state();
         self.lr = lr.clone();
         self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
         if let Some(o) = lr.option.as_ref() {
             self.options_in_login = Some(o.clone());
-        }
-        if self.require_2fa.is_some() && !lr.hwid.is_empty() && Self::enable_trusted_devices() {
-            let devices = Config::get_trusted_devices();
-            if let Some(device) = devices.iter().find(|d| d.hwid == lr.hwid) {
-                if !device.outdate()
-                    && device.id == lr.my_id
-                    && device.name == lr.my_name
-                    && device.platform == lr.my_platform
-                {
-                    log::info!("2FA bypassed by trusted devices");
-                    self.require_2fa = None;
-                }
-            }
         }
         self.video_ack_required = lr.video_ack_required;
     }
@@ -2499,7 +2607,8 @@ impl Connection {
                 if !res {
                     return true;
                 }
-                if !self.validate_password(allow_logon_screen_password) {
+                let credential_result = self.validate_password(allow_logon_screen_password);
+                if credential_result == TrustedDeviceCredentialResult::PasswordRejected {
                     self.update_failure(failure, false, 0);
                     self.check_update_temporary_password(false);
                     if err_msg.is_empty() {
@@ -2514,6 +2623,13 @@ impl Connection {
                     }
                 } else {
                     self.update_failure(failure, true, 0);
+                    if let Some(credential) = self.trusted_device_auth_credential.as_ref() {
+                        let token_result =
+                            self.validate_trusted_device_v2(&lr.trusted_device_token, credential);
+                        if matches!(token_result, Ok(TrustedDeviceValidationResult::Valid)) {
+                            self.require_2fa = None;
+                        }
+                    }
                     if err_msg.is_empty() {
                         #[cfg(target_os = "linux")]
                         self.linux_headless_handle.wait_desktop_cm_ready().await;
@@ -2535,6 +2651,20 @@ impl Connection {
                 if let Ok(res) = totp.check_current(&tfa.code) {
                     if res {
                         self.update_failure(failure, true, 1);
+                        match self.issue_trusted_device_v2(tfa.trust_this_device) {
+                            Ok(TrustedDeviceIssueResult::Issued(token)) => {
+                                self.trusted_device_v2_enrollment_token = Some(token);
+                            }
+                            Ok(TrustedDeviceIssueResult::NotRequested)
+                            | Ok(TrustedDeviceIssueResult::UnsupportedCredential) => {}
+                            Err(err) => {
+                                log::error!("Trusted device V2 enrollment failed: {}", err);
+                                self.send_login_error(TRUSTED_DEVICE_V2_ENROLLMENT_ERROR)
+                                    .await;
+                                return true;
+                            }
+                        }
+                        self.trusted_device_auth_credential = None;
                         self.require_2fa.take();
                         raii::AuthedConnID::set_session_2fa(self.session_key());
                         if !self.send_logon_response_and_keep_alive().await {
@@ -2545,17 +2675,9 @@ impl Connection {
                             self.lr.my_name.to_owned(),
                             self.authorized,
                         );
-                        if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
-                            Config::add_trusted_device(TrustedDevice {
-                                hwid: tfa.hwid,
-                                time: hbb_common::get_time(),
-                                id: self.lr.my_id.clone(),
-                                name: self.lr.my_name.clone(),
-                                platform: self.lr.my_platform.clone(),
-                            });
-                        }
                     } else {
                         self.update_failure(failure, false, 1);
+                        self.clear_trusted_device_v2_login_state();
                         self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
                             .await;
                     }

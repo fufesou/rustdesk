@@ -121,11 +121,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -1756,6 +1754,8 @@ pub struct LoginConfigHandler {
     password_source: PasswordSource, // where the sent password comes from
     shared_password: Option<String>, // Store the shared password
     pub enable_trusted_devices: bool,
+    pub trusted_device_v2_supported: bool,
+    pub sent_trusted_device_v2_token: bool,
     pub record_state: bool,
     pub record_permission: bool,
 }
@@ -1865,6 +1865,8 @@ impl LoginConfigHandler {
         self.adapter_luid = adapter_luid;
         self.selected_windows_session_id = None;
         self.shared_password = shared_password;
+        self.trusted_device_v2_supported = false;
+        self.sent_trusted_device_v2_token = false;
         self.record_state = false;
         self.record_permission = true;
 
@@ -1901,6 +1903,21 @@ impl LoginConfigHandler {
     pub fn save_config(&mut self, config: PeerConfig) {
         config.store(&self.id);
         self.config = config;
+    }
+
+    pub fn get_trusted_device_v2_token(&mut self) -> ResultType<Option<Bytes>> {
+        self.config.get_trusted_device_v2_token()
+    }
+
+    pub fn set_trusted_device_v2_token(&mut self, token: &[u8]) -> ResultType<()> {
+        self.config.set_trusted_device_v2_token(token)?;
+        self.config.store(&self.id);
+        Ok(())
+    }
+
+    pub fn clear_trusted_device_v2_token(&mut self) {
+        self.config.clear_trusted_device_v2_token();
+        self.config.store(&self.id);
     }
 
     /// Set an option for handler's [`PeerConfig`].
@@ -2617,6 +2634,7 @@ impl LoginConfigHandler {
         os_username: String,
         os_password: String,
         password: Vec<u8>,
+        trusted_device_token: Option<Bytes>,
     ) -> Message {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let my_id = Config::get_id_or(crate::DEVICE_ID.lock().unwrap().clone());
@@ -2630,16 +2648,15 @@ impl LoginConfigHandler {
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
         if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+            avatar =
+                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
@@ -2680,11 +2697,6 @@ impl LoginConfigHandler {
         let my_platform = hbb_common::whoami::platform().to_string();
         #[cfg(target_os = "android")]
         let my_platform = "Android".into();
-        let hwid = if self.get_option("trust-this-device") == "Y" {
-            crate::get_hwid()
-        } else {
-            Bytes::new()
-        };
         let mut lr = LoginRequest {
             username: pure_id,
             password: password.into(),
@@ -2700,7 +2712,7 @@ impl LoginConfigHandler {
                 ..Default::default()
             })
             .into(),
-            hwid,
+            trusted_device_token: trusted_device_token.unwrap_or_default(),
             avatar,
             ..Default::default()
         };
@@ -3535,10 +3547,27 @@ async fn send_login(
     password: Vec<u8>,
     peer: &mut Stream,
 ) {
-    let msg_out = lc
-        .read()
-        .unwrap()
-        .create_login_msg(os_username, os_password, password);
+    let trusted_device_token = {
+        let mut lc = lc.write().unwrap();
+        lc.trusted_device_v2_supported = false;
+        match lc.get_trusted_device_v2_token() {
+            Ok(token) => {
+                lc.sent_trusted_device_v2_token = token.is_some();
+                token
+            }
+            Err(err) => {
+                log::warn!("Trusted device V2 token is malformed: {}", err);
+                lc.sent_trusted_device_v2_token = false;
+                None
+            }
+        }
+    };
+    let msg_out = lc.read().unwrap().create_login_msg(
+        os_username,
+        os_password,
+        password,
+        trusted_device_token,
+    );
     allow_err!(peer.send(&msg_out).await);
 }
 
@@ -3598,7 +3627,7 @@ async fn send_switch_login_request(
         lr: hbb_common::protobuf::MessageField::some(
             lc.read()
                 .unwrap()
-                .create_login_msg("".to_owned(), "".to_owned(), vec![])
+                .create_login_msg("".to_owned(), "".to_owned(), vec![], None)
                 .login_request()
                 .to_owned(),
         ),

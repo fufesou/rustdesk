@@ -130,6 +130,35 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
+    fn store_trusted_device_v2_token_from_login_response(&mut self, token: &[u8]) -> bool {
+        if token.len() != config::TRUSTED_DEVICE_V2_TOKEN_LEN {
+            log::error!("Invalid trusted device V2 token length: {}", token.len());
+            self.handler.msgbox(
+                "error",
+                "Login Error",
+                "Invalid trusted device V2 token",
+                "",
+            );
+            return false;
+        }
+
+        let result = {
+            let mut lc = self.handler.lc.write().unwrap();
+            lc.set_trusted_device_v2_token(token)
+        };
+        if let Err(err) = result {
+            log::error!("Failed to store trusted device V2 token: {}", err);
+            self.handler.msgbox(
+                "error",
+                "Login Error",
+                "Failed to store trusted device V2 token",
+                "",
+            );
+            return false;
+        }
+        true
+    }
+
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
@@ -1325,14 +1354,31 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::LoginResponse(lr)) => match lr.union {
                     Some(login_response::Union::Error(err)) => {
                         if err == client::REQUIRE_2FA {
-                            self.handler.lc.write().unwrap().enable_trusted_devices =
-                                lr.enable_trusted_devices;
+                            let mut lc = self.handler.lc.write().unwrap();
+                            lc.enable_trusted_devices = lr.enable_trusted_devices;
+                            lc.trusted_device_v2_supported = lr.trusted_device_v2_supported;
+                            if lc.sent_trusted_device_v2_token && lr.trusted_device_v2_supported {
+                                lc.clear_trusted_device_v2_token();
+                                lc.sent_trusted_device_v2_token = false;
+                            }
                         }
                         if !self.handler.handle_login_error(&err) {
                             return false;
                         }
                     }
                     Some(login_response::Union::PeerInfo(pi)) => {
+                        if !lr.trusted_device_token.is_empty()
+                            && !self.store_trusted_device_v2_token_from_login_response(
+                                &lr.trusted_device_token,
+                            )
+                        {
+                            return false;
+                        }
+                        self.handler
+                            .lc
+                            .write()
+                            .unwrap()
+                            .sent_trusted_device_v2_token = false;
                         let peer_version = pi.version.clone();
                         let peer_platform = pi.platform.clone();
                         self.set_peer_info(&pi);

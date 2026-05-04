@@ -1594,7 +1594,10 @@ pub fn remove_trusted_devices(json: &str) {
 #[cfg(feature = "flutter")]
 pub fn clear_trusted_devices() {
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    Config::clear_trusted_devices();
+    {
+        Config::clear_trusted_devices();
+        allow_err!(Config::clear_trusted_devices_v2());
+    }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     ipc::clear_trusted_devices();
 }
