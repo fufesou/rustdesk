@@ -1093,6 +1093,8 @@ pub(crate) fn generate_one_time_ipc_token() -> String {
 
     let mut token = String::with_capacity(IPC_TOKEN_LEN);
     for _ in 0..(IPC_TOKEN_LEN / IPC_TOKEN_U64_HEX_LEN) {
+        // CSPRNG: hbb_common re-exports rand 0.8; rand::random() uses
+        // ThreadRng, which is seeded from OsRng and uses rand's CSPRNG core.
         let _ = write!(token, "{:016x}", hbb_common::rand::random::<u64>());
     }
     token

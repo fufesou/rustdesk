@@ -348,6 +348,8 @@ fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<PathBuf> {
 pub(crate) fn executable_paths_match(left: &Path, right: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
+        // Callers pass paths resolved through fs::canonicalize() first. Keep this
+        // normalization limited to spelling differences left by Win32 paths.
         fn normalize(path: &Path) -> String {
             let mut normalized = path.to_string_lossy().replace('/', "\\");
             if let Some(stripped) = normalized.strip_prefix(r"\\?\") {
@@ -684,7 +686,8 @@ pub(crate) fn authorize_windows_portable_service_ipc_connection(
     let (authorized, peer_pid, peer_session_id, peer_is_system) =
         stream.portable_service_authorization_status_for_session(expected_session_id);
     if !authorized {
-        // Don't use `peer_pid.is_some() && peer_session_id.is_none() && peer_is_system.is_none();` here.
+        // Session lookup may succeed while SYSTEM identity lookup fails, so only the
+        // SYSTEM identity result determines whether peer identity is unavailable here.
         let identity_unavailable = peer_pid.is_some() && peer_is_system.is_none();
         if identity_unavailable {
             // In portable-service startup, resolving SYSTEM peer identity may fail on some hosts.

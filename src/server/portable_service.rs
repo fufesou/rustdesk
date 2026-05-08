@@ -904,9 +904,25 @@ pub mod client {
     }
 
     #[inline]
+    fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> bool {
+        if expected.len() != IPC_TOKEN_LEN || candidate.len() != IPC_TOKEN_LEN {
+            return false;
+        }
+        expected
+            .as_bytes()
+            .iter()
+            .zip(candidate.as_bytes().iter())
+            .fold(0u8, |diff, (left, right)| diff | (*left ^ *right))
+            == 0
+    }
+
+    #[inline]
     fn consume_runtime_ipc_token_if_match(candidate: &str) -> (bool, Option<String>) {
         let mut token = IPC_RUNTIME_TOKEN.lock().unwrap();
-        if token.as_deref() != Some(candidate) {
+        if !token
+            .as_deref()
+            .is_some_and(|expected| constant_time_ipc_token_eq(expected, candidate))
+        {
             return (false, None);
         }
         let mut shmem_lock = SHMEM.lock().unwrap();
