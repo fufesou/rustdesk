@@ -2517,6 +2517,16 @@ impl Connection {
                 && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if should_defer_cm_ipc_until_terminal_authorization(
+                    self.terminal,
+                    &lr.os_login.username,
+                ) {
+                    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await
+                    {
+                        return keep_alive;
+                    }
+                }
                 self.try_start_cm(lr.my_id, lr.my_name, false);
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
@@ -2538,6 +2548,17 @@ impl Connection {
                 }
             } else if lr.password.is_empty() {
                 if err_msg.is_empty() {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if should_defer_cm_ipc_until_terminal_authorization(
+                        self.terminal,
+                        &lr.os_login.username,
+                    ) {
+                        if let Some(keep_alive) =
+                            self.prepare_terminal_login_for_authorization().await
+                        {
+                            return keep_alive;
+                        }
+                    }
                     self.try_start_cm(lr.my_id, lr.my_name, false);
                 } else {
                     self.send_login_error(
@@ -3661,8 +3682,14 @@ impl Connection {
             if let TerminalAuthorizationMode::OsLogin { failure, scope } = auth_mode {
                 self.update_failure_with_scope(failure, false, 0, scope);
             }
+            let auth_context = if is_terminal_os_login {
+                "OS credential login verification"
+            } else {
+                "Terminal session-user authorization"
+            };
             log::warn!(
-                "OS credential login verification failed: ip={} conn_id={} scope={:?} msg='{}'",
+                "{} failed: ip={} conn_id={} scope={:?} msg='{}'",
+                auth_context,
                 self.ip,
                 self.inner.id(),
                 failure_scope,
@@ -3783,11 +3810,13 @@ impl Connection {
                 let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
                 m.insert(key, Self::bump_failure_entry(cur, time));
             }
-            m.insert(self.ip.clone(), Self::bump_failure_entry(failure, time));
+            let current_ip = m.get(&self.ip).copied().unwrap_or(failure);
+            m.insert(self.ip.clone(), Self::bump_failure_entry(current_ip, time));
         } else {
-            // Update full IP: bump from the *original* passed-in failure
+            // Re-read the full IP bucket in case another failed attempt updated it.
             let mut m = map_mutex.lock().unwrap();
-            m.insert(self.ip.clone(), Self::bump_failure_entry(failure, time));
+            let current_ip = m.get(&self.ip).copied().unwrap_or(failure);
+            m.insert(self.ip.clone(), Self::bump_failure_entry(current_ip, time));
         }
 
         if os_credential_scope {

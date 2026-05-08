@@ -147,8 +147,8 @@ pub(crate) fn record_os_credential_failure(scope: FailureScope) {
     let Some(state_mutex) = state_for_os_credential_scope(scope) else {
         return;
     };
-    let now_ms = get_time();
     let mut state = state_mutex.lock().unwrap();
+    let now_ms = get_time();
     reset_totals_on_idle(&mut state, now_ms);
     normalize_backoff(&mut state, now_ms);
     state.total_failures = state.total_failures.saturating_add(1);
