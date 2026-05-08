@@ -44,6 +44,14 @@ pub(crate) fn portable_service_listener_security_attributes() -> io::Result<Secu
             format!("failed to resolve current process SID: {}", err),
         )
     })?;
+    debug_assert!(
+        user_sid.starts_with("S-1-")
+            && user_sid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-'),
+        "current_process_user_sid_string returned a non-SDDL SID: {}",
+        user_sid
+    );
     // SDDL:
     // - `D:P`                => protected DACL (no inherited ACEs)
     // - `(A;;GA;;;SY)`       => allow GENERIC_ALL to LocalSystem

@@ -904,24 +904,11 @@ pub mod client {
     }
 
     #[inline]
-    fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> bool {
-        if expected.len() != IPC_TOKEN_LEN || candidate.len() != IPC_TOKEN_LEN {
-            return false;
-        }
-        expected
-            .as_bytes()
-            .iter()
-            .zip(candidate.as_bytes().iter())
-            .fold(0u8, |diff, (left, right)| diff | (*left ^ *right))
-            == 0
-    }
-
-    #[inline]
     fn consume_runtime_ipc_token_if_match(candidate: &str) -> (bool, Option<String>) {
         let mut token = IPC_RUNTIME_TOKEN.lock().unwrap();
         if !token
             .as_deref()
-            .is_some_and(|expected| constant_time_ipc_token_eq(expected, candidate))
+            .is_some_and(|expected| ipc::constant_time_ipc_token_eq(expected, candidate))
         {
             return (false, None);
         }
@@ -1050,6 +1037,7 @@ pub mod client {
             if !is_valid_portable_service_shmem_name(&shmem_name) {
                 bail!("Generated invalid portable service shared memory name");
             }
+            let ipc_token = ipc::generate_one_time_ipc_token()?;
             // os error 112, no enough space
             *shmem_lock = Some(crate::portable_service::SharedMemory::create(
                 &shmem_name,
@@ -1062,7 +1050,6 @@ pub mod client {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| anyhow!("portable service shared memory name is unavailable"))?;
-            let ipc_token = ipc::generate_one_time_ipc_token();
             let init_token_result = if let Some(shmem) = shmem_lock.as_mut() {
                 unsafe {
                     libc::memset(shmem.as_ptr() as _, 0, shmem.len() as _);

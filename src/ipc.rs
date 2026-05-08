@@ -73,7 +73,8 @@ use std::{
 pub const IPC_ACTION_CLOSE: &str = "close";
 const PORTABLE_SERVICE_IPC_HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
 pub(crate) const IPC_TOKEN_LEN: usize = 64;
-const IPC_TOKEN_U64_HEX_LEN: usize = 16;
+const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
+const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 
 #[inline]
@@ -497,6 +498,10 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                     handle(data, &mut stream).await;
                                 }
                                 Ok(None) => {
+                                    // `Ok(None)` means a complete frame arrived but did not
+                                    // deserialize into `Data`. Peer close/reset is returned as
+                                    // `Err` by `ConnectionTmpl::next()`. Keep the historical
+                                    // ignore behavior except on the protected `_service` channel.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     {
                                         if postfix == crate::POSTFIX_SERVICE {
@@ -1085,19 +1090,36 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     connect_with_path(ms_timeout, &path).await
 }
 
-#[inline]
-pub(crate) fn generate_one_time_ipc_token() -> String {
+pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
+    use hbb_common::rand::{rngs::OsRng, RngCore as _};
     use std::fmt::Write as _;
 
-    debug_assert_eq!(IPC_TOKEN_LEN % IPC_TOKEN_U64_HEX_LEN, 0);
+    let mut random_bytes = [0u8; IPC_TOKEN_RANDOM_BYTES];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut random_bytes).map_err(|err| {
+        hbb_common::anyhow::anyhow!(
+            "failed to generate portable service ipc token from OsRng: {}",
+            err
+        )
+    })?;
 
     let mut token = String::with_capacity(IPC_TOKEN_LEN);
-    for _ in 0..(IPC_TOKEN_LEN / IPC_TOKEN_U64_HEX_LEN) {
-        // CSPRNG: hbb_common re-exports rand 0.8; rand::random() uses
-        // ThreadRng, which is seeded from OsRng and uses rand's CSPRNG core.
-        let _ = write!(token, "{:016x}", hbb_common::rand::random::<u64>());
+    for byte in random_bytes {
+        let _ = write!(token, "{:02x}", byte);
     }
-    token
+    Ok(token)
+}
+
+pub(crate) fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> bool {
+    if expected.len() != IPC_TOKEN_LEN || candidate.len() != IPC_TOKEN_LEN {
+        return false;
+    }
+    expected
+        .as_bytes()
+        .iter()
+        .zip(candidate.as_bytes().iter())
+        .fold(0u8, |diff, (left, right)| diff | (*left ^ *right))
+        == 0
 }
 
 pub(crate) async fn portable_service_ipc_handshake_as_client<T>(
@@ -1130,6 +1152,8 @@ pub(crate) async fn portable_service_ipc_handshake_as_server<T, F>(
 ) -> ResultType<()>
 where
     T: AsyncRead + AsyncWrite + std::marker::Unpin,
+    // Token validators must use `constant_time_ipc_token_eq` or an equivalent
+    // fixed-length comparison; this handshake is part of the privilege boundary.
     F: FnMut(&str) -> bool,
 {
     let authorized = match stream
