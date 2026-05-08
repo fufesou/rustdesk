@@ -348,8 +348,10 @@ fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<PathBuf> {
 pub(crate) fn executable_paths_match(left: &Path, right: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
-        // Callers pass paths resolved through fs::canonicalize() first. Keep this
-        // normalization limited to spelling differences left by Win32 paths.
+        // Callers pass paths resolved through fs::canonicalize() first, so NT
+        // namespace paths and 8.3 short names are expected to be resolved before
+        // this check. Keep this normalization limited to remaining Win32 spelling
+        // differences.
         fn normalize(path: &Path) -> String {
             let mut normalized = path.to_string_lossy().replace('/', "\\");
             if let Some(stripped) = normalized.strip_prefix(r"\\?\") {
@@ -622,7 +624,6 @@ pub(crate) fn log_rejected_windows_ipc_connection(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[inline]
 pub(crate) fn authorize_service_scoped_ipc_connection(stream: &Connection, postfix: &str) -> bool {
     let peer_pid = stream.peer_pid();
     let (authorized, peer_uid, active_uid) = stream.service_authorization_status();
@@ -643,7 +644,6 @@ pub(crate) fn authorize_service_scoped_ipc_connection(stream: &Connection, postf
 }
 
 #[cfg(windows)]
-#[inline]
 pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix: &str) -> bool {
     let (authorized, peer_pid, peer_session_id, server_session_id, peer_is_system) =
         stream.server_authorization_status();
@@ -670,7 +670,6 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
 }
 
 #[cfg(windows)]
-#[inline]
 pub(crate) fn authorize_windows_portable_service_ipc_connection(
     stream: &Connection,
     postfix: &str,

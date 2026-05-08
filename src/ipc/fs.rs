@@ -442,7 +442,6 @@ pub(crate) fn get_pid_file(postfix: &str) -> String {
 //   https://man7.org/linux/man-pages/man2/ftruncate.2.html
 // - write(2): write bytes via fd
 //   https://man7.org/linux/man-pages/man2/write.2.html
-#[inline]
 fn write_pid_file(path: &Path) -> ResultType<()> {
     let path_c = CString::new(path.as_os_str().as_bytes().to_vec()).map_err(|err| {
         Error::new(
