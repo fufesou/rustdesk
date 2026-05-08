@@ -126,11 +126,8 @@ fn should_record_linux_headless_os_auth_failure(
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn should_defer_cm_ipc_until_terminal_authorization(
-    is_terminal: bool,
-    os_login_username: &str,
-) -> bool {
-    is_terminal && !os_login_username.trim().is_empty()
+fn should_use_terminal_os_login_scope(is_terminal: bool, os_login_username: &str) -> bool {
+    cfg!(target_os = "windows") && is_terminal && !os_login_username.trim().is_empty()
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -2445,10 +2442,7 @@ impl Connection {
             }
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if !should_defer_cm_ipc_until_terminal_authorization(
-                self.terminal,
-                &lr.os_login.username,
-            ) {
+            if !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
                 self.try_start_cm_ipc();
             }
 
@@ -2513,15 +2507,11 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click
-                && !allow_logon_screen_password)
+            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if should_defer_cm_ipc_until_terminal_authorization(
-                    self.terminal,
-                    &lr.os_login.username,
-                ) {
+                if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
                     if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await
                     {
                         return keep_alive;
@@ -2549,10 +2539,7 @@ impl Connection {
             } else if lr.password.is_empty() {
                 if err_msg.is_empty() {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if should_defer_cm_ipc_until_terminal_authorization(
-                        self.terminal,
-                        &lr.os_login.username,
-                    ) {
+                    if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
                         if let Some(keep_alive) =
                             self.prepare_terminal_login_for_authorization().await
                         {
@@ -3611,9 +3598,7 @@ impl Connection {
         }
 
         let normalized_username = self.lr.os_login.username.trim().to_owned();
-        let auth_mode = if normalized_username.is_empty() {
-            TerminalAuthorizationMode::SessionUser
-        } else {
+        let auth_mode = if should_use_terminal_os_login_scope(self.terminal, &normalized_username) {
             // Check failure state
             let failure_scope = FailureScope::TerminalOsLogin;
             let (failure, res) = self.check_failure_with_scope(0, failure_scope).await;
@@ -3632,6 +3617,8 @@ impl Connection {
                 failure,
                 scope: failure_scope,
             }
+        } else {
+            TerminalAuthorizationMode::SessionUser
         };
 
         let is_terminal_os_login = matches!(auth_mode, TerminalAuthorizationMode::OsLogin { .. });
