@@ -179,7 +179,14 @@ pub fn try_start_desktop(_username: &str, _passsword: &str) -> String {
                 }
             }
             Err(e) => {
-                log::error!("Failed to start xsession {}", e);
+                match e.kind {
+                    XSessionStartErrorKind::Auth => {
+                        log::warn!("Failed to authenticate xsession user {}", e);
+                    }
+                    XSessionStartErrorKind::Env => {
+                        log::error!("Failed to start xsession {}", e);
+                    }
+                }
                 map_xsession_start_error_to_login_msg(e.kind).to_owned()
             }
         }
