@@ -28,29 +28,38 @@ void handleUpdate(String releasePageUrl) {
   SimpleWrapper<String> downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
   SimpleWrapper<bool> pendingCancel = SimpleWrapper(false);
+  SimpleWrapper<bool> cancelInFlight = SimpleWrapper(false);
   SimpleWrapper<Future<void> Function()> cancelDownload =
       SimpleWrapper(() async {});
   gFFI.dialogManager.dismissAll();
   gFFI.dialogManager.show((setState, close, context) {
     cancelDownload.value = () async {
+      if (cancelInFlight.value) {
+        return;
+      }
       final id = downloadId.value;
       if (id.isEmpty) {
         pendingCancel.value = true;
         return;
       }
-      pendingCancel.value = false;
-      onCanceled.value();
-      await bind.mainSetCommon(key: 'cancel-downloader', value: id);
-      // Wait for the downloader to be removed.
-      for (int i = 0; i < 10; i++) {
-        await Future.delayed(const Duration(milliseconds: 300));
-        final isCanceled = 'error:Downloader not found' ==
-            await bind.mainGetCommon(key: 'download-data-$id');
-        if (isCanceled) {
-          break;
+      cancelInFlight.value = true;
+      try {
+        pendingCancel.value = false;
+        onCanceled.value();
+        await bind.mainSetCommon(key: 'cancel-downloader', value: id);
+        // Wait for the downloader to be removed.
+        for (int i = 0; i < 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 300));
+          final isCanceled = 'error:Downloader not found' ==
+              await bind.mainGetCommon(key: 'download-data-$id');
+          if (isCanceled) {
+            break;
+          }
         }
+        close();
+      } finally {
+        cancelInFlight.value = false;
       }
-      close();
     };
     return CustomAlertDialog(
         title: Text(translate('Downloading {$appName}')),

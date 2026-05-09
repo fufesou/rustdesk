@@ -3598,16 +3598,22 @@ pub fn handle_custom_client_staging_dir_before_update(
 }
 
 pub fn update_to_verified(file: &str, expected_sha256: &str) -> ResultType<()> {
-    match update_file_extension(file).as_deref() {
-        Some("exe") => {
-            let update_file = verify_update_file_signature_and_sha256(file, expected_sha256)?;
-            let custom_client_staging_dir = get_custom_client_staging_dir();
-            if crate::is_custom_client() {
-                handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
-            } else {
-                // Clean up any residual staging directory from previous custom client
-                allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
-            }
+    let extension = update_file_extension(file).unwrap_or_default();
+    if extension != "exe" && extension != "msi" {
+        bail!("Unsupported update file format: {}", file);
+    }
+
+    let update_file = verify_update_file_signature_and_sha256(file, expected_sha256)?;
+    let custom_client_staging_dir = get_custom_client_staging_dir();
+    if crate::is_custom_client() {
+        handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
+    } else {
+        // Clean up any residual staging directory from previous custom client
+        allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
+    }
+
+    match extension.as_str() {
+        "exe" => {
             if !run_uac(update_file.path_str()?, "--update")? {
                 bail!(
                     "Failed to run the update exe with UAC, error: {:?}",
@@ -3615,14 +3621,12 @@ pub fn update_to_verified(file: &str, expected_sha256: &str) -> ResultType<()> {
                 );
             }
         }
-        Some("msi") => {
-            let update_file = verify_update_file_signature_and_sha256(file, expected_sha256)?;
+        "msi" => {
             if let Err(e) = update_me_msi(update_file.path_str()?, false) {
                 bail!("Failed to run the update msi: {}", e);
             }
         }
         _ => {
-            // unreachable!()
             bail!("Unsupported update file format: {}", file);
         }
     }
@@ -3872,11 +3876,14 @@ fn verify_update_file_signature_for_path(file: &str) -> ResultType<()> {
         );
     }
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     bail!(
-        "Update file signature verification failed for {}: . stderr: {}; stdout: {}",
+        "Update file signature verification failed for {}: status: {}; stderr: {}; stdout: {}",
         file,
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
+        output.status,
+        stderr.trim(),
+        stdout.trim()
     );
 }
 

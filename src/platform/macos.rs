@@ -70,7 +70,11 @@ fn get_update_temp_dmg_dir() -> PathBuf {
 }
 
 fn create_update_temp_dmg_file() -> ResultType<(std::fs::File, PathBuf)> {
-    let dmg_dir = get_update_temp_dmg_dir();
+    let update_temp_dir = get_update_temp_dir();
+    std::fs::create_dir_all(&update_temp_dir)?;
+    std::fs::set_permissions(&update_temp_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let dmg_dir = update_temp_dir.join("dmgdir");
     std::fs::create_dir_all(&dmg_dir)?;
     std::fs::set_permissions(&dmg_dir, std::fs::Permissions::from_mode(0o700))?;
 
