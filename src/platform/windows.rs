@@ -3873,7 +3873,7 @@ fn verify_update_file_signature_for_path(file: &str) -> ResultType<()> {
     }
 
     bail!(
-        "Update file signature verification failed for {}: {}{}",
+        "Update file signature verification failed for {}: . stderr: {}; stdout: {}",
         file,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
