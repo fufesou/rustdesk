@@ -343,8 +343,17 @@ fn update_daemon_agent(
                 bail!("run osascript failed: {}", e);
             }
             Ok(output) if !output.status.success() => {
-                log::warn!("run osascript failed with status: {}", output.status);
-                bail!("run osascript failed with status: {}", output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             _ => {
                 let installed = std::path::Path::new(&agent_plist_file).exists();
@@ -1000,8 +1009,17 @@ fn update_me_from_app_dir(app_dir: String, keep_current_process: bool) -> Result
             .output();
         match output {
             Ok(output) if !output.status.success() => {
-                log::error!("osascript execution failed with status: {}", output.status);
-                bail!("osascript execution failed with status: {}", output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::error!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             Err(e) => {
                 log::error!("run osascript failed: {}", e);

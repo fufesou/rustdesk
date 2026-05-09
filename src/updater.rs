@@ -1,6 +1,7 @@
 use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -18,6 +19,7 @@ enum UpdateMsg {
 
 lazy_static::lazy_static! {
     static ref TX_MSG : Mutex<Sender<UpdateMsg>> = Mutex::new(start_auto_update_check());
+    static ref DOWNLOAD_FILE_SHA256_CACHE: Mutex<HashMap<String, String>> = Default::default();
 }
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -432,16 +434,75 @@ fn fetch_github_release_metadata(api_url: &str) -> ResultType<String> {
         .header(reqwest::header::USER_AGENT, "rustdesk-updater")
         .send()?;
     if !response.status().is_success() {
-        bail!(
-            "Failed to get GitHub release metadata: {}",
-            response.status()
-        );
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            bail!(
+                "Failed to get GitHub release metadata: {}. GitHub API rate limit may have been reached. Please retry later or download from the release page.",
+                status
+            );
+        }
+        bail!("Failed to get GitHub release metadata: {}", status);
     }
     Ok(response.text()?)
 }
 
+fn normalize_sha256_hex(sha256: &str) -> ResultType<String> {
+    let sha256 = sha256.trim().to_ascii_lowercase();
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Update file SHA256 is malformed");
+    }
+    Ok(sha256)
+}
+
+fn cache_download_file_expected_sha256(
+    download_url: &str,
+    expected_sha256: &str,
+) -> ResultType<String> {
+    let expected_sha256 = normalize_sha256_hex(expected_sha256)?;
+    DOWNLOAD_FILE_SHA256_CACHE
+        .lock()
+        .unwrap()
+        .insert(download_url.to_owned(), expected_sha256.clone());
+    Ok(expected_sha256)
+}
+
+fn cached_download_file_expected_sha256(download_url: &str) -> Option<String> {
+    DOWNLOAD_FILE_SHA256_CACHE
+        .lock()
+        .unwrap()
+        .get(download_url)
+        .cloned()
+}
+
+pub fn clear_download_file_expected_sha256(download_url: &str) {
+    DOWNLOAD_FILE_SHA256_CACHE
+        .lock()
+        .unwrap()
+        .remove(download_url);
+}
+
+pub fn refresh_download_file_expected_sha256(download_url: &str) -> ResultType<String> {
+    let expected_sha256 = fetch_github_asset_sha256(download_url, download_url)?;
+    cache_download_file_expected_sha256(download_url, &expected_sha256)
+}
+
 pub fn download_file_expected_sha256(download_url: &str) -> ResultType<String> {
-    fetch_github_asset_sha256(download_url, download_url)
+    match refresh_download_file_expected_sha256(download_url) {
+        Ok(expected_sha256) => Ok(expected_sha256),
+        Err(e) => {
+            if let Some(expected_sha256) = cached_download_file_expected_sha256(download_url) {
+                log::warn!(
+                    "Failed to refresh update file SHA256 for {}, using cached value: {}",
+                    download_url,
+                    e
+                );
+                return Ok(expected_sha256);
+            }
+            Err(e)
+        }
+    }
 }
 
 fn github_release_api_url(update_url: &str) -> ResultType<String> {
@@ -634,6 +695,43 @@ mod tests {
 
         assert!(github_release_asset_sha256(missing, "rustdesk.exe").is_err());
         assert!(github_release_asset_sha256(malformed, "rustdesk.exe").is_err());
+    }
+
+    #[test]
+    fn download_file_sha256_cache_roundtrips_and_clears() {
+        let download_url = format!(
+            "https://github.com/rustdesk/rustdesk/releases/download/test/rustdesk-cache-test-{}-{}.exe",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        );
+        let expected_sha256 = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        clear_download_file_expected_sha256(&download_url);
+
+        let cached = cache_download_file_expected_sha256(&download_url, expected_sha256).unwrap();
+
+        assert_eq!(
+            cached,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+        assert_eq!(
+            cached_download_file_expected_sha256(&download_url),
+            Some(cached)
+        );
+        clear_download_file_expected_sha256(&download_url);
+        assert_eq!(cached_download_file_expected_sha256(&download_url), None);
+    }
+
+    #[test]
+    fn download_file_sha256_cache_rejects_malformed_digest() {
+        let download_url = format!(
+            "https://github.com/rustdesk/rustdesk/releases/download/test/rustdesk-cache-test-{}-{}.exe",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        );
+        clear_download_file_expected_sha256(&download_url);
+
+        assert!(cache_download_file_expected_sha256(&download_url, "sha256:not-hex").is_err());
+        assert_eq!(cached_download_file_expected_sha256(&download_url), None);
     }
 
     #[test]
