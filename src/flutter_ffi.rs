@@ -2932,14 +2932,27 @@ pub fn main_set_common(_key: String, _value: String) {
             let download_url = _value.clone();
             let event_key = "download-new-version".to_owned();
             let data = if let Some(download_file) = get_download_file_from_url(&download_url) {
-                std::fs::remove_file(&download_file).ok();
-                match crate::hbbs_http::downloader::download_file(
-                    download_url,
-                    Some(PathBuf::from(download_file)),
-                    Some(Duration::from_secs(3)),
-                ) {
-                    Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
-                    Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
+                match crate::updater::download_file_expected_sha256(&download_url) {
+                    Ok(_) => {
+                        std::fs::remove_file(&download_file).ok();
+                        match crate::hbbs_http::downloader::download_file(
+                            download_url,
+                            Some(PathBuf::from(download_file)),
+                            Some(Duration::from_secs(3)),
+                        ) {
+                            Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
+                            Err(e) => {
+                                HashMap::from([("name", event_key), ("error", e.to_string())])
+                            }
+                        }
+                    }
+                    Err(e) => HashMap::from([
+                        ("name", event_key),
+                        (
+                            "error",
+                            format!("Failed to get new version file SHA256, {}", e),
+                        ),
+                    ]),
                 }
             } else {
                 HashMap::from([
@@ -2968,6 +2981,7 @@ pub fn main_set_common(_key: String, _value: String) {
                                 let error = format!("Failed to get new version file SHA256, {}", e);
                                 log::error!("{}", error);
                                 push_update_me_error(error);
+                                crate::updater::clear_download_file_expected_sha256(&_value);
                                 fs::remove_file(f).ok();
                                 return;
                             }
@@ -2990,6 +3004,7 @@ pub fn main_set_common(_key: String, _value: String) {
                             let error = format!("Failed to update to new version, {}", e);
                             log::error!("{}", error);
                             push_update_me_error(error);
+                            crate::updater::clear_download_file_expected_sha256(&_value);
                             fs::remove_file(f).ok();
                         }
                     }

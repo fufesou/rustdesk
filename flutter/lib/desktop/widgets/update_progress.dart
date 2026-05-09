@@ -9,6 +9,12 @@ import 'package:url_launcher/url_launcher.dart';
 
 const _eventKeyUpdateMe = 'update-me';
 const _eventKeyUpdateMeReady = 'update-me-ready';
+const _githubRateLimitErrorMarker =
+    'GitHub API rate limit may have been reached';
+// Since this is a rare case,
+// we will not add a translation for this user message and will simply show it in English.
+const _githubRateLimitUserMessage =
+    'The download frequency limit may have been reached. Please try again later.';
 
 void handleUpdate(String releasePageUrl) {
   String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
@@ -75,9 +81,12 @@ void handleUpdate(String releasePageUrl) {
 
 void _showUpdateError(String releasePageUrl, String error,
     {String messageKey = 'download-new-version-failed-tip',
-    bool showRetry = true}) {
+    bool showRetry = true,
+    bool showErrorDetail = true,
+    String? userMessage}) {
   debugPrint('Update error: $error');
   final dialogManager = gFFI.dialogManager;
+  final visibleError = userMessage ?? (showErrorDetail ? error : null);
 
   jumplink() {
     launchUrl(Uri.parse(releasePageUrl));
@@ -99,8 +108,10 @@ void _showUpdateError(String releasePageUrl, String error,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             msgboxContent('custom-nocancel-nook-hasclose', 'Error', messageKey),
-            const SizedBox(height: 8),
-            Text(error),
+            if (visibleError != null) ...[
+              const SizedBox(height: 8),
+              Text(visibleError),
+            ],
           ],
         ),
       ),
@@ -198,7 +209,12 @@ class UpdateProgressState extends State<UpdateProgress> {
 
   void _onError(String error) {
     cancelQueryTimer();
-    _showUpdateError(widget.releasePageUrl, error);
+    if (error.contains(_githubRateLimitErrorMarker)) {
+      _showUpdateError(widget.releasePageUrl, error,
+          userMessage: _githubRateLimitUserMessage);
+    } else {
+      _showUpdateError(widget.releasePageUrl, error, showErrorDetail: false);
+    }
   }
 
   void _updateDownloadData() {
