@@ -3696,7 +3696,6 @@ fn update_file_extension(file: &str) -> Option<String> {
 }
 
 fn verified_update_file_path(file: &str) -> ResultType<PathBuf> {
-    let path = Path::new(file);
     let extension = update_file_extension(file).unwrap_or_default();
     if extension != "exe" && extension != "msi" {
         bail!("Unsupported update file format: {}", file);
