@@ -3797,12 +3797,12 @@ impl Connection {
                 let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
                 m.insert(key, Self::bump_failure_entry(cur, time));
             }
-            let current_ip = m.get(&self.ip).copied().unwrap_or(failure);
+            let current_ip = m.get(&self.ip).copied().unwrap_or((0, 0, 0));
             m.insert(self.ip.clone(), Self::bump_failure_entry(current_ip, time));
         } else {
             // Re-read the full IP bucket in case another failed attempt updated it.
             let mut m = map_mutex.lock().unwrap();
-            let current_ip = m.get(&self.ip).copied().unwrap_or(failure);
+            let current_ip = m.get(&self.ip).copied().unwrap_or((0, 0, 0));
             m.insert(self.ip.clone(), Self::bump_failure_entry(current_ip, time));
         }
 
