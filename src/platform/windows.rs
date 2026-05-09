@@ -3876,11 +3876,14 @@ fn verify_update_file_signature_for_path(file: &str) -> ResultType<()> {
         );
     }
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     bail!(
-        "Update file signature verification failed for {}: . stderr: {}; stdout: {}",
+        "Update file signature verification failed for {}: status: {}; stderr: {}; stdout: {}",
         file,
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
+        output.status,
+        stderr.trim(),
+        stdout.trim()
     );
 }
 
