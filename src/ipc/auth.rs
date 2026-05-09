@@ -166,6 +166,8 @@ fn is_allowed_windows_portable_service_peer(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[inline]
 pub(crate) fn is_allowed_service_peer_uid(peer_uid: u32, active_uid: Option<u32>) -> bool {
+    // Root is allowed at the UID gate because the service side may run as root.
+    // Callers still enforce executable matching before accepting service-scoped peers.
     peer_uid == 0 || active_uid.is_some_and(|uid| uid == peer_uid)
 }
 
@@ -695,6 +697,7 @@ pub(crate) fn authorize_windows_portable_service_ipc_connection(
     if !authorized {
         // Session lookup may succeed while SYSTEM identity lookup fails, so only the
         // SYSTEM identity result determines whether peer identity is unavailable here.
+        // Don't use `peer_pid.is_some() && peer_session_id.is_none() && peer_is_system.is_none();` here.
         let identity_unavailable = peer_pid.is_some() && peer_is_system.is_none();
         if identity_unavailable {
             // In portable-service startup, resolving SYSTEM peer identity may fail on some hosts.
@@ -742,6 +745,8 @@ where
 
     fn service_authorization_status(&self) -> (bool, Option<u32>, Option<u32>) {
         let peer_uid = self.peer_uid();
+        // On Linux, `_service` can use the cached active UID from the service loop for
+        // stable config sync. Uinput does a fresh active-UID lookup in its own authorizer.
         let active_uid = active_uid();
         let authorized = peer_uid.is_some_and(|uid| is_allowed_service_peer_uid(uid, active_uid));
         (authorized, peer_uid, active_uid)
