@@ -3765,10 +3765,12 @@ fn copy_update_file_for_verification(file: &str) -> ResultType<VerifiedUpdateFil
             }
         };
         if let Err(e) = std::io::copy(&mut source_file, &mut copy_file) {
+            drop(copy_file);
             std::fs::remove_file(&path).ok();
             return Err(e.into());
         }
         if let Err(e) = copy_file.flush() {
+            drop(copy_file);
             std::fs::remove_file(&path).ok();
             return Err(e.into());
         }
@@ -3798,14 +3800,18 @@ pub fn verify_update_file_signature_and_sha256(
     let update_path = match update_file.path_str() {
         Ok(path) => path.to_owned(),
         Err(e) => {
-            std::fs::remove_file(&update_file.path).ok();
+            let path = update_file.path.clone();
+            drop(update_file);
+            std::fs::remove_file(&path).ok();
             return Err(e);
         }
     };
     if let Err(e) = verify_update_file_sha256(&mut update_file.file, expected_sha256, &update_path)
         .and_then(|_| verify_update_file_signature_for_path(&update_path))
     {
-        std::fs::remove_file(&update_file.path).ok();
+        let path = update_file.path.clone();
+        drop(update_file);
+        std::fs::remove_file(&path).ok();
         return Err(e);
     }
     Ok(update_file)
