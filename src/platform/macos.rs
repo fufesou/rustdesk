@@ -1101,13 +1101,26 @@ impl Drop for DmgGuard {
     }
 }
 
+fn attach_dmg_failure_message(
+    dmg_path: &str,
+    mount_point: &str,
+    status: impl std::fmt::Display,
+) -> String {
+    format!(
+        "Failed to attach DMG image at {dmg_path}: {status}. A stale mount at {mount_point} may remain from a previous update; detach it with `hdiutil detach {mount_point}` or restart and retry."
+    )
+}
+
 fn attach_dmg(dmg_path: &str, mount_point: &'static str) -> ResultType<DmgGuard> {
     let status = Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
         .status()?;
 
     if !status.success() {
-        bail!("Failed to attach DMG image at {}: {:?}", dmg_path, status);
+        bail!(
+            "{}",
+            attach_dmg_failure_message(dmg_path, mount_point, status)
+        );
     }
 
     Ok(DmgGuard(mount_point))
@@ -1308,6 +1321,17 @@ mod tests {
         assert_eq!(dmg_dir.parent(), Some(get_update_temp_dir().as_path()));
         assert_eq!(mode, 0o700);
         std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn test_attach_dmg_failure_message_mentions_stale_mount_point() {
+        let message =
+            attach_dmg_failure_message("/tmp/RustDesk.dmg", UPDATE_DMG_MOUNT_POINT, "failed");
+
+        assert!(message.contains("/tmp/RustDesk.dmg"));
+        assert!(message.contains(UPDATE_DMG_MOUNT_POINT));
+        assert!(message.contains("stale mount"));
+        assert!(message.contains("hdiutil detach"));
     }
 }
 
