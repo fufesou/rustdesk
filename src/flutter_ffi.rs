@@ -2954,7 +2954,8 @@ pub fn main_set_common(_key: String, _value: String) {
         } else if _key == "update-me" {
             if let Some(new_version_file) = get_download_file_from_url(&_value) {
                 log::debug!(
-                    "New version file is downloaded, update begin, {:?}",
+                    "New version file is downloaded, update begin, url: {}, file: {:?}",
+                    &_value,
                     new_version_file.to_str()
                 );
                 if let Some(f) = new_version_file.to_str() {

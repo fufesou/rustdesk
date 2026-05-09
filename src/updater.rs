@@ -132,8 +132,10 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
+        // let download_url = update_url.replace("tag", "download");
+        // let version = download_url.split('/').last().unwrap_or_default();
+        let download_url = "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-x86_64.exe".to_string();
+        let version = "1.4.6".to_string();
         #[cfg(target_os = "windows")]
         let download_url = if cfg!(feature = "flutter") {
             format!(

@@ -11,8 +11,10 @@ const _eventKeyUpdateMe = 'update-me';
 const _eventKeyUpdateMeReady = 'update-me-ready';
 
 void handleUpdate(String releasePageUrl) {
-  String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  String downloadUrl = isMacOS
+      ? "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-aarch64.dmg"
+      : "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-x86_64.exe";
+  String version = "1.4.6";
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
