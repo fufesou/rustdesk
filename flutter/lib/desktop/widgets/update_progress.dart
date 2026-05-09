@@ -65,7 +65,8 @@ void handleUpdate(String releasePageUrl) {
 }
 
 void _showUpdateError(String releasePageUrl, String error,
-    {bool showRetry = true}) {
+    {String messageKey = 'download-new-version-failed-tip',
+    bool showRetry = true}) {
   debugPrint('Update error: $error');
   final dialogManager = gFFI.dialogManager;
 
@@ -88,8 +89,7 @@ void _showUpdateError(String releasePageUrl, String error,
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            msgboxContent('custom-nocancel-nook-hasclose', 'Error',
-                'download-new-version-failed-tip'),
+            msgboxContent('custom-nocancel-nook-hasclose', 'Error', messageKey),
             const SizedBox(height: 8),
             Text(error),
           ],
@@ -270,7 +270,7 @@ class UpdateProgressState extends State<UpdateProgress> {
           }
           if (evt.containsKey('error')) {
             _showUpdateError(widget.releasePageUrl, evt['error'] as String,
-                showRetry: false);
+                messageKey: 'Failed', showRetry: false);
           }
         }, replace: true);
         bind.mainSetCommon(key: 'update-me', value: widget.downloadUrl);

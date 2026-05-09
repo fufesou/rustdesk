@@ -120,6 +120,15 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
     url
 }
 
+/// Creates a sync HTTP client for `url`.
+///
+/// `tls_danger_accept_invalid_cert` has three states:
+/// - `None`: use cached TLS backend/cert settings when present; otherwise allow
+///   automatic fallback between Rustls/NativeTls and strict/accept-invalid modes.
+/// - `Some(false)`: force strict certificate validation, overriding the cache;
+///   use for security-critical requests such as updates.
+/// - `Some(true)`: force accepting invalid certificates, overriding the cache;
+///   use sparingly.
 pub fn create_http_client_with_url(
     url: &str,
     tls_danger_accept_invalid_cert: Option<bool>,
@@ -233,6 +242,15 @@ fn create_http_client_with_url_(
     client
 }
 
+/// Creates an async HTTP client for `url`.
+///
+/// `tls_danger_accept_invalid_cert` has three states:
+/// - `None`: use cached TLS backend/cert settings when present; otherwise allow
+///   automatic fallback between Rustls/NativeTls and strict/accept-invalid modes.
+/// - `Some(false)`: force strict certificate validation, overriding the cache;
+///   use for security-critical requests such as updates.
+/// - `Some(true)`: force accepting invalid certificates, overriding the cache;
+///   use sparingly.
 pub async fn create_http_client_async_with_url(
     url: &str,
     tls_danger_accept_invalid_cert: Option<bool>,
