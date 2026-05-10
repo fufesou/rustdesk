@@ -120,34 +120,38 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
     url
 }
 
+fn resolve_danger_accept_invalid_cert(
+    force_strict_tls: bool,
+    cached_danger_accept_invalid_cert: Option<bool>,
+) -> Option<bool> {
+    if force_strict_tls {
+        Some(false)
+    } else {
+        cached_danger_accept_invalid_cert
+    }
+}
+
 /// Creates a sync HTTP client for `url`.
 ///
-/// `tls_danger_accept_invalid_cert` has three states:
-/// - `None`: use cached TLS backend/cert settings when present; otherwise allow
-///   automatic fallback between Rustls/NativeTls and strict/accept-invalid modes.
-/// - `Some(false)`: force strict certificate validation, overriding the cache;
-///   use for security-critical requests such as updates.
-/// - `Some(true)`: force accepting invalid certificates, overriding the cache;
-///   use sparingly.
-pub fn create_http_client_with_url(
-    url: &str,
-    tls_danger_accept_invalid_cert: Option<bool>,
-) -> SyncClient {
+/// Set `force_strict_tls` to `true` for security-critical requests that must
+/// reject invalid certificates and ignore the cached certificate policy.
+pub fn create_http_client_with_url(url: &str, force_strict_tls: bool) -> SyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_type_cached = tls_type.is_some();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert =
-        tls_danger_accept_invalid_cert.or_else(|| get_cached_tls_accept_invalid_cert(tls_url));
-    let allow_accept_invalid_fallback = danger_accept_invalid_cert.is_none();
+    let danger_accept_invalid_cert = resolve_danger_accept_invalid_cert(
+        force_strict_tls,
+        get_cached_tls_accept_invalid_cert(tls_url),
+    );
     create_http_client_with_url_(
         url,
         tls_url,
         tls_type,
         is_tls_type_cached,
         danger_accept_invalid_cert,
-        allow_accept_invalid_fallback,
+        danger_accept_invalid_cert,
     )
 }
 
@@ -157,16 +161,16 @@ fn create_http_client_with_url_(
     tls_type: TlsType,
     is_tls_type_cached: bool,
     danger_accept_invalid_cert: Option<bool>,
-    allow_accept_invalid_fallback: bool,
+    original_danger_accept_invalid_cert: Option<bool>,
 ) -> SyncClient {
     let mut client = create_http_client(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && !allow_accept_invalid_fallback {
+    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
         return client;
     }
     if let Err(e) = client.head(url).send() {
         if e.is_request() {
             match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
-                (TlsType::Rustls, _, None) if allow_accept_invalid_fallback => {
+                (TlsType::Rustls, _, None) => {
                     log::warn!(
                         "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
                         tls_url,
@@ -178,7 +182,7 @@ fn create_http_client_with_url_(
                         tls_type,
                         is_tls_type_cached,
                         Some(true),
-                        allow_accept_invalid_fallback,
+                        original_danger_accept_invalid_cert,
                     );
                 }
                 (TlsType::Rustls, false, Some(_)) => {
@@ -192,15 +196,11 @@ fn create_http_client_with_url_(
                         tls_url,
                         TlsType::NativeTls,
                         is_tls_type_cached,
-                        if allow_accept_invalid_fallback {
-                            None
-                        } else {
-                            danger_accept_invalid_cert
-                        },
-                        allow_accept_invalid_fallback,
+                        original_danger_accept_invalid_cert,
+                        original_danger_accept_invalid_cert,
                     );
                 }
-                (TlsType::NativeTls, _, None) if allow_accept_invalid_fallback => {
+                (TlsType::NativeTls, _, None) => {
                     log::warn!(
                         "Failed to connect to server {} with native-tls: {:?}, trying accept invalid cert",
                         tls_url,
@@ -212,7 +212,7 @@ fn create_http_client_with_url_(
                         tls_type,
                         is_tls_type_cached,
                         Some(true),
-                        allow_accept_invalid_fallback,
+                        original_danger_accept_invalid_cert,
                     );
                 }
                 _ => {
@@ -249,32 +249,25 @@ fn create_http_client_with_url_(
 
 /// Creates an async HTTP client for `url`.
 ///
-/// `tls_danger_accept_invalid_cert` has three states:
-/// - `None`: use cached TLS backend/cert settings when present; otherwise allow
-///   automatic fallback between Rustls/NativeTls and strict/accept-invalid modes.
-/// - `Some(false)`: force strict certificate validation, overriding the cache;
-///   use for security-critical requests such as updates.
-/// - `Some(true)`: force accepting invalid certificates, overriding the cache;
-///   use sparingly.
-pub async fn create_http_client_async_with_url(
-    url: &str,
-    tls_danger_accept_invalid_cert: Option<bool>,
-) -> AsyncClient {
+/// Set `force_strict_tls` to `true` for security-critical requests that must
+/// reject invalid certificates and ignore the cached certificate policy.
+pub async fn create_http_client_async_with_url(url: &str, force_strict_tls: bool) -> AsyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_type_cached = tls_type.is_some();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert =
-        tls_danger_accept_invalid_cert.or_else(|| get_cached_tls_accept_invalid_cert(tls_url));
-    let allow_accept_invalid_fallback = danger_accept_invalid_cert.is_none();
+    let danger_accept_invalid_cert = resolve_danger_accept_invalid_cert(
+        force_strict_tls,
+        get_cached_tls_accept_invalid_cert(tls_url),
+    );
     create_http_client_async_with_url_(
         url,
         tls_url,
         tls_type,
         is_tls_type_cached,
         danger_accept_invalid_cert,
-        allow_accept_invalid_fallback,
+        danger_accept_invalid_cert,
     )
     .await
 }
@@ -286,16 +279,16 @@ async fn create_http_client_async_with_url_(
     tls_type: TlsType,
     is_tls_type_cached: bool,
     danger_accept_invalid_cert: Option<bool>,
-    allow_accept_invalid_fallback: bool,
+    original_danger_accept_invalid_cert: Option<bool>,
 ) -> AsyncClient {
     let mut client =
         create_http_client_async(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && !allow_accept_invalid_fallback {
+    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
         return client;
     }
     if let Err(e) = client.head(url).send().await {
         match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
-            (TlsType::Rustls, _, None) if allow_accept_invalid_fallback => {
+            (TlsType::Rustls, _, None) => {
                 log::warn!(
                     "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
                     tls_url,
@@ -307,7 +300,7 @@ async fn create_http_client_async_with_url_(
                     tls_type,
                     is_tls_type_cached,
                     Some(true),
-                    allow_accept_invalid_fallback,
+                    original_danger_accept_invalid_cert,
                 )
                 .await;
             }
@@ -322,16 +315,12 @@ async fn create_http_client_async_with_url_(
                     tls_url,
                     TlsType::NativeTls,
                     is_tls_type_cached,
-                    if allow_accept_invalid_fallback {
-                        None
-                    } else {
-                        danger_accept_invalid_cert
-                    },
-                    allow_accept_invalid_fallback,
+                    original_danger_accept_invalid_cert,
+                    original_danger_accept_invalid_cert,
                 )
                 .await;
             }
-            (TlsType::NativeTls, _, None) if allow_accept_invalid_fallback => {
+            (TlsType::NativeTls, _, None) => {
                 log::warn!(
                     "Failed to connect to server {} with native-tls: {:?}, trying accept invalid cert",
                     tls_url,
@@ -343,7 +332,7 @@ async fn create_http_client_async_with_url_(
                     tls_type,
                     is_tls_type_cached,
                     Some(true),
-                    allow_accept_invalid_fallback,
+                    original_danger_accept_invalid_cert,
                 )
                 .await;
             }
@@ -369,4 +358,35 @@ async fn create_http_client_async_with_url_(
         );
     }
     client
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_strict_tls_overrides_cached_cert_policy() {
+        assert_eq!(resolve_danger_accept_invalid_cert(true, None), Some(false));
+        assert_eq!(
+            resolve_danger_accept_invalid_cert(true, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_danger_accept_invalid_cert(true, Some(true)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn non_strict_tls_uses_cached_cert_policy() {
+        assert_eq!(resolve_danger_accept_invalid_cert(false, None), None);
+        assert_eq!(
+            resolve_danger_accept_invalid_cert(false, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_danger_accept_invalid_cert(false, Some(true)),
+            Some(true)
+        );
+    }
 }

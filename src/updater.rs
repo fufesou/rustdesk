@@ -150,51 +150,15 @@ fn check_update(manually: bool) -> ResultType<()> {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
         };
         log::debug!("New version available: {}", &version);
-        let client = create_http_client_with_url(&download_url, Some(false));
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
-        let expected_sha256 = fetch_github_asset_sha256(&update_url, &download_url)?;
-        let mut is_file_exists = false;
-        if file_path.exists() {
-            // Check if the file size is the same as the server file size
-            // If the file size is the same, we don't need to download it again.
-            let file_size = std::fs::metadata(&file_path)?.len();
-            let response = client.head(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!("Failed to get the file size: {}", response.status());
-            }
-            let total_size = response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|ct_len| ct_len.to_str().ok())
-                .and_then(|ct_len| ct_len.parse::<u64>().ok());
-            let Some(total_size) = total_size else {
-                bail!("Failed to get content length");
-            };
-            if file_size == total_size {
-                match verify_file_sha256(&file_path, &expected_sha256) {
-                    Ok(()) => is_file_exists = true,
-                    Err(e) => {
-                        log::warn!("Removing cached update file with invalid SHA256: {}", e);
-                        std::fs::remove_file(&file_path)?;
-                    }
-                }
-            } else {
-                std::fs::remove_file(&file_path)?;
-            }
+        let expected_sha256 = download_file_expected_sha256(&download_url)?;
+        let verify_res = ensure_verified_update_file(&download_url, &file_path, &expected_sha256);
+        if verify_res.is_err() {
+            clear_download_file_expected_sha256(&download_url);
         }
-        if !is_file_exists {
-            let response = client.get(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!(
-                    "Failed to download the new version file: {}",
-                    response.status()
-                );
-            }
-            let file_data = response.bytes()?;
-            write_verified_download(&file_path, &file_data, &expected_sha256)?;
-        }
+        verify_res?;
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
         // before the download, but not empty after the download.
@@ -202,6 +166,55 @@ fn check_update(manually: bool) -> ResultType<()> {
             #[cfg(target_os = "windows")]
             update_new_version(update_msi, &version, &file_path, &expected_sha256);
         }
+    }
+    Ok(())
+}
+
+fn ensure_verified_update_file(
+    download_url: &str,
+    file_path: &Path,
+    expected_sha256: &str,
+) -> ResultType<()> {
+    let client = create_http_client_with_url(download_url, true);
+    let mut is_file_exists = false;
+    if file_path.exists() {
+        // Check if the file size is the same as the server file size
+        // If the file size is the same, we don't need to download it again.
+        let file_size = std::fs::metadata(file_path)?.len();
+        let response = client.head(download_url).send()?;
+        if !response.status().is_success() {
+            bail!("Failed to get the file size: {}", response.status());
+        }
+        let total_size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|ct_len| ct_len.to_str().ok())
+            .and_then(|ct_len| ct_len.parse::<u64>().ok());
+        let Some(total_size) = total_size else {
+            bail!("Failed to get content length");
+        };
+        if file_size == total_size {
+            match verify_file_sha256(file_path, expected_sha256) {
+                Ok(()) => is_file_exists = true,
+                Err(e) => {
+                    log::warn!("Removing cached update file with invalid SHA256: {}", e);
+                    std::fs::remove_file(file_path)?;
+                }
+            }
+        } else {
+            std::fs::remove_file(file_path)?;
+        }
+    }
+    if !is_file_exists {
+        let response = client.get(download_url).send()?;
+        if !response.status().is_success() {
+            bail!(
+                "Failed to download the new version file: {}",
+                response.status()
+            );
+        }
+        let file_data = response.bytes()?;
+        write_verified_download(file_path, &file_data, expected_sha256)?;
     }
     Ok(())
 }
@@ -428,7 +441,7 @@ fn fetch_github_asset_sha256(update_url: &str, download_url: &str) -> ResultType
 }
 
 fn fetch_github_release_metadata(api_url: &str) -> ResultType<String> {
-    let client = create_http_client_with_url(&api_url, Some(false));
+    let client = create_http_client_with_url(&api_url, true);
     let response = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "rustdesk-updater")
