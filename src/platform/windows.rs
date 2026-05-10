@@ -4932,8 +4932,9 @@ mod tests {
             &update_file_path,
         );
 
-        let _ = std::fs::remove_dir_all(&test_dir);
         assert!(result.is_ok());
+        drop(update_file);
+        std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[test]
@@ -4956,8 +4957,9 @@ mod tests {
             &update_file_path,
         );
 
-        let _ = std::fs::remove_dir_all(&test_dir);
         assert!(result.is_err());
+        drop(update_file);
+        std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[test]

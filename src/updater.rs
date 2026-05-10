@@ -25,6 +25,7 @@ lazy_static::lazy_static! {
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+const UPDATE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
@@ -179,7 +180,10 @@ fn ensure_verified_update_file(
         // Check if the file size is the same as the server file size
         // If the file size is the same, we don't need to download it again.
         let file_size = std::fs::metadata(file_path)?.len();
-        let response = client.head(download_url).send()?;
+        let response = client
+            .head(download_url)
+            .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
+            .send()?;
         if !response.status().is_success() {
             bail!("Failed to get the file size: {}", response.status());
         }
@@ -204,15 +208,14 @@ fn ensure_verified_update_file(
         }
     }
     if !is_file_exists {
-        let response = client.get(download_url).send()?;
+        let mut response = client.get(download_url).send()?;
         if !response.status().is_success() {
             bail!(
                 "Failed to download the new version file: {}",
                 response.status()
             );
         }
-        let file_data = response.bytes()?;
-        write_verified_download(file_path, &file_data, expected_sha256)?;
+        write_verified_download_from_reader(file_path, &mut response, expected_sha256)?;
     }
     Ok(())
 }
@@ -389,26 +392,24 @@ fn install_verified_download(temp_path: &Path, final_path: &Path) -> ResultType<
     Ok(())
 }
 
-fn write_and_verify_download_file(
+fn copy_and_verify_download_file<R: Read>(
     file: &mut std::fs::File,
     temp_path: &Path,
-    file_data: &[u8],
+    reader: &mut R,
     expected_sha256: &str,
 ) -> ResultType<()> {
-    file.write_all(file_data)?;
+    std::io::copy(reader, file)?;
     file.flush()?;
     verify_file_sha256(temp_path, expected_sha256)
 }
 
-fn write_verified_download(
+fn write_verified_download_from_reader<R: Read>(
     final_path: &Path,
-    file_data: &[u8],
+    reader: &mut R,
     expected_sha256: &str,
 ) -> ResultType<()> {
     let (mut file, temp_path) = create_download_temp_file(final_path)?;
-    if let Err(e) =
-        write_and_verify_download_file(&mut file, &temp_path, file_data, expected_sha256)
-    {
+    if let Err(e) = copy_and_verify_download_file(&mut file, &temp_path, reader, expected_sha256) {
         std::fs::remove_file(temp_path).ok();
         return Err(e);
     }
@@ -417,6 +418,16 @@ fn write_verified_download(
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn write_verified_download(
+    final_path: &Path,
+    file_data: &[u8],
+    expected_sha256: &str,
+) -> ResultType<()> {
+    let mut reader = file_data;
+    write_verified_download_from_reader(final_path, &mut reader, expected_sha256)
 }
 
 #[derive(serde::Deserialize)]
@@ -430,8 +441,11 @@ struct GithubReleaseAsset {
     digest: Option<String>,
 }
 
-fn fetch_github_asset_sha256(update_url: &str, download_url: &str) -> ResultType<String> {
-    let api_url = github_release_api_url(update_url)?;
+fn fetch_github_asset_sha256(
+    release_or_download_url: &str,
+    download_url: &str,
+) -> ResultType<String> {
+    let api_url = github_release_api_url(release_or_download_url)?;
     let asset_name = download_asset_name(download_url)?;
     let metadata = fetch_github_release_metadata(&api_url)?;
     github_release_asset_sha256(&metadata, &asset_name)
@@ -442,6 +456,7 @@ fn fetch_github_release_metadata(api_url: &str) -> ResultType<String> {
     let response = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "rustdesk-updater")
+        .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
         .send()?;
     if !response.status().is_success() {
         let status = response.status();
@@ -708,6 +723,11 @@ mod tests {
     }
 
     #[test]
+    fn update_http_request_timeout_is_bounded() {
+        assert_eq!(UPDATE_HTTP_REQUEST_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
     fn download_file_sha256_cache_roundtrips_and_clears() {
         let download_url = format!(
             "https://github.com/rustdesk/rustdesk/releases/download/test/rustdesk-cache-test-{}-{}.exe",
@@ -805,6 +825,28 @@ mod tests {
         assert!(result.is_err());
         assert!(!final_path.exists());
         assert!(std::fs::read_dir(&test_dir).unwrap().next().is_none());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn write_verified_download_from_reader_installs_verified_file() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-reader-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+        let mut data: &[u8] = b"update";
+
+        write_verified_download_from_reader(
+            &final_path,
+            &mut data,
+            "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4",
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"update");
         std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
