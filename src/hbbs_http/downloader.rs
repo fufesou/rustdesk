@@ -175,7 +175,7 @@ async fn do_download(
     auto_del_dur: Option<Duration>,
     mut rx_cancel: UnboundedReceiver<()>,
 ) -> ResultType<bool> {
-    let client = create_http_client_async_with_url(&url, Some(false)).await;
+    let client = create_http_client_async_with_url(&url, true).await;
 
     let mut is_all_downloaded = false;
     tokio::select! {
