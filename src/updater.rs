@@ -218,6 +218,33 @@ fn ensure_verified_update_file(
 }
 
 #[cfg(target_os = "windows")]
+fn verified_update_path(
+    p: &str,
+    expected_sha256: &str,
+    kind: &str,
+    file_path: &Path,
+) -> Option<(crate::platform::VerifiedUpdateFile, String)> {
+    let update_file =
+        match crate::platform::verify_update_file_signature_and_sha256(p, expected_sha256) {
+            Ok(update_file) => update_file,
+            Err(e) => {
+                log::error!("Refusing to update from untrusted {}: {}", kind, e);
+                std::fs::remove_file(file_path).ok();
+                return None;
+            }
+        };
+    let update_path = match update_file.path_str() {
+        Ok(path) => path.to_owned(),
+        Err(e) => {
+            log::error!("Failed to get verified {} path: {}", kind, e);
+            std::fs::remove_file(file_path).ok();
+            return None;
+        }
+    };
+    Some((update_file, update_path))
+}
+
+#[cfg(target_os = "windows")]
 fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expected_sha256: &str) {
     log::debug!(
         "New version is downloaded, update begin, update msi: {update_msi}, version: {version}, file: {:?}",
@@ -226,26 +253,12 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
     if let Some(p) = file_path.to_str() {
         if let Some(session_id) = crate::platform::get_current_process_session_id() {
             if update_msi {
-                let update_file = match crate::platform::verify_update_file_signature_and_sha256(
-                    p,
-                    expected_sha256,
-                ) {
-                    Ok(update_file) => update_file,
-                    Err(e) => {
-                        log::error!("Refusing to update from untrusted msi: {}", e);
-                        std::fs::remove_file(&file_path).ok();
-                        return;
-                    }
+                let Some((_update_file, update_path)) =
+                    verified_update_path(p, expected_sha256, "msi", file_path)
+                else {
+                    return;
                 };
-                let update_path = match update_file.path_str() {
-                    Ok(path) => path,
-                    Err(e) => {
-                        log::error!("Failed to get verified msi path: {}", e);
-                        std::fs::remove_file(&file_path).ok();
-                        return;
-                    }
-                };
-                match crate::platform::update_me_msi(update_path, true) {
+                match crate::platform::update_me_msi(&update_path, true) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);
                     }
@@ -259,24 +272,10 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                     }
                 }
             } else {
-                let update_file = match crate::platform::verify_update_file_signature_and_sha256(
-                    p,
-                    expected_sha256,
-                ) {
-                    Ok(update_file) => update_file,
-                    Err(e) => {
-                        log::error!("Refusing to update from untrusted exe: {}", e);
-                        std::fs::remove_file(&file_path).ok();
-                        return;
-                    }
-                };
-                let update_path = match update_file.path_str() {
-                    Ok(path) => path,
-                    Err(e) => {
-                        log::error!("Failed to get verified exe path: {}", e);
-                        std::fs::remove_file(&file_path).ok();
-                        return;
-                    }
+                let Some((_update_file, update_path)) =
+                    verified_update_path(p, expected_sha256, "exe", file_path)
+                else {
+                    return;
                 };
                 let custom_client_staging_dir = if crate::is_custom_client() {
                     let custom_client_staging_dir =
