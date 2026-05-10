@@ -3783,6 +3783,13 @@ impl Connection {
         scope: FailureScope,
     ) {
         let os_credential_scope = matches!(scope, FailureScope::TerminalOsLogin);
+        if os_credential_scope {
+            if !remove {
+                record_os_credential_failure(scope);
+            }
+            return;
+        }
+
         let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
@@ -3796,9 +3803,6 @@ impl Connection {
                     map_mutex.lock().unwrap().remove(&self.ip);
                 }
             }
-            // Intentionally keep OS-credential backoff state as global.
-            // Reason: if one successful login cleared this state, an attacker could use
-            // intermittent successes to repeatedly reset throttling.
             return;
         }
         // Bump the prefixes, fetching existing values
@@ -3815,10 +3819,6 @@ impl Connection {
             let mut m = map_mutex.lock().unwrap();
             let current_ip = m.get(&self.ip).copied().unwrap_or((0, 0, 0));
             m.insert(self.ip.clone(), Self::bump_failure_entry(current_ip, time));
-        }
-
-        if os_credential_scope {
-            record_os_credential_failure(scope);
         }
     }
 
@@ -3869,6 +3869,39 @@ impl Connection {
     ) -> (((i32, i32, i32), i32), bool) {
         let time = (get_time() / 60_000) as i32;
 
+        if matches!(scope, FailureScope::TerminalOsLogin) {
+            let decision = evaluate_os_credential_policy(scope, get_time());
+            let res = if decision.allowed {
+                true
+            } else {
+                log::warn!(
+                    "OS credential login blocked by policy: ip={} conn_id={} i={} msg='{}'",
+                    self.ip,
+                    self.inner.id(),
+                    i,
+                    decision.login_error.as_deref().unwrap_or("")
+                );
+                if let Some(login_error) = decision.login_error {
+                    // Rare branch and currently temporary response copy; translation can be added later if needed.
+                    self.send_login_error(login_error).await;
+                }
+                if let Some(audit) = decision.audit {
+                    // For OS blocked/backoff events, we currently emit one alarm report per blocked attempt.
+                    // TODO: Add unified cumulative/aggregation fields across alarm producers.
+                    Self::post_alarm_audit(
+                        audit,
+                        json!({
+                                    "ip": self.ip,
+                                    "id": self.lr.my_id.clone(),
+                                    "name": self.lr.my_name.clone(),
+                        }),
+                    );
+                }
+                false
+            };
+            return (((0, 0, 0), time), res);
+        }
+
         // IPv6 addresses are cheap to make so we check prefix/netblock as well
         if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
             if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p64, 64, 60).await {
@@ -3912,36 +3945,6 @@ impl Connection {
                 }),
             );
             false
-        } else if matches!(scope, FailureScope::TerminalOsLogin) {
-            let decision = evaluate_os_credential_policy(scope, get_time());
-            if decision.allowed {
-                true
-            } else {
-                log::warn!(
-                    "OS credential login blocked by policy: ip={} conn_id={} i={} msg='{}'",
-                    self.ip,
-                    self.inner.id(),
-                    i,
-                    decision.login_error.as_deref().unwrap_or("")
-                );
-                if let Some(login_error) = decision.login_error {
-                    // Rare branch and currently temporary response copy; translation can be added later if needed.
-                    self.send_login_error(login_error).await;
-                }
-                if let Some(audit) = decision.audit {
-                    // For OS blocked/backoff events, we currently emit one alarm report per blocked attempt.
-                    // TODO: Add unified cumulative/aggregation fields across alarm producers.
-                    Self::post_alarm_audit(
-                        audit,
-                        json!({
-                                    "ip": self.ip,
-                                    "id": self.lr.my_id.clone(),
-                                    "name": self.lr.my_name.clone(),
-                        }),
-                    );
-                }
-                false
-            }
         } else {
             true
         };
