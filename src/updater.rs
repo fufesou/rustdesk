@@ -173,7 +173,7 @@ fn ensure_verified_update_file(
     file_path: &Path,
     expected_sha256: &str,
 ) -> ResultType<()> {
-    let client = create_http_client_with_url(download_url, Some(false));
+    let client = create_http_client_with_url(download_url, true);
     let mut is_file_exists = false;
     if file_path.exists() {
         // Check if the file size is the same as the server file size
@@ -439,7 +439,7 @@ fn fetch_github_asset_sha256(update_url: &str, download_url: &str) -> ResultType
 }
 
 fn fetch_github_release_metadata(api_url: &str) -> ResultType<String> {
-    let client = create_http_client_with_url(&api_url, Some(false));
+    let client = create_http_client_with_url(&api_url, true);
     let response = client
         .get(api_url)
         .header(reqwest::header::USER_AGENT, "rustdesk-updater")
