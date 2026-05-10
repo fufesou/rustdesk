@@ -295,7 +295,7 @@ class UpdateProgressState extends State<UpdateProgress> {
           }
           if (evt.containsKey('error')) {
             _showUpdateError(widget.releasePageUrl, evt['error'] as String,
-                messageKey: 'Failed', showRetry: false);
+                showRetry: false, showErrorDetail: false);
           }
         }, replace: true);
         bind.mainSetCommon(key: 'update-me', value: widget.downloadUrl);
