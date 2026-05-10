@@ -2439,6 +2439,19 @@ impl Connection {
                 return false;
             }
 
+            #[cfg(target_os = "windows")]
+            if self.terminal
+                && lr.os_login.username.trim().is_empty()
+                && crate::platform::is_prelogin()
+            {
+                self.send_login_error(
+                    "No active console user logged on, please connect and logon first.",
+                )
+                .await;
+                sleep(1.).await;
+                return false;
+            }
+
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
                 self.try_start_cm_ipc();
