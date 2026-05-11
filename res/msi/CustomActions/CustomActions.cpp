@@ -31,17 +31,17 @@ LExit:
     return WcaFinalize(er);
 }
 
-// Helper function to safely delete a file or directory using handle-based deletion.
-// This avoids TOCTOU (Time-Of-Check-Time-Of-Use) race conditions.
+// Helper function to safely delete a file using handle-based deletion.
+// Directories are refused after opening the handle.
 BOOL SafeDeleteItem(LPCWSTR fullPath)
 {
-    // Open the file/directory with DELETE access and FILE_FLAG_OPEN_REPARSE_POINT
+    // Open the file/directory with delete and attribute-read access plus FILE_FLAG_OPEN_REPARSE_POINT
     // to prevent following symlinks.
     // Use shared access to allow deletion even when other processes have the file open.
     DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
     HANDLE hFile = CreateFileW(
         fullPath,
-        DELETE,
+        DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,  // Allow shared access
         NULL,
         OPEN_EXISTING,
@@ -120,10 +120,12 @@ BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
     if (attributes == INVALID_FILE_ATTRIBUTES)
     {
         DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
         {
-            WcaLog(LOGMSG_STANDARD, "Runtime cleanup cannot stat '%ls'. Error: %lu", fullPath, error);
+            return TRUE;
         }
+
+        WcaLog(LOGMSG_STANDARD, "Runtime cleanup cannot stat '%ls'. Error: %lu", fullPath, error);
         return FALSE;
     }
 
@@ -131,14 +133,6 @@ BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
     {
         WcaLog(LOGMSG_STANDARD, "Runtime cleanup skipped directory '%ls'.", fullPath);
         return FALSE;
-    }
-
-    if (attributes & FILE_ATTRIBUTE_READONLY)
-    {
-        if (FALSE == SetFileAttributesW(fullPath, attributes & ~FILE_ATTRIBUTE_READONLY))
-        {
-            WcaLog(LOGMSG_STANDARD, "Runtime cleanup failed to remove read-only attribute from '%ls'. Error: %lu", fullPath, GetLastError());
-        }
     }
 
     WcaLog(LOGMSG_STANDARD, "Runtime cleanup deleting '%ls'.", fullPath);

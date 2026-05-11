@@ -77,8 +77,8 @@
 
 			<Custom Action="AddRegSoftwareSASGeneration" Before="InstallFinalize" Condition="NOT (Installed AND REMOVE AND NOT UPGRADINGPRODUCTCODE) AND (NOT CC_CONNECTION_TYPE=&quot;outgoing&quot;)"/>
 
-			<Custom Action="RemoveRuntimeGeneratedFiles" Before="RemoveFiles"/>
-			<Custom Action="RemoveRuntimeGeneratedFiles.SetParam" Before="RemoveRuntimeGeneratedFiles"/>
+			<Custom Action="RemoveRuntimeGeneratedFiles" Before="RemoveFiles" Condition="Installed AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)"/>
+			<Custom Action="RemoveRuntimeGeneratedFiles.SetParam" Before="RemoveRuntimeGeneratedFiles" Condition="Installed AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)"/>
 			<Custom Action="TryStopDeleteService" Before="RemoveRuntimeGeneratedFiles.SetParam" />
 			<Custom Action="TryStopDeleteService.SetParam" Before="TryStopDeleteService" />
 
