@@ -55,6 +55,21 @@ BOOL SafeDeleteItem(LPCWSTR fullPath)
         return FALSE;
     }
 
+    BY_HANDLE_FILE_INFORMATION fileInfo;
+    if (FALSE == GetFileInformationByHandle(hFile, &fileInfo))
+    {
+        WcaLog(LOGMSG_STANDARD, "SafeDeleteItem: Failed to inspect '%ls'. Error: %lu", fullPath, GetLastError());
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    {
+        WcaLog(LOGMSG_STANDARD, "SafeDeleteItem: Refusing to delete directory '%ls'.", fullPath);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
     // Use SetFileInformationByHandle to mark for deletion.
     // The file will be deleted when the handle is closed.
     FILE_DISPOSITION_INFO dispInfo;
@@ -77,98 +92,57 @@ BOOL SafeDeleteItem(LPCWSTR fullPath)
     return result;
 }
 
-// Helper function to recursively delete a directory's contents with detailed logging.
-void RecursiveDelete(LPCWSTR path)
+BOOL PathEndsWithSlash(LPCWSTR path)
 {
-    // Ensure the path is not empty or null.
-    if (path == NULL || path[0] == L'\0')
+    size_t length = 0;
+    HRESULT hr = StringCchLengthW(path, MAX_PATH, &length);
+    if (FAILED(hr) || length == 0)
     {
-        return;
+        return FALSE;
     }
 
-    // Extra safety: never operate directly on a root path.
-    if (PathIsRootW(path))
+    WCHAR last = path[length - 1];
+    return last == L'\\' || last == L'/';
+}
+
+BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
+{
+    WCHAR fullPath[MAX_PATH];
+    LPCWSTR separator = PathEndsWithSlash(installFolder) ? L"" : L"\\";
+    HRESULT hr = StringCchPrintfW(fullPath, MAX_PATH, L"%s%s%s", installFolder, separator, fileName);
+    if (FAILED(hr))
     {
-        WcaLog(LOGMSG_STANDARD, "RecursiveDelete: refusing to operate on root path '%ls'.", path);
-        return;
+        WcaLog(LOGMSG_STANDARD, "Runtime cleanup path is too long for '%ls'.", fileName);
+        return FALSE;
     }
 
-    // MAX_PATH is enough here since the installer should not be using longer paths.
-    // No need to handle extended-length paths (\\?\) in this context.
-    WCHAR searchPath[MAX_PATH];
-    HRESULT hr = StringCchPrintfW(searchPath, MAX_PATH, L"%s\\*", path);
-    if (FAILED(hr)) {
-        WcaLog(LOGMSG_STANDARD, "RecursiveDelete: Path too long to enumerate: %ls", path);
-        return;
-    }
-
-    WIN32_FIND_DATAW findData;
-    HANDLE hFind = FindFirstFileW(searchPath, &findData);
-
-    if (hFind == INVALID_HANDLE_VALUE)
+    DWORD attributes = GetFileAttributesW(fullPath);
+    if (attributes == INVALID_FILE_ATTRIBUTES)
     {
-        // This can happen if the directory is empty or doesn't exist, which is not an error in our case.
-        WcaLog(LOGMSG_STANDARD, "RecursiveDelete: Failed to enumerate directory '%ls'. It may be missing or inaccessible. Error: %lu", path, GetLastError());
-        return;
-    }
-
-    do
-    {
-        // Skip '.' and '..' directories.
-        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
         {
-            continue;
+            WcaLog(LOGMSG_STANDARD, "Runtime cleanup cannot stat '%ls'. Error: %lu", fullPath, error);
         }
-
-        // MAX_PATH is enough here since the installer should not be using longer paths.
-        // No need to handle extended-length paths (\\?\) in this context.
-        WCHAR fullPath[MAX_PATH];
-        hr = StringCchPrintfW(fullPath, MAX_PATH, L"%s\\%s", path, findData.cFileName);
-        if (FAILED(hr)) {
-            WcaLog(LOGMSG_STANDARD, "RecursiveDelete: Path too long for item '%ls' in '%ls', skipping.", findData.cFileName, path);
-            continue;
-        }
-
-        // Before acting, ensure the read-only attribute is not set.
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
-        {
-            if (FALSE == SetFileAttributesW(fullPath, findData.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY))
-            {
-                WcaLog(LOGMSG_STANDARD, "RecursiveDelete: Failed to remove read-only attribute. Error: %lu", GetLastError());
-            }
-        }
-
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        {
-            // Check for reparse points (symlinks/junctions) to prevent directory traversal attacks.
-            // Do not follow reparse points, only remove the link itself.
-            if (findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            {
-                WcaLog(LOGMSG_STANDARD, "RecursiveDelete: Not recursing into reparse point (symlink/junction), deleting link itself: %ls", fullPath);
-                SafeDeleteItem(fullPath);
-            }
-            else
-            {
-                // Recursively delete directory contents first
-                RecursiveDelete(fullPath);
-                // Then delete the directory itself
-                SafeDeleteItem(fullPath);
-            }
-        }
-        else
-        {
-            // Delete file using safe handle-based deletion
-            SafeDeleteItem(fullPath);
-        }
-    } while (FindNextFileW(hFind, &findData) != 0);
-
-    DWORD lastError = GetLastError();
-    if (lastError != ERROR_NO_MORE_FILES)
-    {
-        WcaLog(LOGMSG_STANDARD, "RecursiveDelete: FindNextFileW failed with error %lu", lastError);
+        return FALSE;
     }
 
-    FindClose(hFind);
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+    {
+        WcaLog(LOGMSG_STANDARD, "Runtime cleanup skipped directory '%ls'.", fullPath);
+        return FALSE;
+    }
+
+    if (attributes & FILE_ATTRIBUTE_READONLY)
+    {
+        if (FALSE == SetFileAttributesW(fullPath, attributes & ~FILE_ATTRIBUTE_READONLY))
+        {
+            WcaLog(LOGMSG_STANDARD, "Runtime cleanup failed to remove read-only attribute from '%ls'. Error: %lu", fullPath, GetLastError());
+        }
+    }
+
+    WcaLog(LOGMSG_STANDARD, "Runtime cleanup deleting '%ls'.", fullPath);
+    return SafeDeleteItem(fullPath);
 }
 
 // See `Package.wxs` for the sequence of this custom action.
@@ -178,13 +152,13 @@ void RecursiveDelete(LPCWSTR path)
 //   2. RemoveExistingProducts
 //      ├─ TerminateProcesses
 //      ├─ TryStopDeleteService
-//      ├─ RemoveInstallFolder - <-- Here
+//      ├─ RemoveRuntimeGeneratedFiles - <-- Here
 //      └─ RemoveFiles
 //   3. InstallValidate
 //   4. InstallFiles
 //   5. InstallExecute
 //   6. InstallFinalize
-UINT __stdcall RemoveInstallFolder(
+UINT __stdcall RemoveRuntimeGeneratedFiles(
     __in MSIHANDLE hInstall)
 {
     HRESULT hr = S_OK;
@@ -194,7 +168,7 @@ UINT __stdcall RemoveInstallFolder(
     LPWSTR pwz = NULL;
     LPWSTR pwzData = NULL;
 
-    hr = WcaInitialize(hInstall, "RemoveInstallFolder");
+    hr = WcaInitialize(hInstall, "RemoveRuntimeGeneratedFiles");
     ExitOnFailure(hr, "Failed to initialize");
 
     hr = WcaGetProperty(L"CustomActionData", &pwzData);
@@ -202,24 +176,20 @@ UINT __stdcall RemoveInstallFolder(
 
     pwz = pwzData;
     hr = WcaReadStringFromCaData(&pwz, &installFolder);
-    ExitOnFailure(hr, "failed to read database key from custom action data: %ls", pwz);
+    ExitOnFailure(hr, "failed to read install folder from custom action data: %ls", pwz);
 
     if (installFolder == NULL || installFolder[0] == L'\0') {
-        WcaLog(LOGMSG_STANDARD, "Install folder path is empty, skipping recursive delete.");
+        WcaLog(LOGMSG_STANDARD, "Install folder path is empty, skipping runtime cleanup.");
         goto LExit;
     }
 
     if (PathIsRootW(installFolder)) {
-        WcaLog(LOGMSG_STANDARD, "Refusing to recursively delete root folder '%ls'.", installFolder);
+        WcaLog(LOGMSG_STANDARD, "Refusing runtime cleanup in root folder '%ls'.", installFolder);
         goto LExit;
     }
 
-    WcaLog(LOGMSG_STANDARD, "Attempting to recursively delete contents of install folder: %ls", installFolder);
-
-    RecursiveDelete(installFolder);
-
-    // The standard MSI 'RemoveFolders' action will take care of removing the (now empty) directories.
-    // We don't need to call RemoveDirectoryW on installFolder itself, as it might still be in use by the installer.
+    WcaLog(LOGMSG_STANDARD, "Removing runtime-generated files from install folder: %ls", installFolder);
+    DeleteRuntimeGeneratedFile(installFolder, L"RuntimeBroker_rustdesk.exe");
 
 LExit:
     ReleaseStr(pwzData);
