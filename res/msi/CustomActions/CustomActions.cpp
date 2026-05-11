@@ -135,14 +135,6 @@ BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
         return FALSE;
     }
 
-    if (attributes & FILE_ATTRIBUTE_READONLY)
-    {
-        if (FALSE == SetFileAttributesW(fullPath, attributes & ~FILE_ATTRIBUTE_READONLY))
-        {
-            WcaLog(LOGMSG_STANDARD, "Runtime cleanup failed to remove read-only attribute from '%ls'. Error: %lu", fullPath, GetLastError());
-        }
-    }
-
     WcaLog(LOGMSG_STANDARD, "Runtime cleanup deleting '%ls'.", fullPath);
     return SafeDeleteItem(fullPath);
 }
