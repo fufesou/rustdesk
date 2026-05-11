@@ -31,8 +31,8 @@ LExit:
     return WcaFinalize(er);
 }
 
-// Helper function to safely delete a file or directory using handle-based deletion.
-// This avoids TOCTOU (Time-Of-Check-Time-Of-Use) race conditions.
+// Helper function to safely delete a file using handle-based deletion.
+// Directories are refused after opening the handle.
 BOOL SafeDeleteItem(LPCWSTR fullPath)
 {
     // Open the file/directory with DELETE access and FILE_FLAG_OPEN_REPARSE_POINT
@@ -120,10 +120,12 @@ BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
     if (attributes == INVALID_FILE_ATTRIBUTES)
     {
         DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
         {
-            WcaLog(LOGMSG_STANDARD, "Runtime cleanup cannot stat '%ls'. Error: %lu", fullPath, error);
+            return TRUE;
         }
+
+        WcaLog(LOGMSG_STANDARD, "Runtime cleanup cannot stat '%ls'. Error: %lu", fullPath, error);
         return FALSE;
     }
 
