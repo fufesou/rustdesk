@@ -415,6 +415,7 @@ fn write_verified_download_from_reader<R: Read>(
         std::fs::remove_file(temp_path).ok();
         return Err(e);
     }
+    drop(file);
     if let Err(e) = install_verified_download(&temp_path, final_path) {
         std::fs::remove_file(temp_path).ok();
         return Err(e);
