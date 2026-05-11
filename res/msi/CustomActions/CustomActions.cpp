@@ -35,13 +35,13 @@ LExit:
 // Directories are refused after opening the handle.
 BOOL SafeDeleteItem(LPCWSTR fullPath)
 {
-    // Open the file/directory with DELETE access and FILE_FLAG_OPEN_REPARSE_POINT
+    // Open the file/directory with delete and attribute-read access plus FILE_FLAG_OPEN_REPARSE_POINT
     // to prevent following symlinks.
     // Use shared access to allow deletion even when other processes have the file open.
     DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
     HANDLE hFile = CreateFileW(
         fullPath,
-        DELETE,
+        DELETE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,  // Allow shared access
         NULL,
         OPEN_EXISTING,
