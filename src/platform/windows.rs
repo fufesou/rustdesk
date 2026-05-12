@@ -3868,6 +3868,7 @@ fn verify_update_file_signature_for_path(file: &str) -> ResultType<()> {
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(AUTHENTICODE_VERIFICATION_SCRIPT)
         .env(UPDATE_FILE_ENV, file)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()?;
     if output.status.success() {
         let publisher_name = String::from_utf8_lossy(&output.stdout);
