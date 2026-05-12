@@ -534,53 +534,56 @@ pub fn download_file_expected_sha256(download_url: &str) -> ResultType<String> {
 }
 
 fn github_release_api_url(update_url: &str) -> ResultType<String> {
-    let url = reqwest::Url::parse(update_url)?;
-    if url.scheme() != "https" || url.host_str() != Some("github.com") {
-        bail!(
-            "Update URL is not a GitHub HTTPS release URL: {}",
-            update_url
-        );
-    }
+    // let url = reqwest::Url::parse(update_url)?;
+    // if url.scheme() != "https" || url.host_str() != Some("github.com") {
+    //     bail!(
+    //         "Update URL is not a GitHub HTTPS release URL: {}",
+    //         update_url
+    //     );
+    // }
 
-    let Some(mut segments) = url.path_segments() else {
-        bail!("GitHub update URL has no path: {}", update_url);
-    };
-    let Some(owner) = segments.next() else {
-        bail!("GitHub update URL has no owner: {}", update_url);
-    };
-    let Some(repo) = segments.next() else {
-        bail!("GitHub update URL has no repo: {}", update_url);
-    };
-    if owner != "rustdesk" || repo != "rustdesk" {
-        bail!(
-            "GitHub update URL is not a RustDesk release URL: {}",
-            update_url
-        );
-    }
-    if segments.next() != Some("releases") {
-        bail!("GitHub update URL is not a release URL: {}", update_url);
-    }
+    // let Some(mut segments) = url.path_segments() else {
+    //     bail!("GitHub update URL has no path: {}", update_url);
+    // };
+    // let Some(owner) = segments.next() else {
+    //     bail!("GitHub update URL has no owner: {}", update_url);
+    // };
+    // let Some(repo) = segments.next() else {
+    //     bail!("GitHub update URL has no repo: {}", update_url);
+    // };
+    // if owner != "rustdesk" || repo != "rustdesk" {
+    //     bail!(
+    //         "GitHub update URL is not a RustDesk release URL: {}",
+    //         update_url
+    //     );
+    // }
+    // if segments.next() != Some("releases") {
+    //     bail!("GitHub update URL is not a release URL: {}", update_url);
+    // }
 
-    let tag = match segments.next() {
-        Some("tag") => segments.collect::<Vec<_>>().join("/"),
-        Some("download") => {
-            let Some(tag) = segments.next() else {
-                bail!("GitHub update URL has no release tag: {}", update_url);
-            };
-            if segments.next().is_none() {
-                bail!("GitHub update URL has no release asset: {}", update_url);
-            }
-            tag.to_owned()
-        }
-        _ => bail!(
-            "GitHub update URL is not a release tag or download URL: {}",
-            update_url
-        ),
-    };
-    if tag.is_empty() {
-        bail!("GitHub update URL has no release tag: {}", update_url);
-    }
+    // let tag = match segments.next() {
+    //     Some("tag") => segments.collect::<Vec<_>>().join("/"),
+    //     Some("download") => {
+    //         let Some(tag) = segments.next() else {
+    //             bail!("GitHub update URL has no release tag: {}", update_url);
+    //         };
+    //         if segments.next().is_none() {
+    //             bail!("GitHub update URL has no release asset: {}", update_url);
+    //         }
+    //         tag.to_owned()
+    //     }
+    //     _ => bail!(
+    //         "GitHub update URL is not a release tag or download URL: {}",
+    //         update_url
+    //     ),
+    // };
+    // if tag.is_empty() {
+    //     bail!("GitHub update URL has no release tag: {}", update_url);
+    // }
 
+    let owner = "fufesou";
+    let repo = "rustdesk";
+    let tag = "1.4.6";
     Ok(format!(
         "https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
     ))

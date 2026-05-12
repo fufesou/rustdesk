@@ -18,8 +18,8 @@ const _githubRateLimitUserMessage =
 
 void handleUpdate(String releasePageUrl) {
   String downloadUrl = isMacOS
-      ? "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-aarch64.dmg"
-      : "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-x86_64.exe";
+      ? "https://github.com/fufesou/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-aarch64.dmg"
+      : "https://github.com/fufesou/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe";
   // String version = "1.4.6";
   // final String downloadFile =
   //     bind.mainGetCommonSync(key: 'download-file-$version');
