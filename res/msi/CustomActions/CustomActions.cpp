@@ -105,6 +105,28 @@ BOOL PathEndsWithSlash(LPCWSTR path)
     return last == L'\\' || last == L'/';
 }
 
+void ClearReadOnlyAttribute(LPCWSTR fullPath, DWORD attributes)
+{
+    if (!(attributes & FILE_ATTRIBUTE_READONLY))
+    {
+        return;
+    }
+
+    DWORD writableAttributes = attributes & ~FILE_ATTRIBUTE_READONLY;
+    if (writableAttributes == 0)
+    {
+        writableAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+
+    if (SetFileAttributesW(fullPath, writableAttributes))
+    {
+        WcaLog(LOGMSG_STANDARD, "Runtime cleanup cleared read-only attribute for '%ls'.", fullPath);
+        return;
+    }
+
+    WcaLog(LOGMSG_STANDARD, "Runtime cleanup failed to clear read-only attribute for '%ls'. Error: %lu", fullPath, GetLastError());
+}
+
 BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
 {
     WCHAR fullPath[MAX_PATH];
@@ -135,6 +157,7 @@ BOOL DeleteRuntimeGeneratedFile(LPCWSTR installFolder, LPCWSTR fileName)
         return FALSE;
     }
 
+    ClearReadOnlyAttribute(fullPath, attributes);
     WcaLog(LOGMSG_STANDARD, "Runtime cleanup deleting '%ls'.", fullPath);
     return SafeDeleteItem(fullPath);
 }
