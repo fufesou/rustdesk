@@ -581,7 +581,7 @@ fn github_release_api_url(update_url: &str) -> ResultType<String> {
     //     bail!("GitHub update URL has no release tag: {}", update_url);
     // }
 
-    let owner = "fufesou";
+    let owner = "rustdesk";
     let repo = "rustdesk";
     let tag = "1.4.6";
     Ok(format!(
