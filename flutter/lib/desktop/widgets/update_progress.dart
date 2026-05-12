@@ -20,16 +20,16 @@ void handleUpdate(String releasePageUrl) {
   String downloadUrl = isMacOS
       ? "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-aarch64.dmg"
       : "https://github.com/fufesou/rustdesk/releases/download/nightly/rustdesk-1.4.6-x86_64.exe";
-  String version = "1.4.6";
-  final String downloadFile =
-      bind.mainGetCommonSync(key: 'download-file-$version');
-  if (downloadFile.startsWith('error:')) {
-    final error = downloadFile.replaceFirst('error:', '');
-    msgBox(gFFI.sessionId, 'custom-nocancel-nook-hasclose', 'Error', error,
-        releasePageUrl, gFFI.dialogManager);
-    return;
-  }
-  downloadUrl = '$downloadUrl/$downloadFile';
+  // String version = "1.4.6";
+  // final String downloadFile =
+  //     bind.mainGetCommonSync(key: 'download-file-$version');
+  // if (downloadFile.startsWith('error:')) {
+  //   final error = downloadFile.replaceFirst('error:', '');
+  //   msgBox(gFFI.sessionId, 'custom-nocancel-nook-hasclose', 'Error', error,
+  //       releasePageUrl, gFFI.dialogManager);
+  //   return;
+  // }
+  // downloadUrl = '$downloadUrl/$downloadFile';
 
   SimpleWrapper<String> downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
