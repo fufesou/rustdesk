@@ -428,6 +428,7 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                     if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
                         println!("{err}");
                     } else {
@@ -446,6 +447,7 @@ pub fn core_main() -> Option<Vec<String>> {
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                     if let Err(err) = crate::ipc::set_unlock_pin(args[1].to_owned(), false) {
                         println!("{err}");
                     } else {
@@ -457,6 +459,14 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             return None;
         } else if args[0] == "--get-id" {
+            let _user_main_ipc_scope = if should_scope_user_main_ipc_for_cli(
+                crate::platform::is_installed(),
+                is_root(),
+            ) {
+                Some(crate::ipc::UserMainIpcScope::new())
+            } else {
+                None
+            };
             println!("{}", crate::ipc::get_id());
             return None;
         } else if args[0] == "--set-id" {
@@ -470,6 +480,7 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                     let old_id = crate::ipc::get_id();
                     let mut res = crate::ui_interface::change_id_shared(args[1].to_owned(), old_id);
                     if res.is_empty() {
@@ -484,6 +495,7 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--config" {
             if args.len() == 2 && !args[0].contains("host=") {
                 if crate::platform::is_installed() && is_root() {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                     // encrypted string used in renaming exe.
                     let name = if args[1].ends_with(".exe") {
                         args[1].to_owned()
@@ -512,6 +524,7 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             }
             if crate::platform::is_installed() && is_root() {
+                let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                 if args.len() == 2 {
                     let options = crate::ipc::get_options();
                     println!("{}", options.get(&args[1]).unwrap_or(&"".to_owned()));
@@ -526,6 +539,7 @@ pub fn core_main() -> Option<Vec<String>> {
             if config::Config::no_register_device() {
                 println!("Cannot assign an unregistrable device!");
             } else if crate::platform::is_installed() && is_root() {
+                let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                 let max = args.len() - 1;
                 let pos = args.iter().position(|x| x == "--token").unwrap_or(max);
                 if pos < max {
@@ -844,6 +858,12 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[inline]
+fn should_scope_user_main_ipc_for_cli(is_installed: bool, is_root: bool) -> bool {
+    is_installed && is_root
 }
 
 /// Check if the executable is a Quick Support version.

@@ -34,7 +34,7 @@ use hbb_common::{
     ResultType,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use ipc_auth::authorize_service_scoped_ipc_connection;
+use ipc_auth::{active_uid, authorize_service_scoped_ipc_connection};
 #[cfg(windows)]
 pub(crate) use ipc_auth::authorize_windows_portable_service_ipc_connection;
 #[cfg(windows)]
@@ -43,7 +43,7 @@ pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
 pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
 #[cfg(target_os = "linux")]
 pub(crate) use ipc_auth::{
-    active_uid, ensure_peer_executable_matches_current_by_fd, is_allowed_service_peer_uid,
+    ensure_peer_executable_matches_current_by_fd, is_allowed_service_peer_uid,
     log_rejected_uinput_connection, peer_uid_from_fd,
 };
 #[cfg(windows)]
@@ -63,6 +63,8 @@ use parity_tokio_ipc::{
 };
 use serde_derive::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::cell::Cell;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
@@ -76,6 +78,55 @@ pub(crate) const IPC_TOKEN_LEN: usize = 64;
 const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
 const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+thread_local! {
+    static USE_USER_MAIN_IPC: Cell<bool> = Cell::new(false);
+}
+
+#[must_use = "bind this guard to a local variable to keep the IPC scope active"]
+/// Thread-local guard for routing root main IPC to the active user on Linux/macOS.
+///
+/// `USE_USER_MAIN_IPC` is thread-local, and `connect()` reads it before its
+/// first `.await`. Keep this guard alive on the same OS thread as the IPC call,
+/// e.g. through a current-thread runtime. Work moved to another thread with
+/// `tokio::spawn` on a multi-thread runtime or `std::thread::spawn` will not
+/// inherit this scope.
+pub(crate) struct UserMainIpcScope {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    previous: bool,
+}
+
+impl UserMainIpcScope {
+    pub(crate) fn new() -> Self {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let previous = USE_USER_MAIN_IPC.with(|use_user_main| {
+                let previous = use_user_main.get();
+                use_user_main.set(true);
+                previous
+            });
+            Self { previous }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for UserMainIpcScope {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.set(self.previous));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn use_user_main_ipc() -> bool {
+    USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.get())
+}
 
 #[inline]
 pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
@@ -1107,11 +1158,6 @@ async fn handle(data: Data, stream: &mut Connection) {
     };
 }
 
-pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
-    let path = Config::ipc_path(postfix);
-    connect_with_path(ms_timeout, &path).await
-}
-
 pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
     use hbb_common::rand::{rngs::OsRng, RngCore as _};
     use std::fmt::Write as _;
@@ -1202,6 +1248,64 @@ where
 async fn connect_with_path(ms_timeout: u64, path: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
     let client = timeout(ms_timeout, Endpoint::connect(path)).await??;
     Ok(ConnectionTmpl::new(client))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn user_main_ipc_uid(effective_uid: u32, active_uid: Option<u32>) -> u32 {
+    if effective_uid == 0 {
+        return active_uid.filter(|uid| *uid != 0).unwrap_or(effective_uid);
+    }
+    effective_uid
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn should_query_user_main_ipc_uid(effective_uid: u32, postfix: &str, use_user_main: bool) -> bool {
+    effective_uid == 0 && postfix.is_empty() && use_user_main
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn ipc_path_for_target(
+    effective_uid: u32,
+    active_uid: Option<u32>,
+    postfix: &str,
+    use_active_user_main_ipc_uid: bool,
+) -> String {
+    let uid = if use_active_user_main_ipc_uid {
+        user_main_ipc_uid(effective_uid, active_uid)
+    } else {
+        effective_uid
+    };
+    Config::ipc_path_for_uid(uid, postfix)
+}
+
+pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let effective_uid = unsafe { hbb_common::libc::geteuid() as u32 };
+        let use_user_main = use_user_main_ipc();
+        let use_active_user_main_ipc_uid =
+            should_query_user_main_ipc_uid(effective_uid, postfix, use_user_main);
+        let active_uid = if use_active_user_main_ipc_uid {
+            active_uid()
+        } else {
+            None
+        };
+        let path = ipc_path_for_target(
+            effective_uid,
+            active_uid,
+            postfix,
+            use_active_user_main_ipc_uid,
+        );
+        return connect_with_path(ms_timeout, &path).await;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let path = Config::ipc_path(postfix);
+        connect_with_path(ms_timeout, &path).await
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1990,7 +2094,87 @@ mod test {
         assert!(std::mem::size_of::<Data>() <= 120);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_user_main_ipc_uid_prefers_active_user_for_root() {
+        assert_eq!(user_main_ipc_uid(0, Some(501)), 501);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_user_main_ipc_uid_keeps_non_root_effective_uid() {
+        assert_eq!(user_main_ipc_uid(501, Some(502)), 501);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_user_main_ipc_uid_keeps_root_without_active_user() {
+        assert_eq!(user_main_ipc_uid(0, None), 0);
+        assert_eq!(user_main_ipc_uid(0, Some(0)), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_user_main_ipc_scope_restores_previous_state() {
+        assert!(!use_user_main_ipc());
+        {
+            let _scope = UserMainIpcScope::new();
+            assert!(use_user_main_ipc());
+            {
+                let _nested_scope = UserMainIpcScope::new();
+                assert!(use_user_main_ipc());
+            }
+            assert!(use_user_main_ipc());
+        }
+        assert!(!use_user_main_ipc());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_ipc_path_target_keeps_effective_uid_by_default() {
+        assert_eq!(
+            ipc_path_for_target(0, Some(501), "", false),
+            Config::ipc_path_for_uid(0, "")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_user_main_ipc_uid_query_requires_root_main_ipc_scope() {
+        assert!(should_query_user_main_ipc_uid(0, "", true));
+        assert!(!should_query_user_main_ipc_uid(501, "", true));
+        assert!(!should_query_user_main_ipc_uid(0, "_cm", true));
+        assert!(!should_query_user_main_ipc_uid(
+            0,
+            crate::POSTFIX_SERVICE,
+            true
+        ));
+        assert!(!should_query_user_main_ipc_uid(0, "", false));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_ipc_path_target_follows_active_user_decision() {
+        assert_eq!(
+            ipc_path_for_target(0, Some(501), "", true),
+            Config::ipc_path_for_uid(501, "")
+        );
+        assert_eq!(
+            ipc_path_for_target(0, Some(501), "_cm", true),
+            Config::ipc_path_for_uid(501, "_cm")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_service_ipc_path_is_shared_across_uids() {
+        assert_eq!(
+            Config::ipc_path_for_uid(0, crate::POSTFIX_SERVICE),
+            Config::ipc_path_for_uid(501, crate::POSTFIX_SERVICE)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_ipc_path_differs_by_uid_for_cm() {
         let effective_uid = unsafe { hbb_common::libc::geteuid() as u32 };
