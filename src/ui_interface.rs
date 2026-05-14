@@ -1361,15 +1361,42 @@ pub(crate) async fn send_to_cm(data: &ipc::Data) {
 const INVALID_FORMAT: &'static str = "Invalid format";
 const UNKNOWN_ERROR: &'static str = "Unknown error";
 
+fn change_id_rendezvous_servers_or_error(
+    rendezvous_servers: Vec<String>,
+) -> Result<Vec<String>, &'static str> {
+    if rendezvous_servers.is_empty() {
+        log::error!("Failed to change id, rendezvous server list is empty");
+        return Err(UNKNOWN_ERROR);
+    }
+    Ok(rendezvous_servers)
+}
+
 #[inline]
 #[tokio::main(flavor = "current_thread")]
 pub async fn change_id_shared(id: String, old_id: String) -> String {
-    let res = change_id_shared_(id, old_id).await.to_owned();
+    let res = change_id_shared_(id, old_id, None).await.to_owned();
     *ASYNC_JOB_STATUS.lock().unwrap() = res.clone();
     res
 }
 
-pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
+#[tokio::main(flavor = "current_thread")]
+pub async fn change_id_shared_with_rendezvous_servers(
+    id: String,
+    old_id: String,
+    rendezvous_servers: Vec<String>,
+) -> String {
+    let res = change_id_shared_(id, old_id, Some(rendezvous_servers))
+        .await
+        .to_owned();
+    *ASYNC_JOB_STATUS.lock().unwrap() = res.clone();
+    res
+}
+
+pub async fn change_id_shared_(
+    id: String,
+    old_id: String,
+    rendezvous_servers: Option<Vec<String>>,
+) -> &'static str {
     if !hbb_common::is_valid_custom_id(&id) {
         log::debug!(
             "debugging invalid id: \"{id}\", len: {}, base64: \"{}\"",
@@ -1397,9 +1424,17 @@ pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let rendezvous_servers = crate::ipc::get_rendezvous_servers(1_000).await;
+    let rendezvous_servers = match rendezvous_servers {
+        Some(servers) => servers,
+        None => crate::ipc::get_rendezvous_servers(1_000).await,
+    };
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let rendezvous_servers = Config::get_rendezvous_servers();
+
+    let rendezvous_servers = match change_id_rendezvous_servers_or_error(rendezvous_servers) {
+        Ok(servers) => servers,
+        Err(err) => return err,
+    };
 
     let mut futs = Vec::new();
     let err: Arc<Mutex<&str>> = Default::default();
@@ -1608,4 +1643,17 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
     *IS_REMOTE_MODIFY_ENABLED_BY_CONTROL_PERMISSIONS
         .lock()
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_change_id_rejects_empty_rendezvous_servers() {
+        assert_eq!(
+            change_id_rendezvous_servers_or_error(Vec::new()),
+            Err(UNKNOWN_ERROR)
+        );
+    }
 }

@@ -428,7 +428,8 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
-                    if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
+                    if let Err(err) = crate::ipc::set_permanent_password_ipc(args[1].to_owned()) {
                         println!("{err}");
                     } else {
                         println!("Done!");
@@ -446,7 +447,8 @@ pub fn core_main() -> Option<Vec<String>> {
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
-                    if let Err(err) = crate::ipc::set_unlock_pin(args[1].to_owned(), false) {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
+                    if let Err(err) = crate::ipc::set_unlock_pin_ipc(args[1].to_owned()) {
                         println!("{err}");
                     } else {
                         println!("Done!");
@@ -457,7 +459,18 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             return None;
         } else if args[0] == "--get-id" {
-            println!("{}", crate::ipc::get_id());
+            if should_scope_user_main_ipc_for_cli(
+                crate::platform::is_installed(),
+                is_root(),
+            ) {
+                let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
+                match crate::ipc::get_id_ipc() {
+                    Ok(id) => println!("{id}"),
+                    Err(err) => println!("{err}"),
+                }
+            } else {
+                println!("{}", crate::ipc::get_id());
+            }
             return None;
         } else if args[0] == "--set-id" {
             if config::is_disable_settings() {
@@ -470,8 +483,20 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
-                    let old_id = crate::ipc::get_id();
-                    let mut res = crate::ui_interface::change_id_shared(args[1].to_owned(), old_id);
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
+                    let mut res = match crate::ipc::get_id_ipc() {
+                        Ok(old_id) => match crate::ipc::get_rendezvous_servers_ipc(1_000) {
+                            Ok(rendezvous_servers) => {
+                                crate::ui_interface::change_id_shared_with_rendezvous_servers(
+                                    args[1].to_owned(),
+                                    old_id,
+                                    rendezvous_servers,
+                                )
+                            }
+                            Err(err) => err.to_string(),
+                        },
+                        Err(err) => err.to_string(),
+                    };
                     if res.is_empty() {
                         res = "Done!".to_owned();
                     }
@@ -484,6 +509,7 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--config" {
             if args.len() == 2 && !args[0].contains("host=") {
                 if crate::platform::is_installed() && is_root() {
+                    let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                     // encrypted string used in renaming exe.
                     let name = if args[1].ends_with(".exe") {
                         args[1].to_owned()
@@ -492,13 +518,21 @@ pub fn core_main() -> Option<Vec<String>> {
                     };
                     if let Ok(lic) = crate::custom_server::get_custom_server_from_string(&name) {
                         if !lic.host.is_empty() {
-                            crate::ui_interface::set_option("key".into(), lic.key);
-                            crate::ui_interface::set_option(
-                                "custom-rendezvous-server".into(),
-                                lic.host,
-                            );
-                            crate::ui_interface::set_option("api-server".into(), lic.api);
-                            crate::ui_interface::set_option("relay-server".into(), lic.relay);
+                            match crate::ipc::get_options_ipc() {
+                                Ok(mut options) => {
+                                    options.insert("key".to_owned(), lic.key);
+                                    options.insert(
+                                        "custom-rendezvous-server".to_owned(),
+                                        lic.host,
+                                    );
+                                    options.insert("api-server".to_owned(), lic.api);
+                                    options.insert("relay-server".to_owned(), lic.relay);
+                                    if let Err(err) = crate::ipc::set_options_ipc(options) {
+                                        println!("{err}");
+                                    }
+                                }
+                                Err(err) => println!("{err}"),
+                            }
                         }
                     }
                 } else {
@@ -512,11 +546,18 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             }
             if crate::platform::is_installed() && is_root() {
+                let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                 if args.len() == 2 {
-                    let options = crate::ipc::get_options();
-                    println!("{}", options.get(&args[1]).unwrap_or(&"".to_owned()));
+                    match crate::ipc::get_options_ipc() {
+                        Ok(options) => {
+                            println!("{}", options.get(&args[1]).map_or("", String::as_str))
+                        }
+                        Err(err) => println!("{err}"),
+                    }
                 } else if args.len() == 3 {
-                    crate::ipc::set_option(&args[1], &args[2]);
+                    if let Err(err) = crate::ipc::set_option_ipc(&args[1], &args[2]) {
+                        println!("{err}");
+                    }
                 }
             } else {
                 println!("Installation and administrative privileges required!");
@@ -526,11 +567,25 @@ pub fn core_main() -> Option<Vec<String>> {
             if config::Config::no_register_device() {
                 println!("Cannot assign an unregistrable device!");
             } else if crate::platform::is_installed() && is_root() {
+                let _user_main_ipc_scope = crate::ipc::UserMainIpcScope::new();
                 let max = args.len() - 1;
                 let pos = args.iter().position(|x| x == "--token").unwrap_or(max);
                 if pos < max {
                     let token = args[pos + 1].to_owned();
-                    let id = crate::ipc::get_id();
+                    let id = match crate::ipc::get_id_ipc() {
+                        Ok(id) => id,
+                        Err(err) => {
+                            println!("{err}");
+                            return None;
+                        }
+                    };
+                    let options = match crate::ipc::get_options_ipc() {
+                        Ok(options) => options,
+                        Err(err) => {
+                            println!("{err}");
+                            return None;
+                        }
+                    };
                     let uuid = crate::encode64(hbb_common::get_uuid());
                     let get_value = |c: &str| {
                         let pos = args.iter().position(|x| x == c).unwrap_or(max);
@@ -608,7 +663,13 @@ pub fn core_main() -> Option<Vec<String>> {
                         if let Some(name) = device_name {
                             body["device_name"] = serde_json::json!(name);
                         }
-                        let url = crate::ui_interface::get_api_server() + "/api/devices/cli";
+                        let url = crate::get_api_server(
+                            options.get("api-server").cloned().unwrap_or_default(),
+                            options
+                                .get("custom-rendezvous-server")
+                                .cloned()
+                                .unwrap_or_default(),
+                        ) + "/api/devices/cli";
                         match crate::post_request_sync(url, body.to_string(), &header) {
                             Err(err) => println!("{}", err),
                             Ok(text) => {
@@ -844,6 +905,12 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[inline]
+fn should_scope_user_main_ipc_for_cli(is_installed: bool, is_root: bool) -> bool {
+    is_installed && is_root
 }
 
 /// Check if the executable is a Quick Support version.
