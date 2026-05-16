@@ -1288,6 +1288,9 @@ fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
             continue;
         }
         let Some(uid) = process.user_id().map(|uid| **uid as u32) else {
+            // Root CLI management commands need a stable matching `--server` target.
+            // If this key process races during enumeration, failing the command is clearer
+            // than silently skipping it; `--server` is not expected to exit frequently.
             bail!("Failed to read --server process uid");
         };
         server_uids.push(uid);
