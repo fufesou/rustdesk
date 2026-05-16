@@ -803,8 +803,16 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
         let peer_is_system = peer_is_system_result
             .as_ref()
             .and_then(|r| r.as_ref().ok().copied());
-        let peer_is_elevated_result =
-            peer_pid.map(|pid| crate::platform::windows::is_elevated(Some(pid)));
+        let session_authorized = is_allowed_windows_session_scoped_peer(
+            peer_is_system.unwrap_or(false),
+            peer_session_id,
+            server_session_id,
+        );
+        let peer_is_elevated_result = if session_authorized {
+            None
+        } else {
+            peer_pid.map(|pid| crate::platform::windows::is_elevated(Some(pid)))
+        };
         let peer_is_elevated = peer_is_elevated_result
             .as_ref()
             .and_then(|r| r.as_ref().ok().copied());
@@ -822,12 +830,7 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
         }
         // Main IPC trusts same-session peers, LocalSystem, and elevated administrators.
         // Service-scoped IPC channels keep their own stricter authorization paths.
-        let authorized = peer_is_elevated.unwrap_or(false)
-            || is_allowed_windows_session_scoped_peer(
-                peer_is_system.unwrap_or(false),
-                peer_session_id,
-                server_session_id,
-            );
+        let authorized = session_authorized || peer_is_elevated.unwrap_or(false);
         if !authorized {
             if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_system_result.as_ref()) {
                 log::debug!(
