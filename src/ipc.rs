@@ -1252,7 +1252,15 @@ fn select_server_uid_for_user_main_ipc(
     server_uids.dedup();
 
     match server_uids.as_slice() {
-        [] => bail!("No --server process found for user main IPC"),
+        [] => {
+            if let Some(uid) = active_uid {
+                // If no `--server` processes are found but the active user is identifiable,
+                // try the active user anyway because the main process may also listen on "" IPC.
+                uid
+            } else {
+                bail!("No --server process found for user main IPC")
+            }
+        }
         [uid] => return Ok(*uid),
         _ => {}
     }
@@ -1312,9 +1320,8 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let use_user_main_ipc = USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.get());
-        let is_root_main_ipc = unsafe { hbb_common::libc::geteuid() == 0 }
-            && postfix.is_empty()
-            && use_user_main_ipc;
+        let is_root_main_ipc =
+            unsafe { hbb_common::libc::geteuid() == 0 } && postfix.is_empty() && use_user_main_ipc;
         if is_root_main_ipc {
             let uid = user_main_ipc_server_uid()?;
             let path = Config::ipc_path_for_uid(uid, postfix);
@@ -2147,8 +2154,11 @@ mod test {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn test_select_server_uid_fails_when_no_server_found() {
-        assert!(select_server_uid_for_user_main_ipc(&[], Some(501), false).is_err());
+    fn test_select_server_uid_uses_active_uid_when_no_server_found() {
+        assert_eq!(
+            select_server_uid_for_user_main_ipc(&[], Some(501), false).unwrap(),
+            501
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2181,8 +2191,6 @@ mod test {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_select_server_uid_fails_when_multiple_servers_are_ambiguous() {
-        assert!(
-            select_server_uid_for_user_main_ipc(&[501, 502], None, false).is_err()
-        );
+        assert!(select_server_uid_for_user_main_ipc(&[501, 502], None, false).is_err());
     }
 }
