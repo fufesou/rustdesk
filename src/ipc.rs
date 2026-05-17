@@ -19,6 +19,8 @@ use bytes::Bytes;
 pub use clipboard::ClipboardFile;
 #[cfg(target_os = "linux")]
 use hbb_common::anyhow;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use hbb_common::anyhow::Ok;
 use hbb_common::{
     allow_err, bail, bytes,
     bytes_codec::BytesCodec,
@@ -1256,7 +1258,7 @@ fn select_server_uid_for_user_main_ipc(
             if let Some(uid) = active_uid {
                 // If no `--server` processes are found but the active user is identifiable,
                 // try the active user anyway because the main process may also listen on "" IPC.
-                uid
+                return Ok(uid);
             } else {
                 bail!("No --server process found for user main IPC")
             }
