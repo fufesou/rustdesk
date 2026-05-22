@@ -441,8 +441,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         await launchUrl(url);
       };
       if (isToUpdate) {
-        onPressed = () {
-          handleUpdate(updateUrl);
+        onPressed = () async {
+          await handleUpdate(updateUrl);
         };
       }
       return buildInstallCard(

@@ -2,6 +2,12 @@ name: Flutter Tag Build
 
 on:
   workflow_dispatch:
+    inputs:
+      upload-tag:
+        description: Release tag used for artifact URLs and release publishing
+        required: false
+        default: test-update-metadata
+        type: string
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -15,4 +21,5 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ github.ref_name }}
+      upload-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.upload-tag || github.ref_name }}
+      publish-update-metadata: true
