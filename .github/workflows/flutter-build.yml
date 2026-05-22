@@ -9,6 +9,9 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      publish-update-metadata:
+        type: boolean
+        default: false
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -45,11 +48,27 @@ env:
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
+  PUBLISH_UPDATE_METADATA: "${{ inputs.publish-update-metadata }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
+  UPDATE_METADATA_SIGNING_ENABLED: "${{ secrets.RUSTDESK_UPDATE_ED25519_SEED != '' && 'true' || 'false' }}"
 
 jobs:
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
+
+  detect-update-metadata-signing:
+    runs-on: ubuntu-22.04
+    outputs:
+      upload_artifact_enabled: ${{ steps.detect.outputs.upload_artifact_enabled }}
+      publish_update_metadata_enabled: ${{ steps.detect.outputs.publish_update_metadata_enabled }}
+      update_metadata_signing_enabled: ${{ steps.detect.outputs.update_metadata_signing_enabled }}
+    steps:
+      - id: detect
+        shell: bash
+        run: |
+          echo "upload_artifact_enabled=${UPLOAD_ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "publish_update_metadata_enabled=${PUBLISH_UPDATE_METADATA}" >> "$GITHUB_OUTPUT"
+          echo "update_metadata_signing_enabled=${UPDATE_METADATA_SIGNING_ENABLED}" >> "$GITHUB_OUTPUT"
 
   build-RustDeskTempTopMostWindow:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
@@ -271,9 +290,49 @@ jobs:
         run: |
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
 
+      - name: Generate update metadata fragments
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ env.TAG_NAME }}
+          VERSION: ${{ env.VERSION }}
+          ARCH: ${{ matrix.job.arch }}
+        run: |
+          python3 -m pip install cryptography
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.exe" --platform windows --arch x86_64 --format exe --fragment-out ./fragments/windows-flutter-x86_64-exe.json
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.msi" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.msi" --platform windows --arch x86_64 --format msi --fragment-out ./fragments/windows-flutter-x86_64-msi.json
+
+      - name: Upload Windows Flutter EXE fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-flutter-x86_64-exe.json
+          path: ./fragments/windows-flutter-x86_64-exe.json
+
+      - name: Upload Windows Flutter MSI fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-flutter-x86_64-msi.json
+          path: ./fragments/windows-flutter-x86_64-msi.json
+
+      - name: Upload signed Windows Flutter EXE
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-flutter-x86_64-exe
+          path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+
+      - name: Upload signed Windows Flutter MSI
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-flutter-x86_64-msi
+          path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+
       - name: Publish Release
         uses: softprops/action-gh-release@v1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && (env.PUBLISH_UPDATE_METADATA != 'true' || env.UPDATE_METADATA_SIGNING_ENABLED != 'true')
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
@@ -363,6 +422,7 @@ jobs:
           python3 res/inline-sciter.py
           # Patch sciter x86
           sed -i 's/branch = "dyn"/branch = "dyn_x86"/g' ./Cargo.toml
+          cargo update -p sciter-rs --precise 674e07d3066ca9a92ced3816203ab6b652629d1e
           cargo build --locked --features inline,vram,hwcodec --release --bins
           mkdir -p ./Release
           mv ./target/release/rustdesk.exe ./Release/rustdesk.exe
@@ -423,9 +483,34 @@ jobs:
         run: |
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput/
 
+      - name: Generate update metadata fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ env.TAG_NAME }}
+          VERSION: ${{ env.VERSION }}
+          ARCH: ${{ matrix.job.arch }}
+        run: |
+          python3 -m pip install cryptography
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}-sciter.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}-sciter.exe" --platform windows --arch x86 --format exe --fragment-out ./fragments/windows-sciter-x86-exe.json
+
+      - name: Upload Windows Sciter EXE fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-sciter-x86-exe.json
+          path: ./fragments/windows-sciter-x86-exe.json
+
+      - name: Upload signed Windows Sciter EXE
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: windows-sciter-x86-exe
+          path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
+
       - name: Publish Release
         uses: softprops/action-gh-release@v1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && (env.PUBLISH_UPDATE_METADATA != 'true' || env.UPDATE_METADATA_SIGNING_ENABLED != 'true')
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
@@ -756,19 +841,199 @@ jobs:
 
       - name: Rename rustdesk
         if: env.UPLOAD_ARTIFACT == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          ARCH: ${{ matrix.job.arch }}
         run: |
-          for name in rustdesk*??.dmg; do
-              mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
-          done
+          if [ -f "rustdesk-${VERSION}.dmg" ]; then
+              mv "rustdesk-${VERSION}.dmg" "rustdesk-${VERSION}-${ARCH}.dmg"
+          fi
+          test -f "rustdesk-${VERSION}-${ARCH}.dmg"
+
+      - name: Install Python
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Generate update metadata fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ env.TAG_NAME }}
+          VERSION: ${{ env.VERSION }}
+          ARCH: ${{ matrix.job.arch }}
+        run: |
+          python3 -m pip install cryptography
+          python3 res/generate_update_metadata.py fragment --artifact "./rustdesk-${VERSION}-${ARCH}.dmg" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.dmg" --platform macos --arch "$ARCH" --format dmg --fragment-out "./fragments/macos-${ARCH}-dmg.json"
+
+      - name: Upload macOS DMG fragment
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: macos-${{ matrix.job.arch }}-dmg.json
+          path: ./fragments/macos-${{ matrix.job.arch }}-dmg.json
+
+      - name: Upload signed macOS DMG
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@master
+        with:
+          name: macos-${{ matrix.job.arch }}-dmg
+          path: ./rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg
 
       - name: Publish DMG package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && (env.PUBLISH_UPDATE_METADATA != 'true' || env.UPDATE_METADATA_SIGNING_ENABLED != 'true')
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
             rustdesk*-${{ matrix.job.arch }}.dmg
+
+  publish-signed-update-metadata:
+    needs: [detect-update-metadata-signing, build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
+    runs-on: ubuntu-22.04
+    if: needs.detect-update-metadata-signing.outputs.upload_artifact_enabled == 'true' && needs.detect-update-metadata-signing.outputs.publish_update_metadata_enabled == 'true' && needs.detect-update-metadata-signing.outputs.update_metadata_signing_enabled == 'true'
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        run: python -m pip install cryptography
+
+      - name: Test update metadata verifier
+        run: cargo test -p hbb_common update_metadata
+
+      - name: Test update metadata script
+        run: python -m unittest discover -s res -p "test_generate_update_metadata.py"
+
+      - name: Download Windows Flutter EXE fragment
+        uses: actions/download-artifact@master
+        with:
+          name: windows-flutter-x86_64-exe.json
+          path: ./fragments/
+
+      - name: Download Windows Flutter MSI fragment
+        uses: actions/download-artifact@master
+        with:
+          name: windows-flutter-x86_64-msi.json
+          path: ./fragments/
+
+      - name: Download Windows Sciter EXE fragment
+        uses: actions/download-artifact@master
+        with:
+          name: windows-sciter-x86-exe.json
+          path: ./fragments/
+
+      - name: Download macOS aarch64 DMG fragment
+        uses: actions/download-artifact@master
+        with:
+          name: macos-aarch64-dmg.json
+          path: ./fragments/
+
+      - name: Download macOS x86_64 DMG fragment
+        uses: actions/download-artifact@master
+        with:
+          name: macos-x86_64-dmg.json
+          path: ./fragments/
+
+      - name: Download Windows Flutter EXE
+        uses: actions/download-artifact@master
+        with:
+          name: windows-flutter-x86_64-exe
+          path: ./artifacts/windows-x86_64/
+
+      - name: Download Windows Flutter MSI
+        uses: actions/download-artifact@master
+        with:
+          name: windows-flutter-x86_64-msi
+          path: ./artifacts/windows-x86_64/
+
+      - name: Download Windows Sciter EXE
+        uses: actions/download-artifact@master
+        with:
+          name: windows-sciter-x86-exe
+          path: ./artifacts/windows-x86/
+
+      - name: Download macOS aarch64 DMG
+        uses: actions/download-artifact@master
+        with:
+          name: macos-aarch64-dmg
+          path: ./artifacts/macos-aarch64/
+
+      - name: Download macOS x86_64 DMG
+        uses: actions/download-artifact@master
+        with:
+          name: macos-x86_64-dmg
+          path: ./artifacts/macos-x86_64/
+
+      - name: Check downloaded release artifacts
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          test -f ./fragments/windows-flutter-x86_64-exe.json
+          test -f ./fragments/windows-flutter-x86_64-msi.json
+          test -f ./fragments/windows-sciter-x86-exe.json
+          test -f ./fragments/macos-aarch64-dmg.json
+          test -f ./fragments/macos-x86_64-dmg.json
+          test -f "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe"
+          test -f "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi"
+          test -f "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe"
+          test -f "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg"
+          test -f "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg"
+
+      - name: Check tag and display version
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          TAG_NAME: ${{ env.TAG_NAME }}
+        run: python res/generate_update_metadata.py check-version --version "$VERSION" --release-id "$TAG_NAME"
+
+      - name: Sign update metadata
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          TAG_NAME: ${{ env.TAG_NAME }}
+          RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+        run: |
+          python res/generate_update_metadata.py sign --fragment ./fragments/windows-flutter-x86_64-exe.json --fragment ./fragments/windows-flutter-x86_64-msi.json --fragment ./fragments/windows-sciter-x86-exe.json --fragment ./fragments/macos-aarch64-dmg.json --fragment ./fragments/macos-x86_64-dmg.json --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --published-at "$(git log -1 --format=%cI)" --key-id 2026-ed25519-main --private-key-seed-env RUSTDESK_UPDATE_ED25519_SEED --metadata-out ./rustdesk-update.json --signature-out ./rustdesk-update.json.sig
+
+      - name: Verify update metadata
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          TAG_NAME: ${{ env.TAG_NAME }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ secrets.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+        run: |
+          python res/generate_update_metadata.py verify --metadata ./rustdesk-update.json --signature ./rustdesk-update.json.sig --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main
+
+      - name: Publish signed update release
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ./artifacts/windows-x86_64/rustdesk-${{ env.VERSION }}-x86_64.exe
+            ./artifacts/windows-x86_64/rustdesk-${{ env.VERSION }}-x86_64.msi
+            ./artifacts/windows-x86/rustdesk-${{ env.VERSION }}-x86-sciter.exe
+            ./artifacts/macos-aarch64/rustdesk-${{ env.VERSION }}-aarch64.dmg
+            ./artifacts/macos-x86_64/rustdesk-${{ env.VERSION }}-x86_64.dmg
+            ./rustdesk-update.json
+            ./rustdesk-update.json.sig
 
   publish_unsigned:
     needs:

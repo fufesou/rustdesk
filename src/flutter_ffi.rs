@@ -2854,6 +2854,19 @@ pub fn main_get_common(key: String) -> String {
             {
                 "error:unsupported".to_owned()
             }
+        } else if key.starts_with("verified-download-url-") {
+            let release_page_url = key.replace("verified-download-url-", "");
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                return match verified_update_artifact_for_release_page_url(&release_page_url) {
+                    Ok(artifact) => artifact.url,
+                    Err(e) => format!("error:{}", e),
+                };
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                "error:unsupported".to_owned()
+            }
         } else {
             "".to_owned()
         }
@@ -2862,6 +2875,36 @@ pub fn main_get_common(key: String) -> String {
 
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
     SyncReturn(main_get_common(key))
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn push_update_me_error(error: String) {
+    let data = HashMap::from([("name", "update-me".to_owned()), ("error", error)]);
+    let _res = flutter::push_global_event(
+        flutter::APP_TYPE_MAIN,
+        serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn push_update_me_ready() {
+    let data = HashMap::from([("name", "update-me-ready".to_owned())]);
+    let _res = flutter::push_global_event(
+        flutter::APP_TYPE_MAIN,
+        serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+    );
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn verified_update_artifact_for_release_page_url(
+    release_page_url: &str,
+) -> ResultType<hbb_common::update_metadata::VerifiedUpdateArtifact> {
+    #[cfg(target_os = "windows")]
+    let update_msi = crate::platform::windows::is_msi_installed()? && !crate::is_custom_client();
+    #[cfg(target_os = "macos")]
+    let update_msi = false;
+    let query = crate::updater::current_update_artifact_query(update_msi);
+    crate::updater::verified_update_artifact_for_release_page_url(release_page_url, query)
 }
 
 pub fn main_set_common(_key: String, _value: String) {
@@ -2903,28 +2946,48 @@ pub fn main_set_common(_key: String, _value: String) {
         if _key == "download-new-version" {
             let download_url = _value.clone();
             let event_key = "download-new-version".to_owned();
-            let data = if let Some(download_file) = get_download_file_from_url(&download_url) {
-                std::fs::remove_file(&download_file).ok();
-                match crate::hbbs_http::downloader::download_file(
-                    download_url,
-                    Some(PathBuf::from(download_file)),
-                    Some(Duration::from_secs(3)),
-                ) {
-                    Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
-                    Err(e) => HashMap::from([("name", event_key), ("error", e.to_string())]),
+            let data = match crate::updater::verified_update_artifact_for_download_url(&download_url)
+            {
+                Ok(artifact) => {
+                    if let Some(download_file) = get_download_file_from_url(&artifact.url) {
+                        std::fs::remove_file(&download_file).ok();
+                        match crate::hbbs_http::downloader::download_file(
+                            artifact.url,
+                            Some(PathBuf::from(download_file)),
+                            Some(Duration::from_secs(3)),
+                        ) {
+                            Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
+                            Err(e) => {
+                                HashMap::from([("name", event_key), ("error", e.to_string())])
+                            }
+                        }
+                    } else {
+                        HashMap::from([
+                            ("name", event_key),
+                            ("error", "Invalid download url".to_string()),
+                        ])
+                    }
                 }
-            } else {
-                HashMap::from([
+                Err(e) => HashMap::from([
                     ("name", event_key),
-                    ("error", "Invalid download url".to_string()),
-                ])
+                    ("error", format!("Failed to verify update metadata, {}", e)),
+                ]),
             };
             let _res = flutter::push_global_event(
                 flutter::APP_TYPE_MAIN,
                 serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
             );
         } else if _key == "update-me" {
-            if let Some(new_version_file) = get_download_file_from_url(&_value) {
+            let artifact = match crate::updater::verified_update_artifact_for_download_url(&_value) {
+                Ok(artifact) => artifact,
+                Err(e) => {
+                    let error = format!("Failed to verify update metadata, {}", e);
+                    log::error!("{}", error);
+                    push_update_me_error(error);
+                    return;
+                }
+            };
+            if let Some(new_version_file) = get_download_file_from_url(&artifact.url) {
                 log::debug!(
                     "New version file is downloaded, update begin, {:?}",
                     new_version_file.to_str()
@@ -2932,32 +2995,38 @@ pub fn main_set_common(_key: String, _value: String) {
                 if let Some(f) = new_version_file.to_str() {
                     // 1.4.0 does not support "--update"
                     // But we can assume that the new version supports it.
-
                     #[cfg(any(target_os = "windows", target_os = "macos"))]
-                    match crate::platform::update_to(f) {
+                    if let Err(e) = crate::updater::verify_existing_update_artifact(
+                        &new_version_file,
+                        artifact.size,
+                        &artifact.sha256,
+                    ) {
+                        let error = format!("Failed to verify update artifact, {}", e);
+                        log::error!("{}", error);
+                        push_update_me_error(error);
+                        return;
+                    }
+
+                    #[cfg(target_os = "windows")]
+                    let update_res = crate::platform::update_to_verified(f, &artifact.sha256);
+                    #[cfg(target_os = "macos")]
+                    let update_res = crate::platform::macos::update_to_verified_dmg(
+                        f,
+                        &artifact.sha256,
+                        Some(push_update_me_ready),
+                    );
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    match update_res {
                         Ok(_) => {
                             log::info!("Update process is launched successfully!");
                         }
                         Err(e) => {
-                            log::error!("Failed to update to new version, {}", e);
+                            let error = format!("Failed to update to new version, {}", e);
+                            log::error!("{}", error);
+                            push_update_me_error(error);
                             fs::remove_file(f).ok();
                         }
                     }
-                }
-            }
-        } else if _key == "extract-update-dmg" {
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(new_version_file) = get_download_file_from_url(&_value) {
-                    if let Some(f) = new_version_file.to_str() {
-                        crate::platform::macos::extract_update_dmg(f);
-                    } else {
-                        // unreachable!()
-                        log::error!("Failed to get the new version file path");
-                    }
-                } else {
-                    // unreachable!()
-                    log::error!("Failed to get the new version file from url: {}", _value);
                 }
             }
         }
