@@ -3,7 +3,8 @@ use hbb_common::{
     bail,
     config::Config,
     get_time,
-    password_security::{decrypt_vec_or_original, encrypt_vec_or_original},
+    log,
+    password_security::{decrypt_vec_or_original, encrypt_vec_or_original, CRYPTO_LOG_PREFIX},
     ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
@@ -52,6 +53,7 @@ impl TOTPInfo {
     }
 
     pub fn into_string(&self) -> ResultType<String> {
+        log::info!("{CRYPTO_LOG_PREFIX} TOTPInfo::into_string encrypt 2fa secret");
         let secret = encrypt_vec_or_original(self.secret.as_slice(), "00", 1024);
         let totp_info = TOTPInfo {
             secret,
@@ -63,6 +65,7 @@ impl TOTPInfo {
 
     pub fn from_str(data: &str) -> ResultType<TOTP> {
         let mut totp_info = serde_json::from_str::<TOTPInfo>(data)?;
+        log::info!("{CRYPTO_LOG_PREFIX} TOTPInfo::from_str decrypt 2fa secret");
         let (secret, success, _) = decrypt_vec_or_original(&totp_info.secret, "00");
         if success {
             totp_info.secret = secret;
@@ -121,6 +124,7 @@ pub struct TelegramBot {
 
 impl TelegramBot {
     fn into_string(&self) -> ResultType<String> {
+        log::info!("{CRYPTO_LOG_PREFIX} TelegramBot::into_string encrypt bot token");
         let token = encrypt_vec_or_original(self.token_str.as_bytes(), "00", 1024);
         let bot = TelegramBot {
             token,
@@ -145,6 +149,7 @@ impl TelegramBot {
             return Ok(None);
         }
         let mut bot = serde_json::from_str::<TelegramBot>(&data)?;
+        log::info!("{CRYPTO_LOG_PREFIX} TelegramBot::get decrypt bot token");
         let (token, success, _) = decrypt_vec_or_original(&bot.token, "00");
         if success {
             bot.token_str = String::from_utf8(token)?;
