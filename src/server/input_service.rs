@@ -32,12 +32,14 @@ use winapi::um::winuser::WHEEL_DELTA;
 
 const INVALID_CURSOR_POS: i32 = i32::MIN;
 const INVALID_DISPLAY_IDX: i32 = -1;
+const CURSOR_DIAG_PREFIX: &str = "==================== cursor_diag";
 
 #[derive(Default)]
 struct StateCursor {
     hcursor: u64,
     cursor_data: Arc<Message>,
     cached_cursor_data: HashMap<u64, Arc<Message>>,
+    last_no_cursor_logged: bool,
 }
 
 impl super::service::Reset for StateCursor {
@@ -393,31 +395,134 @@ fn run_pos(sp: EmptyExtraFieldService, state: &mut StatePos) -> ResultType<()> {
 }
 
 fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()> {
-    if let Some(hcursor) = crate::get_cursor()? {
-        if hcursor != state.hcursor {
-            let msg;
-            if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
-                super::log::trace!("Cursor data cached, hcursor: {}", hcursor);
-                msg = cached.clone();
-            } else {
-                let mut data = crate::get_cursor_data(hcursor)?;
-                data.colors = hbb_common::compress::compress(&data.colors[..]).into();
-                let mut tmp = Message::new();
-                tmp.set_cursor_data(data);
-                msg = Arc::new(tmp);
-                state.cached_cursor_data.insert(hcursor, msg.clone());
-                super::log::trace!("Cursor data updated, hcursor: {}", hcursor);
-            }
-            state.hcursor = hcursor;
-            sp.send_shared(msg.clone());
-            state.cursor_data = msg;
+    match crate::get_cursor() {
+        Ok(Some(hcursor)) => handle_visible_cursor(&sp, state, hcursor)?,
+        Ok(None) => log_no_visible_cursor(state),
+        Err(err) => {
+            super::log::error!(
+                "{} run_cursor get_cursor_failed error={}",
+                CURSOR_DIAG_PREFIX,
+                err
+            );
+            return Err(err);
         }
     }
+    send_cursor_snapshot(sp, state)
+}
+
+fn handle_visible_cursor(
+    sp: &MouseCursorService,
+    state: &mut StateCursor,
+    hcursor: u64,
+) -> ResultType<()> {
+    if state.last_no_cursor_logged {
+        super::log::info!(
+            "{} run_cursor cursor_visible_again hcursor=0x{:x}",
+            CURSOR_DIAG_PREFIX,
+            hcursor
+        );
+        state.last_no_cursor_logged = false;
+    }
+    if hcursor == state.hcursor {
+        return Ok(());
+    }
+    super::log::info!(
+        "{} run_cursor cursor_changed old=0x{:x} new=0x{:x} cached_count={}",
+        CURSOR_DIAG_PREFIX,
+        state.hcursor,
+        hcursor,
+        state.cached_cursor_data.len()
+    );
+    let msg = get_or_create_cursor_msg(state, hcursor)?;
+    state.hcursor = hcursor;
+    super::log::info!(
+        "{} run_cursor send_cursor_data hcursor=0x{:x}",
+        CURSOR_DIAG_PREFIX,
+        hcursor
+    );
+    sp.send_shared(msg.clone());
+    state.cursor_data = msg;
+    Ok(())
+}
+
+fn get_or_create_cursor_msg(state: &mut StateCursor, hcursor: u64) -> ResultType<Arc<Message>> {
+    if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
+        super::log::info!(
+            "{} run_cursor use_cached hcursor=0x{:x}",
+            CURSOR_DIAG_PREFIX,
+            hcursor
+        );
+        return Ok(cached.clone());
+    }
+    let mut data = crate::get_cursor_data(hcursor).map_err(|err| {
+        super::log::error!(
+            "{} run_cursor get_cursor_data_failed hcursor=0x{:x} error={}",
+            CURSOR_DIAG_PREFIX,
+            hcursor,
+            err
+        );
+        err
+    })?;
+    let raw_len = data.colors.len();
+    super::log::info!(
+        "{} run_cursor cursor_data_raw hcursor=0x{:x} width={} height={} hot=({}, {}) raw_len={}",
+        CURSOR_DIAG_PREFIX,
+        hcursor,
+        data.width,
+        data.height,
+        data.hotx,
+        data.hoty,
+        raw_len
+    );
+    data.colors = hbb_common::compress::compress(&data.colors[..]).into();
+    log_compressed_cursor_data(hcursor, raw_len, data.colors.len());
+    let mut tmp = Message::new();
+    tmp.set_cursor_data(data);
+    let msg = Arc::new(tmp);
+    state.cached_cursor_data.insert(hcursor, msg.clone());
+    super::log::info!(
+        "{} run_cursor cursor_data_cached hcursor=0x{:x} cached_count={}",
+        CURSOR_DIAG_PREFIX,
+        hcursor,
+        state.cached_cursor_data.len()
+    );
+    Ok(msg)
+}
+
+fn log_compressed_cursor_data(hcursor: u64, raw_len: usize, compressed_len: usize) {
+    super::log::info!(
+        "{} run_cursor cursor_data_compressed hcursor=0x{:x} raw_len={} compressed_len={}",
+        CURSOR_DIAG_PREFIX,
+        hcursor,
+        raw_len,
+        compressed_len
+    );
+}
+
+fn log_no_visible_cursor(state: &mut StateCursor) {
+    if state.last_no_cursor_logged {
+        return;
+    }
+    super::log::info!(
+        "{} run_cursor no_cursor_visible_or_available last_hcursor=0x{:x} has_data={}",
+        CURSOR_DIAG_PREFIX,
+        state.hcursor,
+        state.cursor_data.union.is_some()
+    );
+    state.last_no_cursor_logged = true;
+}
+
+fn send_cursor_snapshot(sp: MouseCursorService, state: &StateCursor) -> ResultType<()> {
     sp.snapshot(|sps| {
+        super::log::info!(
+            "{} run_cursor snapshot hcursor=0x{:x} has_data={}",
+            CURSOR_DIAG_PREFIX,
+            state.hcursor,
+            state.cursor_data.union.is_some()
+        );
         sps.send_shared(state.cursor_data.clone());
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
 fn run_window_focus(sp: EmptyExtraFieldService, state: &mut StateWindowFocus) -> ResultType<()> {

@@ -108,6 +108,7 @@ pub use acl::{
 pub const FLUTTER_RUNNER_WIN32_WINDOW_CLASS: &'static str = "FLUTTER_RUNNER_WIN32_WINDOW"; // main window, install window
 pub const EXPLORER_EXE: &'static str = "explorer.exe";
 pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
+const CURSOR_DIAG_PREFIX: &str = "==================== cursor_diag";
 
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
@@ -185,7 +186,13 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         let mut ci: CURSORINFO = mem::MaybeUninit::uninit().assume_init();
         ci.cbSize = std::mem::size_of::<CURSORINFO>() as _;
         if crate::portable_service::client::get_cursor_info(&mut ci) == FALSE {
-            return Err(io::Error::last_os_error().into());
+            let err = io::Error::last_os_error();
+            log::warn!(
+                "{} get_cursor GetCursorInfo failed error={}",
+                CURSOR_DIAG_PREFIX,
+                err
+            );
+            return Err(err.into());
         }
         if ci.flags & CURSOR_SHOWING == 0 {
             Ok(None)
@@ -203,10 +210,33 @@ impl IconInfo {
             #[allow(invalid_value)]
             let mut ii = mem::MaybeUninit::uninit().assume_init();
             if GetIconInfo(icon, &mut ii) == FALSE {
-                Err(io::Error::last_os_error().into())
+                let err = io::Error::last_os_error();
+                log::warn!(
+                    "{} GetIconInfo failed hcursor={:?} error={}",
+                    CURSOR_DIAG_PREFIX,
+                    icon,
+                    err
+                );
+                Err(err.into())
             } else {
                 let ii = Self(ii);
+                log::info!(
+                    "{} GetIconInfo ok hcursor={:?} color={:?} mask={:?} hotspot=({}, {}) is_icon={}",
+                    CURSOR_DIAG_PREFIX,
+                    icon,
+                    ii.0.hbmColor,
+                    ii.0.hbmMask,
+                    ii.0.xHotspot,
+                    ii.0.yHotspot,
+                    ii.0.fIcon
+                );
                 if ii.0.hbmMask.is_null() {
+                    log::warn!(
+                        "{} GetIconInfo returned null mask hcursor={:?} color={:?}",
+                        CURSOR_DIAG_PREFIX,
+                        icon,
+                        ii.0.hbmColor
+                    );
                     bail!("Cursor bitmap handle is NULL");
                 }
                 return Ok(ii);
@@ -235,81 +265,40 @@ impl Drop for IconInfo {
 // https://github.com/TurboVNC/tightvnc/blob/a235bae328c12fd1c3aed6f3f034a37a6ffbbd22/vnc_winsrc/winvnc/vncEncoder.cpp
 // https://github.com/TigerVNC/tigervnc/blob/master/win/rfb_win32/DeviceFrameBuffer.cxx
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
-    unsafe {
-        let mut ii = IconInfo::new(hcursor as _)?;
-        let bm_mask = get_bitmap(ii.0.hbmMask)?;
-        let mut width = bm_mask.bmWidth;
-        let mut height = if ii.is_color() {
-            bm_mask.bmHeight
-        } else {
-            bm_mask.bmHeight / 2
-        };
-        let cbits_size = width * height * 4;
-        if cbits_size < 16 {
-            bail!("Invalid icon: too small"); // solve some crash
-        }
-        let mut cbits: Vec<u8> = Vec::new();
-        cbits.resize(cbits_size as _, 0);
-        let mut mbits: Vec<u8> = Vec::new();
-        mbits.resize((bm_mask.bmWidthBytes * bm_mask.bmHeight) as _, 0);
-        let r = GetBitmapBits(ii.0.hbmMask, mbits.len() as _, mbits.as_mut_ptr() as _);
-        if r == 0 {
-            bail!("Failed to copy bitmap data");
-        }
-        if r != (mbits.len() as i32) {
-            bail!(
-                "Invalid mask cursor buffer size, got {} bytes, expected {}",
-                r,
-                mbits.len()
-            );
-        }
-        let do_outline;
-        if ii.is_color() {
-            get_rich_cursor_data(ii.0.hbmColor, width, height, &mut cbits)?;
-            do_outline = fix_cursor_mask(
-                &mut mbits,
-                &mut cbits,
-                width as _,
-                height as _,
-                bm_mask.bmWidthBytes as _,
-            );
-        } else {
-            do_outline = handleMask(
-                cbits.as_mut_ptr(),
-                mbits.as_ptr(),
-                width,
-                height,
-                bm_mask.bmWidthBytes,
-                bm_mask.bmHeight,
-            ) > 0;
-        }
-        if do_outline {
-            let mut outline = Vec::new();
-            outline.resize(((width + 2) * (height + 2) * 4) as _, 0);
-            drawOutline(
-                outline.as_mut_ptr(),
-                cbits.as_ptr(),
-                width,
-                height,
-                outline.len() as _,
-            );
-            cbits = outline;
-            width += 2;
-            height += 2;
-            ii.0.xHotspot += 1;
-            ii.0.yHotspot += 1;
-        }
+    log::info!(
+        "{} get_cursor_data start hcursor=0x{:x}",
+        CURSOR_DIAG_PREFIX,
+        hcursor
+    );
+    let mut ii = IconInfo::new(hcursor as _)?;
+    let bm_mask = get_bitmap(ii.0.hbmMask)?;
+    let mut image = {
+        let source = CursorImageSource::new(hcursor, &ii, &bm_mask);
+        read_cursor_image(source)?
+    };
+    image = apply_cursor_outline(image, &mut ii);
+    let stats = cursor_alpha_stats(&image.colors);
+    log_cursor_data_done(CursorDoneDiag {
+        shape: CursorShapeDiag {
+            hcursor,
+            width: image.width,
+            height: image.height,
+            byte_len: image.colors.len(),
+        },
+        icon_info: &ii.0,
+        stats: &stats,
+        outlined: image.outlined,
+    });
 
-        Ok(CursorData {
-            id: hcursor,
-            colors: cbits.into(),
-            hotx: ii.0.xHotspot as _,
-            hoty: ii.0.yHotspot as _,
-            width: width as _,
-            height: height as _,
-            ..Default::default()
-        })
-    }
+    Ok(CursorData {
+        id: hcursor,
+        colors: image.colors.into(),
+        hotx: ii.0.xHotspot as _,
+        hoty: ii.0.yHotspot as _,
+        width: image.width as _,
+        height: image.height as _,
+        ..Default::default()
+    })
 }
 
 #[inline]
@@ -322,16 +311,324 @@ fn get_bitmap(handle: HBITMAP) -> ResultType<BITMAP> {
             &mut bm as *mut BITMAP as *mut _,
         ) == FALSE
         {
-            return Err(io::Error::last_os_error().into());
+            let err = io::Error::last_os_error();
+            log::warn!(
+                "{} get_bitmap GetObjectA failed handle={:?} error={}",
+                CURSOR_DIAG_PREFIX,
+                handle,
+                err
+            );
+            return Err(err.into());
         }
+        log::info!(
+            "{} get_bitmap handle={:?} width={} height={} width_bytes={} planes={} bits_pixel={} bits={:?}",
+            CURSOR_DIAG_PREFIX,
+            handle,
+            bm.bmWidth,
+            bm.bmHeight,
+            bm.bmWidthBytes,
+            bm.bmPlanes,
+            bm.bmBitsPixel,
+            bm.bmBits
+        );
         if bm.bmPlanes != 1 {
+            log::warn!(
+                "{} get_bitmap unsupported_planes handle={:?} planes={}",
+                CURSOR_DIAG_PREFIX,
+                handle,
+                bm.bmPlanes
+            );
             bail!("Unsupported multi-plane cursor");
         }
         if bm.bmBitsPixel != 1 {
+            log::warn!(
+                "{} get_bitmap unsupported_mask_format handle={:?} bits_pixel={}",
+                CURSOR_DIAG_PREFIX,
+                handle,
+                bm.bmBitsPixel
+            );
             bail!("Unsupported cursor mask format");
         }
         Ok(bm)
     }
+}
+
+struct CursorAlphaStats {
+    pixel_count: usize,
+    visible_pixel_count: usize,
+    all_transparent: bool,
+}
+
+struct CursorImage {
+    colors: Vec<u8>,
+    width: i32,
+    height: i32,
+    outlined: bool,
+}
+
+struct CursorImageSource<'a> {
+    hcursor: u64,
+    is_color: bool,
+    hbm_color: HBITMAP,
+    hbm_mask: HBITMAP,
+    bm_mask: &'a BITMAP,
+    width: i32,
+    height: i32,
+}
+
+impl<'a> CursorImageSource<'a> {
+    fn new(hcursor: u64, icon: &IconInfo, bm_mask: &'a BITMAP) -> Self {
+        let is_color = icon.is_color();
+        let height = if is_color {
+            bm_mask.bmHeight
+        } else {
+            bm_mask.bmHeight / 2
+        };
+        Self {
+            hcursor,
+            is_color,
+            hbm_color: icon.0.hbmColor,
+            hbm_mask: icon.0.hbmMask,
+            bm_mask,
+            width: bm_mask.bmWidth,
+            height,
+        }
+    }
+}
+
+struct CursorBitmapDiag<'a> {
+    hcursor: u64,
+    is_color: bool,
+    width: i32,
+    height: i32,
+    mask: &'a BITMAP,
+    cbits_size: i32,
+}
+
+struct CursorShapeDiag {
+    hcursor: u64,
+    width: i32,
+    height: i32,
+    byte_len: usize,
+}
+
+struct CursorDoneDiag<'a> {
+    shape: CursorShapeDiag,
+    icon_info: &'a ICONINFO,
+    stats: &'a CursorAlphaStats,
+    outlined: bool,
+}
+
+fn read_cursor_image(source: CursorImageSource) -> ResultType<CursorImage> {
+    let cbits_size = cursor_color_buffer_size(&source)?;
+    let mut colors = vec![0; cbits_size as _];
+    let mut mask = vec![0; (source.bm_mask.bmWidthBytes * source.bm_mask.bmHeight) as _];
+    copy_cursor_mask(&source, &mut mask)?;
+    let outlined = fill_cursor_pixels(&source, &mut mask, &mut colors)?;
+    log_cursor_before_outline(
+        CursorShapeDiag {
+            hcursor: source.hcursor,
+            width: source.width,
+            height: source.height,
+            byte_len: colors.len(),
+        },
+        &cursor_alpha_stats(&colors),
+        outlined,
+    );
+    Ok(CursorImage {
+        colors,
+        width: source.width,
+        height: source.height,
+        outlined,
+    })
+}
+
+fn cursor_color_buffer_size(source: &CursorImageSource) -> ResultType<i32> {
+    let cbits_size = source.width * source.height * 4;
+    log_cursor_bitmap_info(CursorBitmapDiag {
+        hcursor: source.hcursor,
+        is_color: source.is_color,
+        width: source.width,
+        height: source.height,
+        mask: source.bm_mask,
+        cbits_size,
+    });
+    if cbits_size >= 16 {
+        return Ok(cbits_size);
+    }
+    log::warn!(
+        "{} get_cursor_data invalid_small hcursor=0x{:x} cbits_size={} width={} height={}",
+        CURSOR_DIAG_PREFIX,
+        source.hcursor,
+        cbits_size,
+        source.width,
+        source.height
+    );
+    bail!("Invalid icon: too small"); // solve some crash
+}
+
+fn copy_cursor_mask(source: &CursorImageSource, mask: &mut Vec<u8>) -> ResultType<()> {
+    unsafe {
+        let copied = GetBitmapBits(source.hbm_mask, mask.len() as _, mask.as_mut_ptr() as _);
+        log_cursor_mask_bits(source.hcursor, copied, mask.len());
+        if copied == 0 {
+            log::warn!(
+                "{} get_cursor_data mask_copy_failed hcursor=0x{:x} expected={} error={}",
+                CURSOR_DIAG_PREFIX,
+                source.hcursor,
+                mask.len(),
+                io::Error::last_os_error()
+            );
+            bail!("Failed to copy bitmap data");
+        }
+        if copied == mask.len() as i32 {
+            return Ok(());
+        }
+        log::warn!(
+            "{} get_cursor_data mask_size_mismatch hcursor=0x{:x} copied={} expected={}",
+            CURSOR_DIAG_PREFIX,
+            source.hcursor,
+            copied,
+            mask.len()
+        );
+        bail!(
+            "Invalid mask cursor buffer size, got {} bytes, expected {}",
+            copied,
+            mask.len()
+        );
+    }
+}
+
+fn fill_cursor_pixels(
+    source: &CursorImageSource,
+    mask: &mut Vec<u8>,
+    colors: &mut Vec<u8>,
+) -> ResultType<bool> {
+    if source.is_color {
+        get_rich_cursor_data(source, colors)?;
+        log_cursor_pixels("color_pixels", source.hcursor, colors);
+        return Ok(fix_cursor_mask(
+            mask,
+            colors,
+            source.width as _,
+            source.height as _,
+            source.bm_mask.bmWidthBytes as _,
+        ));
+    }
+    let outlined = unsafe {
+        handleMask(
+            colors.as_mut_ptr(),
+            mask.as_ptr(),
+            source.width,
+            source.height,
+            source.bm_mask.bmWidthBytes,
+            source.bm_mask.bmHeight,
+        ) > 0
+    };
+    Ok(outlined)
+}
+
+fn apply_cursor_outline(mut image: CursorImage, icon: &mut IconInfo) -> CursorImage {
+    if !image.outlined {
+        return image;
+    }
+    let mut outline = vec![0; ((image.width + 2) * (image.height + 2) * 4) as _];
+    unsafe {
+        drawOutline(
+            outline.as_mut_ptr(),
+            image.colors.as_ptr(),
+            image.width,
+            image.height,
+            outline.len() as _,
+        );
+    }
+    image.colors = outline;
+    image.width += 2;
+    image.height += 2;
+    icon.0.xHotspot += 1;
+    icon.0.yHotspot += 1;
+    image
+}
+
+fn cursor_alpha_stats(rgba: &[u8]) -> CursorAlphaStats {
+    let pixel_count = rgba.len() / 4;
+    let visible_pixel_count = rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count();
+    CursorAlphaStats {
+        pixel_count,
+        visible_pixel_count,
+        all_transparent: pixel_count > 0 && visible_pixel_count == 0,
+    }
+}
+
+fn log_cursor_bitmap_info(diag: CursorBitmapDiag) {
+    log::info!(
+        "{} get_cursor_data bitmap hcursor=0x{:x} color={} width={} height={} mask_width={} mask_height={} mask_width_bytes={} mask_bits_pixel={} mask_planes={} cbits_size={}",
+        CURSOR_DIAG_PREFIX,
+        diag.hcursor,
+        diag.is_color,
+        diag.width,
+        diag.height,
+        diag.mask.bmWidth,
+        diag.mask.bmHeight,
+        diag.mask.bmWidthBytes,
+        diag.mask.bmBitsPixel,
+        diag.mask.bmPlanes,
+        diag.cbits_size
+    );
+}
+
+fn log_cursor_mask_bits(hcursor: u64, copied: i32, expected: usize) {
+    log::info!(
+        "{} get_cursor_data mask_bits hcursor=0x{:x} copied={} expected={}",
+        CURSOR_DIAG_PREFIX,
+        hcursor,
+        copied,
+        expected
+    );
+}
+
+fn log_cursor_pixels(label: &str, hcursor: u64, cbits: &[u8]) {
+    let stats = cursor_alpha_stats(cbits);
+    log::info!(
+        "{} get_cursor_data {} hcursor=0x{:x} pixels={} visible_pixels={} all_transparent={}",
+        CURSOR_DIAG_PREFIX,
+        label,
+        hcursor,
+        stats.pixel_count,
+        stats.visible_pixel_count,
+        stats.all_transparent
+    );
+}
+
+fn log_cursor_before_outline(shape: CursorShapeDiag, stats: &CursorAlphaStats, do_outline: bool) {
+    log::info!(
+        "{} get_cursor_data before_outline hcursor=0x{:x} width={} height={} bytes={} visible_pixels={} all_transparent={} do_outline={}",
+        CURSOR_DIAG_PREFIX,
+        shape.hcursor,
+        shape.width,
+        shape.height,
+        shape.byte_len,
+        stats.visible_pixel_count,
+        stats.all_transparent,
+        do_outline
+    );
+}
+
+fn log_cursor_data_done(diag: CursorDoneDiag) {
+    log::info!(
+        "{} get_cursor_data done hcursor=0x{:x} width={} height={} hot=({}, {}) bytes={} pixels={} visible_pixels={} all_transparent={} outlined={}",
+        CURSOR_DIAG_PREFIX,
+        diag.shape.hcursor,
+        diag.shape.width,
+        diag.shape.height,
+        diag.icon_info.xHotspot,
+        diag.icon_info.yHotspot,
+        diag.shape.byte_len,
+        diag.stats.pixel_count,
+        diag.stats.visible_pixel_count,
+        diag.stats.all_transparent,
+        diag.outlined
+    );
 }
 
 struct DC(HDC);
@@ -412,18 +709,38 @@ impl Drop for BitmapDC {
 }
 
 #[inline]
-fn get_rich_cursor_data(
-    hbm_color: HBITMAP,
-    width: i32,
-    height: i32,
-    out: &mut Vec<u8>,
-) -> ResultType<()> {
+fn get_rich_cursor_data(source: &CursorImageSource, out: &mut Vec<u8>) -> ResultType<()> {
     unsafe {
         let dc = DC::new()?;
-        let bitmap_dc = BitmapDC::new(dc.0, hbm_color)?;
-        if get_di_bits(out.as_mut_ptr(), bitmap_dc.dc(), hbm_color, width, height) > 0 {
-            bail!("Failed to get di bits: {}", io::Error::last_os_error());
+        let bitmap_dc = BitmapDC::new(dc.0, source.hbm_color)?;
+        let rc = get_di_bits(
+            out.as_mut_ptr(),
+            bitmap_dc.dc(),
+            source.hbm_color,
+            source.width,
+            source.height,
+        );
+        if rc > 0 {
+            let err = io::Error::last_os_error();
+            log::warn!(
+                "{} get_rich_cursor_data GetDIBits failed hbm_color={:?} width={} height={} rc={} error={}",
+                CURSOR_DIAG_PREFIX,
+                source.hbm_color,
+                source.width,
+                source.height,
+                rc,
+                err
+            );
+            bail!("Failed to get di bits: {}", err);
         }
+        log::info!(
+            "{} get_rich_cursor_data ok hbm_color={:?} width={} height={} bytes={}",
+            CURSOR_DIAG_PREFIX,
+            source.hbm_color,
+            source.width,
+            source.height,
+            out.len()
+        );
     }
     Ok(())
 }
@@ -4669,5 +4986,21 @@ ProcessId=10136
             arg,
         );
         assert_eq!(pids.len(), 0);
+    }
+
+    #[test]
+    fn test_cursor_alpha_stats_counts_visible_pixels() {
+        let transparent = [0, 0, 0, 0, 12, 34, 56, 0];
+        let mixed = [0, 0, 0, 0, 12, 34, 56, 128, 1, 2, 3, 255];
+
+        let transparent_stats = cursor_alpha_stats(&transparent);
+        assert_eq!(transparent_stats.pixel_count, 2);
+        assert_eq!(transparent_stats.visible_pixel_count, 0);
+        assert!(transparent_stats.all_transparent);
+
+        let mixed_stats = cursor_alpha_stats(&mixed);
+        assert_eq!(mixed_stats.pixel_count, 3);
+        assert_eq!(mixed_stats.visible_pixel_count, 2);
+        assert!(!mixed_stats.all_transparent);
     }
 }
