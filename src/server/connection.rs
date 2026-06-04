@@ -6068,6 +6068,13 @@ mod raii {
                 .filter(|c| c.conn_type == AuthConnType::Remote)
                 .count();
             if remote_count == 0 {
+                #[cfg(target_os = "linux")]
+                log::info!(
+                    "================ wayland_diag last_remote_disconnect conn_id={} remote_count={} session_hold_before_close={}",
+                    self.0,
+                    remote_count,
+                    scrap::wayland::pipewire::is_rdp_session_hold()
+                );
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 {
                     *WALLPAPER_REMOVER.lock().unwrap() = None;
@@ -6078,6 +6085,13 @@ mod raii {
                 let _ = virtual_display_manager::reset_all();
                 #[cfg(target_os = "linux")]
                 scrap::wayland::pipewire::try_close_session();
+                #[cfg(target_os = "linux")]
+                log::info!(
+                    "================ wayland_diag last_remote_disconnect conn_id={} remote_count={} session_hold_after_close={}",
+                    self.0,
+                    remote_count,
+                    scrap::wayland::pipewire::is_rdp_session_hold()
+                );
             }
             Self::check_wake_lock();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

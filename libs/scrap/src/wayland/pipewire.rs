@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -69,9 +69,26 @@ impl PipewireDisplayOffsetCache {
 
 #[inline]
 pub fn close_session() {
-    let _ = RDP_SESSION_INFO.lock().unwrap().take();
+    let mut rdp_info = RDP_SESSION_INFO.lock().unwrap();
+    if let Some(rdp_info_ref) = rdp_info.as_ref() {
+        info!(
+            "================ wayland_diag close_session begin session={} fd={} conn_strong={} streams={} restore_token_supported={}",
+            rdp_info_ref.session,
+            rdp_info_ref.fd.as_raw_fd(),
+            Arc::strong_count(&rdp_info_ref.conn),
+            rdp_info_ref.streams.len(),
+            rdp_info_ref.is_support_restore_token
+        );
+    } else {
+        info!("================ wayland_diag close_session begin session=<none>");
+    }
+    let _ = rdp_info.take();
     clear_wayland_displays_cache();
     HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
+    info!(
+        "================ wayland_diag close_session end session_hold={}",
+        rdp_info.is_some()
+    );
 }
 
 #[inline]
@@ -82,17 +99,35 @@ pub fn is_rdp_session_hold() -> bool {
 pub fn try_close_session() {
     let mut rdp_info = RDP_SESSION_INFO.lock().unwrap();
     let mut close = false;
-    if let Some(rdp_info) = &*rdp_info {
+    if let Some(rdp_info_ref) = &*rdp_info {
+        let server_running = is_server_running();
         // If is server running and restore token is supported, there's no need to keep the session.
-        if is_server_running() && rdp_info.is_support_restore_token {
+        if server_running && rdp_info_ref.is_support_restore_token {
             close = true;
         }
+        info!(
+            "================ wayland_diag try_close_session evaluate session={} fd={} conn_strong={} streams={} server_running={} restore_token_supported={} will_close={}",
+            rdp_info_ref.session,
+            rdp_info_ref.fd.as_raw_fd(),
+            Arc::strong_count(&rdp_info_ref.conn),
+            rdp_info_ref.streams.len(),
+            server_running,
+            rdp_info_ref.is_support_restore_token,
+            close
+        );
+    } else {
+        info!("================ wayland_diag try_close_session evaluate session=<none>");
     }
     if close {
         *rdp_info = None;
         clear_wayland_displays_cache();
         HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
     }
+    info!(
+        "================ wayland_diag try_close_session end session_hold={} cleared={}",
+        rdp_info.is_some(),
+        close
+    );
 }
 
 pub struct RdpSessionInfo {
@@ -925,10 +960,18 @@ fn on_start_response(
             .lock()
             .unwrap()
             .append(&mut streams_from_response(r));
-        fd.clone()
-            .lock()
-            .unwrap()
-            .replace(portal.open_pipe_wire_remote(session.clone(), HashMap::new())?);
+        let remote_fd = portal.open_pipe_wire_remote(session.clone(), HashMap::new())?;
+        let raw_fd = remote_fd.as_raw_fd();
+        fd.clone().lock().unwrap().replace(remote_fd);
+        let stream_count = streams.lock().unwrap().len();
+        info!(
+            "================ wayland_diag on_start_response session={} fd={} streams={} is_server_running={} restore_token_supported={}",
+            session,
+            raw_fd,
+            stream_count,
+            is_server_running(),
+            is_support_restore_token
+        );
 
         Ok(())
     }
@@ -943,6 +986,14 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     if rdp_connection.is_none() {
         let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
         let conn = Arc::new(conn);
+        info!(
+            "================ wayland_diag get_capturables create_session session={} fd={} streams={} conn_strong={} restore_token_supported={}",
+            session,
+            fd.as_raw_fd(),
+            streams.len(),
+            Arc::strong_count(&conn),
+            is_support_restore_token
+        );
 
         let rdp_info = RdpSessionInfo {
             conn,

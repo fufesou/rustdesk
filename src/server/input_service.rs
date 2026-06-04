@@ -633,10 +633,26 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
     let rdp_info_lock = RDP_SESSION_INFO.lock()?;
     let rdp_info = rdp_info_lock.as_ref().ok_or("RDP session is None")?;
+    let session = rdp_info.session.to_string();
+    let conn_strong_before = Arc::strong_count(&rdp_info.conn);
+    let had_keyboard = en.get_custom_keyboard().is_some();
+    let had_mouse = en.get_custom_mouse().is_some();
+    log::info!(
+        "================ wayland_diag setup_rdp_input begin session={} conn_strong={} streams={} had_keyboard={} had_mouse={}",
+        session,
+        conn_strong_before,
+        rdp_info.streams.len(),
+        had_keyboard,
+        had_mouse
+    );
 
     let keyboard = RdpInputKeyboard::new(rdp_info.conn.clone(), rdp_info.session.clone())?;
     en.set_custom_keyboard(Box::new(keyboard));
-    log::info!("RdpInput keyboard created");
+    log::info!(
+        "================ wayland_diag setup_rdp_input keyboard_set session={} conn_strong={}",
+        session,
+        Arc::strong_count(&rdp_info.conn)
+    );
 
     if let Some(stream) = rdp_info.streams.clone().into_iter().next() {
         let resolution = rdp_info
@@ -651,7 +667,20 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
             resolution,
         )?;
         en.set_custom_mouse(Box::new(mouse));
-        log::info!("RdpInput mouse created");
+        log::info!(
+            "================ wayland_diag setup_rdp_input mouse_set session={} conn_strong={} stream_path={} resolution={}x{}",
+            session,
+            Arc::strong_count(&rdp_info.conn),
+            stream.path,
+            resolution.0,
+            resolution.1
+        );
+    } else {
+        log::info!(
+            "================ wayland_diag setup_rdp_input no_mouse_stream session={} conn_strong={}",
+            session,
+            Arc::strong_count(&rdp_info.conn)
+        );
     }
 
     Ok(())
