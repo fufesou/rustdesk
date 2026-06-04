@@ -99,6 +99,13 @@ lazy_static::lazy_static! {
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
 }
 
+pub(crate) const FIXED_TEST_UPDATE_RELEASE_PAGE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
+const FIXED_TEST_UPDATE_RELEASE_ID: &str = "fix-update-metadata";
+const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.6";
+const FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/";
+
 lazy_static::lazy_static! {
     // Is server process, with "--server" args
     static ref IS_SERVER: bool = std::env::args().nth(1) == Some("--server".to_owned());
@@ -950,6 +957,9 @@ pub fn check_software_update() {
 }
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
+    if update_url == FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        return Ok(FIXED_TEST_UPDATE_RELEASE_ID.to_owned());
+    }
     let url = url::Url::parse(update_url)?;
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
         bail!("Update URL is not a GitHub HTTPS release URL: {}", update_url);
@@ -974,6 +984,9 @@ pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String>
 }
 
 pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<String> {
+    if release_id == FIXED_TEST_UPDATE_RELEASE_ID {
+        return Ok(FIXED_TEST_UPDATE_DISPLAY_VERSION.to_owned());
+    }
     let display_version = release_id.strip_prefix('v').unwrap_or(release_id);
     let segments = display_version.split('.').collect::<Vec<_>>();
     if segments.len() != 3
@@ -990,6 +1003,9 @@ pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<St
 }
 
 pub(crate) fn release_download_base_url(update_url: &str) -> ResultType<String> {
+    if update_url == FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        return Ok(FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL.to_owned());
+    }
     let release_id = release_id_from_update_url(update_url)?;
     Ok(format!(
         "https://github.com/rustdesk/rustdesk/releases/download/{release_id}/"
