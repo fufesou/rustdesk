@@ -12,5 +12,5 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "nightly"
-      publish-update-metadata: false
+      upload-tag: "fix-update-metadata"
+      publish-update-metadata: true
