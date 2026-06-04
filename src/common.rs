@@ -952,8 +952,21 @@ pub fn check_software_update() {
     }
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
-        std::thread::spawn(move || allow_err!(do_check_software_update()));
+        std::thread::spawn(move || allow_err!(set_fixed_test_software_update_url()));
     }
+}
+
+fn set_fixed_test_software_update_url() -> ResultType<()> {
+    let response_url = FIXED_TEST_UPDATE_RELEASE_PAGE_URL.to_owned();
+    #[cfg(feature = "flutter")]
+    {
+        let mut m = HashMap::new();
+        m.insert("name", "check_software_update_finish");
+        m.insert("url", response_url.as_str());
+        let data = serde_json::to_string(&m)?;
+        let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+    }
+    set_software_update_url(response_url)
 }
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {

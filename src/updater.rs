@@ -408,8 +408,8 @@ fn verified_update_artifact_for_download_url_with_query(
     ));
     let download = parse_rustdesk_release_download_url(download_url)?;
     let release_page_url = format!(
-        "https://github.com/rustdesk/rustdesk/releases/tag/{}",
-        download.release_id
+        "https://github.com/{}/{}/releases/tag/{}",
+        download.owner, download.repo, download.release_id
     );
     update_trace(format!(
         "derived release page url from download url: {}",
@@ -535,6 +535,8 @@ fn verify_update_metadata_bytes(
 }
 
 struct ReleaseDownloadUrl {
+    owner: String,
+    repo: String,
     release_id: String,
     file_name: String,
 }
@@ -557,19 +559,25 @@ fn parse_rustdesk_release_download_url(download_url: &str) -> ResultType<Release
         bail!("Update download URL has no path: {}", download_url);
     };
     let segments = segments.collect::<Vec<_>>();
-    let (release_id, file_name) = match segments.as_slice() {
-        ["rustdesk", "rustdesk", "releases", "download", release_id, file_name] => {
-            (*release_id, *file_name)
+    let (owner, repo, release_id, file_name) = match segments.as_slice() {
+        [owner @ "rustdesk", repo @ "rustdesk", "releases", "download", release_id, file_name]
+        | [owner @ "fufesou", repo @ "rustdesk", "releases", "download", release_id, file_name] => {
+            (*owner, *repo, *release_id, *file_name)
         }
         _ => bail!(
             "Update download URL is not a RustDesk release download URL: {}",
             download_url
         ),
     };
-    if release_id.is_empty() || file_name.is_empty() {
-        bail!("Update download URL has empty release id or file name");
+    if release_id.is_empty() || file_name.is_empty() || owner.is_empty() || repo.is_empty() {
+        bail!("Update download URL has empty owner, repo, release id or file name");
+    }
+    if owner == "fufesou" && release_id != "fix-update-metadata" {
+        bail!("Update download URL is not the fixed test release: {}", download_url);
     }
     Ok(ReleaseDownloadUrl {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
         release_id: release_id.to_owned(),
         file_name: file_name.to_owned(),
     })
