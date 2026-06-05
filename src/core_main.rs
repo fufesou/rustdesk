@@ -10,6 +10,85 @@ use hbb_common::{config, log};
 #[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
+#[derive(Debug, PartialEq, Eq)]
+enum MacosUpdateArgs {
+    VerifiedDmg {
+        dmg_path: String,
+        metadata_path: String,
+        signature_path: String,
+    },
+    LegacyDmg {
+        dmg_path: String,
+    },
+    App,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_update_exit_code<E: std::fmt::Display>(
+    result: Result<(), E>,
+    failure_prefix: &str,
+) -> Option<i32> {
+    match result {
+        Ok(()) => None,
+        Err(err) => {
+            eprintln!("{}: {}", failure_prefix, err);
+            log::error!("{}: {}", failure_prefix, err);
+            Some(1)
+        }
+    }
+}
+
+fn parse_macos_update_args(args: &[String]) -> Result<MacosUpdateArgs, String> {
+    if args.first().map(String::as_str) != Some("--update") {
+        return Err("not a macOS update command".to_owned());
+    }
+    let Some(dmg_path) = args.get(1) else {
+        return Ok(MacosUpdateArgs::App);
+    };
+    let is_dmg = std::path::Path::new(dmg_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dmg"));
+    if !is_dmg {
+        return Err(format!("invalid DMG update argument: {dmg_path}"));
+    }
+
+    let mut metadata_path: Option<String> = None;
+    let mut signature_path: Option<String> = None;
+    let mut index = 2;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1) else {
+            return Err(format!("missing value for {}", args[index]));
+        };
+        match args[index].as_str() {
+            "--metadata" => {
+                if metadata_path.replace(value.clone()).is_some() {
+                    return Err("duplicate --metadata argument".to_owned());
+                }
+            }
+            "--signature" => {
+                if signature_path.replace(value.clone()).is_some() {
+                    return Err("duplicate --signature argument".to_owned());
+                }
+            }
+            other => return Err(format!("unsupported macOS update argument: {other}")),
+        }
+        index += 2;
+    }
+
+    match (metadata_path, signature_path) {
+        (Some(metadata_path), Some(signature_path)) => Ok(MacosUpdateArgs::VerifiedDmg {
+            dmg_path: dmg_path.clone(),
+            metadata_path,
+            signature_path,
+        }),
+        (None, None) => Ok(MacosUpdateArgs::LegacyDmg {
+            dmg_path: dmg_path.clone(),
+        }),
+        _ => Err("both --metadata and --signature are required for signed DMG update".to_owned()),
+    }
+}
+
 #[macro_export]
 macro_rules! my_println{
     ($($arg:tt)*) => {
@@ -232,7 +311,15 @@ pub fn core_main() -> Option<Vec<String>> {
                         "Update failed!".to_string()
                     }
                     Ok(false) => "Update failed!".to_string(),
-                    Ok(true) => match platform::update_me(false) {
+                    Ok(true) => match if args
+                        .iter()
+                        .skip(1)
+                        .any(|arg| arg == platform::UPDATE_SINGLE_EXE_ARG)
+                    {
+                        platform::update_me_single_exe(false)
+                    } else {
+                        platform::update_me(false)
+                    } {
                         Ok(_) => "Updated successfully!".to_string(),
                         Err(err) => {
                             log::error!("Failed with error: {err}");
@@ -335,34 +422,56 @@ pub fn core_main() -> Option<Vec<String>> {
         {
             use crate::platform;
             if args[0] == "--update" {
-                if args.len() > 1 && args[1].ends_with(".dmg") {
-                    // Version check is unnecessary unless downgrading to an older version
-                    // that lacks "update dmg" support. This is a special case since we cannot
-                    // detect the version before extracting the DMG, so we skip the check.
-                    let dmg_path = &args[1];
-                    println!("Updating from DMG: {}", dmg_path);
-                    match platform::update_from_dmg(dmg_path) {
-                        Ok(_) => {
-                            println!("Update process from DMG started successfully.");
-                            // The new process will handle the rest. We can exit.
+                match parse_macos_update_args(&args) {
+                    Ok(MacosUpdateArgs::VerifiedDmg {
+                        dmg_path,
+                        metadata_path,
+                        signature_path,
+                    }) => {
+                        println!("Updating from verified DMG: {}", dmg_path);
+                        let update_result = platform::update_from_verified_dmg_sidecar(
+                            &dmg_path,
+                            &metadata_path,
+                            &signature_path,
+                        );
+                        if let Some(code) = macos_update_exit_code(
+                            update_result,
+                            "Failed to start verified update from DMG",
+                        ) {
+                            std::process::exit(code);
                         }
-                        Err(err) => {
-                            eprintln!("Failed to start update from DMG: {}", err);
-                        }
+                        println!("Update process from verified DMG started successfully.");
                     }
-                } else {
-                    println!("Starting update process...");
-                    log::info!("Starting update process...");
-                    let _text = match platform::update_me() {
-                        Ok(_) => {
-                            println!("{}", translate("Updated successfully!".to_string()));
-                            log::info!("Updated successfully!");
+                    Ok(MacosUpdateArgs::App) => {
+                        println!("Starting update process...");
+                        log::info!("Starting update process...");
+                        let update_result = platform::update_me();
+                        if let Some(code) =
+                            macos_update_exit_code(update_result, "Update failed with error")
+                        {
+                            std::process::exit(code);
                         }
-                        Err(err) => {
-                            eprintln!("Update failed with error: {}", err);
-                            log::error!("Update failed with error: {err}");
+                        println!("{}", translate("Updated successfully!".to_string()));
+                        log::info!("Updated successfully!");
+                    }
+                    Ok(MacosUpdateArgs::LegacyDmg { dmg_path }) => {
+                        println!("Updating from DMG: {}", dmg_path);
+                        log::warn!(
+                            "legacy offline update: signed metadata not found; release hash was not verified"
+                        );
+                        let update_result = platform::update_from_dmg(&dmg_path);
+                        if let Some(code) =
+                            macos_update_exit_code(update_result, "Failed to start update from DMG")
+                        {
+                            std::process::exit(code);
                         }
-                    };
+                        println!("Update process from DMG started successfully.");
+                    }
+                    Err(err) => {
+                        eprintln!("Invalid update arguments: {}", err);
+                        log::error!("Invalid update arguments: {}", err);
+                        std::process::exit(1);
+                    }
                 }
                 return None;
             }
@@ -966,6 +1075,76 @@ mod tests {
         ] {
             assert!(!is_user_main_ipc_scope_cli_command(&args(&[command])));
         }
+    }
+
+    #[test]
+    fn macos_update_args_parse_verified_and_app() {
+        assert_eq!(
+            parse_macos_update_args(&args(&[
+                "--update",
+                "/tmp/RustDesk.dmg",
+                "--metadata",
+                "/tmp/rustdesk-update.json",
+                "--signature",
+                "/tmp/rustdesk-update.json.sig",
+            ]))
+            .unwrap(),
+            MacosUpdateArgs::VerifiedDmg {
+                dmg_path: "/tmp/RustDesk.dmg".to_owned(),
+                metadata_path: "/tmp/rustdesk-update.json".to_owned(),
+                signature_path: "/tmp/rustdesk-update.json.sig".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_macos_update_args(&args(&["--update"])).unwrap(),
+            MacosUpdateArgs::App
+        );
+    }
+
+    #[test]
+    fn macos_update_args_accept_legacy_bare_dmg() {
+        assert_eq!(
+            parse_macos_update_args(&args(&["--update", "/tmp/RustDesk.dmg"])).unwrap(),
+            MacosUpdateArgs::LegacyDmg {
+                dmg_path: "/tmp/RustDesk.dmg".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn macos_update_args_reject_partial_or_duplicate_sidecars() {
+        assert!(parse_macos_update_args(&args(&[
+            "--update",
+            "/tmp/RustDesk.dmg",
+            "--metadata",
+            "/tmp/rustdesk-update.json",
+        ]))
+        .is_err());
+        assert!(parse_macos_update_args(&args(&[
+            "--update",
+            "/tmp/RustDesk.dmg",
+            "--signature",
+            "/tmp/rustdesk-update.json.sig",
+        ]))
+        .is_err());
+        assert!(parse_macos_update_args(&args(&[
+            "--update",
+            "/tmp/RustDesk.dmg",
+            "--metadata",
+            "/tmp/rustdesk-update.json",
+            "--signature",
+            "/tmp/rustdesk-update.json.sig",
+            "--metadata",
+            "/tmp/other.json",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn macos_update_args_reject_invalid_update_target() {
+        let error = parse_macos_update_args(&args(&["--update", "/tmp/RustDesk.zip"])).unwrap_err();
+        assert!(error.contains("invalid"));
+        assert!(error.contains("RustDesk.zip"));
     }
 }
 
