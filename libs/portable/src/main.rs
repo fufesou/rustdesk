@@ -9,6 +9,8 @@ use bin_reader::BinaryReader;
 
 pub mod bin_reader;
 #[cfg(windows)]
+mod secure_update;
+#[cfg(windows)]
 mod ui;
 
 #[cfg(windows)]
@@ -19,6 +21,8 @@ const APP_METADATA_CONFIG: &str = "meta.toml";
 const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const APP_PREFIX: &str = "rustdesk";
 const APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+#[cfg(windows)]
+const UPDATE_ARG: &str = "--update";
 #[cfg(windows)]
 const SET_FOREGROUND_WINDOW_ENV_KEY: &str = "SET_FOREGROUND_WINDOW";
 
@@ -174,6 +178,70 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     }
 }
 
+#[cfg(windows)]
+fn execute_update(reader: &BinaryReader, args: &[String]) -> std::io::Result<()> {
+    use std::{io, os::windows::process::CommandExt};
+
+    let mut update_dir = secure_update::SecureUpdateDir::create()?;
+    let executable = update_dir.extract(reader)?;
+    let portable_exe = std::env::current_exe()?;
+    let portable_name = portable_exe.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Portable executable name is unavailable",
+        )
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env(APPNAME_RUNTIME_ENV_KEY, portable_name)
+        .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+    if use_null_stdio() {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "Embedded updater exited with status {status}"
+        )));
+    }
+    update_dir.cleanup()
+}
+
+#[cfg(windows)]
+fn report_update_error(error: &std::io::Error) {
+    use std::{ffi::OsStr, iter, os::windows::ffi::OsStrExt, ptr};
+    use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND};
+
+    let title = OsStr::new("RustDesk Update")
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let message = OsStr::new(&format!(
+        "Protected full update did not complete cleanly: {error}"
+    ))
+    .encode_wide()
+    .chain(iter::once(0))
+    .collect::<Vec<_>>();
+    eprintln!("Protected full update did not complete cleanly: {error}");
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
 fn main() {
     let mut args = Vec::new();
     let mut arg_exe = Default::default();
@@ -194,6 +262,13 @@ fn main() {
 
     let mut ui = false;
     let reader = BinaryReader::default();
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some(UPDATE_ARG) {
+        if let Err(error) = execute_update(&reader, &args) {
+            report_update_error(&error);
+        }
+        return;
+    }
     if let Some(exe) = setup(
         reader,
         None,

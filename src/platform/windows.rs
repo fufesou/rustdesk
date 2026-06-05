@@ -17,6 +17,7 @@ use hbb_common::{
     sysinfo::{Pid, System},
     timeout, tokio,
 };
+use sha2::Digest;
 use std::{
     collections::HashMap,
     ffi::{CString, OsString},
@@ -25,7 +26,11 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        },
     },
     path::*,
     ptr::null_mut,
@@ -59,8 +64,9 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
-            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
+            ES_SYSTEM_REQUIRED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, HANDLE,
+            PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION, PSID,
+            SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
             TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
@@ -1459,6 +1465,25 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
     ))
 }
 
+fn copy_update_directory_cmd(src_exe: &str, path: &str) -> ResultType<String> {
+    let source_dir = PathBuf::from(src_exe)
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {src_exe}"))?
+        .to_string_lossy()
+        .to_string();
+    Ok(format!(
+        "
+        taskkill /F /IM \"{broker_exe}\"
+        XCOPY \"{source_dir}\" \"{path}\" /Y /E /H /I /K /R /Z || exit /b
+        if exist \"{ORIGIN_PROCESS_EXE}\" (
+            copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\" || exit /b
+        )
+        ",
+        ORIGIN_PROCESS_EXE = win_topmost_window::ORIGIN_PROCESS_EXE,
+        broker_exe = win_topmost_window::INJECTED_PROCESS_EXE,
+    ))
+}
+
 #[inline]
 pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
     let src_exe_filename = PathBuf::from(src_exe)
@@ -1472,7 +1497,7 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
     } else {
         Ok(format!(
             "
-        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\"
+        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\" || exit /b
         ",
         ))
     }
@@ -1483,7 +1508,9 @@ pub fn remove_meta_toml_cmd(is_msi: bool, path: &str) -> String {
     if is_msi && crate::is_custom_client() {
         format!(
             "
-        del /F /Q \"{path}\\meta.toml\"
+        if exist \"{path}\\meta.toml\" (
+            del /F /Q \"{path}\\meta.toml\" || exit /b
+        )
         ",
         )
     } else {
@@ -2013,6 +2040,7 @@ pub fn remove_custom_client_staging_dir(staging_dir: &Path) -> ResultType<bool> 
     if !staging_dir.exists() {
         return Ok(false);
     }
+    ensure_custom_client_staging_dir_is_safe(staging_dir)?;
 
     // First explicitly removes `custom.txt` to ensure stale config is never replayed,
     // even if the subsequent directory removal fails.
@@ -2032,7 +2060,7 @@ pub fn remove_custom_client_staging_dir(staging_dir: &Path) -> ResultType<bool> 
     Ok(false)
 }
 
-// Prepare custom client update by copying staged custom.txt to current directory and loading it.
+// Prepare custom client update by loading staged custom.txt.
 // Returns:
 // 1. Ok(true) if preparation was successful or no staging directory exists.
 // 2. Ok(false) if custom.txt file exists but has invalid contents or fails security checks
@@ -2040,10 +2068,6 @@ pub fn remove_custom_client_staging_dir(staging_dir: &Path) -> ResultType<bool> 
 // 3. Err if any unexpected error occurs during file operations.
 pub fn prepare_custom_client_update() -> ResultType<bool> {
     let custom_client_staging_dir = get_custom_client_staging_dir();
-    let current_exe = std::env::current_exe()?;
-    let current_exe_dir = current_exe
-        .parent()
-        .ok_or(anyhow!("Cannot get parent directory of current exe"))?;
 
     let staging_dir = custom_client_staging_dir.clone();
     let clear_staging_on_exit = crate::SimpleCallOnReturn {
@@ -2067,6 +2091,7 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
     };
 
     if custom_client_staging_dir.exists() {
+        ensure_custom_client_staging_dir_is_safe(&custom_client_staging_dir)?;
         let custom_txt_path = custom_client_staging_dir.join("custom.txt");
         if !custom_txt_path.exists() {
             return Ok(true);
@@ -2081,29 +2106,10 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
             return Ok(false);
         }
         if metadata.is_file() {
-            // Copy custom.txt to current directory
-            let local_custom_file_path = current_exe_dir.join("custom.txt");
-            log::debug!(
-                "Copying staged custom file from {:?} to {:?}",
-                custom_txt_path,
-                local_custom_file_path
-            );
+            let custom_client_config = fs::read_to_string(&custom_txt_path)?;
+            let is_valid_custom_client = crate::read_custom_client(custom_client_config.trim());
 
-            // No need to check symlink before copying.
-            // `load_custom_client()` will fail if the file is not valid.
-            fs::copy(&custom_txt_path, &local_custom_file_path)?;
-            log::info!("Staged custom client file copied to current directory.");
-
-            // Load custom client
-            let is_custom_file_exists =
-                local_custom_file_path.exists() && local_custom_file_path.is_file();
-            crate::load_custom_client();
-
-            // Remove the copied custom.txt file
-            allow_err!(fs::remove_file(&local_custom_file_path));
-
-            // Check if loaded successfully
-            if is_custom_file_exists && !crate::common::is_custom_client() {
+            if !is_valid_custom_client {
                 // The custom.txt file existed, but its contents are invalid.
                 log::error!("Failed to load custom client from custom.txt.");
                 drop(clear_staging_on_exit);
@@ -2111,7 +2117,12 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
                 return Ok(false);
             }
         } else {
-            log::info!("No custom client files found in staging directory.");
+            log::error!(
+                "custom.txt at {:?} is not a regular file. Refusing to load custom client.",
+                custom_txt_path
+            );
+            drop(clear_staging_on_exit);
+            return Ok(false);
         }
     } else {
         log::info!(
@@ -3259,6 +3270,38 @@ fn get_directory_size_kb(path: &str) -> u64 {
 }
 
 pub fn update_me(debug: bool) -> ResultType<()> {
+    update_me_(debug)
+}
+
+fn start_service_cmd(app_name: &str) -> String {
+    format!("sc start \"{app_name}\" || exit /b")
+}
+
+fn handle_update_command_result(
+    result: ResultType<()>,
+    app_name: &str,
+    restore_service: bool,
+) -> ResultType<()> {
+    let Err(update_error) = result else {
+        return Ok(());
+    };
+    if !restore_service || is_self_service_running() {
+        return Err(update_error);
+    }
+    if let Err(restore_error) = run_cmds(
+        start_service_cmd(app_name),
+        false,
+        "restore_service_after_failed_update",
+    ) {
+        bail!("Update failed: {update_error}; failed to restore service: {restore_error}");
+    }
+    Err(update_error)
+}
+
+fn update_me_(debug: bool) -> ResultType<()> {
+    if !is_elevated(None)? {
+        bail!("Full directory updates require an elevated verified package");
+    }
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
     let (subkey, path, _, exe) = get_install_info();
@@ -3321,20 +3364,20 @@ pub fn update_me(debug: bool) -> ResultType<()> {
             "".to_string()
         } else {
             format!(
-                "reg add {} /f /v DisplayIcon /t REG_SZ /d \"{}\"",
+                "reg add \"{}\" /f /v DisplayIcon /t REG_SZ /d \"{}\" || exit /b",
                 subkey, display_icon
             )
         };
         format!(
             "
 {reg_display_icon}
-reg add {subkey} /f /v DisplayVersion /t REG_SZ /d \"{version}\"
-reg add {subkey} /f /v Version /t REG_SZ /d \"{version}\"
-reg add {subkey} /f /v BuildDate /t REG_SZ /d \"{build_date}\"
-reg add {subkey} /f /v VersionMajor /t REG_DWORD /d {version_major}
-reg add {subkey} /f /v VersionMinor /t REG_DWORD /d {version_minor}
-reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {version_build}
-reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
+reg add \"{subkey}\" /f /v DisplayVersion /t REG_SZ /d \"{version}\" || exit /b
+reg add \"{subkey}\" /f /v Version /t REG_SZ /d \"{version}\" || exit /b
+reg add \"{subkey}\" /f /v BuildDate /t REG_SZ /d \"{build_date}\" || exit /b
+reg add \"{subkey}\" /f /v VersionMajor /t REG_DWORD /d {version_major} || exit /b
+reg add \"{subkey}\" /f /v VersionMinor /t REG_DWORD /d {version_minor} || exit /b
+reg add \"{subkey}\" /f /v VersionBuild /t REG_DWORD /d {version_build} || exit /b
+reg add \"{subkey}\" /f /v EstimatedSize /t REG_DWORD /d {size} || exit /b
         "
         )
     }
@@ -3371,7 +3414,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
-        format!("sc start {}", &app_name)
+        start_service_cmd(&app_name)
     } else {
         "".to_owned()
     };
@@ -3403,11 +3446,11 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
-sc stop {app_name}
-taskkill /F /IM {app_name}.exe{filter}
-{reg_cmd}
+sc stop \"{app_name}\"
+taskkill /F /IM \"{app_name}.exe\"{filter}
 {copy_exe}
 {rename_exe}
+{reg_cmd}
 {remove_meta_toml}
 {restore_service_cmd}
 {uninstall_printer_cmd}
@@ -3415,7 +3458,7 @@ taskkill /F /IM {app_name}.exe{filter}
 {sleep}
     ",
         app_name = app_name,
-        copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
+        copy_exe = copy_update_directory_cmd(&src_exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
         sleep = if debug { "timeout 300" } else { "" },
@@ -3478,7 +3521,11 @@ taskkill /F /IM {app_name}.exe{filter}
         }),
     };
 
-    run_cmds(cmds, debug, "update")?;
+    handle_update_command_result(
+        run_cmds(cmds, debug, "update"),
+        &app_name,
+        is_service_running,
+    )?;
 
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");
@@ -3549,6 +3596,7 @@ pub fn handle_custom_client_staging_dir_before_update(
 
     // Clean up existing staging directory
     if custom_client_staging_dir.exists() {
+        ensure_custom_client_staging_dir_is_safe(custom_client_staging_dir)?;
         log::debug!(
             "Removing existing custom client staging directory: {:?}",
             custom_client_staging_dir
@@ -3585,11 +3633,24 @@ pub fn handle_custom_client_staging_dir_before_update(
         }
 
         if metadata.is_file() {
+            if let Some(untrusted_path) =
+                find_untrusted_existing_staging_path_component(custom_client_staging_dir, |path| {
+                    std::fs::symlink_metadata(path)
+                        .ok()
+                        .map(|metadata| metadata.file_attributes())
+                })
+            {
+                bail!(
+                    "Refusing to use custom client staging path through reparse point: {:?}",
+                    untrusted_path
+                );
+            }
             if !custom_client_staging_dir.exists() {
                 if let Err(e) = std::fs::create_dir_all(custom_client_staging_dir) {
                     bail!("Failed to create parent directory {:?} when staging custom client files: {}", custom_client_staging_dir, e);
                 }
             }
+            ensure_custom_client_staging_dir_is_safe(custom_client_staging_dir)?;
             let dst_path = custom_client_staging_dir.join("custom.txt");
             if let Err(e) = std::fs::copy(&src_path, &dst_path) {
                 allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
@@ -3601,8 +3662,8 @@ pub fn handle_custom_client_staging_dir_before_update(
                 );
             }
         } else {
-            log::warn!(
-                "custom.txt at {:?} is not a regular file, skipping.",
+            bail!(
+                "custom.txt at {:?} is not a regular file, refusing to stage custom client.",
                 src_path
             );
         }
@@ -3613,29 +3674,287 @@ pub fn handle_custom_client_staging_dir_before_update(
     Ok(())
 }
 
-// Used for auto update and manual update in the main window.
-pub fn update_to(file: &str) -> ResultType<()> {
-    if file.ends_with(".exe") {
-        let custom_client_staging_dir = get_custom_client_staging_dir();
-        if crate::is_custom_client() {
-            handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
-        } else {
-            // Clean up any residual staging directory from previous custom client
-            allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
+fn ensure_custom_client_staging_dir_is_safe(staging_dir: &Path) -> ResultType<()> {
+    if let Some(untrusted_path) =
+        find_untrusted_existing_staging_path_component(staging_dir, |path| {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|metadata| metadata.file_attributes())
+        })
+    {
+        bail!(
+            "Refusing to use custom client staging path through reparse point: {:?}",
+            untrusted_path
+        );
+    }
+
+    let metadata = std::fs::symlink_metadata(staging_dir)
+        .map_err(|e| anyhow!("Failed to read staging directory {:?}: {}", staging_dir, e))?;
+    if !metadata.is_dir() {
+        bail!(
+            "Custom client staging path is not a directory: {:?}",
+            staging_dir
+        );
+    }
+    Ok(())
+}
+
+fn find_untrusted_existing_staging_path_component<F>(
+    staging_dir: &Path,
+    mut file_attributes_for_path: F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path) -> Option<u32>,
+{
+    let mut ancestors = staging_dir
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    for path in ancestors {
+        let Some(attributes) = file_attributes_for_path(path) else {
+            continue;
+        };
+        if !is_update_file_attributes_trusted(attributes) {
+            return Some(path.to_path_buf());
         }
-        if !run_uac(file, "--update")? {
-            bail!(
-                "Failed to run the update exe with UAC, error: {:?}",
-                std::io::Error::last_os_error()
-            );
-        }
-    } else if file.ends_with(".msi") {
-        if let Err(e) = update_me_msi(file, false) {
-            bail!("Failed to run the update msi: {}", e);
-        }
-    } else {
-        // unreachable!()
+    }
+    None
+}
+
+pub fn update_to_verified(file: &str, expected_sha256: &str) -> ResultType<()> {
+    let extension = update_file_extension(file).unwrap_or_default();
+    if extension != "exe" && extension != "msi" {
         bail!("Unsupported update file format: {}", file);
+    }
+
+    let update_file = copy_and_verify_update_file_sha256(file, expected_sha256)?;
+    let custom_client_staging_dir = get_custom_client_staging_dir();
+    if crate::is_custom_client() {
+        handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
+    } else {
+        // Clean up any residual staging directory from previous custom client
+        allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
+    }
+
+    match extension.as_str() {
+        "exe" => {
+            if !run_uac(update_file.path_str()?, "--update")? {
+                bail!(
+                    "Failed to run the update exe with UAC, error: {:?}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        "msi" => {
+            if let Err(e) = update_me_msi(update_file.path_str()?, false) {
+                bail!("Failed to run the update msi: {}", e);
+            }
+        }
+        _ => {
+            bail!("Unsupported update file format: {}", file);
+        }
+    }
+    Ok(())
+}
+
+const UPDATE_FILE_COPY_ATTEMPTS: usize = 16;
+
+pub struct VerifiedUpdateFile {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl VerifiedUpdateFile {
+    pub fn path_str(&self) -> ResultType<&str> {
+        let Some(path) = self.path.to_str() else {
+            bail!("Invalid update file path: {}", self.path.display());
+        };
+        Ok(path)
+    }
+}
+
+fn is_update_file_attributes_trusted(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+fn update_file_open_flags() -> u32 {
+    FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+fn update_file_extension(file: &str) -> Option<String> {
+    Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn verified_update_file_path(file: &str) -> ResultType<PathBuf> {
+    let extension = update_file_extension(file).unwrap_or_default();
+    if extension != "exe" && extension != "msi" {
+        bail!("Unsupported update file format: {}", file);
+    }
+    Ok(std::env::temp_dir().join(format!(
+        "rustdesk-verified-{}-{}.{}",
+        std::process::id(),
+        hbb_common::rand::random::<u64>(),
+        extension
+    )))
+}
+
+fn is_temp_update_file_name(file_name: &str) -> bool {
+    let file_name = file_name.to_ascii_lowercase();
+    if let Some(file_name) = file_name
+        .strip_prefix('.')
+        .and_then(|file_name| file_name.strip_suffix(".download"))
+    {
+        return file_name.starts_with("rustdesk-")
+            && (file_name.contains(".exe.") || file_name.contains(".msi."));
+    }
+    if !(file_name.ends_with(".msi") || file_name.ends_with(".exe")) {
+        return false;
+    }
+    file_name.starts_with("rustdesk-")
+}
+
+fn open_update_file_for_verification(file: &str) -> ResultType<std::fs::File> {
+    let update_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(update_file_open_flags())
+        .open(file)
+        .map_err(|e| anyhow!("Failed to lock update file {}: {}", file, e))?;
+    let metadata = update_file
+        .metadata()
+        .map_err(|e| anyhow!("Failed to read update file metadata {}: {}", file, e))?;
+    if !is_update_file_attributes_trusted(metadata.file_attributes()) {
+        bail!(
+            "Refusing to verify update file through reparse point: {}",
+            file
+        );
+    }
+    Ok(update_file)
+}
+
+fn copy_update_file_for_verification(file: &str) -> ResultType<VerifiedUpdateFile> {
+    let mut source_file = open_update_file_for_verification(file)?;
+    for _ in 0..UPDATE_FILE_COPY_ATTEMPTS {
+        let path = verified_update_file_path(file)?;
+        let mut copy_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(update_file_open_flags())
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow!(
+                    "Failed to create verified update file {}: {}",
+                    path.display(),
+                    e
+                )
+                .into())
+            }
+        };
+        if let Err(e) = std::io::copy(&mut source_file, &mut copy_file) {
+            drop(copy_file);
+            std::fs::remove_file(&path).ok();
+            return Err(e.into());
+        }
+        if let Err(e) = copy_file.flush() {
+            drop(copy_file);
+            std::fs::remove_file(&path).ok();
+            return Err(e.into());
+        }
+        if let Err(e) = copy_file.seek(io::SeekFrom::Start(0)) {
+            drop(copy_file);
+            std::fs::remove_file(&path).ok();
+            return Err(e.into());
+        }
+        return Ok(VerifiedUpdateFile {
+            file: copy_file,
+            path,
+        });
+    }
+
+    bail!("Failed to create verified update file for {}", file);
+}
+
+pub fn copy_and_verify_update_file_sha256(
+    file: &str,
+    expected_sha256: &str,
+) -> ResultType<VerifiedUpdateFile> {
+    let mut update_file = copy_update_file_for_verification(file)?;
+    let update_path = match update_file.path_str() {
+        Ok(path) => path.to_owned(),
+        Err(e) => {
+            let path = update_file.path.clone();
+            drop(update_file);
+            std::fs::remove_file(&path).ok();
+            return Err(e);
+        }
+    };
+    if let Err(e) = verify_update_file_sha256(&mut update_file.file, expected_sha256, &update_path)
+    {
+        let path = update_file.path.clone();
+        drop(update_file);
+        std::fs::remove_file(&path).ok();
+        return Err(e);
+    }
+    let path = update_file.path.clone();
+    drop(update_file);
+
+    let mut read_file = match open_update_file_for_verification(&update_path) {
+        Ok(file) => file,
+        Err(e) => {
+            std::fs::remove_file(&path).ok();
+            return Err(e);
+        }
+    };
+    if let Err(e) = verify_update_file_sha256(&mut read_file, expected_sha256, &update_path) {
+        drop(read_file);
+        std::fs::remove_file(&path).ok();
+        return Err(e);
+    }
+    Ok(VerifiedUpdateFile {
+        file: read_file,
+        path,
+    })
+}
+
+fn verify_update_file_sha256(
+    update_file: &mut std::fs::File,
+    expected_sha256: &str,
+    file: &str,
+) -> ResultType<()> {
+    let expected_sha256 = expected_sha256.trim().to_ascii_lowercase();
+    if expected_sha256.len() != 64 || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Expected update file SHA256 is malformed for {}", file);
+    }
+
+    update_file.seek(io::SeekFrom::Start(0))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = update_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    update_file.seek(io::SeekFrom::Start(0))?;
+
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != expected_sha256 {
+        bail!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            file,
+            expected_sha256,
+            actual_sha256
+        );
     }
     Ok(())
 }
@@ -3750,10 +4069,8 @@ pub fn try_remove_temp_update_files() {
         if let Ok(entry) = entry {
             let path = entry.path();
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match files like rustdesk-*.msi or rustdesk-*.exe
-                if file_name.starts_with("rustdesk-")
-                    && (file_name.ends_with(".msi") || file_name.ends_with(".exe"))
-                {
+                // Match cached update files, verified copies, and stale download temp files.
+                if is_temp_update_file_name(file_name) {
                     // Skip files modified within the last hour to avoid deleting files being downloaded
                     if let Ok(metadata) = std::fs::metadata(&path) {
                         if let Ok(modified) = metadata.modified() {
@@ -4596,6 +4913,74 @@ mod tests {
         };
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn untrusted_existing_staging_path_component_detects_parent_reparse_point() {
+        let staging_dir = PathBuf::from(r"C:\safe\parent\child");
+        let flagged = find_untrusted_existing_staging_path_component(&staging_dir, |path| {
+            if path == Path::new(r"C:\safe\parent") {
+                Some(winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT)
+            } else if path == staging_dir {
+                Some(winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(flagged, Some(PathBuf::from(r"C:\safe\parent")));
+    }
+
+    #[test]
+    fn untrusted_existing_staging_path_component_ignores_drive_prefix() {
+        let staging_dir = PathBuf::from(r"C:\safe\parent\child");
+        let flagged = find_untrusted_existing_staging_path_component(&staging_dir, |path| {
+            if path == Path::new(r"C:") {
+                Some(winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT)
+            } else if path == Path::new(r"C:\") || path == staging_dir {
+                Some(winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(flagged, None);
+    }
+
+    #[test]
+    fn update_file_sha256_rejects_mismatched_open_file_handle() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-sha256-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let update_file_path = test_dir.join("update.exe");
+        std::fs::write(&update_file_path, b"rustdesk").unwrap();
+        let update_file_path = update_file_path.to_string_lossy().to_string();
+        let mut update_file = open_update_file_for_verification(&update_file_path).unwrap();
+
+        let result = verify_update_file_sha256(
+            &mut update_file,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            &update_file_path,
+        );
+
+        assert!(result.is_err());
+        drop(update_file);
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn temp_update_file_name_matches_plain_cached_artifacts() {
+        assert!(is_temp_update_file_name("rustdesk-1.4.7-x86_64.exe"));
+        assert!(is_temp_update_file_name("rustdesk-1.4.7-x86_64.MSI"));
+        assert!(is_temp_update_file_name(".rustdesk-1.4.7-x86_64.exe.123.download"));
+        assert!(is_temp_update_file_name(".rustdesk-1.4.7-x86_64.EXE.123.download"));
+        assert!(!is_temp_update_file_name("rustdesk.exe"));
+        assert!(!is_temp_update_file_name("rustdesk.msi"));
+        assert!(!is_temp_update_file_name(".rustdesk.exe.123.download"));
     }
 
     #[test]
