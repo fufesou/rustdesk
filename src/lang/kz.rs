@@ -765,5 +765,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "Барлық мониторлар"),
         ("#{} monitor", "Монитор {}"),
         ("conn-e2ee-unavailable-tip", "Ұштан-ұшқа шифрлауды тексеру мүмкін болмады.\nҚашықтағы құрылғы әлі бапталып жатқан болуы мүмкін. Кейінірек қайталап көріңіз.\nЕгер бұл қайталана берсе, сервер сенімсіз болуы мүмкін.\nСонда да жалғастыру керек пе?"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }
