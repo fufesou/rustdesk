@@ -765,5 +765,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "모든 모니터"),
         ("#{} monitor", "#{} 모니터"),
         ("conn-e2ee-unavailable-tip", "종단 간 암호화를 확인할 수 없습니다.\n원격 장치가 아직 설정 중일 수 있습니다. 나중에 다시 시도하세요.\n이 문제가 계속되면 서버를 신뢰할 수 없을 수 있습니다.\n그래도 계속하시겠습니까?"),
+        ("wayland-keyboard-input-reset-choice-tip", "키보드 입력 선택 초기화"),
+        ("remember-wayland-keyboard-choice-tip", "이 원격 컴퓨터에 대해 다시 묻지 않기"),
+        ("Why this happens", "이런 현상이 발생하는 이유"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }
