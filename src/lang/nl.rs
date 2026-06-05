@@ -745,5 +745,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("preset-password-in-use-tip", "Het basis wachtwoord is momenteel in gebruik."),
         ("Enable privacy mode", "Privacymodus inschakelen"),
         ("allow-remote-toolbar-docking-any-edge", ""),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }
