@@ -17,8 +17,15 @@ const _githubRateLimitUserMessage =
     'The download frequency limit may have been reached. Please try again later.';
 
 Future<void> handleUpdate(String releasePageUrl) async {
+  SimpleWrapper<bool> canceled = SimpleWrapper(false);
+  _showVerifyingUpdate(() {
+    canceled.value = true;
+  });
   final downloadUrl =
       await bind.mainGetCommon(key: 'verified-download-url-$releasePageUrl');
+  if (canceled.value) {
+    return;
+  }
   if (downloadUrl.startsWith('error:')) {
     final error = downloadUrl.replaceFirst('error:', '');
     _showUpdateError(releasePageUrl, error);
@@ -73,6 +80,34 @@ Future<void> handleUpdate(String releasePageUrl) async {
           }, isOutline: true),
         ]);
   });
+}
+
+void _showVerifyingUpdate(VoidCallback onCancel) {
+  gFFI.dialogManager.dismissAll();
+  gFFI.dialogManager.show(
+    (setState, close, context) => CustomAlertDialog(
+      title: Text(translate('Verifying update')),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(translate('Please wait while {$appName} verifies the update.')),
+          const SizedBox(height: 12),
+          const LinearProgressIndicator(
+            minHeight: 20,
+            borderRadius: BorderRadius.all(Radius.circular(5)),
+          ),
+        ],
+      ).marginSymmetric(horizontal: 8).paddingOnly(top: 12),
+      actions: [
+        dialogButton('Cancel', onPressed: () {
+          onCancel();
+          close();
+        }, isOutline: true),
+      ],
+    ),
+    tag: 'verifying-update',
+  );
 }
 
 void _showUpdateError(String releasePageUrl, String error,

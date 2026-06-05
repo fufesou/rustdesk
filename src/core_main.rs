@@ -1040,7 +1040,7 @@ fn is_root() -> bool {
     crate::platform::is_root()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_user_main_ipc_scope_cli_command(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
@@ -1063,6 +1063,7 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn user_main_ipc_scope_cli_command_matches_management_commands_only() {
         for command in [
