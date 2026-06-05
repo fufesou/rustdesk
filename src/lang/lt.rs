@@ -765,5 +765,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "Visi monitoriai"),
         ("#{} monitor", "Monitorius {}"),
         ("conn-e2ee-unavailable-tip", "Nepavyko patikrinti galinio šifravimo.\nNuotolinis įrenginys galbūt vis dar nustatomas. Bandykite dar kartą vėliau.\nJei tai kartojasi, serveris gali būti nepatikimas.\nVis tiek tęsti?"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }

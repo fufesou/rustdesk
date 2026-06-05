@@ -765,5 +765,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "Monitore guztiak"),
         ("#{} monitor", "{}. monitorea"),
         ("conn-e2ee-unavailable-tip", "Ezin izan da muturretik muturrerako enkriptatzea egiaztatu.\nUrruneko gailua oraindik konfiguratzen ari daiteke. Saiatu berriro geroago.\nHonek jarraitzen badu, zerbitzaria fidagaitza izan daiteke.\nHala ere jarraitu?"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }

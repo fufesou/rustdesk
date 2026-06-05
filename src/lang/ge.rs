@@ -765,5 +765,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "ყველა მონიტორი"),
         ("#{} monitor", "მონიტორი {}"),
         ("conn-e2ee-unavailable-tip", "ბოლომდე დაშიფვრის გადამოწმება ვერ მოხერხდა.\nდისტანციური მოწყობილობა შესაძლოა ჯერ კიდევ მზადდება. სცადეთ მოგვიანებით.\nთუ ეს კვლავ გაგრძელდება, სერვერი შესაძლოა არასანდო იყოს.\nმაინც გააგრძელებთ?"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }
