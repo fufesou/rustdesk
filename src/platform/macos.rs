@@ -24,8 +24,6 @@ use hbb_common::{
     sysinfo::{Pid, Process, ProcessRefreshKind, System},
     update_metadata::{UpdateArtifactQuery, UpdateMetadataPolicy, VerifiedUpdateArtifact},
 };
-#[cfg(test)]
-use hbb_common::update_metadata::TrustedUpdateKey;
 use include_dir::{include_dir, Dir};
 use objc::rc::autoreleasepool;
 use objc::{class, msg_send, sel, sel_impl};
@@ -1115,25 +1113,6 @@ fn verify_dmg_sidecar_metadata(
     )
 }
 
-#[cfg(test)]
-fn verify_dmg_sidecar_metadata_with_keys(
-    dmg_path: &str,
-    metadata_bytes: &[u8],
-    signature_bytes: &[u8],
-    trusted_keys: &[TrustedUpdateKey],
-) -> ResultType<VerifiedUpdateArtifact> {
-    let file_name = dmg_file_name(dmg_path)?;
-    let policy = dmg_sidecar_policy();
-    let query = dmg_sidecar_query(&file_name);
-    hbb_common::update_metadata::verify_update_metadata_with_keys(
-        metadata_bytes,
-        signature_bytes,
-        &policy,
-        &query,
-        trusted_keys,
-    )
-}
-
 fn dmg_sidecar_policy<'a>() -> UpdateMetadataPolicy<'a> {
     UpdateMetadataPolicy {
         app: "rustdesk",
@@ -1378,7 +1357,7 @@ mod tests {
     use hbb_common::{
         base64::{engine::general_purpose::STANDARD, Engine as _},
         sodiumoxide::crypto::sign,
-        update_metadata::UPDATE_METADATA_SIGNATURE_CONTEXT,
+        update_metadata::{TrustedUpdateKey, UPDATE_METADATA_SIGNATURE_CONTEXT},
     };
     use serde_json::{json, Value};
 
@@ -1418,6 +1397,24 @@ mod tests {
             algorithm: "ed25519",
             public_key,
         }
+    }
+
+    fn verify_dmg_sidecar_metadata_with_keys(
+        dmg_path: &str,
+        metadata_bytes: &[u8],
+        signature_bytes: &[u8],
+        trusted_keys: &[TrustedUpdateKey],
+    ) -> ResultType<VerifiedUpdateArtifact> {
+        let file_name = dmg_file_name(dmg_path)?;
+        let policy = dmg_sidecar_policy();
+        let query = dmg_sidecar_query(&file_name);
+        hbb_common::update_metadata::verify_update_metadata_with_keys(
+            metadata_bytes,
+            signature_bytes,
+            &policy,
+            &query,
+            trusted_keys,
+        )
     }
 
     fn update_metadata_for_dmg(file_name: &str) -> Value {

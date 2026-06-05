@@ -745,5 +745,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("preset-password-in-use-tip", "当前使用预设密码"),
         ("Enable privacy mode", "允许隐私模式"),
         ("allow-remote-toolbar-docking-any-edge", ""),
+        ("Verifying update", "正在验证更新"),
+        ("Please wait while {} verifies the update.", "请稍候，{} 正在验证更新。"),
     ].iter().cloned().collect();
 }
