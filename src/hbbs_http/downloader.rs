@@ -1,21 +1,89 @@
-use super::create_http_client_async_with_url;
+use super::create_http_client_async_with_url_strict;
 use hbb_common::{
     bail,
     lazy_static::lazy_static,
     log,
     tokio::{
         self,
-        fs::File,
+        fs::{File, OpenOptions},
         io::AsyncWriteExt,
         sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     },
     ResultType,
 };
 use serde_derive::Serialize;
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
 
 lazy_static! {
     static ref DOWNLOADERS: Mutex<HashMap<String, Downloader>> = Default::default();
+}
+
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn ensure_success_status(status: reqwest::StatusCode, context: &str) -> ResultType<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    bail!("{context}: {status}");
+}
+
+fn ensure_downloaded_size_matches(
+    downloaded_size: u64,
+    total_size: u64,
+    url: &str,
+) -> ResultType<()> {
+    if downloaded_size == total_size {
+        return Ok(());
+    }
+    bail!("Downloaded size mismatch for {url}: expected {total_size}, got {downloaded_size}");
+}
+
+fn has_cancel_request(rx_cancel: &mut UnboundedReceiver<()>) -> bool {
+    rx_cancel.try_recv().is_ok()
+}
+
+fn finish_download_if_not_canceled(
+    id: &str,
+    final_path: Option<PathBuf>,
+    rx_cancel: &mut UnboundedReceiver<()>,
+) -> bool {
+    let mut downloaders = DOWNLOADERS.lock().unwrap();
+    if has_cancel_request(rx_cancel) {
+        return false;
+    }
+    if let Some(downloader) = downloaders.get_mut(id) {
+        if let Some(final_path) = final_path {
+            downloader.path = Some(final_path);
+        }
+        downloader.finished = true;
+    }
+    true
+}
+
+fn resolve_total_size(
+    signed_size: Option<u64>,
+    content_length: Option<u64>,
+    url: &str,
+) -> ResultType<Option<u64>> {
+    if signed_size.is_some() {
+        return Ok(signed_size);
+    }
+    if content_length.is_some() {
+        return Ok(content_length);
+    }
+    bail!("Failed to get content length for {url}");
+}
+
+fn identity_encoded_request(
+    builder: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    builder.header(reqwest::header::ACCEPT_ENCODING, "identity")
 }
 
 /// This struct is used to return the download data to the caller.
@@ -31,6 +99,7 @@ pub struct DownloadData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_size: Option<u64>,
     pub downloaded_size: u64,
+    pub finished: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -40,10 +109,33 @@ struct Downloader {
     path: Option<PathBuf>,
     // Some file may be empty, so we use Option<u64> to indicate if the size is known
     total_size: Option<u64>,
+    signed_size: Option<u64>,
+    auto_del_dur: Option<Duration>,
+    has_finish_handler: bool,
     downloaded_size: u64,
     error: Option<String>,
     finished: bool,
     tx_cancel: UnboundedSender<()>,
+}
+
+type DownloadFinishHandler = Box<dyn FnOnce(&Path) -> ResultType<PathBuf> + Send>;
+
+fn ensure_downloader_contract_matches(
+    downloader: &Downloader,
+    path: Option<&Path>,
+    signed_size: Option<u64>,
+    auto_del_dur: Option<Duration>,
+    has_finish_handler: bool,
+    url: &str,
+) -> ResultType<()> {
+    if downloader.path.as_deref() == path
+        && downloader.signed_size == signed_size
+        && downloader.auto_del_dur == auto_del_dur
+        && downloader.has_finish_handler == has_finish_handler
+    {
+        return Ok(());
+    }
+    bail!("Existing downloader for {url} has different options");
 }
 
 // The caller should check if the file is downloaded successfully and remove the job from the map.
@@ -51,8 +143,42 @@ pub fn download_file(
     url: String,
     path: Option<PathBuf>,
     auto_del_dur: Option<Duration>,
+    signed_size: Option<u64>,
 ) -> ResultType<String> {
+    download_file_(url, path, auto_del_dur, signed_size, None)
+}
+
+pub fn download_file_with_finish_handler<F>(
+    url: String,
+    path: Option<PathBuf>,
+    auto_del_dur: Option<Duration>,
+    signed_size: Option<u64>,
+    finish_handler: F,
+) -> ResultType<String>
+where
+    F: FnOnce(&Path) -> ResultType<PathBuf> + Send + 'static,
+{
+    download_file_(
+        url,
+        path,
+        auto_del_dur,
+        signed_size,
+        Some(Box::new(finish_handler)),
+    )
+}
+
+fn download_file_(
+    url: String,
+    path: Option<PathBuf>,
+    auto_del_dur: Option<Duration>,
+    signed_size: Option<u64>,
+    finish_handler: Option<DownloadFinishHandler>,
+) -> ResultType<String> {
+    if finish_handler.is_some() && path.is_none() {
+        bail!("Download finish handler requires a file path");
+    }
     let id = url.clone();
+    let has_finish_handler = finish_handler.is_some();
     // First pass: if a non-error downloader exists for this URL, reuse it.
     // If an errored downloader exists, remove it so this call can retry.
     let mut stale_path = None;
@@ -60,6 +186,14 @@ pub fn download_file(
         let mut downloaders = DOWNLOADERS.lock().unwrap();
         if let Some(downloader) = downloaders.get(&id) {
             if downloader.error.is_none() {
+                ensure_downloader_contract_matches(
+                    downloader,
+                    path.as_deref(),
+                    signed_size,
+                    auto_del_dur,
+                    has_finish_handler,
+                    &id,
+                )?;
                 return Ok(id);
             }
             stale_path = downloader.path.clone();
@@ -69,7 +203,11 @@ pub fn download_file(
     if let Some(p) = stale_path {
         if p.exists() {
             if let Err(e) = std::fs::remove_file(&p) {
-                log::warn!("Failed to remove stale download file {}: {}", p.display(), e);
+                log::warn!(
+                    "Failed to remove stale download file {}: {}",
+                    p.display(),
+                    e
+                );
             }
         }
     }
@@ -86,7 +224,10 @@ pub fn download_file(
     let downloader = Downloader {
         data: Vec::new(),
         path: path.clone(),
-        total_size: None,
+        total_size: signed_size,
+        signed_size,
+        auto_del_dur,
+        has_finish_handler,
         downloaded_size: 0,
         error: None,
         tx_cancel: tx,
@@ -98,6 +239,14 @@ pub fn download_file(
         let mut downloaders = DOWNLOADERS.lock().unwrap();
         if let Some(existing) = downloaders.get(&id) {
             if existing.error.is_none() {
+                ensure_downloader_contract_matches(
+                    existing,
+                    path.as_deref(),
+                    signed_size,
+                    auto_del_dur,
+                    has_finish_handler,
+                    &id,
+                )?;
                 return Ok(id);
             }
             stale_path_after_check = existing.path.clone();
@@ -108,14 +257,26 @@ pub fn download_file(
     if let Some(p) = stale_path_after_check {
         if p.exists() {
             if let Err(e) = std::fs::remove_file(&p) {
-                log::warn!("Failed to remove stale download file {}: {}", p.display(), e);
+                log::warn!(
+                    "Failed to remove stale download file {}: {}",
+                    p.display(),
+                    e
+                );
             }
         }
     }
 
     let id2 = id.clone();
     std::thread::spawn(
-        move || match do_download(&id2, url, path, auto_del_dur, rx) {
+        move || match do_download(
+            &id2,
+            url,
+            path,
+            auto_del_dur,
+            signed_size,
+            finish_handler,
+            rx,
+        ) {
             Ok(is_all_downloaded) => {
                 let mut downloaded_size = 0;
                 let mut total_size = 0;
@@ -150,6 +311,9 @@ pub fn download_file(
                 let err = e.to_string();
                 log::error!("Download {}, failed: {}", &id2, &err);
                 DOWNLOADERS.lock().unwrap().get_mut(&id2).map(|downloader| {
+                    if let Some(path) = downloader.path.as_ref() {
+                        std::fs::remove_file(path).ok();
+                    }
                     downloader.error = Some(err);
                 });
             }
@@ -159,70 +323,187 @@ pub fn download_file(
     Ok(id)
 }
 
+pub fn complete_existing_file(
+    id: String,
+    path: PathBuf,
+    total_size: u64,
+    auto_del_dur: Option<Duration>,
+) -> ResultType<String> {
+    let final_path = path.clone();
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        bail!("Download path is not a file: {}", path.display());
+    }
+    ensure_downloaded_size_matches(metadata.len(), total_size, &id)?;
+
+    let (tx, _rx) = unbounded_channel();
+    let downloader = Downloader {
+        data: Vec::new(),
+        path: Some(path),
+        total_size: Some(total_size),
+        signed_size: Some(total_size),
+        auto_del_dur,
+        has_finish_handler: false,
+        downloaded_size: total_size,
+        error: None,
+        finished: true,
+        tx_cancel: tx,
+    };
+    let mut stale_path = None;
+    {
+        let mut downloaders = DOWNLOADERS.lock().unwrap();
+        if let Some(existing) = downloaders.get(&id) {
+            if existing.error.is_none() {
+                if !existing.finished
+                    || existing.path.as_deref() != Some(final_path.as_path())
+                    || existing.total_size != Some(total_size)
+                    || existing.auto_del_dur != auto_del_dur
+                {
+                    bail!("Existing downloader for {id} is not complete");
+                }
+                return Ok(id);
+            }
+            stale_path = existing.path.clone();
+        }
+        downloaders.insert(id.clone(), downloader);
+    }
+    if let Some(stale_path) = stale_path {
+        if stale_path != final_path && stale_path.exists() {
+            std::fs::remove_file(stale_path).ok();
+        }
+    }
+
+    if let Some(dur) = auto_del_dur {
+        let id_del = id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(dur);
+            DOWNLOADERS.lock().unwrap().remove(&id_del);
+        });
+    }
+    Ok(id)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn do_download(
     id: &str,
     url: String,
     path: Option<PathBuf>,
     auto_del_dur: Option<Duration>,
+    signed_size: Option<u64>,
+    mut finish_handler: Option<DownloadFinishHandler>,
     mut rx_cancel: UnboundedReceiver<()>,
 ) -> ResultType<bool> {
-    let client = create_http_client_async_with_url(&url).await;
+    let client;
+    tokio::select! {
+        _ = rx_cancel.recv() => {
+            return Ok(false);
+        }
+        created_client = create_http_client_async_with_url_strict(&url) => {
+            client = created_client;
+        }
+    };
 
     let mut is_all_downloaded = false;
-    tokio::select! {
+    let content_length = tokio::select! {
         _ = rx_cancel.recv() => {
             return Ok(is_all_downloaded);
         }
-        head_resp = client.head(&url).send() => {
+        head_resp = tokio::time::timeout(
+            DOWNLOAD_REQUEST_TIMEOUT,
+            identity_encoded_request(client.head(&url)).send(),
+        ) => {
             match head_resp {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     if resp.status().is_success() {
-                        let total_size = resp
+                        let content_length = resp
                             .headers()
                             .get(reqwest::header::CONTENT_LENGTH)
                             .and_then(|ct_len| ct_len.to_str().ok())
                             .and_then(|ct_len| ct_len.parse::<u64>().ok());
-                        let Some(total_size) = total_size else {
-                            bail!("Failed to get content length");
-                        };
-                        DOWNLOADERS.lock().unwrap().get_mut(id).map(|downloader| {
-                            downloader.total_size = Some(total_size);
-                        });
+                        if let Some(content_length) = content_length {
+                            if signed_size.is_none() {
+                                DOWNLOADERS.lock().unwrap().get_mut(id).map(|downloader| {
+                                    downloader.total_size = Some(content_length);
+                                });
+                            } else if signed_size != Some(content_length) {
+                                log::warn!(
+                                    "Download size from metadata differs from content length for {}: metadata {:?}, content length {}",
+                                    url,
+                                    signed_size,
+                                    content_length
+                                );
+                            }
+                        }
+                        content_length
                     } else {
-                        bail!("Failed to get content length: {}", resp.status());
+                        log::warn!("Failed to get content length: {}", resp.status());
+                        None
                     }
                 }
-                Err(e) => {
-                    return Err(e.into());
+                Ok(Err(e)) => {
+                    log::warn!("Failed to get content length: {}", e);
+                    None
+                }
+                Err(_) => {
+                    log::warn!("Timed out while getting download file size");
+                    None
                 }
             }
         }
-    }
+    };
+    let total_size = resolve_total_size(signed_size, content_length, &url)?;
 
     let mut response;
     tokio::select! {
         _ = rx_cancel.recv() => {
             return Ok(is_all_downloaded);
         }
-        resp = client.get(url).send() => {
-            response = resp?;
+        resp = tokio::time::timeout(
+            DOWNLOAD_REQUEST_TIMEOUT,
+            identity_encoded_request(client.get(&url)).send(),
+        ) => {
+            match resp {
+                Ok(Ok(resp)) => {
+                    ensure_success_status(resp.status(), "Failed to start download")?;
+                    response = resp;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => bail!("Timed out while starting download"),
+            }
         }
     }
 
     let mut dest: Option<File> = None;
+    let path_for_finish = path.clone();
     if let Some(p) = path {
-        dest = Some(File::create(p).await?);
+        dest = Some(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .await?,
+        );
     }
 
+    let mut downloaded_size = 0_u64;
     loop {
         tokio::select! {
             _ = rx_cancel.recv() => {
                 break;
             }
-            chunk = response.chunk() => {
+            chunk = tokio::time::timeout(DOWNLOAD_READ_TIMEOUT, response.chunk()) => {
                 match chunk {
-                    Ok(Some(chunk)) => {
+                    Ok(Ok(Some(chunk))) => {
+                        let chunk_size = chunk.len() as u64;
+                        let Some(next_downloaded_size) = downloaded_size.checked_add(chunk_size) else {
+                            bail!("Downloaded size overflow for {url}");
+                        };
+                        if let Some(total_size) = total_size {
+                            if next_downloaded_size > total_size {
+                                ensure_downloaded_size_matches(next_downloaded_size, total_size, &url)?;
+                            }
+                        }
+                        downloaded_size = next_downloaded_size;
                         match dest {
                             Some(ref mut f) => {
                                 f.write_all(&chunk).await?;
@@ -239,14 +520,15 @@ async fn do_download(
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         is_all_downloaded = true;
                         break;
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::error!("Download {} failed: {}", id, e);
                         return Err(e.into());
                     }
+                    Err(_) => bail!("Timed out while reading download data"),
                 }
             }
         }
@@ -256,10 +538,27 @@ async fn do_download(
         f.flush().await?;
     }
 
-    if let Some(ref mut downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {
-        downloader.finished = true;
-    }
+    let final_path = if is_all_downloaded {
+        if let Some(total_size) = total_size {
+            ensure_downloaded_size_matches(downloaded_size, total_size, &url)?;
+        }
+        if let Some(finish_handler) = finish_handler.take() {
+            let Some(downloaded_path) = path_for_finish.as_ref() else {
+                bail!("Download finish handler requires a file path");
+            };
+            Some(finish_handler(downloaded_path)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if is_all_downloaded {
+        if !finish_download_if_not_canceled(id, final_path, &mut rx_cancel) {
+            return Ok(false);
+        }
+
         let id_del = id.to_string();
         if let Some(dur) = auto_del_dur {
             tokio::spawn(async move {
@@ -277,7 +576,13 @@ pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
         let downloaded_size = downloader.downloaded_size;
         let total_size = downloader.total_size.clone();
         let error = downloader.error.clone();
-        let data = if total_size.unwrap_or(0) == downloaded_size && downloader.path.is_none() {
+        let finished = downloader.finished;
+        let data = if finished
+            && total_size
+                .map(|total_size| total_size == downloaded_size)
+                .unwrap_or(true)
+            && downloader.path.is_none()
+        {
             downloader.data.clone()
         } else {
             Vec::new()
@@ -288,6 +593,7 @@ pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
             path,
             total_size,
             downloaded_size,
+            finished,
             error,
         };
         Ok(download_data)
@@ -297,7 +603,12 @@ pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
 }
 
 pub fn cancel(id: &str) {
-    if let Some(downloader) = DOWNLOADERS.lock().unwrap().get(id) {
+    let mut downloaders = DOWNLOADERS.lock().unwrap();
+    if downloaders.get(id).is_some_and(|downloader| downloader.finished) {
+        downloaders.remove(id);
+        return;
+    }
+    if let Some(downloader) = downloaders.get(id) {
         // downloader.is_canceled.store(true, Ordering::SeqCst);
         // The receiver may not be able to receive the cancel signal, so we also set the atomic bool to true
         let _ = downloader.tx_cancel.send(());
@@ -306,4 +617,364 @@ pub fn cancel(id: &str) {
 
 pub fn remove(id: &str) {
     let _ = DOWNLOADERS.lock().unwrap().remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_download_if_not_canceled_rejects_pending_cancel() {
+        let id = format!(
+            "https://example.com/rustdesk-finish-cancel-{}.exe",
+            std::process::id()
+        );
+        let (tx, mut rx) = unbounded_channel();
+        let (downloader_tx, _downloader_rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: None,
+                total_size: Some(8),
+                signed_size: Some(8),
+                auto_del_dur: None,
+                has_finish_handler: true,
+                downloaded_size: 8,
+                error: None,
+                finished: false,
+                tx_cancel: downloader_tx,
+            },
+        );
+        tx.send(()).unwrap();
+
+        assert!(!finish_download_if_not_canceled(&id, None, &mut rx));
+        assert!(!DOWNLOADERS.lock().unwrap().get(&id).unwrap().finished);
+        remove(&id);
+    }
+
+    #[test]
+    fn downloaded_size_must_match_content_length() {
+        assert!(ensure_downloaded_size_matches(10, 10, "https://example.com/file").is_ok());
+        assert!(ensure_downloaded_size_matches(9, 10, "https://example.com/file").is_err());
+        assert!(ensure_downloaded_size_matches(11, 10, "https://example.com/file").is_err());
+    }
+
+    #[test]
+    fn unsigned_download_requires_content_length() {
+        assert_eq!(
+            resolve_total_size(None, Some(8), "https://example.com/file").unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            resolve_total_size(Some(8), None, "https://example.com/file").unwrap(),
+            Some(8)
+        );
+        assert!(resolve_total_size(None, None, "https://example.com/file").is_err());
+    }
+
+    #[test]
+    fn completed_existing_file_is_reported_as_finished() {
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-complete-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"rustdesk").unwrap();
+        let id = format!("https://example.com/rustdesk-{}.exe", std::process::id());
+
+        let result = complete_existing_file(id.clone(), path.clone(), 8, None);
+        assert!(result.is_ok());
+
+        let data = get_download_data(&id).unwrap();
+        assert!(data.finished);
+        assert_eq!(data.downloaded_size, 8);
+        assert_eq!(data.total_size, Some(8));
+        assert_eq!(data.path, Some(path.clone()));
+
+        remove(&id);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_existing_file_removes_stale_error_path() {
+        let stale_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-stale-test-{}.tmp",
+            std::process::id()
+        ));
+        let final_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-final-test-{}.exe",
+            std::process::id()
+        ));
+        std::fs::write(&stale_path, b"stale").unwrap();
+        std::fs::write(&final_path, b"rustdesk").unwrap();
+        let id = format!("https://example.com/rustdesk-stale-{}.exe", std::process::id());
+
+        let (tx, _rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(stale_path.clone()),
+                total_size: Some(5),
+                signed_size: Some(5),
+                auto_del_dur: None,
+                has_finish_handler: false,
+                downloaded_size: 5,
+                error: Some("failed".to_owned()),
+                finished: true,
+                tx_cancel: tx,
+            },
+        );
+
+        let result = complete_existing_file(id.clone(), final_path.clone(), 8, None);
+        assert!(result.is_ok());
+        assert!(!stale_path.exists());
+
+        remove(&id);
+        std::fs::remove_file(final_path).unwrap();
+    }
+
+    #[test]
+    fn completed_existing_file_keeps_final_path_when_retrying_same_path() {
+        let final_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-same-path-test-{}.exe",
+            std::process::id()
+        ));
+        std::fs::write(&final_path, b"rustdesk").unwrap();
+        let id = format!(
+            "https://example.com/rustdesk-same-path-{}.exe",
+            std::process::id()
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(final_path.clone()),
+                total_size: Some(5),
+                signed_size: Some(5),
+                auto_del_dur: None,
+                has_finish_handler: false,
+                downloaded_size: 5,
+                error: Some("failed".to_owned()),
+                finished: true,
+                tx_cancel: tx,
+            },
+        );
+
+        let result = complete_existing_file(id.clone(), final_path.clone(), 8, None);
+        assert!(result.is_ok());
+        assert!(final_path.exists());
+
+        remove(&id);
+        std::fs::remove_file(final_path).unwrap();
+    }
+
+    #[test]
+    fn cancel_removes_finished_existing_file_without_deleting_it() {
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-cancel-finished-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"rustdesk").unwrap();
+        let id = format!(
+            "https://example.com/rustdesk-cancel-finished-{}.exe",
+            std::process::id()
+        );
+
+        complete_existing_file(id.clone(), path.clone(), 8, None).unwrap();
+        cancel(&id);
+
+        assert!(get_download_data(&id).is_err());
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn download_file_rejects_existing_url_with_different_contract() {
+        let old_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-old-contract-test-{}",
+            std::process::id()
+        ));
+        let new_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-new-contract-test-{}",
+            std::process::id()
+        ));
+        let id = format!(
+            "https://example.com/rustdesk-contract-{}.exe",
+            std::process::id()
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(old_path),
+                total_size: Some(8),
+                signed_size: Some(8),
+                auto_del_dur: None,
+                has_finish_handler: false,
+                downloaded_size: 0,
+                error: None,
+                finished: false,
+                tx_cancel: tx,
+            },
+        );
+
+        let result = download_file(id.clone(), Some(new_path), None, Some(8));
+
+        assert!(result.is_err());
+        remove(&id);
+    }
+
+    #[test]
+    fn download_file_rejects_existing_url_with_different_auto_delete_duration() {
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-auto-delete-contract-test-{}",
+            std::process::id()
+        ));
+        let id = format!(
+            "https://example.com/rustdesk-auto-delete-contract-{}.exe",
+            std::process::id()
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(path.clone()),
+                total_size: Some(8),
+                signed_size: Some(8),
+                auto_del_dur: Some(Duration::from_secs(1)),
+                has_finish_handler: false,
+                downloaded_size: 0,
+                error: None,
+                finished: false,
+                tx_cancel: tx,
+            },
+        );
+
+        let result = download_file(id.clone(), Some(path), Some(Duration::from_secs(3)), Some(8));
+
+        assert!(result.is_err());
+        remove(&id);
+    }
+
+    #[test]
+    fn download_file_with_finish_handler_requires_path() {
+        let id = format!(
+            "https://example.com/rustdesk-finish-handler-no-path-{}.exe",
+            std::process::id()
+        );
+
+        let result =
+            download_file_with_finish_handler(id.clone(), None, None, Some(8), |_| unreachable!());
+
+        assert!(result.is_err());
+        assert!(get_download_data(&id).is_err());
+    }
+
+    #[test]
+    fn complete_existing_file_rejects_incomplete_existing_downloader() {
+        let final_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-incomplete-existing-test-{}.exe",
+            std::process::id()
+        ));
+        std::fs::write(&final_path, b"rustdesk").unwrap();
+        let id = format!(
+            "https://example.com/rustdesk-incomplete-{}.exe",
+            std::process::id()
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(final_path.clone()),
+                total_size: Some(8),
+                signed_size: Some(8),
+                auto_del_dur: None,
+                has_finish_handler: false,
+                downloaded_size: 0,
+                error: None,
+                finished: false,
+                tx_cancel: tx,
+            },
+        );
+
+        let result = complete_existing_file(id.clone(), final_path.clone(), 8, None);
+
+        assert!(result.is_err());
+        remove(&id);
+        std::fs::remove_file(final_path).unwrap();
+    }
+
+    #[test]
+    fn complete_existing_file_rejects_different_auto_delete_duration() {
+        let final_path = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-existing-auto-delete-test-{}.exe",
+            std::process::id()
+        ));
+        std::fs::write(&final_path, b"rustdesk").unwrap();
+        let id = format!(
+            "https://example.com/rustdesk-existing-auto-delete-{}.exe",
+            std::process::id()
+        );
+
+        complete_existing_file(
+            id.clone(),
+            final_path.clone(),
+            8,
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let result = complete_existing_file(
+            id.clone(),
+            final_path.clone(),
+            8,
+            Some(Duration::from_secs(3)),
+        );
+
+        assert!(result.is_err());
+        remove(&id);
+        std::fs::remove_file(final_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_existing_file_rejects_symlink() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-downloader-symlink-existing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let target_path = test_dir.join("target");
+        let link_path = test_dir.join("rustdesk-update.exe");
+        std::fs::write(&target_path, b"rustdesk").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+        let id = format!("https://example.com/rustdesk-symlink-{}.exe", std::process::id());
+
+        let result = complete_existing_file(id, link_path, 8, None);
+
+        assert!(result.is_err());
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn download_requests_ask_for_identity_encoding() {
+        let client = reqwest::Client::new();
+        let request = identity_encoded_request(client.get("https://example.com/file"))
+            .build()
+            .expect("request");
+
+        assert_eq!(
+            request.headers().get(reqwest::header::ACCEPT_ENCODING),
+            Some(&reqwest::header::HeaderValue::from_static("identity"))
+        );
+    }
 }

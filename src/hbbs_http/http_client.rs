@@ -9,6 +9,9 @@ use hbb_common::{
     },
 };
 use reqwest::{blocking::Client as SyncClient, Client as AsyncClient};
+use std::time::Duration;
+
+const TLS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 macro_rules! configure_http_client {
     ($builder:expr, $tls_type:expr, $danger_accept_invalid_cert:expr, $Client: ty) => {{
@@ -123,35 +126,100 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
 pub fn create_http_client_with_url(url: &str) -> SyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_type_cached = tls_type.is_some();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let tls_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let cached_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+        probe_config_from_cache(
+            get_cached_tls_type(tls_url),
+            cached_danger_accept_invalid_cert,
+            false,
+        );
     create_http_client_with_url_(
         url,
         tls_url,
         tls_type,
-        is_tls_type_cached,
-        tls_danger_accept_invalid_cert,
-        tls_danger_accept_invalid_cert,
+        can_reuse_cached_probe,
+        danger_accept_invalid_cert,
+        cached_danger_accept_invalid_cert,
+        false,
     )
+}
+
+fn probe_config_from_cache(
+    cached_tls_type: Option<TlsType>,
+    cached_danger_accept_invalid_cert: Option<bool>,
+    force_strict_tls: bool,
+) -> (TlsType, bool, Option<bool>) {
+    if force_strict_tls {
+        let can_reuse_cached_probe =
+            cached_tls_type.is_some() && cached_danger_accept_invalid_cert == Some(false);
+        let tls_type = if can_reuse_cached_probe {
+            cached_tls_type.unwrap_or(TlsType::Rustls)
+        } else {
+            TlsType::Rustls
+        };
+        (tls_type, can_reuse_cached_probe, Some(false))
+    } else {
+        let can_reuse_cached_probe =
+            cached_tls_type.is_some() && cached_danger_accept_invalid_cert.is_some();
+        let tls_type = cached_tls_type.unwrap_or(TlsType::Rustls);
+        (
+            tls_type,
+            can_reuse_cached_probe,
+            cached_danger_accept_invalid_cert,
+        )
+    }
+}
+
+pub fn create_http_client_with_url_strict(url: &str) -> SyncClient {
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(url, &proxy_conf);
+    let cached_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+        probe_config_from_cache(
+            get_cached_tls_type(tls_url),
+            cached_danger_accept_invalid_cert,
+            true,
+        );
+    create_http_client_with_url_(
+        url,
+        tls_url,
+        tls_type,
+        can_reuse_cached_probe,
+        danger_accept_invalid_cert,
+        cached_danger_accept_invalid_cert,
+        true,
+    )
+}
+
+fn next_danger_accept_invalid_cert(
+    current_danger_accept_invalid_cert: Option<bool>,
+    original_danger_accept_invalid_cert: Option<bool>,
+    force_strict_tls: bool,
+) -> Option<bool> {
+    if force_strict_tls && current_danger_accept_invalid_cert == Some(false) {
+        Some(false)
+    } else {
+        original_danger_accept_invalid_cert
+    }
 }
 
 fn create_http_client_with_url_(
     url: &str,
     tls_url: &str,
     tls_type: TlsType,
-    is_tls_type_cached: bool,
+    can_reuse_cached_probe: bool,
     danger_accept_invalid_cert: Option<bool>,
     original_danger_accept_invalid_cert: Option<bool>,
+    force_strict_tls: bool,
 ) -> SyncClient {
     let mut client = create_http_client(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
+    if can_reuse_cached_probe {
         return client;
     }
-    if let Err(e) = client.head(url).send() {
+    let send_result = client.head(url).timeout(TLS_PROBE_TIMEOUT).send();
+    if let Err(e) = send_result {
         if e.is_request() {
-            match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
+            match (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) {
                 (TlsType::Rustls, _, None) => {
                     log::warn!(
                         "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
@@ -162,9 +230,10 @@ fn create_http_client_with_url_(
                         url,
                         tls_url,
                         tls_type,
-                        is_tls_type_cached,
+                        can_reuse_cached_probe,
                         Some(true),
                         original_danger_accept_invalid_cert,
+                        force_strict_tls,
                     );
                 }
                 (TlsType::Rustls, false, Some(_)) => {
@@ -173,13 +242,19 @@ fn create_http_client_with_url_(
                         tls_url,
                         e
                     );
+                    let next_danger_accept_invalid_cert = next_danger_accept_invalid_cert(
+                        danger_accept_invalid_cert,
+                        original_danger_accept_invalid_cert,
+                        force_strict_tls,
+                    );
                     client = create_http_client_with_url_(
                         url,
                         tls_url,
                         TlsType::NativeTls,
-                        is_tls_type_cached,
-                        original_danger_accept_invalid_cert,
-                        original_danger_accept_invalid_cert,
+                        can_reuse_cached_probe,
+                        next_danger_accept_invalid_cert,
+                        next_danger_accept_invalid_cert,
+                        force_strict_tls,
                     );
                 }
                 (TlsType::NativeTls, _, None) => {
@@ -192,9 +267,10 @@ fn create_http_client_with_url_(
                         url,
                         tls_url,
                         tls_type,
-                        is_tls_type_cached,
+                        can_reuse_cached_probe,
                         Some(true),
                         original_danger_accept_invalid_cert,
+                        force_strict_tls,
                     );
                 }
                 _ => {
@@ -232,17 +308,43 @@ fn create_http_client_with_url_(
 pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_type_cached = tls_type.is_some();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let cached_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+        probe_config_from_cache(
+            get_cached_tls_type(tls_url),
+            cached_danger_accept_invalid_cert,
+            false,
+        );
     create_http_client_async_with_url_(
         url,
         tls_url,
         tls_type,
-        is_tls_type_cached,
+        can_reuse_cached_probe,
         danger_accept_invalid_cert,
+        cached_danger_accept_invalid_cert,
+        false,
+    )
+    .await
+}
+
+pub async fn create_http_client_async_with_url_strict(url: &str) -> AsyncClient {
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(url, &proxy_conf);
+    let cached_danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url);
+    let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+        probe_config_from_cache(
+            get_cached_tls_type(tls_url),
+            cached_danger_accept_invalid_cert,
+            true,
+        );
+    create_http_client_async_with_url_(
+        url,
+        tls_url,
+        tls_type,
+        can_reuse_cached_probe,
         danger_accept_invalid_cert,
+        cached_danger_accept_invalid_cert,
+        true,
     )
     .await
 }
@@ -252,17 +354,19 @@ async fn create_http_client_async_with_url_(
     url: &str,
     tls_url: &str,
     tls_type: TlsType,
-    is_tls_type_cached: bool,
+    can_reuse_cached_probe: bool,
     danger_accept_invalid_cert: Option<bool>,
     original_danger_accept_invalid_cert: Option<bool>,
+    force_strict_tls: bool,
 ) -> AsyncClient {
     let mut client =
         create_http_client_async(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
+    if can_reuse_cached_probe {
         return client;
     }
-    if let Err(e) = client.head(url).send().await {
-        match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
+    let send_result = client.head(url).timeout(TLS_PROBE_TIMEOUT).send().await;
+    if let Err(e) = send_result {
+        match (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) {
             (TlsType::Rustls, _, None) => {
                 log::warn!(
                     "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
@@ -273,9 +377,10 @@ async fn create_http_client_async_with_url_(
                     url,
                     tls_url,
                     tls_type,
-                    is_tls_type_cached,
+                    can_reuse_cached_probe,
                     Some(true),
                     original_danger_accept_invalid_cert,
+                    force_strict_tls,
                 )
                 .await;
             }
@@ -285,13 +390,19 @@ async fn create_http_client_async_with_url_(
                     tls_url,
                     e
                 );
+                let next_danger_accept_invalid_cert = next_danger_accept_invalid_cert(
+                    danger_accept_invalid_cert,
+                    original_danger_accept_invalid_cert,
+                    force_strict_tls,
+                );
                 client = create_http_client_async_with_url_(
                     url,
                     tls_url,
                     TlsType::NativeTls,
-                    is_tls_type_cached,
-                    original_danger_accept_invalid_cert,
-                    original_danger_accept_invalid_cert,
+                    can_reuse_cached_probe,
+                    next_danger_accept_invalid_cert,
+                    next_danger_accept_invalid_cert,
+                    force_strict_tls,
                 )
                 .await;
             }
@@ -305,9 +416,10 @@ async fn create_http_client_async_with_url_(
                     url,
                     tls_url,
                     tls_type,
-                    is_tls_type_cached,
+                    can_reuse_cached_probe,
                     Some(true),
                     original_danger_accept_invalid_cert,
+                    force_strict_tls,
                 )
                 .await;
             }
@@ -333,4 +445,29 @@ async fn create_http_client_async_with_url_(
         );
     }
     client
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_tls_ignores_cached_tls_type_when_policy_changes() {
+        let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+            probe_config_from_cache(Some(TlsType::NativeTls), Some(true), true);
+
+        assert!(matches!(tls_type, TlsType::Rustls));
+        assert!(!can_reuse_cached_probe);
+        assert_eq!(danger_accept_invalid_cert, Some(false));
+    }
+
+    #[test]
+    fn cached_tls_type_is_reused_when_policy_matches() {
+        let (tls_type, can_reuse_cached_probe, danger_accept_invalid_cert) =
+            probe_config_from_cache(Some(TlsType::NativeTls), Some(false), true);
+
+        assert!(matches!(tls_type, TlsType::NativeTls));
+        assert!(can_reuse_cached_probe);
+        assert_eq!(danger_accept_invalid_cert, Some(false));
+    }
 }
