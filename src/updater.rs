@@ -168,7 +168,6 @@ fn check_update(manually: bool) -> ResultType<()> {
         update_trace("check_update skipped because auto update is disabled and request is not manual");
         return Ok(());
     }
-    do_check_software_update()?;
 
     let update_url = current_software_update_url()?;
     update_trace(format!("resolved software update url: {}", update_url));
