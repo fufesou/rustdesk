@@ -758,5 +758,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("wayland-keyboard-input-reset-choice-tip", "אפס את בחירת קלט המקלדת"),
         ("remember-wayland-keyboard-choice-tip", "אל תשאל שוב עבור מחשב מרוחק זה"),
         ("Why this happens", "מדוע זה קורה"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }
