@@ -299,8 +299,8 @@ jobs:
           ARCH: ${{ matrix.job.arch }}
         run: |
           python3 -m pip install cryptography
-          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.exe" --platform windows --arch x86_64 --format exe --fragment-out ./fragments/windows-flutter-x86_64-exe.json
-          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.msi" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.msi" --platform windows --arch x86_64 --format msi --fragment-out ./fragments/windows-flutter-x86_64-msi.json
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.exe" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.exe" --platform windows --arch x86_64 --format exe --github-repository "${GITHUB_REPOSITORY}" --fragment-out ./fragments/windows-flutter-x86_64-exe.json
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}.msi" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.msi" --platform windows --arch x86_64 --format msi --github-repository "${GITHUB_REPOSITORY}" --fragment-out ./fragments/windows-flutter-x86_64-msi.json
 
       - name: Upload Windows Flutter EXE fragment
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
@@ -492,7 +492,7 @@ jobs:
           ARCH: ${{ matrix.job.arch }}
         run: |
           python3 -m pip install cryptography
-          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}-sciter.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}-sciter.exe" --platform windows --arch x86 --format exe --fragment-out ./fragments/windows-sciter-x86-exe.json
+          python3 res/generate_update_metadata.py fragment --artifact "./SignOutput/rustdesk-${VERSION}-${ARCH}-sciter.exe" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}-sciter.exe" --platform windows --arch x86 --format exe --github-repository "${GITHUB_REPOSITORY}" --fragment-out ./fragments/windows-sciter-x86-exe.json
 
       - name: Upload Windows Sciter EXE fragment
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
@@ -866,7 +866,7 @@ jobs:
           ARCH: ${{ matrix.job.arch }}
         run: |
           python3 -m pip install cryptography
-          python3 res/generate_update_metadata.py fragment --artifact "./rustdesk-${VERSION}-${ARCH}.dmg" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.dmg" --platform macos --arch "$ARCH" --format dmg --fragment-out "./fragments/macos-${ARCH}-dmg.json"
+          python3 res/generate_update_metadata.py fragment --artifact "./rustdesk-${VERSION}-${ARCH}.dmg" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-${ARCH}.dmg" --platform macos --arch "$ARCH" --format dmg --github-repository "${GITHUB_REPOSITORY}" --fragment-out "./fragments/macos-${ARCH}-dmg.json"
 
       - name: Upload macOS DMG fragment
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.UPDATE_METADATA_SIGNING_ENABLED == 'true'
@@ -1019,7 +1019,7 @@ jobs:
           TAG_NAME: ${{ env.TAG_NAME }}
           RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ secrets.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
         run: |
-          python res/generate_update_metadata.py verify --metadata ./rustdesk-update.json --signature ./rustdesk-update.json.sig --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main
+          python res/generate_update_metadata.py verify --metadata ./rustdesk-update.json --signature ./rustdesk-update.json.sig --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main --github-repository "${GITHUB_REPOSITORY}"
 
       - name: Publish signed update release
         uses: softprops/action-gh-release@v1

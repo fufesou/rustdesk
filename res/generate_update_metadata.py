@@ -14,7 +14,7 @@ APP_NAME = "rustdesk"
 SCHEMA_VERSION = 1
 SIGNATURE_ALGORITHM = "ed25519"
 SIGNATURE_CONTEXT = b"RustDesk update metadata v1\n"
-GITHUB_RELEASE_PREFIX = "https://github.com/rustdesk/rustdesk/releases/download"
+DEFAULT_GITHUB_REPOSITORY = "rustdesk/rustdesk"
 def fail(message):
     raise SystemExit(message)
 def read_json(path):
@@ -44,14 +44,27 @@ def display_version_from_release_id(release_id):
     if not match:
         return None
     return match.group(1)
-def parse_artifact_url(url):
+def validate_github_repository(github_repository):
+    parts = github_repository.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        fail(f"GitHub repository must use owner/name format: {github_repository}")
+    for part in parts:
+        if unquote(part) != part:
+            fail(f"GitHub repository must not require URL decoding: {github_repository}")
+        if any(char in part for char in (" ", "\\", "?", "#")):
+            fail(f"invalid GitHub repository: {github_repository}")
+    return parts
+def github_release_prefix(github_repository):
+    return f"https://github.com/{github_repository}/releases/download"
+def parse_artifact_url(url, github_repository):
+    owner, repo = validate_github_repository(github_repository)
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.netloc != "github.com":
         fail(f"artifact URL must use GitHub HTTPS: {url}")
     if parsed.query or parsed.fragment:
         fail(f"artifact URL must not contain query or fragment: {url}")
     parts = [part for part in parsed.path.split("/") if part]
-    expected_prefix = ["rustdesk", "rustdesk", "releases", "download"]
+    expected_prefix = [owner, repo, "releases", "download"]
     if len(parts) != 6 or parts[:4] != expected_prefix:
         fail(f"artifact URL must be a RustDesk release asset URL: {url}")
     release_id = parts[4]
@@ -62,8 +75,8 @@ def parse_artifact_url(url):
     if unquote(file_name) != file_name:
         fail(f"artifact URL file name must not require URL decoding: {url}")
     return release_id, file_name
-def expected_artifact_url(release_id, file_name):
-    return f"{GITHUB_RELEASE_PREFIX}/{release_id}/{file_name}"
+def expected_artifact_url(release_id, file_name, github_repository):
+    return f"{github_release_prefix(github_repository)}/{release_id}/{file_name}"
 def load_seed_from_env(env_name):
     encoded = os.environ.get(env_name)
     if not encoded:
@@ -109,15 +122,15 @@ def validate_fragment(fragment):
         fail("fragment size must be a non-negative integer")
     if not re.fullmatch(r"[0-9a-f]{64}", fragment["sha256"]):
         fail("fragment sha256 must be 64 lowercase hex characters")
-def validate_fragment_url(fragment):
-    release_id, file_name = parse_artifact_url(fragment["url"])
+def validate_fragment_url(fragment, github_repository):
+    release_id, file_name = parse_artifact_url(fragment["url"], github_repository)
     if fragment["file_name"] != file_name:
         fail("fragment URL basename does not match file_name")
     return release_id
 def command_fragment(args):
     artifact_path = Path(args.artifact)
     artifact_bytes = artifact_path.read_bytes()
-    release_id, url_file_name = parse_artifact_url(args.artifact_url)
+    release_id, url_file_name = parse_artifact_url(args.artifact_url, args.github_repository)
     if artifact_path.name != url_file_name:
         fail("artifact URL basename must match artifact file name")
     validate_release_id(release_id)
@@ -204,9 +217,9 @@ def command_verify(args):
         fail("local artifact set does not match metadata artifact set")
     for artifact in artifacts:
         validate_fragment(artifact)
-        validate_fragment_url(artifact)
+        validate_fragment_url(artifact, args.github_repository)
         file_name = artifact["file_name"]
-        expected_url = expected_artifact_url(args.release_id, file_name)
+        expected_url = expected_artifact_url(args.release_id, file_name, args.github_repository)
         if artifact["url"] != expected_url:
             fail(f"artifact URL mismatch for {file_name}")
         local_path = local_artifacts[file_name]
@@ -235,6 +248,7 @@ def build_parser():
     fragment.add_argument("--platform", required=True)
     fragment.add_argument("--arch", required=True)
     fragment.add_argument("--format", required=True)
+    fragment.add_argument("--github-repository", default=DEFAULT_GITHUB_REPOSITORY)
     fragment.add_argument("--fragment-out", required=True)
     fragment.set_defaults(func=command_fragment)
     sign = subparsers.add_parser("sign", help="Sign release metadata")
@@ -257,6 +271,7 @@ def build_parser():
     verify.add_argument("--release-id", required=True)
     verify.add_argument("--trusted-public-key-base64", required=True)
     verify.add_argument("--trusted-public-key-id", required=True)
+    verify.add_argument("--github-repository", default=DEFAULT_GITHUB_REPOSITORY)
     verify.set_defaults(func=command_verify)
     check_version = subparsers.add_parser("check-version", help="Validate tag/version consistency")
     check_version.add_argument("--version", required=True)

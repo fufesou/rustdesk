@@ -11,6 +11,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 SCRIPT = Path(__file__).with_name("generate_update_metadata.py")
 GITHUB_RELEASE = "https://github.com/rustdesk/rustdesk/releases/download"
+FORK_GITHUB_REPOSITORY = "fufesou/rustdesk"
+FORK_GITHUB_RELEASE = f"https://github.com/{FORK_GITHUB_REPOSITORY}/releases/download"
 class GenerateUpdateMetadataTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -106,7 +108,7 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         )
         self.run_script(*args, env={"RUSTDESK_UPDATE_ED25519_SEED": self.seed_b64})
         return metadata, signature
-    def verify_release(self, metadata, signature, artifacts, version="1.4.6", release_id="v1.4.6", public_key=None, key_id="test-ed25519-main", check=True):
+    def verify_release(self, metadata, signature, artifacts, version="1.4.6", release_id="v1.4.6", public_key=None, key_id="test-ed25519-main", github_repository=None, check=True):
         args = [
             "verify",
             "--metadata",
@@ -124,6 +126,8 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
             "--trusted-public-key-id",
             key_id,
         ]
+        if github_repository:
+            args.extend(["--github-repository", github_repository])
         for artifact in artifacts:
             args.extend(["--artifact", str(artifact)])
         return self.run_script(*args, check=check)
@@ -136,6 +140,39 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         self.assertEqual(data["platform"], "windows")
         self.assertEqual(data["arch"], "x86_64")
         self.assertEqual(data["format"], "exe")
+    def test_fragment_and_verify_accept_configured_github_repository(self):
+        artifact = self.write_artifact("rustdesk-1.4.6-x86_64.exe")
+        fragment = self.fragment_path("fork.json")
+        self.run_script(
+            "fragment",
+            "--artifact",
+            str(artifact),
+            "--artifact-url",
+            f"{FORK_GITHUB_RELEASE}/fix-update-metadata/{artifact.name}",
+            "--platform",
+            "windows",
+            "--arch",
+            "x86_64",
+            "--format",
+            "exe",
+            "--github-repository",
+            FORK_GITHUB_REPOSITORY,
+            "--fragment-out",
+            str(fragment),
+        )
+        metadata, signature = self.sign_fragments([fragment], release_id="fix-update-metadata")
+        self.verify_release(
+            metadata,
+            signature,
+            [artifact],
+            release_id="fix-update-metadata",
+            github_repository=FORK_GITHUB_REPOSITORY,
+        )
+        data = json.loads(fragment.read_text(encoding="utf-8"))
+        self.assertEqual(
+            data["url"],
+            f"{FORK_GITHUB_RELEASE}/fix-update-metadata/{artifact.name}",
+        )
     def test_sign_sorts_fragments_and_outputs_base64_signature(self):
         _, mac_fragment = self.make_fragment(
             "rustdesk-1.4.6-aarch64.dmg",
