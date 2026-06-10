@@ -1,8 +1,7 @@
 use crate::{
     common::{
-        display_version_from_release_id, do_check_software_update, release_download_base_url,
-        release_id_from_update_url, release_metadata_url, release_signature_url,
-        url_has_explicit_port,
+        display_version_from_release_id, release_download_base_url, release_id_from_update_url,
+        release_metadata_url, release_signature_url, url_has_explicit_port,
     },
     hbbs_http::create_http_client_with_url_strict,
 };
@@ -41,6 +40,29 @@ const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 const UPDATE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_METADATA_SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
+const UPDATE_TRACE_PREFIX: &str = "========================";
+
+fn update_trace(message: impl AsRef<str>) {
+    log::info!("{} {}", UPDATE_TRACE_PREFIX, message.as_ref());
+}
+
+fn update_trace_warn(message: impl AsRef<str>) {
+    log::warn!("{} {}", UPDATE_TRACE_PREFIX, message.as_ref());
+}
+
+fn update_trace_error(message: impl AsRef<str>) {
+    log::error!("{} {}", UPDATE_TRACE_PREFIX, message.as_ref());
+}
+
+fn describe_update_query(query: &UpdateArtifactQuery<'_>) -> String {
+    format!(
+        "platform={}, arch={}, format={}, file_name={}",
+        query.platform,
+        query.arch,
+        query.format,
+        query.file_name.unwrap_or("<none>")
+    )
+}
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
@@ -140,49 +162,92 @@ fn check_update(manually: bool) -> ResultType<()> {
     let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
     #[cfg(not(target_os = "windows"))]
     let update_msi = false;
-    if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
+    let allow_auto_update = config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE);
+    update_trace(format!(
+        "check_update start: manually={}, allow_auto_update={}, update_msi={}",
+        manually, allow_auto_update, update_msi
+    ));
+    if !(manually || allow_auto_update) {
+        update_trace(
+            "check_update skipped because auto update is disabled and request is not manual",
+        );
         return Ok(());
     }
-    do_check_software_update()?;
+    crate::common::set_fixed_test_software_update_url()?;
 
     let update_url = current_software_update_url()?;
+    update_trace(format!("resolved software update url: {}", update_url));
     if update_url.is_empty() {
-        log::debug!("No update available.");
-    } else {
-        let update_format = current_update_format(update_msi);
-        if update_format == "unknown" {
-            log::debug!("Automatic update is not supported on this platform.");
-            return Ok(());
-        }
-        #[cfg(target_os = "macos")]
-        if !manually {
-            log::debug!("Background auto-install is not supported on macOS.");
-            return Ok(());
-        }
-        let query = UpdateArtifactQuery {
-            platform: current_update_platform(),
-            arch: current_update_arch(),
-            format: update_format,
-            file_name: None,
-        };
-        let artifact = verified_update_artifact_from_release_page_url(&update_url, &query)?;
-        let download_url = artifact.url.as_str();
-        let version = artifact.version.as_str();
+        update_trace("no update available after discovery");
+        return Ok(());
+    }
+    let update_format = current_update_format(update_msi);
+    if update_format == "unknown" {
+        update_trace("automatic update is not supported on this platform");
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if !manually {
+        update_trace("background auto-install is not supported on macOS");
+        return Ok(());
+    }
+    let query = UpdateArtifactQuery {
+        platform: current_update_platform(),
+        arch: current_update_arch(),
+        format: update_format,
+        file_name: None,
+    };
+    install_available_update(&update_url, update_msi, query)
+}
+
+fn install_available_update(
+    update_url: &str,
+    update_msi: bool,
+    query: UpdateArtifactQuery<'_>,
+) -> ResultType<()> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = update_msi;
+    update_trace(format!(
+        "selecting verified update artifact with query: {}",
+        describe_update_query(&query)
+    ));
+    let artifact = verified_update_artifact_from_release_page_url(update_url, &query)?;
+    let download_url = artifact.url.as_str();
+    update_trace(format!(
+        "verified update artifact selected: version={}, release_id={}, file_name={}, size={}, sha256={}, url={}",
+        artifact.version, artifact.release_id, artifact.file_name, artifact.size, artifact.sha256, artifact.url
+    ));
+    #[cfg(target_os = "windows")]
+    log::debug!("New version available: {}", artifact.version);
+    let file_path = verified_update_download_path(download_url)?;
+    ensure_verified_update_artifact(download_url, &file_path, artifact.size, &artifact.sha256)?;
+    update_trace(format!(
+        "verified update artifact is ready on disk: {}",
+        file_path.display()
+    ));
+    if has_no_active_conns() {
+        update_trace("no active connections, proceeding to launch updater");
         #[cfg(target_os = "windows")]
-        log::debug!("New version available: {}", &version);
-        let Some(file_path) = get_download_file_from_url(download_url) else {
-            bail!("Failed to get the file path from the URL: {}", download_url);
-        };
-        ensure_verified_update_artifact(download_url, &file_path, artifact.size, &artifact.sha256)?;
-        // We have checked if the `conns` is empty before, but we need to check again.
-        // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
-        // before the download, but not empty after the download.
-        if has_no_active_conns() {
-            #[cfg(target_os = "windows")]
-            update_new_version(update_msi, version, &file_path, &artifact.sha256);
-        }
+        update_new_version(update_msi, &artifact.version, &file_path, &artifact.sha256);
+    } else {
+        update_trace_warn("skipping updater launch because active connections still exist");
     }
     Ok(())
+}
+
+fn verified_update_download_path(download_url: &str) -> ResultType<PathBuf> {
+    let Some(file_path) = get_download_file_from_url(download_url) else {
+        update_trace_error(format!(
+            "failed to derive local download path from url: {}",
+            download_url
+        ));
+        bail!("Failed to get the file path from the URL: {}", download_url);
+    };
+    update_trace(format!(
+        "resolved local download path: {}",
+        file_path.display()
+    ));
+    Ok(file_path)
 }
 
 fn current_software_update_url() -> ResultType<String> {
@@ -291,6 +356,11 @@ fn verified_update_artifact_for_download_url_with_query(
     download_url: &str,
     query: UpdateArtifactQuery<'_>,
 ) -> ResultType<VerifiedUpdateArtifact> {
+    update_trace(format!(
+        "verifying requested download url: {}, query={}",
+        download_url,
+        describe_update_query(&query)
+    ));
     if let Some(artifact) = get_cached_verified_update_artifact(download_url, &query) {
         if query
             .file_name
@@ -306,13 +376,25 @@ fn verified_update_artifact_for_download_url_with_query(
     }
     let download = parse_rustdesk_release_download_url(download_url)?;
     let release_page_url = format!(
-        "https://github.com/rustdesk/rustdesk/releases/tag/{}",
-        download.release_id
+        "https://github.com/{}/{}/releases/tag/{}",
+        download.owner, download.repo, download.release_id
     );
+    update_trace(format!(
+        "derived release page url from download url: {}",
+        release_page_url
+    ));
     let artifact = verified_update_artifact_from_release_page_url(&release_page_url, &query)?;
     if artifact.url != download_url {
+        update_trace_error(format!(
+            "verified artifact url mismatch: requested={}, verified={}",
+            download_url, artifact.url
+        ));
         bail!("update artifact URL does not match requested download URL");
     }
+    update_trace(format!(
+        "download url verification succeeded for file: {}",
+        artifact.file_name
+    ));
     cache_verified_update_artifact(&artifact);
     Ok(artifact)
 }
@@ -326,6 +408,10 @@ fn verified_update_artifact_from_release_page_url(
     let expected_artifact_url_prefix = release_download_base_url(update_url)?;
     let metadata_url = release_metadata_url(update_url)?;
     let signature_url = release_signature_url(update_url)?;
+    update_trace(format!(
+        "fetching update metadata sidecars: metadata_url={}, signature_url={}",
+        metadata_url, signature_url
+    ));
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
     let signature_bytes = fetch_update_sidecar_bytes(&signature_url)?;
     verify_update_metadata_bytes(
@@ -346,6 +432,15 @@ fn verify_update_metadata_bytes(
     expected_artifact_url_prefix: &str,
     query: &UpdateArtifactQuery<'_>,
 ) -> ResultType<VerifiedUpdateArtifact> {
+    update_trace(format!(
+        "verifying update metadata bytes: display_version={}, release_id={}, query={}, metadata_bytes={}, signature_bytes={}, expected_artifact_url_prefix={}",
+        display_version,
+        release_id,
+        describe_update_query(query),
+        metadata_bytes.len(),
+        signature_bytes.len(),
+        expected_artifact_url_prefix
+    ));
     let policy = UpdateMetadataPolicy {
         app: "rustdesk",
         allowed_package_ids: &["rustdesk"],
@@ -353,15 +448,30 @@ fn verify_update_metadata_bytes(
         expected_release_id: Some(release_id),
         expected_artifact_url_prefix: Some(expected_artifact_url_prefix),
     };
-    hbb_common::update_metadata::verify_update_metadata(
+    let result = hbb_common::update_metadata::verify_update_metadata(
         metadata_bytes,
         signature_bytes,
         &policy,
         query,
-    )
+    );
+    match &result {
+        Ok(artifact) => update_trace(format!(
+            "update metadata verification succeeded: file_name={}, url={}, size={}, sha256={}",
+            artifact.file_name, artifact.url, artifact.size, artifact.sha256
+        )),
+        Err(err) => update_trace_error(format!(
+            "update metadata verification failed for release_id={}, query={}: {}",
+            release_id,
+            describe_update_query(query),
+            err
+        )),
+    }
+    result
 }
 
 struct ReleaseDownloadUrl {
+    owner: String,
+    repo: String,
     release_id: String,
     file_name: String,
 }
@@ -394,19 +504,35 @@ fn parse_rustdesk_release_download_url(download_url: &str) -> ResultType<Release
         bail!("Update download URL has no path: {}", download_url);
     };
     let segments = segments.collect::<Vec<_>>();
-    let (release_id, file_name) = match segments.as_slice() {
-        ["rustdesk", "rustdesk", "releases", "download", release_id, file_name] => {
-            (*release_id, *file_name)
+    release_download_url_from_segments(&segments, download_url)
+}
+
+fn release_download_url_from_segments(
+    segments: &[&str],
+    download_url: &str,
+) -> ResultType<ReleaseDownloadUrl> {
+    let (owner, repo, release_id, file_name) = match segments {
+        [owner @ "rustdesk", repo @ "rustdesk", "releases", "download", release_id, file_name]
+        | [owner @ "fufesou", repo @ "rustdesk", "releases", "download", release_id, file_name] => {
+            (*owner, *repo, *release_id, *file_name)
         }
         _ => bail!(
             "Update download URL is not a RustDesk release download URL: {}",
             download_url
         ),
     };
-    if release_id.is_empty() || file_name.is_empty() {
-        bail!("Update download URL has empty release id or file name");
+    if release_id.is_empty() || file_name.is_empty() || owner.is_empty() || repo.is_empty() {
+        bail!("Update download URL has empty owner, repo, release id or file name");
+    }
+    if owner == "fufesou" && release_id != crate::common::FIXED_TEST_UPDATE_RELEASE_ID {
+        bail!(
+            "Update download URL is not the fixed test release: {}",
+            download_url
+        );
     }
     Ok(ReleaseDownloadUrl {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
         release_id: release_id.to_owned(),
         file_name: file_name.to_owned(),
     })
@@ -461,22 +587,34 @@ fn read_limited_response_bytes<R: Read>(
 }
 
 fn fetch_update_sidecar_bytes(url: &str) -> ResultType<Vec<u8>> {
+    update_trace(format!("fetch_update_sidecar_bytes start: {}", url));
     let client = create_http_client_with_url_strict(url);
     let mut response = client
         .get(url)
         .timeout(UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT)
         .send()?;
     if !response.status().is_success() {
+        update_trace_error(format!(
+            "fetch_update_sidecar_bytes failed: url={}, status={}",
+            url,
+            response.status()
+        ));
         bail!(
             "Failed to download update metadata sidecar: {}",
             response.status()
         );
     }
-    read_limited_response_bytes(
+    let bytes = read_limited_response_bytes(
         &mut response,
         UPDATE_METADATA_SIDECAR_MAX_BYTES,
         "Update metadata sidecar",
-    )
+    )?;
+    update_trace(format!(
+        "fetch_update_sidecar_bytes success: url={}, bytes={}",
+        url,
+        bytes.len()
+    ));
+    Ok(bytes)
 }
 
 pub fn verify_existing_update_artifact(
@@ -509,47 +647,119 @@ fn ensure_verified_update_artifact(
     expected_size: u64,
     expected_sha256: &str,
 ) -> ResultType<()> {
-    let mut is_file_exists = false;
-    if let Some(file_size) = cached_update_artifact_size(file_path)? {
-        if file_size == expected_size {
-            match verify_file_sha256(file_path, expected_sha256) {
-                Ok(()) => is_file_exists = true,
-                Err(e) => {
-                    log::warn!("Removing cached update file with invalid SHA256: {}", e);
-                    remove_cached_update_artifact(file_path)?;
-                }
-            }
-        } else {
-            log::warn!(
-                "Removing cached update file with size mismatch for {}: expected {}, got {}",
-                file_path.display(),
-                expected_size,
-                file_size
-            );
-            remove_cached_update_artifact(file_path)?;
-        }
+    update_trace(format!(
+        "ensure_verified_update_artifact start: download_url={}, file_path={}, expected_size={}, expected_sha256={}",
+        download_url,
+        file_path.display(),
+        expected_size,
+        expected_sha256
+    ));
+    if !verify_cached_update_artifact(file_path, expected_size, expected_sha256)? {
+        download_update_artifact(download_url, file_path, expected_size, expected_sha256)?;
     }
-    if !is_file_exists {
-        let client = create_http_client_with_url_strict(download_url);
-        let response = client
-            .get(download_url)
-            .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
-            .send()?;
-        if !response.status().is_success() {
-            bail!(
-                "Failed to download the new version file: {}",
-                response.status()
-            );
-        }
-        let mut limited_response = response.take(expected_size.saturating_add(1));
-        write_verified_update_artifact(
-            file_path,
-            &mut limited_response,
-            expected_size,
-            expected_sha256,
-        )?;
-    }
+    update_trace(format!(
+        "ensure_verified_update_artifact success: file_path={}",
+        file_path.display()
+    ));
     Ok(())
+}
+
+fn verify_cached_update_artifact(
+    file_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> ResultType<bool> {
+    let Some(file_size) = cached_update_artifact_size(file_path)? else {
+        return Ok(false);
+    };
+    update_trace(format!(
+        "cached update artifact found: path={}, actual_size={}",
+        file_path.display(),
+        file_size
+    ));
+    if file_size != expected_size {
+        remove_cached_update_artifact_with_size_mismatch(file_path, expected_size, file_size)?;
+        return Ok(false);
+    }
+    match verify_file_sha256(file_path, expected_sha256) {
+        Ok(()) => {
+            update_trace(format!(
+                "cached update artifact sha256 verified, reusing file: {}",
+                file_path.display()
+            ));
+            Ok(true)
+        }
+        Err(e) => {
+            update_trace_warn(format!(
+                "removing cached update artifact due to sha256 mismatch: path={}, err={}",
+                file_path.display(),
+                e
+            ));
+            log::warn!("Removing cached update file with invalid SHA256: {}", e);
+            remove_cached_update_artifact(file_path)?;
+            Ok(false)
+        }
+    }
+}
+
+fn remove_cached_update_artifact_with_size_mismatch(
+    file_path: &Path,
+    expected_size: u64,
+    file_size: u64,
+) -> ResultType<()> {
+    update_trace_warn(format!(
+        "removing cached update artifact due to size mismatch: path={}, expected_size={}, actual_size={}",
+        file_path.display(),
+        expected_size,
+        file_size
+    ));
+    log::warn!(
+        "Removing cached update file with size mismatch for {}: expected {}, got {}",
+        file_path.display(),
+        expected_size,
+        file_size
+    );
+    remove_cached_update_artifact(file_path)
+}
+
+fn download_update_artifact(
+    download_url: &str,
+    file_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> ResultType<()> {
+    update_trace(format!(
+        "downloading update artifact: download_url={}",
+        download_url
+    ));
+    let client = create_http_client_with_url_strict(download_url);
+    let response = client
+        .get(download_url)
+        .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
+        .send()?;
+    if !response.status().is_success() {
+        update_trace_error(format!(
+            "update artifact download failed: download_url={}, status={}",
+            download_url,
+            response.status()
+        ));
+        bail!(
+            "Failed to download the new version file: {}",
+            response.status()
+        );
+    }
+    update_trace(format!(
+        "update artifact download response ok: download_url={}, status={}",
+        download_url,
+        response.status()
+    ));
+    let mut limited_response = response.take(expected_size.saturating_add(1));
+    write_verified_update_artifact(
+        file_path,
+        &mut limited_response,
+        expected_size,
+        expected_sha256,
+    )
 }
 
 fn cached_update_artifact_size(file_path: &Path) -> ResultType<Option<u64>> {
@@ -592,10 +802,18 @@ fn verified_update_path(
     kind: &str,
     file_path: &Path,
 ) -> Option<(crate::platform::VerifiedUpdateFile, String)> {
+    update_trace(format!(
+        "verified_update_path start: source_path={}, kind={}, expected_sha256={}",
+        p, kind, expected_sha256
+    ));
     let update_file = match crate::platform::copy_and_verify_update_file_sha256(p, expected_sha256)
     {
         Ok(update_file) => update_file,
         Err(e) => {
+            update_trace_error(format!(
+                "verified_update_path failed verification: source_path={}, kind={}, err={}",
+                p, kind, e
+            ));
             log::error!("Refusing to update from invalid {}: {}", kind, e);
             std::fs::remove_file(file_path).ok();
             return None;
@@ -604,117 +822,253 @@ fn verified_update_path(
     let update_path = match update_file.path_str() {
         Ok(path) => path.to_owned(),
         Err(e) => {
+            update_trace_error(format!(
+                "verified_update_path failed to read verified path: source_path={}, kind={}, err={}",
+                p, kind, e
+            ));
             log::error!("Failed to get verified {} path: {}", kind, e);
             std::fs::remove_file(file_path).ok();
             return None;
         }
     };
+    update_trace(format!(
+        "verified_update_path success: kind={}, source_path={}, verified_path={}",
+        kind, p, update_path
+    ));
     Some((update_file, update_path))
 }
 
 #[cfg(target_os = "windows")]
 fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expected_sha256: &str) {
+    update_trace(format!(
+        "update_new_version start: update_msi={}, version={}, file_path={}, expected_sha256={}",
+        update_msi,
+        version,
+        file_path.display(),
+        expected_sha256
+    ));
     log::debug!(
         "New version is downloaded, update begin, update msi: {update_msi}, version: {version}, file: {:?}",
         file_path.to_str()
     );
     if let Some(p) = file_path.to_str() {
         if let Some(session_id) = crate::platform::get_current_process_session_id() {
-            if update_msi {
-                let Some((_update_file, update_path)) =
-                    verified_update_path(p, expected_sha256, "msi", file_path)
-                else {
-                    return;
-                };
-                match crate::platform::update_me_msi(&update_path, true) {
-                    Ok(_) => {
-                        log::debug!("New version \"{}\" updated.", version);
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to install the new msi version  \"{}\": {}",
-                            version,
-                            e
-                        );
-                        std::fs::remove_file(&file_path).ok();
-                    }
-                }
-            } else {
-                let Some((_update_file, update_path)) =
-                    verified_update_path(p, expected_sha256, "exe", file_path)
-                else {
-                    return;
-                };
-                let custom_client_staging_dir = if crate::is_custom_client() {
-                    let custom_client_staging_dir =
-                        crate::platform::get_custom_client_staging_dir();
-                    if let Err(e) = crate::platform::handle_custom_client_staging_dir_before_update(
-                        &custom_client_staging_dir,
-                    ) {
-                        log::error!(
-                            "Failed to handle custom client staging dir before update: {}",
-                            e
-                        );
-                        std::fs::remove_file(&file_path).ok();
-                        return;
-                    }
-                    Some(custom_client_staging_dir)
-                } else {
-                    // Clean up any residual staging directory from previous custom client
-                    let staging_dir = crate::platform::get_custom_client_staging_dir();
-                    hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
-                        &staging_dir
-                    ));
-                    None
-                };
-                let update_launched = match crate::platform::launch_privileged_process(
-                    session_id,
-                    &format!(
-                        "\"{}\" --update {}",
-                        update_path,
-                        crate::platform::UPDATE_SINGLE_EXE_ARG
-                    ),
-                ) {
-                    Ok(h) => {
-                        if h.is_null() {
-                            log::error!("Failed to update to the new version: {}", version);
-                            false
-                        } else {
-                            log::debug!("New version \"{}\" is launched.", version);
-                            unsafe {
-                                winapi::um::handleapi::CloseHandle(h);
-                            }
-                            true
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to run the new version: {}", e);
-                        false
-                    }
-                };
-                if !update_launched {
-                    if let Some(dir) = custom_client_staging_dir {
-                        hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
-                            &dir
-                        ));
-                    }
-                    std::fs::remove_file(&file_path).ok();
-                }
-            }
+            update_new_version_in_session(
+                update_msi,
+                version,
+                file_path,
+                expected_sha256,
+                p,
+                session_id,
+            );
         } else {
+            update_trace_error(format!(
+                "update_new_version failed to resolve current process session id for source_path={}",
+                file_path.display()
+            ));
             log::error!(
                 "Failed to get the current process session id, Error {}",
                 std::io::Error::last_os_error()
             );
-            std::fs::remove_file(&file_path).ok();
+            std::fs::remove_file(file_path).ok();
         }
     } else {
-        // unreachable!()
+        update_trace_error(format!(
+            "update_new_version failed to convert source path to string: {}",
+            file_path.display()
+        ));
         log::error!(
             "Failed to convert the file path to string: {}",
             file_path.display()
         );
     }
+}
+
+#[cfg(target_os = "windows")]
+fn update_new_version_in_session(
+    update_msi: bool,
+    version: &str,
+    file_path: &PathBuf,
+    expected_sha256: &str,
+    source_path: &str,
+    session_id: u32,
+) {
+    update_trace(format!(
+        "update_new_version resolved session id: session_id={}, update_msi={}, source_path={}",
+        session_id, update_msi, source_path
+    ));
+    if update_msi {
+        update_new_msi_version(version, file_path, expected_sha256, source_path);
+    } else {
+        update_new_exe_version(version, file_path, expected_sha256, source_path, session_id);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn update_new_msi_version(
+    version: &str,
+    file_path: &PathBuf,
+    expected_sha256: &str,
+    source_path: &str,
+) {
+    update_trace(format!(
+        "update_new_version verifying msi before launch: source_path={}",
+        source_path
+    ));
+    let Some((_update_file, update_path)) =
+        verified_update_path(source_path, expected_sha256, "msi", file_path)
+    else {
+        return;
+    };
+    update_trace(format!(
+        "update_new_version launching msi installer: verified_path={}",
+        update_path
+    ));
+    match crate::platform::update_me_msi(&update_path, true) {
+        Ok(_) => {
+            update_trace(format!(
+                "update_new_version msi launch succeeded: version={}, verified_path={}",
+                version, update_path
+            ));
+            log::debug!("New version \"{}\" updated.", version);
+        }
+        Err(e) => {
+            update_trace_error(format!(
+                "update_new_version msi launch failed: version={}, verified_path={}, err={}",
+                version, update_path, e
+            ));
+            log::error!(
+                "Failed to install the new msi version  \"{}\": {}",
+                version,
+                e
+            );
+            std::fs::remove_file(file_path).ok();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn update_new_exe_version(
+    version: &str,
+    file_path: &PathBuf,
+    expected_sha256: &str,
+    source_path: &str,
+    session_id: u32,
+) {
+    let Some((_update_file, update_path)) =
+        verified_update_path(source_path, expected_sha256, "exe", file_path)
+    else {
+        return;
+    };
+    let custom_client_staging_dir = prepare_custom_client_staging_dir(file_path);
+    let Some(custom_client_staging_dir) = custom_client_staging_dir else {
+        return;
+    };
+    let launch_cmd = format!(
+        "\"{}\" --update {}",
+        update_path,
+        crate::platform::UPDATE_SINGLE_EXE_ARG
+    );
+    update_trace(format!(
+        "update_new_version launching privileged updater: session_id={}, command={}",
+        session_id, launch_cmd
+    ));
+    if !launch_verified_exe_update(version, &update_path, session_id, &launch_cmd) {
+        cleanup_failed_exe_update(file_path, custom_client_staging_dir);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_custom_client_staging_dir(file_path: &PathBuf) -> Option<Option<PathBuf>> {
+    if crate::is_custom_client() {
+        let custom_client_staging_dir = crate::platform::get_custom_client_staging_dir();
+        update_trace(format!(
+            "update_new_version preparing custom client staging dir: {}",
+            custom_client_staging_dir.display()
+        ));
+        if let Err(e) = crate::platform::handle_custom_client_staging_dir_before_update(
+            &custom_client_staging_dir,
+        ) {
+            update_trace_error(format!(
+                "update_new_version failed to prepare custom client staging dir: dir={}, err={}",
+                custom_client_staging_dir.display(),
+                e
+            ));
+            log::error!(
+                "Failed to handle custom client staging dir before update: {}",
+                e
+            );
+            std::fs::remove_file(file_path).ok();
+            return None;
+        }
+        Some(Some(custom_client_staging_dir))
+    } else {
+        cleanup_residual_custom_client_staging_dir();
+        Some(None)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_residual_custom_client_staging_dir() {
+    let staging_dir = crate::platform::get_custom_client_staging_dir();
+    update_trace(format!(
+        "update_new_version cleaning residual custom client staging dir: {}",
+        staging_dir.display()
+    ));
+    hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
+        &staging_dir
+    ));
+}
+
+#[cfg(target_os = "windows")]
+fn launch_verified_exe_update(
+    version: &str,
+    update_path: &str,
+    session_id: u32,
+    launch_cmd: &str,
+) -> bool {
+    match crate::platform::launch_privileged_process(session_id, launch_cmd) {
+        Ok(h) => {
+            if h.is_null() {
+                update_trace_error(format!(
+                    "update_new_version launch returned null handle: version={}, verified_path={}",
+                    version, update_path
+                ));
+                log::error!("Failed to update to the new version: {}", version);
+                false
+            } else {
+                update_trace(format!(
+                    "update_new_version privileged updater launched: version={}, verified_path={}",
+                    version, update_path
+                ));
+                log::debug!("New version \"{}\" is launched.", version);
+                unsafe {
+                    winapi::um::handleapi::CloseHandle(h);
+                }
+                true
+            }
+        }
+        Err(e) => {
+            update_trace_error(format!(
+                "update_new_version privileged updater launch failed: version={}, verified_path={}, err={}",
+                version, update_path, e
+            ));
+            log::error!("Failed to run the new version: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_failed_exe_update(file_path: &PathBuf, custom_client_staging_dir: Option<PathBuf>) {
+    if let Some(dir) = custom_client_staging_dir {
+        hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(&dir));
+    }
+    update_trace_warn(format!(
+        "update_new_version removing source update file after failed launch: {}",
+        file_path.display()
+    ));
+    std::fs::remove_file(file_path).ok();
 }
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
@@ -803,7 +1157,11 @@ pub(crate) fn install_verified_download(temp_path: &Path, final_path: &Path) -> 
     }
     if let Some(backup_path) = backup_path {
         if let Err(e) = std::fs::remove_file(&backup_path) {
-            log::warn!("Failed to remove update backup {}: {}", backup_path.display(), e);
+            log::warn!(
+                "Failed to remove update backup {}: {}",
+                backup_path.display(),
+                e
+            );
         }
     }
     Ok(())
@@ -815,6 +1173,12 @@ fn write_verified_update_artifact<R: Read>(
     expected_size: u64,
     expected_sha256: &str,
 ) -> ResultType<()> {
+    update_trace(format!(
+        "write_verified_update_artifact start: final_path={}, expected_size={}, expected_sha256={}",
+        final_path.display(),
+        expected_size,
+        expected_sha256
+    ));
     let (mut file, temp_path) = create_download_temp_file(final_path)?;
     if let Err(e) = copy_and_verify_update_artifact(
         &mut file,
@@ -823,14 +1187,29 @@ fn write_verified_update_artifact<R: Read>(
         expected_size,
         expected_sha256,
     ) {
+        update_trace_error(format!(
+            "write_verified_update_artifact verification failed: temp_path={}, err={}",
+            temp_path.display(),
+            e
+        ));
         std::fs::remove_file(temp_path).ok();
         return Err(e);
     }
     drop(file);
     if let Err(e) = install_verified_download(&temp_path, final_path) {
+        update_trace_error(format!(
+            "write_verified_update_artifact install failed: temp_path={}, final_path={}, err={}",
+            temp_path.display(),
+            final_path.display(),
+            e
+        ));
         std::fs::remove_file(temp_path).ok();
         return Err(e);
     }
+    update_trace(format!(
+        "write_verified_update_artifact success: final_path={}",
+        final_path.display()
+    ));
     Ok(())
 }
 
@@ -843,7 +1222,20 @@ fn copy_and_verify_update_artifact<R: Read>(
 ) -> ResultType<()> {
     let bytes_written = std::io::copy(reader, file)?;
     file.flush()?;
+    update_trace(format!(
+        "copy_and_verify_update_artifact wrote bytes: temp_path={}, bytes_written={}, expected_size={}, expected_sha256={}",
+        temp_path.display(),
+        bytes_written,
+        expected_size,
+        expected_sha256
+    ));
     if bytes_written != expected_size {
+        update_trace_error(format!(
+            "copy_and_verify_update_artifact size mismatch: temp_path={}, expected_size={}, actual_size={}",
+            temp_path.display(),
+            expected_size,
+            bytes_written
+        ));
         bail!(
             "Update artifact size mismatch for {}: expected {}, got {}",
             temp_path.display(),
@@ -865,6 +1257,12 @@ fn verify_file_sha256(path: &Path, expected_sha256: &str) -> ResultType<()> {
 
     let actual_sha256 = sha256_file_hex(path)?;
     if actual_sha256 != expected_sha256 {
+        update_trace_error(format!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_sha256,
+            actual_sha256
+        ));
         bail!(
             "SHA256 mismatch for {}: expected {}, got {}",
             path.display(),
@@ -872,6 +1270,11 @@ fn verify_file_sha256(path: &Path, expected_sha256: &str) -> ResultType<()> {
             actual_sha256
         );
     }
+    update_trace(format!(
+        "SHA256 verified for {}: {}",
+        path.display(),
+        actual_sha256
+    ));
     Ok(())
 }
 
@@ -956,6 +1359,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.release_id, "v1.4.6");
+        assert_eq!(parsed.file_name, "rustdesk.exe");
+    }
+
+    #[test]
+    fn parse_rustdesk_release_download_url_accepts_fixed_test_release_path() {
+        let parsed = parse_rustdesk_release_download_url(
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.release_id, "fix-update-metadata");
         assert_eq!(parsed.file_name, "rustdesk.exe");
     }
 

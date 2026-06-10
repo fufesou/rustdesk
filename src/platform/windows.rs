@@ -3685,43 +3685,118 @@ where
 }
 
 pub fn update_to_verified(file: &str, expected_sha256: &str) -> ResultType<()> {
+    let extension = verified_update_extension(file)?;
+    let update_file = copy_and_verify_update_file_sha256(file, expected_sha256)?;
+    let verified_path = update_file.path_str()?.to_owned();
+    update_trace(format!(
+        "update_to_verified verified update file prepared: source_file={}, verified_path={}",
+        file, verified_path
+    ));
+    prepare_update_staging_dir()?;
+    launch_verified_update(file, extension.as_str(), verified_path.as_str())
+}
+
+fn verified_update_extension(file: &str) -> ResultType<String> {
     let extension = update_file_extension(file).unwrap_or_default();
+    update_trace(format!(
+        "update_to_verified start: file={}, extension={}",
+        file, extension
+    ));
     if extension != "exe" && extension != "msi" {
+        update_trace_error(format!(
+            "update_to_verified unsupported file format: file={}, extension={}",
+            file, extension
+        ));
         bail!("Unsupported update file format: {}", file);
     }
+    Ok(extension)
+}
 
-    let update_file = copy_and_verify_update_file_sha256(file, expected_sha256)?;
+fn prepare_update_staging_dir() -> ResultType<()> {
     let custom_client_staging_dir = get_custom_client_staging_dir();
     if crate::is_custom_client() {
+        update_trace(format!(
+            "update_to_verified preparing custom client staging dir: {}",
+            custom_client_staging_dir.display()
+        ));
         handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)?;
     } else {
         // Clean up any residual staging directory from previous custom client
+        update_trace(format!(
+            "update_to_verified cleaning residual custom client staging dir: {}",
+            custom_client_staging_dir.display()
+        ));
         allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
-    }
-
-    match extension.as_str() {
-        "exe" => {
-            let args = format!("--update {}", UPDATE_SINGLE_EXE_ARG);
-            if !run_uac(update_file.path_str()?, &args)? {
-                bail!(
-                    "Failed to run the update exe with UAC, error: {:?}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        "msi" => {
-            if let Err(e) = update_me_msi(update_file.path_str()?, false) {
-                bail!("Failed to run the update msi: {}", e);
-            }
-        }
-        _ => {
-            bail!("Unsupported update file format: {}", file);
-        }
     }
     Ok(())
 }
 
+fn launch_verified_update(file: &str, extension: &str, verified_path: &str) -> ResultType<()> {
+    match extension {
+        "exe" => launch_verified_exe_update_with_uac(verified_path),
+        "msi" => launch_verified_msi_update(verified_path),
+        _ => {
+            update_trace_error(format!(
+                "update_to_verified unsupported file format after verification: file={}, extension={}",
+                file, extension
+            ));
+            bail!("Unsupported update file format: {}", file);
+        }
+    }
+}
+
+fn launch_verified_exe_update_with_uac(verified_path: &str) -> ResultType<()> {
+    let args = format!("--update {}", UPDATE_SINGLE_EXE_ARG);
+    update_trace(format!(
+        "update_to_verified launching exe with UAC: verified_path={}, args={}",
+        verified_path, args
+    ));
+    if !run_uac(verified_path, &args)? {
+        update_trace_error(format!(
+            "update_to_verified run_uac returned false: verified_path={}",
+            verified_path
+        ));
+        bail!(
+            "Failed to run the update exe with UAC, error: {:?}",
+            std::io::Error::last_os_error()
+        );
+    }
+    update_trace(format!(
+        "update_to_verified exe launch succeeded: verified_path={}",
+        verified_path
+    ));
+    Ok(())
+}
+
+fn launch_verified_msi_update(verified_path: &str) -> ResultType<()> {
+    update_trace(format!(
+        "update_to_verified launching msi installer: verified_path={}",
+        verified_path
+    ));
+    if let Err(e) = update_me_msi(verified_path, false) {
+        update_trace_error(format!(
+            "update_to_verified msi launch failed: verified_path={}, err={}",
+            verified_path, e
+        ));
+        bail!("Failed to run the update msi: {}", e);
+    }
+    update_trace(format!(
+        "update_to_verified msi launch succeeded: verified_path={}",
+        verified_path
+    ));
+    Ok(())
+}
+
+const UPDATE_TRACE_PREFIX: &str = "========================";
 const UPDATE_FILE_COPY_ATTEMPTS: usize = 16;
+
+fn update_trace(message: impl AsRef<str>) {
+    log::info!("{} {}", UPDATE_TRACE_PREFIX, message.as_ref());
+}
+
+fn update_trace_error(message: impl AsRef<str>) {
+    log::error!("{} {}", UPDATE_TRACE_PREFIX, message.as_ref());
+}
 
 pub struct VerifiedUpdateFile {
     file: std::fs::File,
@@ -3757,12 +3832,18 @@ fn verified_update_file_path(file: &str) -> ResultType<PathBuf> {
     if extension != "exe" && extension != "msi" {
         bail!("Unsupported update file format: {}", file);
     }
-    Ok(std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "rustdesk-verified-{}-{}.{}",
         std::process::id(),
         hbb_common::rand::random::<u64>(),
         extension
-    )))
+    ));
+    update_trace(format!(
+        "verified_update_file_path generated path: source_file={}, verified_path={}",
+        file,
+        path.display()
+    ));
+    Ok(path)
 }
 
 fn is_temp_update_file_name(file_name: &str) -> bool {
@@ -3781,6 +3862,10 @@ fn is_temp_update_file_name(file_name: &str) -> bool {
 }
 
 fn open_update_file_for_verification(file: &str) -> ResultType<std::fs::File> {
+    update_trace(format!(
+        "open_update_file_for_verification start: file={}",
+        file
+    ));
     let update_file = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
@@ -3791,52 +3876,62 @@ fn open_update_file_for_verification(file: &str) -> ResultType<std::fs::File> {
         .metadata()
         .map_err(|e| anyhow!("Failed to read update file metadata {}: {}", file, e))?;
     if !is_update_file_attributes_trusted(metadata.file_attributes()) {
+        update_trace_error(format!(
+            "open_update_file_for_verification rejected reparse point: file={}, attributes={}",
+            file,
+            metadata.file_attributes()
+        ));
         bail!(
             "Refusing to verify update file through reparse point: {}",
             file
         );
     }
+    update_trace(format!(
+        "open_update_file_for_verification success: file={}, attributes={}",
+        file,
+        metadata.file_attributes()
+    ));
     Ok(update_file)
 }
 
 fn copy_update_file_for_verification(file: &str) -> ResultType<VerifiedUpdateFile> {
+    update_trace(format!(
+        "copy_update_file_for_verification start: source_file={}",
+        file
+    ));
     let mut source_file = open_update_file_for_verification(file)?;
-    for _ in 0..UPDATE_FILE_COPY_ATTEMPTS {
+    for attempt in 0..UPDATE_FILE_COPY_ATTEMPTS {
         let path = verified_update_file_path(file)?;
-        let mut copy_file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(update_file_open_flags())
-            .open(&path)
-        {
+        update_trace(format!(
+            "copy_update_file_for_verification attempt {}: source_file={}, verified_path={}",
+            attempt + 1,
+            file,
+            path.display()
+        ));
+        let copy_file = match create_verified_update_copy_file(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
+                update_trace_error(format!(
+                    "copy_update_file_for_verification failed to create verified file: verified_path={}, err={}",
+                    path.display(),
+                    e
+                ));
                 return Err(anyhow!(
                     "Failed to create verified update file {}: {}",
                     path.display(),
                     e
                 )
-                .into())
+                .into());
             }
         };
-        if let Err(e) = std::io::copy(&mut source_file, &mut copy_file) {
-            drop(copy_file);
-            std::fs::remove_file(&path).ok();
-            return Err(e.into());
-        }
-        if let Err(e) = copy_file.flush() {
-            drop(copy_file);
-            std::fs::remove_file(&path).ok();
-            return Err(e.into());
-        }
-        if let Err(e) = copy_file.seek(io::SeekFrom::Start(0)) {
-            drop(copy_file);
-            std::fs::remove_file(&path).ok();
-            return Err(e.into());
-        }
+        let copy_file =
+            copy_source_to_verified_update_file(file, &path, &mut source_file, copy_file)?;
+        update_trace(format!(
+            "copy_update_file_for_verification success: source_file={}, verified_path={}",
+            file,
+            path.display()
+        ));
         return Ok(VerifiedUpdateFile {
             file: copy_file,
             path,
@@ -3846,11 +3941,88 @@ fn copy_update_file_for_verification(file: &str) -> ResultType<VerifiedUpdateFil
     bail!("Failed to create verified update file for {}", file);
 }
 
+fn create_verified_update_copy_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(update_file_open_flags())
+        .open(path)
+}
+
+fn copy_source_to_verified_update_file(
+    source_path: &str,
+    verified_path: &Path,
+    source_file: &mut std::fs::File,
+    mut copy_file: std::fs::File,
+) -> ResultType<std::fs::File> {
+    if let Err(e) = std::io::copy(source_file, &mut copy_file) {
+        update_trace_error(format!(
+            "copy_update_file_for_verification copy failed: source_file={}, verified_path={}, err={}",
+            source_path,
+            verified_path.display(),
+            e
+        ));
+        drop(copy_file);
+        std::fs::remove_file(verified_path).ok();
+        return Err(e.into());
+    }
+    flush_verified_update_copy(verified_path, copy_file)
+}
+
+fn flush_verified_update_copy(
+    verified_path: &Path,
+    mut copy_file: std::fs::File,
+) -> ResultType<std::fs::File> {
+    if let Err(e) = copy_file.flush() {
+        update_trace_error(format!(
+            "copy_update_file_for_verification flush failed: verified_path={}, err={}",
+            verified_path.display(),
+            e
+        ));
+        drop(copy_file);
+        std::fs::remove_file(verified_path).ok();
+        return Err(e.into());
+    }
+    if let Err(e) = copy_file.seek(io::SeekFrom::Start(0)) {
+        update_trace_error(format!(
+            "copy_update_file_for_verification seek failed: verified_path={}, err={}",
+            verified_path.display(),
+            e
+        ));
+        drop(copy_file);
+        std::fs::remove_file(verified_path).ok();
+        return Err(e.into());
+    }
+    Ok(copy_file)
+}
+
 pub fn copy_and_verify_update_file_sha256(
     file: &str,
     expected_sha256: &str,
 ) -> ResultType<VerifiedUpdateFile> {
-    let mut update_file = copy_update_file_for_verification(file)?;
+    update_trace(format!(
+        "copy_and_verify_update_file_sha256 start: file={}, expected_sha256={}",
+        file, expected_sha256
+    ));
+    let update_file = copy_update_file_for_verification(file)?;
+    let (update_file, update_path) = verified_update_file_with_path_string(update_file)?;
+    let path = verify_copied_update_file_sha256(update_file, expected_sha256, &update_path)?;
+    let read_file = reopen_and_verify_update_file(&path, &update_path, expected_sha256)?;
+    update_trace(format!(
+        "copy_and_verify_update_file_sha256 success: source_file={}, verified_path={}",
+        file, update_path
+    ));
+    Ok(VerifiedUpdateFile {
+        file: read_file,
+        path,
+    })
+}
+
+fn verified_update_file_with_path_string(
+    update_file: VerifiedUpdateFile,
+) -> ResultType<(VerifiedUpdateFile, String)> {
     let update_path = match update_file.path_str() {
         Ok(path) => path.to_owned(),
         Err(e) => {
@@ -3860,8 +4032,19 @@ pub fn copy_and_verify_update_file_sha256(
             return Err(e);
         }
     };
-    if let Err(e) = verify_update_file_sha256(&mut update_file.file, expected_sha256, &update_path)
-    {
+    Ok((update_file, update_path))
+}
+
+fn verify_copied_update_file_sha256(
+    mut update_file: VerifiedUpdateFile,
+    expected_sha256: &str,
+    update_path: &str,
+) -> ResultType<PathBuf> {
+    if let Err(e) = verify_update_file_sha256(&mut update_file.file, expected_sha256, update_path) {
+        update_trace_error(format!(
+            "copy_and_verify_update_file_sha256 sha256 verification failed: verified_path={}, err={}",
+            update_path, e
+        ));
         let path = update_file.path.clone();
         drop(update_file);
         std::fs::remove_file(&path).ok();
@@ -3869,23 +4052,35 @@ pub fn copy_and_verify_update_file_sha256(
     }
     let path = update_file.path.clone();
     drop(update_file);
+    Ok(path)
+}
 
-    let mut read_file = match open_update_file_for_verification(&update_path) {
+fn reopen_and_verify_update_file(
+    path: &Path,
+    update_path: &str,
+    expected_sha256: &str,
+) -> ResultType<std::fs::File> {
+    let mut read_file = match open_update_file_for_verification(update_path) {
         Ok(file) => file,
         Err(e) => {
-            std::fs::remove_file(&path).ok();
+            update_trace_error(format!(
+                "copy_and_verify_update_file_sha256 failed to reopen verified file: verified_path={}, err={}",
+                update_path, e
+            ));
+            std::fs::remove_file(path).ok();
             return Err(e);
         }
     };
-    if let Err(e) = verify_update_file_sha256(&mut read_file, expected_sha256, &update_path) {
+    if let Err(e) = verify_update_file_sha256(&mut read_file, expected_sha256, update_path) {
+        update_trace_error(format!(
+            "copy_and_verify_update_file_sha256 reopened file verification failed: verified_path={}, err={}",
+            update_path, e
+        ));
         drop(read_file);
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path).ok();
         return Err(e);
     }
-    Ok(VerifiedUpdateFile {
-        file: read_file,
-        path,
-    })
+    Ok(read_file)
 }
 
 fn verify_update_file_sha256(
@@ -3894,7 +4089,15 @@ fn verify_update_file_sha256(
     file: &str,
 ) -> ResultType<()> {
     let expected_sha256 = expected_sha256.trim().to_ascii_lowercase();
+    update_trace(format!(
+        "verify_update_file_sha256 start: file={}, expected_sha256={}",
+        file, expected_sha256
+    ));
     if expected_sha256.len() != 64 || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        update_trace_error(format!(
+            "verify_update_file_sha256 malformed expected digest: file={}, expected_sha256={}",
+            file, expected_sha256
+        ));
         bail!("Expected update file SHA256 is malformed for {}", file);
     }
 
@@ -3912,6 +4115,10 @@ fn verify_update_file_sha256(
 
     let actual_sha256 = format!("{:x}", hasher.finalize());
     if actual_sha256 != expected_sha256 {
+        update_trace_error(format!(
+            "verify_update_file_sha256 mismatch: file={}, expected_sha256={}, actual_sha256={}",
+            file, expected_sha256, actual_sha256
+        ));
         bail!(
             "SHA256 mismatch for {}: expected {}, got {}",
             file,
@@ -3919,6 +4126,10 @@ fn verify_update_file_sha256(
             actual_sha256
         );
     }
+    update_trace(format!(
+        "verify_update_file_sha256 success: file={}, actual_sha256={}",
+        file, actual_sha256
+    ));
     Ok(())
 }
 
@@ -5052,11 +5263,17 @@ mod tests {
         ));
         let all_users_dir = test_dir.join("AllUsers");
         std::fs::create_dir_all(&all_users_dir).unwrap();
-        let staging_dir = all_users_dir.join("RustDesk").join("RustDeskCustomClientStaging");
+        let staging_dir = all_users_dir
+            .join("RustDesk")
+            .join("RustDeskCustomClientStaging");
         std::fs::create_dir_all(&staging_dir).unwrap();
         std::fs::write(staging_dir.join("custom.txt"), b"invalid staged config").unwrap();
 
-        let current_exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let current_exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let local_custom_txt = current_exe_dir.join("custom.txt");
         let _local_custom_txt_restore = TestFileRestore::new(local_custom_txt.clone());
         std::fs::write(&local_custom_txt, b"existing local config").unwrap();
@@ -5084,7 +5301,9 @@ mod tests {
                 .as_nanos()
         ));
         let all_users_dir = test_dir.join("AllUsers");
-        let staging_dir = all_users_dir.join("RustDesk").join("RustDeskCustomClientStaging");
+        let staging_dir = all_users_dir
+            .join("RustDesk")
+            .join("RustDeskCustomClientStaging");
         std::fs::create_dir_all(staging_dir.join("custom.txt")).unwrap();
 
         let _all_users_profile_restore = TestEnvRestore::set("ALLUSERSPROFILE", &all_users_dir);
@@ -5106,7 +5325,11 @@ mod tests {
                 .as_nanos()
         ));
         let staging_dir = test_dir.join("staging");
-        let current_exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let current_exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let local_custom_txt = current_exe_dir.join("custom.txt");
         let _local_custom_txt_restore = TestFileRestore::new(local_custom_txt.clone());
         if local_custom_txt.is_dir() {
@@ -5127,8 +5350,12 @@ mod tests {
     fn temp_update_file_name_matches_plain_cached_artifacts() {
         assert!(is_temp_update_file_name("rustdesk-1.4.7-x86_64.exe"));
         assert!(is_temp_update_file_name("rustdesk-1.4.7-x86_64.MSI"));
-        assert!(is_temp_update_file_name(".rustdesk-1.4.7-x86_64.exe.123.download"));
-        assert!(is_temp_update_file_name(".rustdesk-1.4.7-x86_64.EXE.123.download"));
+        assert!(is_temp_update_file_name(
+            ".rustdesk-1.4.7-x86_64.exe.123.download"
+        ));
+        assert!(is_temp_update_file_name(
+            ".rustdesk-1.4.7-x86_64.EXE.123.download"
+        ));
         assert!(!is_temp_update_file_name("rustdesk.exe"));
         assert!(!is_temp_update_file_name("rustdesk.msi"));
         assert!(!is_temp_update_file_name(".rustdesk.exe.123.download"));
@@ -5136,9 +5363,11 @@ mod tests {
 
     #[test]
     fn copy_single_exe_cmd_does_not_copy_source_directory() {
-        let cmd =
-            copy_single_exe_cmd(r"C:\Temp\rustdesk-verified-123.exe", r"C:\Program Files\RustDesk")
-                .unwrap();
+        let cmd = copy_single_exe_cmd(
+            r"C:\Temp\rustdesk-verified-123.exe",
+            r"C:\Program Files\RustDesk",
+        )
+        .unwrap();
 
         assert!(cmd.contains(r#"copy /Y "C:\Temp\rustdesk-verified-123.exe""#));
         assert!(!cmd.contains(r#"XCOPY "C:\Temp""#));

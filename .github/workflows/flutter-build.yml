@@ -42,7 +42,7 @@ env:
   # 2. Update the `VCPKG_COMMIT_ID` in `ci.yml` and `playground.yml`.
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836" # 2025.01.13, got "/opt/artifacts/vcpkg/vcpkg: No such file or directory" with latest version
-  VERSION: "1.4.7"
+  VERSION: "1.4.5"
   NDK_VERSION: "r28c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
@@ -894,11 +894,11 @@ jobs:
           VERSION: ${{ env.VERSION }}
           TAG_NAME: ${{ env.TAG_NAME }}
         run: |
-          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.exe" --platform windows --arch x86_64 --format exe --fragment-out ./fragments/windows-flutter-x86_64-exe.json
-          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.msi" --platform windows --arch x86_64 --format msi --fragment-out ./fragments/windows-flutter-x86_64-msi.json
-          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86-sciter.exe" --platform windows --arch x86 --format exe --fragment-out ./fragments/windows-sciter-x86-exe.json
-          python res/generate_update_metadata.py fragment --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-aarch64.dmg" --platform macos --arch aarch64 --format dmg --fragment-out ./fragments/macos-aarch64-dmg.json
-          python res/generate_update_metadata.py fragment --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --artifact-url "https://github.com/rustdesk/rustdesk/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.dmg" --platform macos --arch x86_64 --format dmg --fragment-out ./fragments/macos-x86_64-dmg.json
+          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.exe" --github-repository "${GITHUB_REPOSITORY}" --platform windows --arch x86_64 --format exe --fragment-out ./fragments/windows-flutter-x86_64-exe.json
+          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.msi" --github-repository "${GITHUB_REPOSITORY}" --platform windows --arch x86_64 --format msi --fragment-out ./fragments/windows-flutter-x86_64-msi.json
+          python res/generate_update_metadata.py fragment --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86-sciter.exe" --github-repository "${GITHUB_REPOSITORY}" --platform windows --arch x86 --format exe --fragment-out ./fragments/windows-sciter-x86-exe.json
+          python res/generate_update_metadata.py fragment --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-aarch64.dmg" --github-repository "${GITHUB_REPOSITORY}" --platform macos --arch aarch64 --format dmg --fragment-out ./fragments/macos-aarch64-dmg.json
+          python res/generate_update_metadata.py fragment --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --artifact-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/rustdesk-${VERSION}-x86_64.dmg" --github-repository "${GITHUB_REPOSITORY}" --platform macos --arch x86_64 --format dmg --fragment-out ./fragments/macos-x86_64-dmg.json
 
       - name: Sign update metadata
         shell: bash
@@ -907,7 +907,7 @@ jobs:
           TAG_NAME: ${{ env.TAG_NAME }}
           RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
         run: |
-          python res/generate_update_metadata.py sign --fragment ./fragments/windows-flutter-x86_64-exe.json --fragment ./fragments/windows-flutter-x86_64-msi.json --fragment ./fragments/windows-sciter-x86-exe.json --fragment ./fragments/macos-aarch64-dmg.json --fragment ./fragments/macos-x86_64-dmg.json --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --published-at "$(git log -1 --format=%cI)" --key-id 2026-ed25519-main --private-key-seed-env RUSTDESK_UPDATE_ED25519_SEED --metadata-out ./rustdesk-update.json --signature-out ./rustdesk-update.json.sig
+          python res/generate_update_metadata.py sign --fragment ./fragments/windows-flutter-x86_64-exe.json --fragment ./fragments/windows-flutter-x86_64-msi.json --fragment ./fragments/windows-sciter-x86-exe.json --fragment ./fragments/macos-aarch64-dmg.json --fragment ./fragments/macos-x86_64-dmg.json --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --github-repository "${GITHUB_REPOSITORY}" --published-at "$(git log -1 --format=%cI)" --key-id 2026-ed25519-main --private-key-seed-env RUSTDESK_UPDATE_ED25519_SEED --metadata-out ./rustdesk-update.json --signature-out ./rustdesk-update.json.sig
 
       - name: Verify update metadata
         shell: bash
@@ -916,7 +916,7 @@ jobs:
           TAG_NAME: ${{ env.TAG_NAME }}
           RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: dvx01zHZ3G2Rd9Jl4cY/Ail/xX80+wbMfXVgzLumVTs=
         run: |
-          python res/generate_update_metadata.py verify --metadata ./rustdesk-update.json --signature ./rustdesk-update.json.sig --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main
+          python res/generate_update_metadata.py verify --metadata ./rustdesk-update.json --signature ./rustdesk-update.json.sig --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.exe" --artifact "./artifacts/windows-x86_64/rustdesk-${VERSION}-x86_64.msi" --artifact "./artifacts/windows-x86/rustdesk-${VERSION}-x86-sciter.exe" --artifact "./artifacts/macos-aarch64/rustdesk-${VERSION}-aarch64.dmg" --artifact "./artifacts/macos-x86_64/rustdesk-${VERSION}-x86_64.dmg" --package-id rustdesk --version "$VERSION" --release-id "$TAG_NAME" --github-repository "${GITHUB_REPOSITORY}" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main
 
       - name: Publish signed update release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
