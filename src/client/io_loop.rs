@@ -10,6 +10,8 @@ use crate::{
     common::get_default_sound_input,
     ui_session_interface::{InvokeUiSession, Session},
 };
+
+const RESTART_REMOTE_DEVICE_NO_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::{clipboard::try_empty_clipboard_files, clipboard_file::unix_file_clip};
 #[cfg(any(
@@ -244,7 +246,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
-                                    self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
+                                    self.handler.msgbox("restarting", "Restarting remote device", "Connection in progress. Please wait.", "");
                                 } else {
                                     log::info!("Reset by the peer");
                                     self.handler.msgbox("error", "Connection Error", "Reset by the peer", "");
@@ -279,6 +281,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
+                            if self.handler.is_restarting_remote_device()
+                                && last_recv_time.elapsed() >= RESTART_REMOTE_DEVICE_NO_DATA_TIMEOUT
+                            {
+                                self.handler.msgbox("restarting-show", "Restarting remote device", "Connection in progress. Please wait.", "");
+                                break;
+                            }
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
                                 continue;
@@ -1288,6 +1296,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::VideoFrame(vf)) => {
                     if !self.first_frame {
                         self.first_frame = true;
+                        self.handler.lc.write().unwrap().clear_restarting_remote_device();
                         self.handler.close_success();
                         self.handler.adapt_size();
                         self.send_toggle_virtual_display_msg(peer).await;

@@ -55,6 +55,7 @@ import 'package:flutter_hbb/native/custom_cursor.dart'
 typedef HandleMsgBox = Function(Map<String, dynamic> evt, String id);
 typedef ReconnectHandle = Function(OverlayDialogManager, SessionID, bool);
 final _constSessionId = Uuid().v4obj();
+const _restartReconnectSilentDelay = 5;
 
 class CachedPeerData {
   Map<String, dynamic> updatePrivacyMode = {};
@@ -119,6 +120,7 @@ class FfiModel with ChangeNotifier {
   bool _touchMode = false;
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
+  Timer? _restartReconnectDelayTimer;
   var _reconnects = 1;
   DateTime? _offlineReconnectStartTime;
   bool _viewOnly = false;
@@ -250,6 +252,7 @@ class FfiModel with ChangeNotifier {
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
+    resetRestartReconnectState();
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
@@ -922,8 +925,20 @@ class FfiModel with ChangeNotifier {
       enterUserLoginAndPasswordDialog(
           sessionId, dialogManager, 'terminal-admin-login-tip', false);
     } else if (type == 'restarting') {
-      showMsgBox(sessionId, type, title, text, link, false, dialogManager,
-          hasCancel: false);
+      if (_restartReconnectDelayTimer == null) {
+        parent.target?.inputModel.setRelativeMouseMode(false);
+        bind.sessionReconnect(sessionId: sessionId, forceRelay: false);
+        clearPermissions();
+        _restartReconnectDelayTimer =
+            Timer(Duration(seconds: _restartReconnectSilentDelay), () {
+          _restartReconnectDelayTimer = null;
+          reconnect(dialogManager, sessionId, false);
+        });
+      }
+    } else if (type == 'restarting-show') {
+      _restartReconnectDelayTimer?.cancel();
+      _restartReconnectDelayTimer = null;
+      reconnect(dialogManager, sessionId, false);
     } else if (type == 'wait-remote-accept-nook') {
       showWaitAcceptDialog(sessionId, type, title, text, dialogManager);
     } else if (type == 'on-uac' || type == 'on-foreground-elevated') {
@@ -947,6 +962,11 @@ class FfiModel with ChangeNotifier {
       }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
+  }
+
+  void resetRestartReconnectState() {
+    _restartReconnectDelayTimer?.cancel();
+    _restartReconnectDelayTimer = null;
   }
 
   /// Auto-retry check for "Remote desktop is offline" error.
@@ -1374,6 +1394,7 @@ class FfiModel with ChangeNotifier {
       if (displays.isNotEmpty) {
         _reconnects = 1;
         _offlineReconnectStartTime = null;
+        resetRestartReconnectState();
         waitForFirstImage.value = true;
         isRefreshing = false;
       }
@@ -3879,6 +3900,7 @@ class FFI {
     }
     if (ffiModel.waitForFirstImage.value == true) {
       ffiModel.waitForFirstImage.value = false;
+      ffiModel.resetRestartReconnectState();
       dialogManager.dismissAll();
       await canvasModel.updateViewStyle();
       await canvasModel.updateScrollStyle();
