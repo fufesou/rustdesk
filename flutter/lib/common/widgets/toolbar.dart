@@ -89,7 +89,7 @@ bool allowDisplaySwitchInPrivacyMode(PeerInfo pi, String privacyModeImpl) {
   return pi.platform == kPeerPlatformMacOS ||
       (pi.platform == kPeerPlatformWindows &&
           _isWindowsMode1PrivacyImpl(privacyModeImpl) &&
-          versionCmp(pi.version, '1.4.8') >= 0);
+          versionCmp(pi.version, '1.4.7') >= 0);
 }
 
 class TTextMenu {
