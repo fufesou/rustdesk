@@ -43,7 +43,7 @@ jobs:
 
       - name: Download the source code
         run: |
-          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+          git clone https://github.com/fufesou/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
 
       - name: Build the project
         run: |
