@@ -4,7 +4,7 @@ use super::filetype::FileDescription;
 use crate::{ClipboardFile, CliprdrError};
 use cs::FuseServer;
 use fuser::MountOption;
-use hbb_common::{config::APP_NAME, log};
+use hbb_common::{config::Config, log};
 use parking_lot::Mutex;
 use std::{
     io,
@@ -15,13 +15,13 @@ use std::{
 
 lazy_static::lazy_static! {
     static ref FUSE_MOUNT_POINT_CLIENT: Arc<String> = {
-        let mnt_path = format!("/tmp/{}/{}", APP_NAME.read().unwrap(), "cliprdr-client");
+        let mnt_path = fuse_mount_point("cliprdr-client");
         // No need to run `canonicalize()` here.
         Arc::new(mnt_path)
     };
 
     static ref FUSE_MOUNT_POINT_SERVER: Arc<String> = {
-        let mnt_path = format!("/tmp/{}/{}", APP_NAME.read().unwrap(), "cliprdr-server");
+        let mnt_path = fuse_mount_point("cliprdr-server");
         // No need to run `canonicalize()` here.
         Arc::new(mnt_path)
     };
@@ -31,6 +31,21 @@ lazy_static::lazy_static! {
 }
 
 static FUSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, PartialEq, Eq)]
+enum MountPointState {
+    HealthyMount,
+    NotMounted,
+    StaleMount,
+    Unknown,
+}
+
+fn fuse_mount_point(name: &str) -> String {
+    let mut path = PathBuf::from(Config::ipc_path(""));
+    path.pop();
+    path.push(name);
+    path.to_string_lossy().to_string()
+}
 
 pub fn get_exclude_paths(is_client: bool) -> Arc<String> {
     if is_client {
@@ -55,15 +70,26 @@ pub fn init_fuse_context(is_client: bool) -> Result<(), CliprdrError> {
         FUSE_CONTEXT_SERVER.lock()
     };
     if let Some(ctx) = fuse_context_lock.as_ref() {
-        if is_mount_point_healthy(&ctx.mount_point) {
-            return Ok(());
+        match inspect_mount_point_state(&ctx.mount_point) {
+            MountPointState::HealthyMount => return Ok(()),
+            MountPointState::StaleMount | MountPointState::NotMounted => {
+                log::warn!(
+                    "clipboard FUSE mount {} is disconnected, remounting",
+                    ctx.mount_point.display()
+                );
+                let stale_context = fuse_context_lock.take();
+                drop(fuse_context_lock);
+                drop(stale_context);
+                return init_fuse_context(is_client);
+            }
+            MountPointState::Unknown => {
+                log::warn!(
+                    "failed to verify clipboard FUSE mount {}",
+                    ctx.mount_point.display()
+                );
+                return Err(CliprdrError::CliprdrInit);
+            }
         }
-        log::warn!(
-            "clipboard FUSE mount {} is disconnected, remounting",
-            ctx.mount_point.display()
-        );
-        let stale_context = fuse_context_lock.take();
-        drop(stale_context);
     }
     let mount_point = if is_client {
         FUSE_MOUNT_POINT_CLIENT.clone()
@@ -72,10 +98,32 @@ pub fn init_fuse_context(is_client: bool) -> Result<(), CliprdrError> {
     };
 
     let mount_point = std::path::PathBuf::from(&*mount_point);
+    match inspect_mount_point_state(&mount_point) {
+        MountPointState::HealthyMount => {
+            log::warn!(
+                "clipboard FUSE mount {} is already active in another context",
+                mount_point.display()
+            );
+            return Err(CliprdrError::ClipboardOccupied);
+        }
+        MountPointState::StaleMount => {
+            log::warn!(
+                "clipboard FUSE mount {} is stale, cleaning up before remount",
+                mount_point.display()
+            );
+            unmount_fuse_mount_point(&mount_point);
+            validate_mount_state_after_stale_cleanup(
+                &mount_point,
+                inspect_mount_point_state(&mount_point),
+            )?;
+        }
+        MountPointState::Unknown => return Err(CliprdrError::CliprdrInit),
+        MountPointState::NotMounted => {}
+    }
     let (server, tx) = FuseServer::new(FUSE_TIMEOUT);
     let server = Arc::new(Mutex::new(server));
 
-    prepare_fuse_mount_point(&mount_point);
+    prepare_fuse_mount_point(&mount_point)?;
     let mnt_opts = [
         MountOption::FSName("rustdesk-cliprdr-fs".to_string()),
         MountOption::NoAtime,
@@ -168,57 +216,198 @@ struct FuseContext {
 }
 
 // this function must be called after the main IPC is up
-fn prepare_fuse_mount_point(mount_point: &Path) {
+fn prepare_fuse_mount_point(mount_point: &PathBuf) -> Result<(), CliprdrError> {
     use std::{
         fs::{self, Permissions},
         os::unix::prelude::PermissionsExt,
     };
 
     if let Some(parent) = mount_point.parent() {
+        reject_symlink_path(parent)?;
         if let Err(e) = fs::create_dir_all(parent) {
             log::warn!("failed to create FUSE mount parent {:?}: {:?}", parent, e);
+            return Err(CliprdrError::CliprdrInit);
         }
     }
 
-    unmount_fuse_mount_point(mount_point);
+    reject_symlink_path(mount_point)?;
 
-    if let Err(e) = fs::create_dir_all(mount_point) {
+    let recovered_stale_mount = if let Err(e) = fs::create_dir_all(mount_point) {
         log::warn!(
-            "failed to create FUSE mount point {:?}: {:?}",
-            mount_point,
+            "failed to create clipboard FUSE mount point {}, trying stale mount cleanup: {:?}",
+            mount_point.display(),
             e
         );
-    }
+        if let Err(e) = std::process::Command::new("umount")
+            .arg(mount_point)
+            .status()
+        {
+            log::warn!("umount {:?} may fail: {:?}", mount_point, e);
+        }
+        fs::create_dir_all(mount_point).map_err(|e| {
+            log::error!(
+                "failed to create clipboard FUSE mount point {} after cleanup: {:?}",
+                mount_point.display(),
+                e
+            );
+            CliprdrError::CliprdrInit
+        })?;
+        true
+    } else {
+        false
+    };
     if let Err(e) = fs::set_permissions(mount_point, Permissions::from_mode(0o777)) {
         log::warn!(
-            "failed to set FUSE mount point permissions {:?}: {:?}",
-            mount_point,
+            "failed to set clipboard FUSE mount point permissions {}: {:?}",
+            mount_point.display(),
             e
         );
     }
-}
 
-fn is_mount_point_healthy(mount_point: &Path) -> bool {
-    is_mount_point_healthy_result(std::fs::metadata(mount_point))
-}
-
-fn is_mount_point_healthy_result<T>(result: io::Result<T>) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(e) => {
-            e.raw_os_error() != Some(libc::ENOTCONN) && e.kind() != io::ErrorKind::NotFound
+    if !recovered_stale_mount {
+        if let Err(e) = std::process::Command::new("umount")
+            .arg(mount_point)
+            .status()
+        {
+            log::warn!("umount {:?} may fail: {:?}", mount_point, e);
         }
     }
+    Ok(())
+}
+
+fn inspect_mount_point_state(mount_point: &Path) -> MountPointState {
+    if ensure_mount_point_path_is_safe(mount_point).is_err() {
+        return MountPointState::Unknown;
+    }
+    inspect_mount_point_state_with(
+        mount_point,
+        std::fs::metadata(mount_point),
+        std::fs::read_to_string("/proc/self/mountinfo"),
+    )
+}
+
+fn validate_mount_state_after_stale_cleanup(
+    mount_point: &Path,
+    mount_state: MountPointState,
+) -> Result<(), CliprdrError> {
+    match mount_state {
+        MountPointState::NotMounted => Ok(()),
+        MountPointState::HealthyMount => {
+            log::warn!(
+                "clipboard FUSE mount {} is still active after stale cleanup",
+                mount_point.display()
+            );
+            Err(CliprdrError::ClipboardOccupied)
+        }
+        MountPointState::StaleMount => {
+            log::warn!(
+                "clipboard FUSE mount {} is still stale after cleanup",
+                mount_point.display()
+            );
+            Err(CliprdrError::CliprdrInit)
+        }
+        MountPointState::Unknown => {
+            log::warn!(
+                "failed to verify clipboard FUSE mount {} after cleanup",
+                mount_point.display()
+            );
+            Err(CliprdrError::CliprdrInit)
+        }
+    }
+}
+
+fn inspect_mount_point_state_with<T>(
+    mount_point: &Path,
+    metadata_result: io::Result<T>,
+    mountinfo_result: io::Result<String>,
+) -> MountPointState {
+    match metadata_result {
+        Ok(_) => match mountinfo_result {
+            Ok(mountinfo) => {
+                if is_mount_point_listed_in_mountinfo(mount_point, &mountinfo) {
+                    MountPointState::HealthyMount
+                } else {
+                    MountPointState::NotMounted
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to read mountinfo for {:?}: {:?}", mount_point, e);
+                MountPointState::Unknown
+            }
+        },
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => MountPointState::StaleMount,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => MountPointState::NotMounted,
+        Err(e) => {
+            log::warn!("failed to inspect FUSE mount {:?}: {:?}", mount_point, e);
+            MountPointState::Unknown
+        }
+    }
+}
+
+fn is_mount_point_listed_in_mountinfo(mount_point: &Path, mountinfo: &str) -> bool {
+    let mount_point = mount_point.to_string_lossy();
+    mountinfo.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _mount_id = fields.next();
+        let _parent_id = fields.next();
+        let _major_minor = fields.next();
+        let _root = fields.next();
+        let mount_path = fields.next();
+        mount_path == Some(mount_point.as_ref())
+    })
+}
+
+fn reject_symlink_metadata_result(
+    path: &Path,
+    metadata_result: io::Result<std::fs::Metadata>,
+    allow_disconnected_mount: bool,
+) -> Result<(), CliprdrError> {
+    match metadata_result {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            log::warn!("refusing to use symlinked FUSE path {:?}", path);
+            Err(CliprdrError::CliprdrInit)
+        }
+        Ok(_) => Ok(()),
+        Err(e) if allow_disconnected_mount && e.raw_os_error() == Some(libc::ENOTCONN) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            log::warn!("failed to inspect FUSE path {:?}: {:?}", path, e);
+            Err(CliprdrError::CliprdrInit)
+        }
+    }
+}
+
+fn reject_symlink_path(path: &Path) -> Result<(), CliprdrError> {
+    reject_symlink_metadata_result(path, std::fs::symlink_metadata(path), false)
+}
+
+fn ensure_mount_point_path_is_safe(mount_point: &Path) -> Result<(), CliprdrError> {
+    if let Some(parent) = mount_point.parent() {
+        reject_symlink_path(parent)?;
+    }
+    reject_symlink_metadata_result(mount_point, std::fs::symlink_metadata(mount_point), true)
 }
 
 fn unmount_fuse_mount_point(mount_point: &Path) {
+    if ensure_mount_point_path_is_safe(mount_point).is_err() {
+        log::warn!(
+            "refusing to unmount unsafe clipboard FUSE mount point {:?}",
+            mount_point
+        );
+        return;
+    }
     if run_unmount_command("umount", &["-l"], mount_point) {
         return;
     }
     if run_unmount_command("fusermount3", &["-uz"], mount_point) {
         return;
     }
-    run_unmount_command("fusermount", &["-uz"], mount_point);
+    if !run_unmount_command("fusermount", &["-uz"], mount_point) {
+        log::warn!(
+            "failed to unmount clipboard FUSE mount point {:?}",
+            mount_point
+        );
+    }
 }
 
 fn run_unmount_command(program: &str, args: &[&str], mount_point: &Path) -> bool {
@@ -246,22 +435,24 @@ fn run_unmount_command(program: &str, args: &[&str], mount_point: &Path) -> bool
 }
 
 fn uninit_fuse_context_(is_client: bool) {
-    let mut fuse_context_lock = if is_client {
-        FUSE_CONTEXT_CLIENT.lock()
-    } else {
-        FUSE_CONTEXT_SERVER.lock()
+    let ctx = {
+        let mut fuse_context_lock = if is_client {
+            FUSE_CONTEXT_CLIENT.lock()
+        } else {
+            FUSE_CONTEXT_SERVER.lock()
+        };
+        fuse_context_lock.take()
     };
-    let ctx = fuse_context_lock.take();
     drop(ctx);
 }
 
 impl Drop for FuseContext {
     fn drop(&mut self) {
-        log::info!("unmounting clipboard FUSE from {}", self.mount_point.display());
-        unmount_fuse_mount_point(&self.mount_point);
-        if let Some(session) = self.session.lock().take() {
-            session.join();
-        }
+        self.session.lock().take().map(|s| s.join());
+        log::info!(
+            "unmounting clipboard FUSE from {}",
+            self.mount_point.display()
+        );
     }
 }
 
@@ -303,24 +494,60 @@ mod tests {
     use super::*;
     use std::{fs, io};
 
-    #[test]
-    fn reports_disconnected_fuse_mount_as_unhealthy() {
-        let err = io::Error::from_raw_os_error(libc::ENOTCONN);
+    #[cfg(target_family = "unix")]
+    use std::os::unix::fs::symlink;
 
-        assert!(!is_mount_point_healthy_result::<()>(Err(err)));
+    #[test]
+    fn classifies_mount_point_state_from_metadata_and_mountinfo() {
+        let mount_point = std::env::temp_dir().join(format!(
+            "rustdesk-fuse-mount-state-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mountinfo = format!(
+            "123 1 0:45 / {} rw,nosuid,nodev - fuse.rustdesk rustdesk rw\n",
+            mount_point.display()
+        );
+
+        assert_eq!(
+            inspect_mount_point_state_with(&mount_point, Ok(()), Ok(mountinfo)),
+            MountPointState::HealthyMount
+        );
+        assert_eq!(
+            inspect_mount_point_state_with(&mount_point, Ok(()), Ok(String::new())),
+            MountPointState::NotMounted
+        );
+
+        let disconnected_metadata: io::Result<()> =
+            Err(io::Error::from_raw_os_error(libc::ENOTCONN));
+        assert_eq!(
+            inspect_mount_point_state_with(&mount_point, disconnected_metadata, Ok(String::new())),
+            MountPointState::StaleMount
+        );
     }
 
     #[test]
-    fn reports_existing_directory_mount_point_as_healthy() {
-        let mount_point = std::env::temp_dir().join(format!(
-            "rustdesk-fuse-mount-health-test-{}",
-            std::process::id()
+    #[cfg(target_family = "unix")]
+    fn rejects_symlink_mount_point() {
+        let base = std::env::temp_dir().join(format!(
+            "rustdesk-fuse-symlink-test-{}-{}",
+            std::process::id(),
+            line!()
         ));
-        let _ = fs::remove_dir_all(&mount_point);
-        fs::create_dir(&mount_point).unwrap();
+        let mount_parent = base.join("parent");
+        let mount_point = mount_parent.join("cliprdr-client");
+        let symlink_target = base.join("symlink-target");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&mount_parent).unwrap();
+        fs::create_dir_all(&symlink_target).unwrap();
+        symlink(&symlink_target, &mount_point).unwrap();
 
-        assert!(is_mount_point_healthy(&mount_point));
+        assert!(matches!(
+            prepare_fuse_mount_point(&mount_point),
+            Err(CliprdrError::CliprdrInit)
+        ));
 
-        let _ = fs::remove_dir_all(&mount_point);
+        let _ = fs::remove_dir_all(&base);
     }
 }
