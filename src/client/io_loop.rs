@@ -147,9 +147,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         // No need to call `enable(false)` for sciter version, because each client of sciter version is a new process.
                         // It's better to check if the peers are windows(support file copy&paste), but it's not necessary.
                         #[cfg(feature = "flutter")]
-                        if !crate::flutter::sessions::has_connected_sessions_running(
-                            ConnType::DEFAULT_CONN,
-                        ) {
+                        if !crate::flutter::sessions::has_sessions_running(ConnType::DEFAULT_CONN) {
                             ContextSend::enable(false);
                         };
                     }),

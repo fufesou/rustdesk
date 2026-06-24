@@ -314,6 +314,16 @@ fn validate_mount_state_after_stale_cleanup(
             Err(CliprdrError::CliprdrInit)
         }
     }
+
+    if !recovered_stale_mount {
+        if let Err(e) = std::process::Command::new("umount")
+            .arg(mount_point)
+            .status()
+        {
+            log::warn!("umount {:?} may fail: {:?}", mount_point, e);
+        }
+    }
+    Ok(())
 }
 
 fn inspect_mount_point_state_with<T>(
