@@ -404,16 +404,10 @@ pub mod unix_file_clip {
                     stream_id,
                     requested_data,
                 };
-                match fuse::init_fuse_context(side == ClipboardSide::Client) {
-                    Ok(()) => {
-                        hbb_common::allow_err!(fuse::handle_file_content_response(
-                            side == ClipboardSide::Client,
-                            response
-                        ));
-                    }
-                    Err(e) => {
-                        log::error!("failed to initialize clipboard FUSE context: {:?}", e);
-                    }
+                if let Err(e) =
+                    fuse::handle_file_content_response(side == ClipboardSide::Client, response)
+                {
+                    log::error!("failed to handle file contents response: {:?}", e);
                 }
             }
             ClipboardFile::NotifyCallback {
