@@ -176,6 +176,11 @@ lazy_static::lazy_static! {
 
 const PUBLIC_SERVER: &str = "public";
 
+struct SecureConnectionResult {
+    peer_pk: Option<Vec<u8>>,
+    insecure_fallback: bool,
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_key_state(key: enigo::Key) -> bool {
     use enigo::KeyboardControllable;
@@ -209,6 +214,7 @@ impl Client {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
+        interface.update_insecure_session_fallback(false);
         match Self::_start(peer, key, token, conn_type, interface.clone()).await {
             Err(err) => {
                 let err_str = err.to_string();
@@ -575,10 +581,13 @@ impl Client {
                         let mut conn = conn?;
                         feedback = rr.feedback;
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
-                        let pk =
+                        let secure_result =
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
+                        if secure_result.insecure_fallback {
+                            interface.update_insecure_session_fallback(true);
+                        }
                         return Ok((
-                            (conn, typ == "IPv6", pk, kcp, typ),
+                            (conn, typ == "IPv6", secure_result.peer_pk, kcp, typ),
                             (feedback, rendezvous_server),
                             false,
                         ));
@@ -744,16 +753,19 @@ impl Client {
             punch_type
         );
         let res = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await;
-        let pk: Option<Vec<u8>> = match res {
-            Ok(pk) => pk,
+        let secure_result = match res {
+            Ok(result) => result,
             Err(e) => {
                 // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                 interface.update_direct(Some(direct));
                 bail!(e);
             }
         };
+        if secure_result.insecure_fallback {
+            interface.update_insecure_session_fallback(true);
+        }
         log::debug!("{} punch secure_connection ok", punch_type);
-        Ok((conn, direct, pk, kcp, typ))
+        Ok((conn, direct, secure_result.peer_pk, kcp, typ))
     }
 
     /// Establish secure connection with the server.
@@ -762,33 +774,28 @@ impl Client {
         signed_id_pk: Vec<u8>,
         key: &str,
         conn: &mut Stream,
-    ) -> ResultType<Option<Vec<u8>>> {
+    ) -> ResultType<SecureConnectionResult> {
         let rs_pk = get_rs_pk(if key.is_empty() {
             config::RS_PUB_KEY
         } else {
             key
         });
-        let mut sign_pk = None;
-        let mut option_pk = None;
-        if !signed_id_pk.is_empty() {
-            if let Some(rs_pk) = rs_pk {
-                if let Ok((id, pk)) = decode_id_pk(&signed_id_pk, &rs_pk) {
-                    if id == peer_id {
-                        sign_pk = Some(sign::PublicKey(pk));
-                        option_pk = Some(pk.to_vec());
-                    }
-                }
-            }
-            if sign_pk.is_none() {
-                log::error!("Handshake failed: invalid public key from rendezvous server");
-            }
-        }
-        let sign_pk = match sign_pk {
-            Some(v) => v,
+        let allow_insecure_fallback = Self::allow_insecure_session_fallback();
+        let peer_key = Self::validate_signed_peer_key(
+            peer_id,
+            &signed_id_pk,
+            rs_pk.as_ref(),
+            allow_insecure_fallback,
+        )?;
+        let (sign_pk, option_pk) = match peer_key {
+            Some((sign_pk, pk)) => (sign_pk, Some(pk)),
             None => {
                 // send an empty message out in case server is setting up secure and waiting for first message
                 conn.send(&Message::new()).await?;
-                return Ok(option_pk);
+                return Ok(SecureConnectionResult {
+                    peer_pk: None,
+                    insecure_fallback: true,
+                });
             }
         };
         match timeout(READ_TIMEOUT, conn.next()).await? {
@@ -810,29 +817,93 @@ impl Client {
                                 conn.set_key(key);
                             } else {
                                 log::error!("Handshake failed: sign failure");
-                                conn.send(&Message::new()).await?;
+                                if allow_insecure_fallback {
+                                    log::warn!("Handshake fallback allowed: peer id mismatch");
+                                    conn.send(&Message::new()).await?;
+                                    return Ok(SecureConnectionResult {
+                                        peer_pk: None,
+                                        insecure_fallback: true,
+                                    });
+                                } else {
+                                    bail!("Handshake failed: peer id mismatch");
+                                }
                             }
                         } else {
-                            // fall back to non-secure connection in case pk mismatch
-                            log::info!("pk mismatch, fall back to non-secure");
-                            let mut msg_out = Message::new();
-                            msg_out.set_public_key(PublicKey::new());
-                            conn.send(&msg_out).await?;
+                            if allow_insecure_fallback {
+                                // fall back to non-secure connection in case pk mismatch
+                                log::warn!("Handshake fallback allowed: peer public key mismatch");
+                                let mut msg_out = Message::new();
+                                msg_out.set_public_key(PublicKey::new());
+                                conn.send(&msg_out).await?;
+                                return Ok(SecureConnectionResult {
+                                    peer_pk: None,
+                                    insecure_fallback: true,
+                                });
+                            } else {
+                                bail!("Handshake failed: peer public key mismatch");
+                            }
                         }
                     } else {
                         log::error!("Handshake failed: invalid message type");
-                        conn.send(&Message::new()).await?;
+                        if allow_insecure_fallback {
+                            log::warn!("Handshake fallback allowed: invalid message type");
+                            conn.send(&Message::new()).await?;
+                            return Ok(SecureConnectionResult {
+                                peer_pk: None,
+                                insecure_fallback: true,
+                            });
+                        } else {
+                            bail!("Handshake failed: invalid message type");
+                        }
                     }
                 } else {
                     log::error!("Handshake failed: invalid message format");
-                    conn.send(&Message::new()).await?;
+                    if allow_insecure_fallback {
+                        log::warn!("Handshake fallback allowed: invalid message format");
+                        conn.send(&Message::new()).await?;
+                        return Ok(SecureConnectionResult {
+                            peer_pk: None,
+                            insecure_fallback: true,
+                        });
+                    } else {
+                        bail!("Handshake failed: invalid message format");
+                    }
                 }
             }
             None => {
                 bail!("Reset by the peer");
             }
         }
-        Ok(option_pk)
+        Ok(SecureConnectionResult {
+            peer_pk: option_pk,
+            insecure_fallback: false,
+        })
+    }
+
+    fn allow_insecure_session_fallback() -> bool {
+        Config::get_option(keys::OPTION_ALLOW_INSECURE_SESSION_FALLBACK) == "Y"
+    }
+
+    fn validate_signed_peer_key(
+        peer_id: &str,
+        signed_id_pk: &[u8],
+        rs_pk: Option<&sign::PublicKey>,
+        allow_insecure_fallback: bool,
+    ) -> ResultType<Option<(sign::PublicKey, Vec<u8>)>> {
+        if signed_id_pk.is_empty() {
+            if allow_insecure_fallback {
+                log::warn!("Handshake fallback allowed: missing public key from rendezvous server");
+                return Ok(None);
+            }
+            bail!("Handshake failed: missing public key from rendezvous server");
+        }
+        let Some(rs_pk) = rs_pk else {
+            bail!("Handshake failed: missing rendezvous public key");
+        };
+        match decode_id_pk(signed_id_pk, rs_pk) {
+            Ok((id, pk)) if id == peer_id => Ok(Some((sign::PublicKey(pk), pk.to_vec()))),
+            _ => bail!("Handshake failed: invalid public key from rendezvous server"),
+        }
     }
 
     /// Request a relay connection to the server.
@@ -1763,6 +1834,7 @@ pub struct LoginConfigHandler {
     pub mark_unsupported: Vec<CodecFormat>,
     pub selected_windows_session_id: Option<u32>,
     pub peer_info: Option<PeerInfo>,
+    pub insecure_session_fallback: bool,
     password_source: PasswordSource, // where the sent password comes from
     shared_password: Option<String>, // Store the shared password
     pub enable_trusted_devices: bool,
@@ -3746,6 +3818,32 @@ pub trait Interface: Send + Clone + 'static + Sized {
         self.get_lch().write().unwrap().received = received;
     }
 
+    fn update_insecure_session_fallback(&self, fallback: bool) {
+        self.get_lch().write().unwrap().insecure_session_fallback = fallback;
+    }
+
+    fn warn_insecure_session_fallback_if_needed(&self) {
+        let lch = self.get_lch();
+        let (fallback, direct) = {
+            let mut lc = lch.write().unwrap();
+            let fallback = lc.insecure_session_fallback;
+            lc.insecure_session_fallback = false;
+            (fallback, lc.direct.unwrap_or(false))
+        };
+        if fallback {
+            self.warn_insecure_session_fallback(direct);
+        }
+    }
+
+    fn warn_insecure_session_fallback(&self, direct: bool) {
+        let text = if direct {
+            "Direct and unencrypted connection"
+        } else {
+            "Relayed and unencrypted connection"
+        };
+        self.msgbox("custom-nocancel-nook-hasclose-warning", "Warning", text, "");
+    }
+
     fn on_establish_connection_error(&self, err: String) {
         let title = "Connection Error";
         let text = err.to_string();
@@ -4177,6 +4275,33 @@ pub mod peer_online {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod secure_connection_policy_tests {
+    use super::{sign, Client};
+
+    #[test]
+    fn signed_peer_key_is_required_by_default() {
+        let result = Client::validate_signed_peer_key("peer-id", &[], None, false);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn signed_peer_key_can_be_omitted_only_for_explicit_legacy_fallback() {
+        let result = Client::validate_signed_peer_key("peer-id", &[], None, true);
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn invalid_signed_peer_key_is_rejected_even_with_legacy_fallback() {
+        let (rs_pk, _) = sign::gen_keypair();
+        let result = Client::validate_signed_peer_key("peer-id", b"invalid", Some(&rs_pk), true);
+
+        assert!(result.is_err());
     }
 }
 

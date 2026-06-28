@@ -1301,6 +1301,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !self.first_frame {
                         self.first_frame = true;
                         self.handler.close_success();
+                        self.handler.warn_insecure_session_fallback_if_needed();
                         self.handler.adapt_size();
                         self.send_toggle_virtual_display_msg(peer).await;
                         self.send_toggle_privacy_mode_msg(peer).await;
@@ -1360,7 +1361,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                 return false;
                             }
                         }
+                        let warn_without_video =
+                            !self.handler.is_default() && !self.handler.is_view_camera();
                         self.handler.handle_peer_info(pi);
+                        if warn_without_video {
+                            self.handler.warn_insecure_session_fallback_if_needed();
+                        }
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {

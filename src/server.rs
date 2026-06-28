@@ -202,55 +202,19 @@ pub async fn create_tcp_connection(
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
-    let (sk, pk) = Config::get_key_pair();
-    if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
-        let mut sk_ = [0u8; sign::SECRETKEYBYTES];
-        sk_[..].copy_from_slice(&sk);
-        let sk = sign::SecretKey(sk_);
-        let mut msg_out = Message::new();
-        let (our_pk_b, our_sk_b) = box_::gen_keypair();
-        msg_out.set_signed_id(SignedId {
-            id: sign::sign(
-                &IdPk {
-                    id: Config::get_id(),
-                    pk: Bytes::from(our_pk_b.0.to_vec()),
-                    ..Default::default()
-                }
-                .write_to_bytes()
-                .unwrap_or_default(),
-                &sk,
-            )
-            .into(),
-            ..Default::default()
-        });
-        timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
-        match timeout(CONNECT_TIMEOUT, stream.next()).await? {
-            Some(res) => {
-                let bytes = res?;
-                if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
-                    if let Some(message::Union::PublicKey(pk)) = msg_in.union {
-                        if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
-                            stream.set_key(tcp::Encrypt::decode(
-                                &pk.symmetric_value,
-                                &pk.asymmetric_value,
-                                &our_sk_b,
-                            )?);
-                        } else if pk.asymmetric_value.is_empty() {
-                            Config::set_key_confirmed(false);
-                            log::info!("Force to update pk");
-                        } else {
-                            bail!("Handshake failed: invalid public sign key length from peer");
-                        }
-                    } else {
-                        log::error!("Handshake failed: invalid message type");
-                    }
-                } else {
-                    bail!("Handshake failed: invalid message format");
-                }
-            }
-            None => {
-                bail!("Failed to receive public key");
-            }
+    if secure {
+        if let Err(err) = setup_secure_connection(&mut stream).await {
+            post_alarm_audit_for_connection(
+                id,
+                AlarmAuditType::InsecureConnection,
+                serde_json::json!({
+                    "ip": addr.ip(),
+                    "action": "fail_close",
+                    "reason": err.to_string(),
+                }),
+                None,
+            );
+            return Err(err);
         }
     }
 
@@ -266,8 +230,69 @@ pub async fn create_tcp_connection(
         }
         log::info!("wake up macos");
     }
-    Connection::start(addr, stream, id, Arc::downgrade(&server), meta).await;
+    Connection::start(addr, stream, id, Arc::downgrade(&server), meta, secure).await;
     Ok(())
+}
+
+async fn setup_secure_connection(stream: &mut Stream) -> ResultType<()> {
+    let (sk, pk) = Config::get_key_pair();
+    if pk.len() != sign::PUBLICKEYBYTES || sk.len() != sign::SECRETKEYBYTES {
+        bail!("Handshake failed: missing local signing key");
+    }
+
+    let mut sk_ = [0u8; sign::SECRETKEYBYTES];
+    sk_[..].copy_from_slice(&sk);
+    let sk = sign::SecretKey(sk_);
+    let mut msg_out = Message::new();
+    let (our_pk_b, our_sk_b) = box_::gen_keypair();
+    msg_out.set_signed_id(SignedId {
+        id: sign::sign(
+            &IdPk {
+                id: Config::get_id(),
+                pk: Bytes::from(our_pk_b.0.to_vec()),
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap_or_default(),
+            &sk,
+        )
+        .into(),
+        ..Default::default()
+    });
+    timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
+    match timeout(CONNECT_TIMEOUT, stream.next()).await? {
+        Some(res) => {
+            let bytes = res?;
+            let msg_in = match Message::parse_from_bytes(&bytes) {
+                Ok(msg) => msg,
+                Err(_) => bail!("Handshake failed: invalid message format"),
+            };
+            let Some(message::Union::PublicKey(pk)) = msg_in.union else {
+                bail!("Handshake failed: invalid message type");
+            };
+            validate_secure_public_key(&pk)?;
+            stream.set_key(tcp::Encrypt::decode(
+                &pk.symmetric_value,
+                &pk.asymmetric_value,
+                &our_sk_b,
+            )?);
+        }
+        None => {
+            bail!("Failed to receive public key");
+        }
+    }
+    Ok(())
+}
+
+fn validate_secure_public_key(pk: &PublicKey) -> ResultType<()> {
+    if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
+        return Ok(());
+    }
+    if pk.asymmetric_value.is_empty() {
+        Config::set_key_confirmed(false);
+        bail!("Handshake failed: empty public key from peer");
+    }
+    bail!("Handshake failed: invalid public sign key length from peer");
 }
 
 pub async fn accept_connection(
@@ -335,6 +360,27 @@ async fn create_relay_connection_(
     stream.send(&msg_out).await?;
     create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod secure_connection_tests {
+    use super::*;
+
+    #[test]
+    fn secure_public_key_rejects_empty_key() {
+        let mut pk = PublicKey::new();
+        pk.asymmetric_value = Bytes::new();
+
+        assert!(validate_secure_public_key(&pk).is_err());
+    }
+
+    #[test]
+    fn secure_public_key_rejects_wrong_length_key() {
+        let mut pk = PublicKey::new();
+        pk.asymmetric_value = Bytes::from(vec![1; box_::PUBLICKEYBYTES - 1]);
+
+        assert!(validate_secure_public_key(&pk).is_err());
+    }
 }
 
 impl Server {

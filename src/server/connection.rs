@@ -263,6 +263,7 @@ pub struct Connection {
     display_idx: usize,
     stream: super::Stream,
     server: super::ServerPtrWeak,
+    secure: bool,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
     timer: crate::RustDeskInterval,
@@ -409,6 +410,7 @@ impl Connection {
         id: i32,
         server: super::ServerPtrWeak,
         meta: super::ConnectionMeta,
+        secure: bool,
     ) {
         let super::ConnectionMeta {
             control_permissions,
@@ -460,6 +462,7 @@ impl Connection {
             display_idx: *display_service::PRIMARY_DISPLAY_IDX,
             stream,
             server,
+            secure,
             hash,
             read_jobs: Vec::new(),
             timer: crate::rustdesk_interval(time::interval(SEC30)),
@@ -1348,6 +1351,15 @@ impl Connection {
             audit["conn_audit_ref"] = json!(audit_ref);
         }
         self.post_conn_audit(audit);
+        if !self.secure {
+            self.post_alarm_audit(
+                AlarmAuditType::InsecureConnection,
+                json!({
+                    "ip": addr.ip(),
+                    "action": "accepted",
+                }),
+            );
+        }
         true
     }
 
@@ -1442,28 +1454,12 @@ impl Connection {
     }
 
     fn post_alarm_audit(&self, typ: AlarmAuditType, info: Value) {
-        let url = crate::get_audit_server(
-            Config::get_option("api-server"),
-            Config::get_option("custom-rendezvous-server"),
-            "alarm".to_owned(),
-        );
-        if url.is_empty() {
-            return;
-        }
-        let mut v = Value::default();
-        v["id"] = json!(Config::get_id());
-        v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
-        v["typ"] = json!(typ as i8);
-        v["info"] = serde_json::Value::String(info.to_string());
-        v["conn_id"] = json!(self.inner.id());
-        if typ == AlarmAuditType::IpWhitelist {
-            if let Some(audit_ref) = self.conn_audit_ref() {
-                v["conn_audit_ref"] = json!(audit_ref);
-            }
-        }
-        tokio::spawn(async move {
-            allow_err!(Self::post_audit_async(url, v).await);
-        });
+        let audit_ref = if typ == AlarmAuditType::IpWhitelist {
+            self.conn_audit_ref()
+        } else {
+            None
+        };
+        post_alarm_audit_for_connection(self.inner.id(), typ, info, audit_ref);
     }
 
     #[inline]
@@ -1844,6 +1840,7 @@ impl Connection {
             self.update_options(&o).await;
         }
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
+            self.keyboard = false;
             let dir = if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
                 &dir
             } else {
@@ -2407,6 +2404,12 @@ impl Connection {
                 raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
                 return false;
             }
+        }
+        if self.is_authed_file_transfer_conn()
+            && Self::should_reject_authed_file_transfer_message(&msg)
+        {
+            log::warn!("Rejecting non-file-transfer message on FileTransfer connection");
+            return true;
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
@@ -5129,11 +5132,30 @@ impl Connection {
         false
     }
 
+    fn is_authed_file_transfer_conn(&self) -> bool {
+        if let Some(id) = self.authed_conn_id.as_ref() {
+            return id.conn_type() == AuthConnType::FileTransfer;
+        }
+        false
+    }
+
     fn is_authed_view_camera_conn(&self) -> bool {
         if let Some(id) = self.authed_conn_id.as_ref() {
             return id.conn_type() == AuthConnType::ViewCamera;
         }
         false
+    }
+
+    fn is_file_transfer_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => true,
+            Some(message::Union::Misc(misc)) => is_file_transfer_scoped_misc(misc),
+            _ => false,
+        }
+    }
+
+    fn should_reject_authed_file_transfer_message(msg: &Message) -> bool {
+        !Self::is_file_transfer_scoped_message(msg)
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
@@ -5531,6 +5553,49 @@ pub enum AlarmAuditType {
     ExceedIPv6PrefixAttempts = 6,
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
+    InsecureConnection = 9,
+}
+
+pub(crate) fn post_alarm_audit_for_connection(
+    conn_id: i32,
+    typ: AlarmAuditType,
+    info: Value,
+    conn_audit_ref: Option<&str>,
+) {
+    let url = crate::get_audit_server(
+        Config::get_option("api-server"),
+        Config::get_option("custom-rendezvous-server"),
+        "alarm".to_owned(),
+    );
+    if url.is_empty() {
+        return;
+    }
+    let mut v = Value::default();
+    v["id"] = json!(Config::get_id());
+    v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
+    v["typ"] = json!(typ as i8);
+    v["info"] = serde_json::Value::String(info.to_string());
+    v["conn_id"] = json!(conn_id);
+    if typ == AlarmAuditType::IpWhitelist {
+        if let Some(audit_ref) = conn_audit_ref {
+            v["conn_audit_ref"] = json!(audit_ref);
+        }
+    }
+    tokio::spawn(async move {
+        allow_err!(Connection::post_audit_async(url, v).await);
+    });
+}
+
+fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(misc.union.as_ref(), Some(misc::Union::SelectedSid(_)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = misc;
+        false
+    }
 }
 
 pub enum FileAuditType {
@@ -5651,6 +5716,53 @@ impl FileRemoveLogControl {
             })
             .count();
         v
+    }
+}
+
+#[cfg(test)]
+mod file_transfer_scope_tests {
+    use super::*;
+
+    #[test]
+    fn file_transfer_scope_allows_file_action() {
+        let mut msg = Message::new();
+        msg.set_file_action(FileAction::new());
+
+        assert!(Connection::is_file_transfer_scoped_message(&msg));
+    }
+
+    #[test]
+    fn file_transfer_scope_rejects_mouse_event() {
+        let mut msg = Message::new();
+        msg.set_mouse_event(MouseEvent::new());
+
+        assert!(!Connection::is_file_transfer_scoped_message(&msg));
+    }
+
+    #[test]
+    fn file_transfer_scope_rejects_screenshot_request() {
+        let mut msg = Message::new();
+        msg.set_screenshot_request(ScreenshotRequest::new());
+
+        assert!(!Connection::is_file_transfer_scoped_message(&msg));
+    }
+
+    #[test]
+    fn file_transfer_scope_rejects_capture_displays() {
+        let mut misc = Misc::new();
+        misc.set_capture_displays(CaptureDisplays::new());
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+
+        assert!(!Connection::is_file_transfer_scoped_message(&msg));
+    }
+
+    #[test]
+    fn authed_file_transfer_guard_rejects_login_request() {
+        let mut msg = Message::new();
+        msg.set_login_request(LoginRequest::new());
+
+        assert!(Connection::should_reject_authed_file_transfer_message(&msg));
     }
 }
 

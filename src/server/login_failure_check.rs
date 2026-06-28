@@ -2,9 +2,9 @@ use crate::AlarmAuditType;
 use hbb_common::get_time;
 #[cfg(target_os = "windows")]
 use hbb_common::tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
-use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
+use std::sync::Mutex;
 
 const OS_CREDENTIAL_LOGIN_TOTAL_IDLE_RESET_MS: i64 = 120 * 60 * 1_000;
 const OS_CREDENTIAL_LOGIN_BACKOFF_BASE_SECONDS: i64 = 15;
