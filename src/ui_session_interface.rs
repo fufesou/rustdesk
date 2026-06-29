@@ -52,6 +52,7 @@ use crate::keyboard;
 use crate::{client::Data, client::Interface};
 
 const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
+const TEST_OUT_OF_SCOPE_MESSAGE_DELAY_SECS: u64 = 5;
 
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
@@ -230,6 +231,37 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn is_port_forward(&self) -> bool {
         let conn_type = self.lc.read().unwrap().conn_type;
         conn_type == ConnType::PORT_FORWARD || conn_type == ConnType::RDP
+    }
+
+    fn schedule_out_of_scope_message_for_scope_test(&self) {
+        let conn_type = if self.is_file_transfer() {
+            "file-transfer"
+        } else if self.is_view_camera() {
+            "view-camera"
+        } else if self.is_terminal() {
+            "terminal"
+        } else {
+            return;
+        };
+        let session = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TokioDuration::from_secs(
+                TEST_OUT_OF_SCOPE_MESSAGE_DELAY_SECS,
+            ))
+            .await;
+            let mut msg = Message::new();
+            msg.set_mouse_event(MouseEvent {
+                mask: MOUSE_TYPE_DOWN,
+                x: 0,
+                y: 0,
+                ..Default::default()
+            });
+            log::warn!(
+                "Sending test out-of-scope MouseEvent on {} session",
+                conn_type
+            );
+            session.send(Data::Message(msg));
+        });
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1842,6 +1874,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             );
         }
         self.on_connected(self.lc.read().unwrap().conn_type);
+        self.schedule_out_of_scope_message_for_scope_test();
         #[cfg(windows)]
         {
             let mut path = std::env::temp_dir();
