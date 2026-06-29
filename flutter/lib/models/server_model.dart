@@ -19,6 +19,20 @@ import 'model.dart';
 
 const kLoginDialogTag = "LOGIN";
 
+const _peerDisplayMaxLength = 128;
+final _peerDisplayUnsafeChars =
+    RegExp(r'[\x00-\x1F\x7F\u202A-\u202E\u2066-\u2069]');
+
+String _peerDisplayText(dynamic value,
+    [int maxLength = _peerDisplayMaxLength]) {
+  final text =
+      (value?.toString() ?? '').replaceAll(_peerDisplayUnsafeChars, '').trim();
+  if (text.runes.length <= maxLength) {
+    return text;
+  }
+  return '${String.fromCharCodes(text.runes.take(maxLength - 3))}...';
+}
+
 const kUseTemporaryPassword = "use-temporary-password";
 const kUsePermanentPassword = "use-permanent-password";
 const kUseBothPasswords = "use-both-passwords";
@@ -846,9 +860,9 @@ class Client {
     isViewCamera = json['is_view_camera'];
     isTerminal = json['is_terminal'] ?? false;
     portForward = json['port_forward'];
-    name = json['name'];
-    avatar = json['avatar'] ?? '';
-    peerId = json['peer_id'];
+    name = _peerDisplayText(json['name']);
+    avatar = _peerDisplayText(json['avatar'], 2048);
+    peerId = _peerDisplayText(json['peer_id']);
     keyboard = json['keyboard'];
     clipboard = json['clipboard'];
     audio = json['audio'];

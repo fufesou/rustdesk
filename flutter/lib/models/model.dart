@@ -820,7 +820,15 @@ class FfiModel with ChangeNotifier {
 
   handleSwitchDisplay(
       Map<String, dynamic> evt, SessionID sessionId, String peerId) {
-    final display = int.parse(evt['display']);
+    final display = int.tryParse(evt['display']?.toString() ?? '');
+    if (display == null) {
+      debugPrint('Drop malformed switch_display event: invalid display');
+      return;
+    }
+    if (display < 0 || display >= _pi.displays.length) {
+      debugPrint('Drop malformed switch_display event: invalid display index');
+      return;
+    }
 
     if (_pi.currentDisplay != kAllDisplayValue) {
       if (bind.peerGetSessionsCount(
@@ -1307,6 +1315,28 @@ class FfiModel with ChangeNotifier {
     }
   }
 
+  List<Display>? _decodePeerInfoDisplays(dynamic displaysJson) {
+    try {
+      final decoded = json.decode(displaysJson);
+      if (decoded is! List<dynamic>) {
+        debugPrint('Drop malformed peer_info event: displays is not a list');
+        return null;
+      }
+      List<Display> displays = [];
+      for (final display in decoded) {
+        if (display is! Map<String, dynamic>) {
+          debugPrint('Drop malformed peer_info event: invalid display');
+          return null;
+        }
+        displays.add(evtToDisplay(display));
+      }
+      return displays;
+    } catch (e) {
+      debugPrint('Drop malformed peer_info event: invalid displays JSON: $e');
+      return null;
+    }
+  }
+
   /// Handle the peer info event based on [evt].
   handlePeerInfo(Map<String, dynamic> evt, String peerId, bool isCache) async {
     parent.target?.chatModel.voiceCallStatus.value = VoiceCallStatus.notStarted;
@@ -1323,6 +1353,41 @@ class FfiModel with ChangeNotifier {
     bind.mainLoadRecentPeers();
 
     parent.target?.dialogManager.dismissAll();
+    final currentDisplay =
+        int.tryParse(evt['current_display']?.toString() ?? '');
+    if (currentDisplay == null) {
+      debugPrint('Drop malformed peer_info event: invalid current_display');
+      return;
+    }
+
+    final connType = parent.target?.connType;
+    List<Display>? newDisplays;
+    Map<String, dynamic>? features;
+    if (connType == ConnType.defaultConn || connType == ConnType.viewCamera) {
+      final decodedDisplays = _decodePeerInfoDisplays(evt['displays']);
+      if (decodedDisplays == null) {
+        return;
+      }
+      if (currentDisplay != kAllDisplayValue &&
+          (currentDisplay < 0 || currentDisplay >= decodedDisplays.length)) {
+        debugPrint('Drop malformed peer_info event: invalid current_display');
+        return;
+      }
+      newDisplays = decodedDisplays;
+
+      try {
+        final decoded = json.decode(evt['features']);
+        if (decoded is! Map<String, dynamic>) {
+          debugPrint('Drop malformed peer_info event: features is not a map');
+          return;
+        }
+        features = decoded;
+      } catch (e) {
+        debugPrint('Drop malformed peer_info event: invalid features JSON: $e');
+        return;
+      }
+    }
+
     _pi.version = evt['version'];
     // Note: Relative mouse mode is NOT auto-enabled on connect.
     // Users must manually enable it via toolbar or keyboard shortcut (Ctrl+Alt+Shift+M).
@@ -1341,7 +1406,6 @@ class FfiModel with ChangeNotifier {
     _pi.hostname = evt['hostname'];
     _pi.platform = evt['platform'];
     _pi.sasEnabled = evt['sas_enabled'] == 'true';
-    final currentDisplay = int.parse(evt['current_display']);
     if (_pi.primaryDisplay == kInvalidDisplayIndex) {
       _pi.primaryDisplay = currentDisplay;
     }
@@ -1358,7 +1422,6 @@ class FfiModel with ChangeNotifier {
       //
     }
 
-    final connType = parent.target?.connType;
     if (isPeerAndroid) {
       _touchMode = true;
     } else {
@@ -1390,12 +1453,9 @@ class FfiModel with ChangeNotifier {
       }
     } else if (connType == ConnType.defaultConn ||
         connType == ConnType.viewCamera) {
-      List<Display> newDisplays = [];
-      List<dynamic> displays = json.decode(evt['displays']);
-      for (int i = 0; i < displays.length; ++i) {
-        newDisplays.add(evtToDisplay(displays[i]));
-      }
-      _pi.displays.value = newDisplays;
+      final displays = newDisplays!;
+      final peerFeatures = features!;
+      _pi.displays.value = displays;
       _pi.displaysCount.value = _pi.displays.length;
       if (_pi.currentDisplay < _pi.displays.length) {
         // now replaced to _updateCurDisplay
@@ -1408,8 +1468,7 @@ class FfiModel with ChangeNotifier {
         waitForFirstImage.value = true;
         isRefreshing = false;
       }
-      Map<String, dynamic> features = json.decode(evt['features']);
-      _pi.features.privacyMode = features['privacy_mode'] == true;
+      _pi.features.privacyMode = peerFeatures['privacy_mode'] == true;
       if (!isCache) {
         handleResolutions(peerId, evt["resolutions"]);
       }
@@ -3868,7 +3927,12 @@ class FFI {
             debugPrint('json.decode fail1(): $e, ${message.field0}');
           }
           if (event != null) {
-            await cb(event);
+            try {
+              await cb(event);
+            } catch (e, stackTrace) {
+              debugPrint(
+                  'Peer event handler failed (${event['name'] ?? 'unknown'}): $e\n$stackTrace');
+            }
           }
         } else if (message is EventToUI_Rgba) {
           final display = message.field0;
