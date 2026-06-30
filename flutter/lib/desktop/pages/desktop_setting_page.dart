@@ -1752,6 +1752,12 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
                               'Allow insecure TLS fallback',
                               'allow-insecure-tls-fallback-tip',
                               kOptionAllowInsecureTLSFallback),
+                          divider,
+                          switchWidget(
+                              Icons.warning_amber_rounded,
+                              'Allow insecure session fallback',
+                              'allow-insecure-session-fallback-tip',
+                              kOptionAllowInsecureSessionFallback),
                           if (!outgoingOnly) divider,
                           if (!outgoingOnly)
                             listTile(
