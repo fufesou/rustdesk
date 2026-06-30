@@ -2770,6 +2770,10 @@ class CanvasModel with ChangeNotifier {
 }
 
 // data for cursor
+const String _cursorDiagnosticPrefix = '==============================';
+const String _cursorDiagnosticFileLogKey = 'cursor-diagnostic-log';
+const Duration _cursorDiagnosticInterval = Duration(seconds: 1);
+
 class CursorData {
   final String peerId;
   final String id;
@@ -2937,6 +2941,12 @@ class CursorModel with ChangeNotifier {
   // int.parse(evt['id']) may cause FormatException
   // So we use String here.
   String _id = "-1";
+  String? _lastLoggedCursorId;
+  String? _lastLoggedCacheMissCursorId;
+  DateTime? _lastCursorDataLogTime;
+  DateTime? _lastCursorIdLogTime;
+  DateTime? _lastCursorCacheMissLogTime;
+  bool _cursorDiagnosticFileLogFailed = false;
   double _hotx = 0;
   double _hoty = 0;
   double _displayOriginX = 0;
@@ -3043,6 +3053,26 @@ class CursorModel with ChangeNotifier {
   }
 
   CursorModel(this.parent);
+
+  void _logCursorDiagnostic(String message) {
+    final log = '$_cursorDiagnosticPrefix INFO $message';
+    debugPrint(log);
+    if (!isDesktop) {
+      return;
+    }
+    unawaited(
+      bind
+          .mainSetCommon(key: _cursorDiagnosticFileLogKey, value: log)
+          .catchError((e) {
+        if (_cursorDiagnosticFileLogFailed) {
+          return;
+        }
+        _cursorDiagnosticFileLogFailed = true;
+        debugPrint(
+            '$_cursorDiagnosticPrefix INFO cursor diagnostic file log failed: $e');
+      }),
+    );
+  }
 
   Set<String> get cachedKeys => _cacheKeys;
   addKey(String key) => _cacheKeys.add(key);
@@ -3357,11 +3387,46 @@ class CursorModel with ChangeNotifier {
     if (await _updateCache(rgba, image, id, hotx, hoty, width, height)) {
       _images[id]?.item1.dispose();
       _images[id] = Tuple3(image, hotx, hoty);
+      if (_shouldLogCursorData()) {
+        _logCursorDiagnostic(
+          'cursor_data received, peer=$peerId, id=$id, size=${width}x$height, hot=$hotx,$hoty, rgba_len=${rgba.length}',
+        );
+      }
     }
 
     // Update last cursor data.
     // Do not use the previous `image` and `id`, because `_id` may be changed.
     _updateCurData();
+  }
+
+  bool _shouldLogCursorData() {
+    final now = DateTime.now();
+    final last = _lastCursorDataLogTime;
+    if (last != null && now.difference(last) < _cursorDiagnosticInterval) {
+      return false;
+    }
+    _lastCursorDataLogTime = now;
+    return true;
+  }
+
+  bool _shouldLogCursorId() {
+    final now = DateTime.now();
+    final last = _lastCursorIdLogTime;
+    if (last != null && now.difference(last) < _cursorDiagnosticInterval) {
+      return false;
+    }
+    _lastCursorIdLogTime = now;
+    return true;
+  }
+
+  bool _shouldLogCursorCacheMiss() {
+    final now = DateTime.now();
+    final last = _lastCursorCacheMissLogTime;
+    if (last != null && now.difference(last) < _cursorDiagnosticInterval) {
+      return false;
+    }
+    _lastCursorCacheMissLogTime = now;
+    return true;
   }
 
   Future<bool> _updateCache(
@@ -3422,7 +3487,20 @@ class CursorModel with ChangeNotifier {
   }
 
   updateCursorId(Map<String, dynamic> evt) {
-    if (!_updateCurData()) {
+    if (_updateCurData()) {
+      if (_lastLoggedCursorId != _id && _shouldLogCursorId()) {
+        _logCursorDiagnostic(
+          'cursor_id applied, peer=$peerId, id=$_id, cache_hit=true',
+        );
+        _lastLoggedCursorId = _id;
+      }
+    } else {
+      if (_lastLoggedCacheMissCursorId != _id && _shouldLogCursorCacheMiss()) {
+        _logCursorDiagnostic(
+          'cursor_id cache miss, peer=$peerId, id=$_id, image_cached=${_images.containsKey(_id)}, data_cached=${_cacheMap.containsKey(_id)}',
+        );
+        _lastLoggedCacheMissCursorId = _id;
+      }
       debugPrint(
           'WARNING: updateCursorId $_id, cache is ${_cache == null ? "null" : "not null"}. without notifyListeners()');
     }
@@ -3477,6 +3555,11 @@ class CursorModel with ChangeNotifier {
     _clearCache();
     _cache = null;
     _cacheMap.clear();
+    _lastLoggedCursorId = null;
+    _lastLoggedCacheMissCursorId = null;
+    _lastCursorDataLogTime = null;
+    _lastCursorIdLogTime = null;
+    _lastCursorCacheMissLogTime = null;
   }
 
   _clearCache() {

@@ -32,12 +32,22 @@ use winapi::um::winuser::WHEEL_DELTA;
 
 const INVALID_CURSOR_POS: i32 = i32::MIN;
 const INVALID_DISPLAY_IDX: i32 = -1;
+const CURSOR_DIAGNOSTIC_PREFIX: &str = "==============================";
+const CURSOR_HASH_SAMPLE_INTERVAL_MS: u64 = 1_000;
+const CURSOR_EVENT_LOG_INTERVAL_MS: u64 = 1_000;
+const CURSOR_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const CURSOR_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 
 #[derive(Default)]
 struct StateCursor {
     hcursor: u64,
     cursor_data: Arc<Message>,
     cached_cursor_data: HashMap<u64, Arc<Message>>,
+    cursor_hashes: HashMap<u64, u64>,
+    cursor_hash_sample_times: HashMap<u64, Instant>,
+    last_handle_log: Option<Instant>,
+    last_hash_change_log: Option<Instant>,
+    last_sample_failure_log: Option<Instant>,
 }
 
 impl super::service::Reset for StateCursor {
@@ -119,6 +129,7 @@ const XKB_KEY_INSERT: u16 = evdev::Key::KEY_INSERT.code() + 8;
 pub struct MouseCursorSub {
     inner: ConnInner,
     cached: HashMap<u64, Arc<Message>>,
+    last_data_log: Option<Instant>,
 }
 
 impl From<ConnInner> for MouseCursorSub {
@@ -126,8 +137,20 @@ impl From<ConnInner> for MouseCursorSub {
         Self {
             inner,
             cached: HashMap::new(),
+            last_data_log: None,
         }
     }
+}
+
+fn should_log_after(last: &mut Option<Instant>, interval_ms: u64) -> bool {
+    let now = Instant::now();
+    if let Some(last_at) = *last {
+        if now.duration_since(last_at) < Duration::from_millis(interval_ms) {
+            return false;
+        }
+    }
+    *last = Some(now);
+    true
 }
 
 impl Subscriber for MouseCursorSub {
@@ -142,6 +165,18 @@ impl Subscriber for MouseCursorSub {
             if let Some(msg) = self.cached.get(&cd.id) {
                 self.inner.send(msg.clone());
             } else {
+                if should_log_after(&mut self.last_data_log, CURSOR_EVENT_LOG_INTERVAL_MS) {
+                    super::log::info!(
+                        "{} INFO cursor send data, conn={}, cursor_id={}, size={}x{}, hot={},{}",
+                        CURSOR_DIAGNOSTIC_PREFIX,
+                        self.id(),
+                        cd.id,
+                        cd.width,
+                        cd.height,
+                        cd.hotx,
+                        cd.hoty
+                    );
+                }
                 self.inner.send(msg.clone());
                 let mut tmp = Message::new();
                 // only send id out, require client side cache also
@@ -345,6 +380,95 @@ pub fn new_window_focus() -> GenericService {
     svc.sp
 }
 
+fn update_cursor_hash(mut hash: u64, value: u64) -> u64 {
+    for b in value.to_le_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(CURSOR_HASH_PRIME);
+    }
+    hash
+}
+
+fn cursor_data_hash(data: &hbb_common::message_proto::CursorData) -> u64 {
+    let mut hash = update_cursor_hash(CURSOR_HASH_OFFSET, data.id);
+    hash = update_cursor_hash(hash, data.hotx as u64);
+    hash = update_cursor_hash(hash, data.hoty as u64);
+    hash = update_cursor_hash(hash, data.width as u64);
+    hash = update_cursor_hash(hash, data.height as u64);
+    for b in data.colors.iter() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(CURSOR_HASH_PRIME);
+    }
+    hash
+}
+
+fn should_sample_cursor_hash(hcursor: u64, state: &mut StateCursor, force_sample: bool) -> bool {
+    let now = Instant::now();
+    if force_sample {
+        state.cursor_hash_sample_times.insert(hcursor, now);
+        return true;
+    }
+    match state.cursor_hash_sample_times.get(&hcursor) {
+        Some(last)
+            if now.duration_since(*last)
+                < Duration::from_millis(CURSOR_HASH_SAMPLE_INTERVAL_MS) =>
+        {
+            false
+        }
+        _ => {
+            state.cursor_hash_sample_times.insert(hcursor, now);
+            true
+        }
+    }
+}
+
+fn sample_cursor_hash_change(
+    hcursor: u64,
+    state: &mut StateCursor,
+    force_sample: bool,
+) -> ResultType<()> {
+    if !should_sample_cursor_hash(hcursor, state, force_sample) {
+        return Ok(());
+    }
+    let data = crate::get_cursor_data(hcursor)?;
+    let hash = cursor_data_hash(&data);
+    if let Some(previous_hash) = state.cursor_hashes.get(&hcursor) {
+        if *previous_hash != hash
+            && should_log_after(
+                &mut state.last_hash_change_log,
+                CURSOR_EVENT_LOG_INTERVAL_MS,
+            )
+        {
+            super::log::info!(
+                "{} INFO cursor same handle image changed, hcursor={}, previous_hash={:016x}, current_hash={:016x}, size={}x{}, hot={},{}",
+                CURSOR_DIAGNOSTIC_PREFIX,
+                hcursor,
+                previous_hash,
+                hash,
+                data.width,
+                data.height,
+                data.hotx,
+                data.hoty
+            );
+        }
+    }
+    state.cursor_hashes.insert(hcursor, hash);
+    Ok(())
+}
+
+fn log_cursor_sample_failure(hcursor: u64, error: &dyn std::fmt::Display, state: &mut StateCursor) {
+    if should_log_after(
+        &mut state.last_sample_failure_log,
+        CURSOR_EVENT_LOG_INTERVAL_MS,
+    ) {
+        super::log::info!(
+            "{} INFO cursor same handle sample failed, hcursor={}, error={}",
+            CURSOR_DIAGNOSTIC_PREFIX,
+            hcursor,
+            error
+        );
+    }
+}
+
 #[inline]
 fn update_last_cursor_pos(x: i32, y: i32) {
     let mut lock = LATEST_SYS_CURSOR_POS.lock().unwrap();
@@ -396,21 +520,48 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
     if let Some(hcursor) = crate::get_cursor()? {
         if hcursor != state.hcursor {
             let msg;
-            if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
-                super::log::trace!("Cursor data cached, hcursor: {}", hcursor);
-                msg = cached.clone();
+            if let Some(cached) = state.cached_cursor_data.get(&hcursor).cloned() {
+                if should_log_after(&mut state.last_handle_log, CURSOR_EVENT_LOG_INTERVAL_MS) {
+                    super::log::info!(
+                        "{} INFO cursor handle changed, hcursor={}, cache_hit=true",
+                        CURSOR_DIAGNOSTIC_PREFIX,
+                        hcursor
+                    );
+                }
+                if let Err(e) = sample_cursor_hash_change(hcursor, state, true) {
+                    log_cursor_sample_failure(hcursor, &e, state);
+                }
+                msg = cached;
             } else {
                 let mut data = crate::get_cursor_data(hcursor)?;
+                let hash = cursor_data_hash(&data);
+                if should_log_after(&mut state.last_handle_log, CURSOR_EVENT_LOG_INTERVAL_MS) {
+                    super::log::info!(
+                        "{} INFO cursor handle changed, hcursor={}, cache_hit=false, hash={:016x}, size={}x{}, hot={},{}",
+                        CURSOR_DIAGNOSTIC_PREFIX,
+                        hcursor,
+                        hash,
+                        data.width,
+                        data.height,
+                        data.hotx,
+                        data.hoty
+                    );
+                }
+                state.cursor_hashes.insert(hcursor, hash);
+                state
+                    .cursor_hash_sample_times
+                    .insert(hcursor, Instant::now());
                 data.colors = hbb_common::compress::compress(&data.colors[..]).into();
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);
                 msg = Arc::new(tmp);
                 state.cached_cursor_data.insert(hcursor, msg.clone());
-                super::log::trace!("Cursor data updated, hcursor: {}", hcursor);
             }
             state.hcursor = hcursor;
             sp.send_shared(msg.clone());
             state.cursor_data = msg;
+        } else if let Err(e) = sample_cursor_hash_change(hcursor, state, false) {
+            log_cursor_sample_failure(hcursor, &e, state);
         }
     }
     sp.snapshot(|sps| {
