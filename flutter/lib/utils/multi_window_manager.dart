@@ -65,6 +65,7 @@ class RustDeskMultiWindowManager {
   final List<int> _viewCameraWindows = List.empty(growable: true);
   final List<int> _portForwardWindows = List.empty(growable: true);
   final List<int> _terminalWindows = List.empty(growable: true);
+  final Map<int, int> _displayByWindowId = {};
 
   moveTabToNewWindow(int windowId, String peerId, String sessionId,
       WindowType windowType) async {
@@ -141,6 +142,7 @@ class RustDeskMultiWindowManager {
       windowIDs,
       jsonEncode(params),
       screenRect: screenRect,
+      display: display,
     );
   }
 
@@ -187,6 +189,7 @@ class RustDeskMultiWindowManager {
     List<int> windows,
     String msg, {
     Rect? screenRect,
+    int? display,
   }) async {
     if (openInTabs) {
       if (windows.isEmpty) {
@@ -202,20 +205,33 @@ class RustDeskMultiWindowManager {
           if (_inactiveWindows.contains(windowId)) {
             if (screenRect == null) {
               await restoreWindowPosition(type,
-                  windowId: windowId, peerId: remoteId);
+                  windowId: windowId, peerId: remoteId, display: display);
             }
             await DesktopMultiWindow.invokeMethod(windowId, methodName, msg);
             if (methodName != kWindowEventNewRemoteDesktop) {
               WindowController.fromWindowId(windowId).show();
             }
             registerActiveWindow(windowId);
+            _recordDisplayWindow(type, windowId, display);
             return MultiWindowCallResult(windowId, null);
           }
         }
       }
       final windowId = await newSessionWindow(
           type, remoteId, msg, windows, screenRect != null);
+      _recordDisplayWindow(type, windowId, display);
       return MultiWindowCallResult(windowId, null);
+    }
+  }
+
+  void _recordDisplayWindow(WindowType type, int windowId, int? display) {
+    if (type != WindowType.RemoteDesktop && type != WindowType.ViewCamera) {
+      return;
+    }
+    if (display != null && display >= 0) {
+      _displayByWindowId[windowId] = display;
+    } else {
+      _displayByWindowId.remove(windowId);
     }
   }
 
@@ -422,6 +438,7 @@ class RustDeskMultiWindowManager {
   }
 
   void clearWindowType(WindowType type) {
+    clearDisplayWindowType(type);
     switch (type) {
       case WindowType.Main:
         return;
@@ -441,6 +458,15 @@ class RustDeskMultiWindowManager {
         _terminalWindows.clear();
       case WindowType.Unknown:
         break;
+    }
+  }
+
+  void clearDisplayWindowType(WindowType type) {
+    if (type != WindowType.RemoteDesktop && type != WindowType.ViewCamera) {
+      return;
+    }
+    for (final windowId in _findWindowsByType(type)) {
+      _displayByWindowId.remove(windowId);
     }
   }
 
@@ -472,11 +498,13 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {
-          await saveWindowPosition(type, windowId: wId);
+          await saveWindowPosition(type,
+              windowId: wId, display: _displayByWindowId[wId]);
         } catch (e) {
           debugPrint('Failed to save window position of $wId, $e');
         }
@@ -485,6 +513,7 @@ class RustDeskMultiWindowManager {
         await WindowController.fromWindowId(wId).setPreventClose(false);
         await WindowController.fromWindowId(wId).close();
         _activeWindows.remove(wId);
+        _displayByWindowId.remove(wId);
       } catch (e) {
         debugPrint("$e");
         return;

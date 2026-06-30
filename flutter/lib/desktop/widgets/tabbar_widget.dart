@@ -405,13 +405,30 @@ class _DesktopTabState extends State<DesktopTab>
     super.onWindowUnmaximize();
   }
 
+  int? _windowPositionDisplay() {
+    final state = controller.state.value;
+    if (state.tabs.isEmpty || state.selected >= state.tabs.length) {
+      return null;
+    }
+    final page = state.selectedTabInfo.page;
+    int? display;
+    if (tabType == DesktopTabType.remoteScreen && page is RemotePage) {
+      display = page.ffi.ffiModel.pi.currentDisplay;
+    } else if (tabType == DesktopTabType.viewCamera && page is ViewCameraPage) {
+      display = page.ffi.ffiModel.pi.currentDisplay;
+    }
+    return display == kAllDisplayValue ? null : display;
+  }
+
   _saveFrame({bool? flush}) async {
     try {
       if (tabType == DesktopTabType.main) {
         await saveWindowPosition(WindowType.Main, flush: flush);
       } else if (kWindowType != null && kWindowId != null) {
         await saveWindowPosition(kWindowType!,
-            windowId: kWindowId, flush: flush);
+            windowId: kWindowId,
+            flush: flush,
+            display: _windowPositionDisplay());
       }
     } catch (e) {
       debugPrint('Error saving window position: $e');
@@ -610,7 +627,9 @@ class _DesktopTabState extends State<DesktopTab>
                               .then((value) => stateGlobal.setMaximized(value));
                         }
                       }
-                    : (isIncomingHomePage ? () {} : null), // Keep tap recognizer for Windows touch.
+                    : (isIncomingHomePage
+                        ? () {}
+                        : null), // Keep tap recognizer for Windows touch.
                 onPanStart: (_) => startDragging(isMainWindow),
                 onPanCancel: () {
                   // We want to disable dragging of the tab area in the tab bar.

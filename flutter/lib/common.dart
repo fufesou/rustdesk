@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:back_button_interceptor/back_button_interceptor.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -1740,7 +1739,21 @@ String get windowFramePrefix =>
         ? "incoming_"
         : (bind.isOutgoingOnly() ? "outgoing_" : ""));
 
-typedef WindowKey = ({WindowType type, int? windowId});
+typedef WindowKey = ({WindowType type, int? windowId, int? display});
+
+bool _isDisplayWindowType(WindowType type) =>
+    type == WindowType.RemoteDesktop || type == WindowType.ViewCamera;
+
+bool _useDisplayWindowFrameKey(WindowType type, int? display) =>
+    _isDisplayWindowType(type) && display != null && display >= 0;
+
+String _windowFrameKey(WindowType type, {int? display}) {
+  final baseKey = windowFramePrefix + type.name;
+  if (_useDisplayWindowFrameKey(type, display)) {
+    return '$baseKey.display.$display';
+  }
+  return baseKey;
+}
 
 LastWindowPosition? _lastWindowPosition = null;
 final Debouncer _saveWindowDebounce = Debouncer(delay: Duration(seconds: 1));
@@ -1748,7 +1761,7 @@ final Debouncer _saveWindowDebounce = Debouncer(delay: Duration(seconds: 1));
 /// Save window position and size on exit
 /// Note that windowId must be provided if it's subwindow
 Future<void> saveWindowPosition(WindowType type,
-    {int? windowId, bool? flush}) async {
+    {int? windowId, bool? flush, int? display}) async {
   if (type != WindowType.Main && windowId == null) {
     debugPrint(
         "Error: windowId cannot be null when saving positions for sub window");
@@ -1760,7 +1773,14 @@ Future<void> saveWindowPosition(WindowType type,
   bool isFullscreen = stateGlobal.fullscreen.isTrue;
 
   setPreFrame() {
-    final pos = bind.getLocalFlutterOption(k: windowFramePrefix + type.name);
+    var pos = '';
+    if (_useDisplayWindowFrameKey(type, display)) {
+      pos = bind.getLocalFlutterOption(
+          k: _windowFrameKey(type, display: display));
+    }
+    if (pos.isEmpty) {
+      pos = bind.getLocalFlutterOption(k: _windowFrameKey(type));
+    }
     var lpos = LastWindowPosition.loadFromString(pos);
     if (lpos != null) {
       if (lpos.offsetWidth != null && lpos.offsetHeight != null) {
@@ -1824,7 +1844,7 @@ Future<void> saveWindowPosition(WindowType type,
   final pos = LastWindowPosition(sz?.width, sz?.height, position?.dx,
       position?.dy, isMaximized, isFullscreen);
 
-  final WindowKey key = (type: type, windowId: windowId);
+  final WindowKey key = (type: type, windowId: windowId, display: display);
 
   final bool haveNewWindowPosition =
       (_lastWindowPosition == null) || !pos.equals(_lastWindowPosition!);
@@ -1848,28 +1868,43 @@ Future<void> _saveWindowPositionActual(WindowKey key) async {
 
   if (pos != null) {
     debugPrint(
-        "Saving frame: ${key.windowId}: ${pos.width}/${pos.height}, offset:${pos.offsetWidth}/${pos.offsetHeight}, isMaximized:${pos.isMaximized}, isFullscreen:${pos.isFullscreen}");
+        "Saving frame: ${key.windowId}: display:${key.display}, ${pos.width}/${pos.height}, offset:${pos.offsetWidth}/${pos.offsetHeight}, isMaximized:${pos.isMaximized}, isFullscreen:${pos.isFullscreen}");
 
-    await bind.setLocalFlutterOption(
-        k: windowFramePrefix + key.type.name, v: pos.toString());
+    if (_useDisplayWindowFrameKey(key.type, key.display)) {
+      await bind.setLocalFlutterOption(
+          k: _windowFrameKey(key.type, display: key.display),
+          v: pos.toString());
+    } else {
+      await bind.setLocalFlutterOption(
+          k: _windowFrameKey(key.type), v: pos.toString());
+    }
 
     if ((key.type == WindowType.RemoteDesktop ||
             key.type == WindowType.ViewCamera) &&
         key.windowId != null) {
       await _saveSessionWindowPosition(key.type, key.windowId!,
-          pos.isMaximized ?? false, pos.isFullscreen ?? false, pos);
+          pos.isMaximized ?? false, pos.isFullscreen ?? false, pos,
+          display: key.display);
     }
   }
 }
 
 Future _saveSessionWindowPosition(WindowType windowType, int windowId,
-    bool isMaximized, bool isFullscreen, LastWindowPosition pos) async {
+    bool isMaximized, bool isFullscreen, LastWindowPosition pos,
+    {int? display}) async {
   final remoteList = await DesktopMultiWindow.invokeMethod(
       windowId, kWindowEventGetRemoteList, null);
   getPeerPos(String peerId) {
     if (isMaximized || isFullscreen) {
-      final peerPos = bind.mainGetPeerFlutterOptionSync(
-          id: peerId, k: windowFramePrefix + windowType.name);
+      var peerPos = '';
+      if (_useDisplayWindowFrameKey(windowType, display)) {
+        peerPos = bind.mainGetPeerFlutterOptionSync(
+            id: peerId, k: _windowFrameKey(windowType, display: display));
+      }
+      if (peerPos.isEmpty) {
+        peerPos = bind.mainGetPeerFlutterOptionSync(
+            id: peerId, k: _windowFrameKey(windowType));
+      }
       var lpos = LastWindowPosition.loadFromString(peerPos);
       return LastWindowPosition(
               lpos?.width ?? pos.offsetWidth,
@@ -1886,10 +1921,15 @@ Future _saveSessionWindowPosition(WindowType windowType, int windowId,
 
   if (remoteList != null) {
     for (final peerId in remoteList.split(',')) {
-      bind.mainSetPeerFlutterOptionSync(
-          id: peerId,
-          k: windowFramePrefix + windowType.name,
-          v: getPeerPos(peerId));
+      if (_useDisplayWindowFrameKey(windowType, display)) {
+        bind.mainSetPeerFlutterOptionSync(
+            id: peerId,
+            k: _windowFrameKey(windowType, display: display),
+            v: getPeerPos(peerId));
+      } else {
+        bind.mainSetPeerFlutterOptionSync(
+            id: peerId, k: _windowFrameKey(windowType), v: getPeerPos(peerId));
+      }
     }
   }
 }
@@ -2003,20 +2043,37 @@ Future<bool> restoreWindowPosition(WindowType type,
   }
 
   bool isRemotePeerPos = false;
+  bool isDisplaySpecificPos = false;
   String? pos;
   // No need to check mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs)
   // Though "open in tabs" is true and the new window restore peer position, it's ok.
   if ((type == WindowType.RemoteDesktop || type == WindowType.ViewCamera) &&
       windowId != null &&
       peerId != null) {
-    final peerPos = bind.mainGetPeerFlutterOptionSync(
-        id: peerId, k: windowFramePrefix + type.name);
+    var peerPos = '';
+    if (_useDisplayWindowFrameKey(type, display)) {
+      peerPos = bind.mainGetPeerFlutterOptionSync(
+          id: peerId, k: _windowFrameKey(type, display: display));
+      isDisplaySpecificPos = peerPos.isNotEmpty;
+    }
+    if (peerPos.isEmpty) {
+      peerPos = bind.mainGetPeerFlutterOptionSync(
+          id: peerId, k: _windowFrameKey(type));
+    }
     if (peerPos.isNotEmpty) {
       pos = peerPos;
     }
     isRemotePeerPos = pos != null;
   }
-  pos ??= bind.getLocalFlutterOption(k: windowFramePrefix + type.name);
+  if (pos == null && _useDisplayWindowFrameKey(type, display)) {
+    final localPos =
+        bind.getLocalFlutterOption(k: _windowFrameKey(type, display: display));
+    if (localPos.isNotEmpty) {
+      pos = localPos;
+      isDisplaySpecificPos = true;
+    }
+  }
+  pos ??= bind.getLocalFlutterOption(k: _windowFrameKey(type));
 
   var lpos = LastWindowPosition.loadFromString(pos);
   if (lpos == null) {
@@ -2040,7 +2097,7 @@ Future<bool> restoreWindowPosition(WindowType type,
     return true;
   }
   if (type == WindowType.RemoteDesktop || type == WindowType.ViewCamera) {
-    if (!isRemotePeerPos && windowId != null) {
+    if (!isRemotePeerPos && !isDisplaySpecificPos && windowId != null) {
       if (lpos.offsetWidth != null) {
         lpos.offsetWidth = lpos.offsetWidth! + windowId * kNewWindowOffset;
       }
@@ -2048,7 +2105,7 @@ Future<bool> restoreWindowPosition(WindowType type,
         lpos.offsetHeight = lpos.offsetHeight! + windowId * kNewWindowOffset;
       }
     }
-    if (display != null) {
+    if (display != null && !isDisplaySpecificPos) {
       if (lpos.offsetWidth != null) {
         lpos.offsetWidth = lpos.offsetWidth! + display * kNewWindowOffset;
       }
