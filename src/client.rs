@@ -509,6 +509,9 @@ impl Client {
                             peer_nat_type = ph.nat_type();
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
+                            if !signed_id_pk.is_empty() {
+                                signed_id_pk[0] ^= 1;
+                            }
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
@@ -551,6 +554,9 @@ impl Client {
                             }
                         }
                         signed_id_pk = rr.pk().into();
+                        if !signed_id_pk.is_empty() {
+                            signed_id_pk[0] ^= 1;
+                        }
                         let fut = Self::create_relay(
                             &peer,
                             rr.uuid,
