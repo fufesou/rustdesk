@@ -1369,6 +1369,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         self.handler.handle_peer_info(pi);
+                        if self.handler.is_file_transfer() && self.pending_insecure_connection_toast {
+                            self.pending_insecure_connection_toast = false;
+                            self.handler.toast("error", "e2ee-failed-tip");
+                        }
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
