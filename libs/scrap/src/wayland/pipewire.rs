@@ -145,6 +145,113 @@ impl std::fmt::Display for GStreamerError {
 
 impl Error for GStreamerError {}
 
+const PIXEL_STRIDE: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameOrientation {
+    Rotate0,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    FlipRotate0,
+    FlipRotate90,
+    FlipRotate180,
+    FlipRotate270,
+}
+
+impl Default for FrameOrientation {
+    fn default() -> Self {
+        Self::Rotate0
+    }
+}
+
+impl FrameOrientation {
+    fn from_tag(tag: &str) -> Option<Self> {
+        // GStreamer's image-orientation tag describes the transform to apply
+        // for display, the same values consumed by videoflip's automatic mode.
+        match tag {
+            "rotate-0" => Some(Self::Rotate0),
+            "rotate-90" => Some(Self::Rotate90),
+            "rotate-180" => Some(Self::Rotate180),
+            "rotate-270" => Some(Self::Rotate270),
+            "flip-rotate-0" => Some(Self::FlipRotate0),
+            "flip-rotate-90" => Some(Self::FlipRotate90),
+            "flip-rotate-180" => Some(Self::FlipRotate180),
+            "flip-rotate-270" => Some(Self::FlipRotate270),
+            _ => None,
+        }
+    }
+
+    fn output_size(self, width: usize, height: usize) -> (usize, usize) {
+        match self {
+            Self::Rotate90 | Self::Rotate270 | Self::FlipRotate90 | Self::FlipRotate270 => {
+                (height, width)
+            }
+            _ => (width, height),
+        }
+    }
+
+    fn source_position(self, x: usize, y: usize, width: usize, height: usize) -> (usize, usize) {
+        match self {
+            Self::Rotate0 => (x, y),
+            Self::Rotate90 => (y, height - 1 - x),
+            Self::Rotate180 => (width - 1 - x, height - 1 - y),
+            Self::Rotate270 => (width - 1 - y, x),
+            Self::FlipRotate0 => (width - 1 - x, y),
+            Self::FlipRotate90 => (width - 1 - y, height - 1 - x),
+            Self::FlipRotate180 => (x, height - 1 - y),
+            Self::FlipRotate270 => (y, x),
+        }
+    }
+}
+
+fn apply_orientation(
+    orientation: FrameOrientation,
+    src: &[u8],
+    width: usize,
+    height: usize,
+    dst: &mut Vec<u8>,
+) -> (usize, usize) {
+    let (dst_width, dst_height) = orientation.output_size(width, height);
+    dst.clear();
+    dst.resize(dst_width * dst_height * PIXEL_STRIDE, 0);
+    for y in 0..dst_height {
+        for x in 0..dst_width {
+            let (src_x, src_y) = orientation.source_position(x, y, width, height);
+            let src_i = (src_y * width + src_x) * PIXEL_STRIDE;
+            let dst_i = (y * dst_width + x) * PIXEL_STRIDE;
+            dst[dst_i..dst_i + PIXEL_STRIDE].copy_from_slice(&src[src_i..src_i + PIXEL_STRIDE]);
+        }
+    }
+    (dst_width, dst_height)
+}
+
+fn install_orientation_probe(
+    sink: &gst::Element,
+    orientation: &Arc<Mutex<FrameOrientation>>,
+) -> ResultType<()> {
+    let sink_pad = sink
+        .get_static_pad("sink")
+        .ok_or_else(|| GStreamerError("Failed to get appsink sink pad.".into()))?;
+    let orientation = orientation.clone();
+    sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data {
+            if let gst::EventView::Tag(tag_event) = event.view() {
+                if let Some(tag) = tag_event.get_tag().get::<gst::tags::ImageOrientation>() {
+                    if let Some(tag) = tag.get() {
+                        match FrameOrientation::from_tag(tag) {
+                            Some(value) => *orientation.lock().unwrap() = value,
+                            None => warn!("Unsupported GStreamer image-orientation tag: {}", tag),
+                        }
+                    }
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
@@ -254,12 +361,15 @@ fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Err
 pub struct PipeWireRecorder {
     buffer: Option<gst::MappedBuffer<gst::buffer::Readable>>,
     buffer_cropped: Vec<u8>,
+    buffer_oriented: Vec<u8>,
     pix_fmt: String,
     is_cropped: bool,
     pipeline: gst::Pipeline,
     appsink: AppSink,
     width: usize,
     height: usize,
+    orientation: Arc<Mutex<FrameOrientation>>,
+    last_orientation: FrameOrientation,
     saved_raw_data: Vec<u8>, // for faster compare and copy
 }
 
@@ -283,20 +393,19 @@ impl PipeWireRecorder {
         // system-memory video/x-raw format, widening negotiation so the portal can
         // settle on a format it can deliver via its SHM path.
         let convert = gst::ElementFactory::make("videoconvert", None)?;
-        let flip = gst::ElementFactory::make("videoflip", None)?;
-        // pipewiresrc exposes PipeWire SPA_META_VideoTransform as the GStreamer
-        // image-orientation tag. OBS handles the same SPA metadata directly;
-        // videoflip's automatic mode applies the matching rotation/flip here.
-        flip.set_property_from_str("method", "automatic");
 
         let sink = gst::ElementFactory::make("appsink", None)?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
+        let orientation = Arc::new(Mutex::new(FrameOrientation::default()));
+        // pipewiresrc exposes PipeWire SPA_META_VideoTransform as the GStreamer
+        // image-orientation tag. OBS handles the same SPA metadata directly;
+        // we consume the tag here to avoid a runtime dependency on videoflip.
+        install_orientation_probe(&sink, &orientation)?;
 
-        pipeline.add_many(&[&src, &convert, &flip, &sink])?;
+        pipeline.add_many(&[&src, &convert, &sink])?;
         src.link(&convert)?;
-        convert.link(&flip)?;
-        flip.link(&sink)?;
+        convert.link(&sink)?;
 
         let appsink = sink
             .dynamic_cast::<AppSink>()
@@ -354,7 +463,10 @@ impl PipeWireRecorder {
             width: 0,
             height: 0,
             buffer_cropped: vec![],
+            buffer_oriented: vec![],
             is_cropped: false,
+            orientation,
+            last_orientation: FrameOrientation::default(),
             saved_raw_data: Vec::new(),
         })
     }
@@ -393,12 +505,17 @@ impl Recorder for PipeWireRecorder {
             let buf = buf
                 .into_mapped_buffer_readable()
                 .map_err(|_| GStreamerError("Failed to map buffer.".into()))?;
+            let orientation = *self.orientation.lock().unwrap();
+            if orientation != self.last_orientation {
+                self.saved_raw_data.clear();
+                self.last_orientation = orientation;
+            }
             if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, buf.as_slice()) {
                 return Ok(PixelProvider::NONE);
             }
             let buf_size = buf.get_size();
             // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
+            if buf_size != (w * h * PIXEL_STRIDE) {
                 // for some reason the width and height of the caps do not guarantee correct buffer
                 // size, so ignore those buffers, see:
                 // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
@@ -419,11 +536,11 @@ impl Recorder for PipeWireRecorder {
                     let h_crop = h_crop as usize;
                     self.buffer_cropped.clear();
                     let data = buf.as_slice();
-                    // BGRx is 4 bytes per pixel
-                    self.buffer_cropped.reserve(w_crop * h_crop * 4);
+                    self.buffer_cropped.reserve(w_crop * h_crop * PIXEL_STRIDE);
                     for y in y_off..(y_off + h_crop) {
-                        let i = 4 * (w * y + x_off);
-                        self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
+                        let i = PIXEL_STRIDE * (w * y + x_off);
+                        self.buffer_cropped
+                            .extend(&data[i..i + PIXEL_STRIDE * w_crop]);
                     }
                     self.width = w_crop;
                     self.height = h_crop;
@@ -448,9 +565,22 @@ impl Recorder for PipeWireRecorder {
                 .ok_or("Failed to get buffer as ref")?
                 .as_slice()
         };
+        let orientation = self.last_orientation;
+        let (width, height, buf) = if orientation == FrameOrientation::Rotate0 {
+            (self.width, self.height, buf)
+        } else {
+            let (width, height) = apply_orientation(
+                orientation,
+                buf,
+                self.width,
+                self.height,
+                &mut self.buffer_oriented,
+            );
+            (width, height, self.buffer_oriented.as_slice())
+        };
         match self.pix_fmt.as_str() {
-            "BGRx" => Ok(PixelProvider::BGR0(self.width, self.height, buf)),
-            "RGBx" => Ok(PixelProvider::RGB0(self.width, self.height, buf)),
+            "BGRx" => Ok(PixelProvider::BGR0(width, height, buf)),
+            "RGBx" => Ok(PixelProvider::RGB0(width, height, buf)),
             _ => Err(Box::new(GStreamerError(format!(
                 "Unreachable! Unknown pix_fmt, {}",
                 &self.pix_fmt
