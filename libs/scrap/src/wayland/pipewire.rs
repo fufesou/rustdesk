@@ -283,14 +283,20 @@ impl PipeWireRecorder {
         // system-memory video/x-raw format, widening negotiation so the portal can
         // settle on a format it can deliver via its SHM path.
         let convert = gst::ElementFactory::make("videoconvert", None)?;
+        let flip = gst::ElementFactory::make("videoflip", None)?;
+        // pipewiresrc exposes PipeWire SPA_META_VideoTransform as the GStreamer
+        // image-orientation tag. OBS handles the same SPA metadata directly;
+        // videoflip's automatic mode applies the matching rotation/flip here.
+        flip.set_property_from_str("method", "automatic");
 
         let sink = gst::ElementFactory::make("appsink", None)?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
 
-        pipeline.add_many(&[&src, &convert, &sink])?;
+        pipeline.add_many(&[&src, &convert, &flip, &sink])?;
         src.link(&convert)?;
-        convert.link(&sink)?;
+        convert.link(&flip)?;
+        flip.link(&sink)?;
 
         let appsink = sink
             .dynamic_cast::<AppSink>()
