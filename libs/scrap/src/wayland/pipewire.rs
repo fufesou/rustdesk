@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -145,6 +145,197 @@ impl std::fmt::Display for GStreamerError {
 
 impl Error for GStreamerError {}
 
+const PIXEL_STRIDE: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VideoMetaSnapshot {
+    width: usize,
+    height: usize,
+    offsets: Vec<usize>,
+    strides: Vec<i32>,
+}
+
+impl VideoMetaSnapshot {
+    fn from_meta(meta: &gstreamer_video::VideoMeta) -> Self {
+        Self {
+            width: meta.get_width() as usize,
+            height: meta.get_height() as usize,
+            offsets: meta.get_offset().to_vec(),
+            strides: meta.get_stride().to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoFrameLayout {
+    width: usize,
+    height: usize,
+    offset: usize,
+    stride: isize,
+}
+
+impl VideoFrameLayout {
+    fn compact(width: usize, height: usize) -> Result<Self, GStreamerError> {
+        let stride = checked_frame_row_bytes(width)?;
+        Ok(Self {
+            width,
+            height,
+            offset: 0,
+            stride: checked_usize_to_isize(stride)?,
+        })
+    }
+
+    fn from_snapshot(meta: &VideoMetaSnapshot) -> Result<Self, GStreamerError> {
+        let offset = *meta
+            .offsets
+            .get(0)
+            .ok_or_else(|| GStreamerError("VideoMeta has no plane offset.".into()))?;
+        let stride = *meta
+            .strides
+            .get(0)
+            .ok_or_else(|| GStreamerError("VideoMeta has no plane stride.".into()))?;
+        if stride == 0 {
+            return Err(GStreamerError("VideoMeta plane stride is zero.".into()));
+        }
+        Ok(Self {
+            width: meta.width,
+            height: meta.height,
+            offset,
+            stride: stride as isize,
+        })
+    }
+
+    fn row_start(self, row: usize) -> Result<usize, GStreamerError> {
+        let start = self.offset as i128 + self.stride as i128 * row as i128;
+        if start < 0 || start > usize::MAX as i128 {
+            return Err(GStreamerError(
+                "VideoMeta row offset is out of range.".into(),
+            ));
+        }
+        Ok(start as usize)
+    }
+
+    fn is_compact(self, width: usize, height: usize) -> Result<bool, GStreamerError> {
+        Ok(self.width == width
+            && self.height == height
+            && self.offset == 0
+            && self.stride > 0
+            && self.stride as usize == checked_frame_row_bytes(width)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameDiagnostics {
+    pix_fmt: String,
+    caps_width: usize,
+    caps_height: usize,
+    buffer_size: usize,
+    crop: Option<(u32, u32, u32, u32)>,
+    video_meta: Option<VideoMetaSnapshot>,
+    orientation_tag: Option<String>,
+}
+
+fn checked_frame_row_bytes(width: usize) -> Result<usize, GStreamerError> {
+    width
+        .checked_mul(PIXEL_STRIDE)
+        .ok_or_else(|| GStreamerError("Frame row size overflow.".into()))
+}
+
+fn checked_frame_size(width: usize, height: usize) -> Result<usize, GStreamerError> {
+    checked_frame_row_bytes(width)?
+        .checked_mul(height)
+        .ok_or_else(|| GStreamerError("Frame size overflow.".into()))
+}
+
+fn checked_usize_to_isize(value: usize) -> Result<isize, GStreamerError> {
+    if value > isize::MAX as usize {
+        Err(GStreamerError("Frame stride does not fit in isize.".into()))
+    } else {
+        Ok(value as isize)
+    }
+}
+
+fn get_frame_layout(
+    video_meta: Option<&VideoMetaSnapshot>,
+    width: usize,
+    height: usize,
+) -> Result<VideoFrameLayout, GStreamerError> {
+    match video_meta {
+        Some(meta) => VideoFrameLayout::from_snapshot(meta),
+        None => VideoFrameLayout::compact(width, height),
+    }
+}
+
+fn copy_frame_region(
+    src: &[u8],
+    layout: VideoFrameLayout,
+    x_off: usize,
+    y_off: usize,
+    width: usize,
+    height: usize,
+    dst: &mut Vec<u8>,
+) -> Result<(), GStreamerError> {
+    if x_off.checked_add(width).map_or(true, |x| x > layout.width)
+        || y_off
+            .checked_add(height)
+            .map_or(true, |y| y > layout.height)
+    {
+        return Err(GStreamerError(
+            "Requested frame region is outside VideoMeta layout.".into(),
+        ));
+    }
+
+    let total_size = checked_frame_size(width, height)?;
+    let row_bytes = checked_frame_row_bytes(width)?;
+    let x_bytes = checked_frame_row_bytes(x_off)?;
+    dst.clear();
+    dst.reserve(total_size);
+
+    for row in 0..height {
+        let src_row = layout.row_start(y_off + row)?;
+        let start = src_row
+            .checked_add(x_bytes)
+            .ok_or_else(|| GStreamerError("Frame row offset overflow.".into()))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| GStreamerError("Frame row end overflow.".into()))?;
+        if end > src.len() {
+            return Err(GStreamerError(
+                "VideoMeta row exceeds mapped buffer size.".into(),
+            ));
+        }
+        dst.extend_from_slice(&src[start..end]);
+    }
+    Ok(())
+}
+
+fn install_orientation_probe(
+    sink: &gst::Element,
+    orientation_tag: &Arc<Mutex<Option<String>>>,
+) -> ResultType<()> {
+    let sink_pad = sink
+        .get_static_pad("sink")
+        .ok_or_else(|| GStreamerError("Failed to get appsink sink pad.".into()))?;
+    let orientation_tag = orientation_tag.clone();
+    sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data {
+            if let gst::EventView::Tag(tag_event) = event.view() {
+                if let Some(tag) = tag_event.get_tag().get::<gst::tags::ImageOrientation>() {
+                    if let Some(tag) = tag.get() {
+                        let mut last = orientation_tag.lock().unwrap();
+                        if last.as_deref() != Some(tag) {
+                            info!("PipeWire image-orientation tag changed: {}", tag);
+                            *last = Some(tag.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
@@ -254,12 +445,16 @@ fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Err
 pub struct PipeWireRecorder {
     buffer: Option<gst::MappedBuffer<gst::buffer::Readable>>,
     buffer_cropped: Vec<u8>,
+    buffer_strided: Vec<u8>,
     pix_fmt: String,
     is_cropped: bool,
+    is_strided: bool,
     pipeline: gst::Pipeline,
     appsink: AppSink,
     width: usize,
     height: usize,
+    orientation_tag: Arc<Mutex<Option<String>>>,
+    last_frame_diagnostics: Option<FrameDiagnostics>,
     saved_raw_data: Vec<u8>, // for faster compare and copy
 }
 
@@ -287,6 +482,11 @@ impl PipeWireRecorder {
         let sink = gst::ElementFactory::make("appsink", None)?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
+        let orientation_tag = Arc::new(Mutex::new(None));
+        // pipewiresrc translates PipeWire SPA_META_VideoTransform into the
+        // image-orientation tag when its GStreamer plugin supports that meta.
+        // Log it here to verify whether the compositor actually provides it.
+        install_orientation_probe(&sink, &orientation_tag)?;
 
         pipeline.add_many(&[&src, &convert, &sink])?;
         src.link(&convert)?;
@@ -348,9 +548,20 @@ impl PipeWireRecorder {
             width: 0,
             height: 0,
             buffer_cropped: vec![],
+            buffer_strided: vec![],
             is_cropped: false,
+            is_strided: false,
+            orientation_tag,
+            last_frame_diagnostics: None,
             saved_raw_data: Vec::new(),
         })
+    }
+
+    fn log_frame_diagnostics(&mut self, diagnostics: FrameDiagnostics) {
+        if self.last_frame_diagnostics.as_ref() != Some(&diagnostics) {
+            info!("PipeWire frame diagnostics: {:?}", diagnostics);
+            self.last_frame_diagnostics = Some(diagnostics);
+        }
     }
 }
 
@@ -380,6 +591,9 @@ impl Recorder for PipeWireRecorder {
             let mut crop = buf
                 .get_meta::<gstreamer_video::VideoCropMeta>()
                 .map(|m| m.get_rect());
+            let video_meta = buf
+                .get_meta::<gstreamer_video::VideoMeta>()
+                .map(|m| VideoMetaSnapshot::from_meta(&m));
             // only crop if necessary
             if Some((0, 0, w as u32, h as u32)) == crop {
                 crop = None;
@@ -387,47 +601,71 @@ impl Recorder for PipeWireRecorder {
             let buf = buf
                 .into_mapped_buffer_readable()
                 .map_err(|_| GStreamerError("Failed to map buffer.".into()))?;
-            if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, buf.as_slice()) {
-                return Ok(PixelProvider::NONE);
-            }
             let buf_size = buf.get_size();
-            // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
-                // for some reason the width and height of the caps do not guarantee correct buffer
-                // size, so ignore those buffers, see:
-                // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
-                trace!(
-                    "Size of mapped buffer: {} does NOT match size of capturable {}x{}@BGRx, \
-                    dropping it!",
-                    buf_size,
-                    w,
-                    h
-                );
-            } else {
-                // Copy region specified by crop into self.buffer_cropped
-                // TODO: Figure out if ffmpeg provides a zero copy alternative
-                if let Some((x_off, y_off, w_crop, h_crop)) = crop {
-                    let x_off = x_off as usize;
-                    let y_off = y_off as usize;
-                    let w_crop = w_crop as usize;
-                    let h_crop = h_crop as usize;
-                    self.buffer_cropped.clear();
-                    let data = buf.as_slice();
-                    // BGRx is 4 bytes per pixel
-                    self.buffer_cropped.reserve(w_crop * h_crop * 4);
-                    for y in y_off..(y_off + h_crop) {
-                        let i = 4 * (w * y + x_off);
-                        self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
-                    }
-                    self.width = w_crop;
-                    self.height = h_crop;
-                } else {
-                    self.width = w;
-                    self.height = h;
+            let orientation_tag = self.orientation_tag.lock().unwrap().clone();
+            self.log_frame_diagnostics(FrameDiagnostics {
+                pix_fmt: self.pix_fmt.clone(),
+                caps_width: w,
+                caps_height: h,
+                buffer_size: buf_size,
+                crop,
+                video_meta: video_meta.clone(),
+                orientation_tag,
+            });
+
+            let layout = get_frame_layout(video_meta.as_ref(), w, h)?;
+            let compact_size = checked_frame_size(w, h)?;
+            let is_compact = layout.is_compact(w, h)? && buf_size == compact_size;
+
+            if let Some((x_off, y_off, w_crop, h_crop)) = crop {
+                let x_off = x_off as usize;
+                let y_off = y_off as usize;
+                let w_crop = w_crop as usize;
+                let h_crop = h_crop as usize;
+                if let Err(err) = copy_frame_region(
+                    buf.as_slice(),
+                    layout,
+                    x_off,
+                    y_off,
+                    w_crop,
+                    h_crop,
+                    &mut self.buffer_cropped,
+                ) {
+                    warn!("Failed to copy cropped PipeWire frame: {}", err);
+                    return Ok(PixelProvider::NONE);
                 }
-                self.is_cropped = crop.is_some();
-                self.buffer = Some(buf);
+                self.width = w_crop;
+                self.height = h_crop;
+                self.is_cropped = true;
+                self.is_strided = false;
+            } else if is_compact {
+                self.width = w;
+                self.height = h;
+                self.is_cropped = false;
+                self.is_strided = false;
+            } else {
+                // GStreamer may expose PipeWire buffers with non-zero offsets or
+                // non-tight row strides. RustDesk's PixelBuffer infers stride from
+                // data length, so normalize to a compact BGRx/RGBx frame here.
+                if let Err(err) =
+                    copy_frame_region(buf.as_slice(), layout, 0, 0, w, h, &mut self.buffer_strided)
+                {
+                    warn!("Failed to copy strided PipeWire frame: {}", err);
+                    return Ok(PixelProvider::NONE);
+                }
+                trace!(
+                    "Normalized PipeWire frame layout: caps={}x{}, size={}, layout={:?}",
+                    w,
+                    h,
+                    buf_size,
+                    layout
+                );
+                self.width = w;
+                self.height = h;
+                self.is_cropped = false;
+                self.is_strided = true;
             }
+            self.buffer = Some(buf);
         } else {
             return Ok(PixelProvider::NONE);
         }
@@ -436,12 +674,17 @@ impl Recorder for PipeWireRecorder {
         }
         let buf = if self.is_cropped {
             self.buffer_cropped.as_slice()
+        } else if self.is_strided {
+            self.buffer_strided.as_slice()
         } else {
             self.buffer
                 .as_ref()
                 .ok_or("Failed to get buffer as ref")?
                 .as_slice()
         };
+        if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, buf) {
+            return Ok(PixelProvider::NONE);
+        }
         match self.pix_fmt.as_str() {
             "BGRx" => Ok(PixelProvider::BGR0(self.width, self.height, buf)),
             "RGBx" => Ok(PixelProvider::RGB0(self.width, self.height, buf)),
