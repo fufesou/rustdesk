@@ -154,11 +154,12 @@ fn rotate_180_frame(src: &[u8], width: usize, height: usize, dst: &mut Vec<u8>) 
         .and_then(|pixels| pixels.checked_mul(PIXEL_STRIDE))
         .ok_or_else(|| GStreamerError(format!("Frame size overflow: {}x{}.", width, height)))?;
     if src.len() != frame_size {
-        return Err(Box::new(GStreamerError(format!(
+        return Err(GStreamerError(format!(
             "Unexpected frame size for rotate-180: got {}, expected {}.",
             src.len(),
             frame_size
-        ))));
+        ))
+        .into());
     }
 
     dst.clear();
