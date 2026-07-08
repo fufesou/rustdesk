@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -145,6 +145,34 @@ impl std::fmt::Display for GStreamerError {
 
 impl Error for GStreamerError {}
 
+const PIXEL_STRIDE: usize = 4;
+const PIPEWIRE_TEST_LOG_PREFIX: &str = "=====================";
+
+fn rotate_180_frame(src: &[u8], width: usize, height: usize, dst: &mut Vec<u8>) -> ResultType<()> {
+    let frame_size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(PIXEL_STRIDE))
+        .ok_or_else(|| GStreamerError(format!("Frame size overflow: {}x{}.", width, height)))?;
+    if src.len() != frame_size {
+        return Err(Box::new(GStreamerError(format!(
+            "Unexpected frame size for rotate-180: got {}, expected {}.",
+            src.len(),
+            frame_size
+        ))));
+    }
+
+    dst.clear();
+    dst.resize(frame_size, 0);
+    // For packed row-major RGBx/BGRx, reversing pixel order is a 180-degree rotation.
+    for (dst_pixel, src_pixel) in dst
+        .chunks_exact_mut(PIXEL_STRIDE)
+        .zip(src.chunks_exact(PIXEL_STRIDE).rev())
+    {
+        dst_pixel.copy_from_slice(src_pixel);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
@@ -229,7 +257,7 @@ impl Capturable for PipeWireCapturable {
 }
 
 fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Error>> {
-    let rec = PipeWireRecorder::new(capturable)?;
+    let rec = PipeWireRecorder::new_with_test_transform(capturable, false)?;
     if let Some(sample) = rec
         .appsink
         .try_pull_sample(gst::ClockTime::from_mseconds(300))
@@ -254,17 +282,27 @@ fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Err
 pub struct PipeWireRecorder {
     buffer: Option<gst::MappedBuffer<gst::buffer::Readable>>,
     buffer_cropped: Vec<u8>,
+    buffer_rotated: Vec<u8>,
     pix_fmt: String,
     is_cropped: bool,
     pipeline: gst::Pipeline,
     appsink: AppSink,
     width: usize,
     height: usize,
+    force_test_rotate_180: bool,
+    logged_test_transform: bool,
     saved_raw_data: Vec<u8>, // for faster compare and copy
 }
 
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
+        Self::new_with_test_transform(capturable, true)
+    }
+
+    fn new_with_test_transform(
+        capturable: PipeWireCapturable,
+        force_test_rotate_180: bool,
+    ) -> ResultType<Self> {
         let pipeline = gst::Pipeline::new(None);
 
         let src = gst::ElementFactory::make("pipewiresrc", None)?;
@@ -340,6 +378,16 @@ impl PipeWireRecorder {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
 
+        if force_test_rotate_180 {
+            // OBS's linux-pipewire source reads SPA_META_VideoTransform before rendering.
+            // This test branch forces the equivalent final-frame transform to verify the
+            // PipeWire pixel path.
+            info!(
+                "{} PipeWire test transform enabled: force rotate-180 on captured frames.",
+                PIPEWIRE_TEST_LOG_PREFIX
+            );
+        }
+
         Ok(Self {
             pipeline,
             appsink,
@@ -348,7 +396,10 @@ impl PipeWireRecorder {
             width: 0,
             height: 0,
             buffer_cropped: vec![],
+            buffer_rotated: vec![],
             is_cropped: false,
+            force_test_rotate_180,
+            logged_test_transform: false,
             saved_raw_data: Vec::new(),
         })
     }
@@ -391,8 +442,7 @@ impl Recorder for PipeWireRecorder {
                 return Ok(PixelProvider::NONE);
             }
             let buf_size = buf.get_size();
-            // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
+            if buf_size != (w * h * PIXEL_STRIDE) {
                 // for some reason the width and height of the caps do not guarantee correct buffer
                 // size, so ignore those buffers, see:
                 // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
@@ -414,10 +464,11 @@ impl Recorder for PipeWireRecorder {
                     self.buffer_cropped.clear();
                     let data = buf.as_slice();
                     // BGRx is 4 bytes per pixel
-                    self.buffer_cropped.reserve(w_crop * h_crop * 4);
+                    self.buffer_cropped.reserve(w_crop * h_crop * PIXEL_STRIDE);
                     for y in y_off..(y_off + h_crop) {
-                        let i = 4 * (w * y + x_off);
-                        self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
+                        let i = PIXEL_STRIDE * (w * y + x_off);
+                        self.buffer_cropped
+                            .extend(&data[i..i + PIXEL_STRIDE * w_crop]);
                     }
                     self.width = w_crop;
                     self.height = h_crop;
@@ -434,13 +485,36 @@ impl Recorder for PipeWireRecorder {
         if self.buffer.is_none() {
             return Err(Box::new(GStreamerError("No buffer available!".into())));
         }
-        let buf = if self.is_cropped {
+        let source_buf = if self.is_cropped {
             self.buffer_cropped.as_slice()
         } else {
             self.buffer
                 .as_ref()
                 .ok_or("Failed to get buffer as ref")?
                 .as_slice()
+        };
+        let buf = if self.force_test_rotate_180 {
+            rotate_180_frame(
+                source_buf,
+                self.width,
+                self.height,
+                &mut self.buffer_rotated,
+            )?;
+            if !self.logged_test_transform {
+                info!(
+                    "{} PipeWire test transform applied: rotate-180, format={}, size={}x{}, cropped={}, input_bytes={}.",
+                    PIPEWIRE_TEST_LOG_PREFIX,
+                    self.pix_fmt,
+                    self.width,
+                    self.height,
+                    self.is_cropped,
+                    source_buf.len()
+                );
+                self.logged_test_transform = true;
+            }
+            self.buffer_rotated.as_slice()
+        } else {
+            source_buf
         };
         match self.pix_fmt.as_str() {
             "BGRx" => Ok(PixelProvider::BGR0(self.width, self.height, buf)),
@@ -1403,16 +1477,19 @@ fn fill_multi_matched_positions_cursor(
                 // to avoid interference from previous position.
                 mouse_move_to_(&mouse_move_to, get_cursor_pos, 300, 300);
 
-                let mut rec = PipeWireRecorder::new(PipeWireCapturable {
-                    dbus_conn: conn.clone(),
-                    fd: fd.clone(),
-                    path: pw_stream_with_cursor.path,
-                    source_type: pw_stream_with_cursor.source_type,
-                    primary: false,
-                    position: pw_stream_with_cursor.position,
-                    logical_size: pw_stream_with_cursor.size,
-                    physical_size: (0, 0),
-                })?;
+                let mut rec = PipeWireRecorder::new_with_test_transform(
+                    PipeWireCapturable {
+                        dbus_conn: conn.clone(),
+                        fd: fd.clone(),
+                        path: pw_stream_with_cursor.path,
+                        source_type: pw_stream_with_cursor.source_type,
+                        primary: false,
+                        position: pw_stream_with_cursor.position,
+                        logical_size: pw_stream_with_cursor.size,
+                        physical_size: (0, 0),
+                    },
+                    false,
+                )?;
                 // Take first frame and copy owned buffer to avoid borrow across second capture
                 let (is_bgr, w, first_buf): (bool, usize, Vec<u8>) =
                     match rec.capture(CAPTURE_TIMEOUT_MS) {
