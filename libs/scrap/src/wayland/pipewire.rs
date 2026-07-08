@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::{create_dir_all, File};
+use std::io::{BufWriter, Write};
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::{
@@ -7,7 +9,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -55,6 +57,13 @@ struct PipewireDisplayOffsetCache {
 // KDE Plasma may not provide position info
 static HAS_POSITION_ATTR: AtomicBool = AtomicBool::new(false);
 static IS_SERVER_RUNNING: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1:true, 2: false
+static HAS_DUMPED_PIPEWIRE_FRAME: AtomicBool = AtomicBool::new(false);
+
+const PIXEL_STRIDE: usize = 4;
+const RGB_STRIDE: usize = 3;
+const PIPEWIRE_TEST_LOG_PREFIX: &str = "=====================";
+const PIPEWIRE_FRAME_DUMP_DIR: &str = "/tmp/RustDesk";
+const PIPEWIRE_FRAME_DUMP_PATH: &str = "/tmp/RustDesk/pipewire-first-frame.ppm";
 
 impl PipewireDisplayOffsetCache {
     fn displays_to_key(displays: &Arc<Displays>) -> String {
@@ -145,6 +154,86 @@ impl std::fmt::Display for GStreamerError {
 
 impl Error for GStreamerError {}
 
+fn maybe_dump_pipewire_frame(pix_fmt: &str, data: &[u8], width: usize, height: usize) {
+    if HAS_DUMPED_PIPEWIRE_FRAME
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    match dump_pipewire_frame_ppm(pix_fmt, data, width, height) {
+        Ok(()) => info!(
+            "{} PipeWire first raw frame dumped: path={}, format={}, size={}x{}, bytes={}.",
+            PIPEWIRE_TEST_LOG_PREFIX,
+            PIPEWIRE_FRAME_DUMP_PATH,
+            pix_fmt,
+            width,
+            height,
+            data.len()
+        ),
+        Err(err) => warn!(
+            "{} Failed to dump PipeWire first raw frame: {}.",
+            PIPEWIRE_TEST_LOG_PREFIX, err
+        ),
+    }
+}
+
+fn dump_pipewire_frame_ppm(
+    pix_fmt: &str,
+    data: &[u8],
+    width: usize,
+    height: usize,
+) -> ResultType<()> {
+    let frame_size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(PIXEL_STRIDE))
+        .ok_or_else(|| GStreamerError(format!("Frame size overflow: {}x{}.", width, height)))?;
+    if data.len() != frame_size {
+        bail!(
+            "Unexpected frame size for dump: got {}, expected {}",
+            data.len(),
+            frame_size
+        );
+    }
+
+    let rgb_size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(RGB_STRIDE))
+        .ok_or_else(|| GStreamerError(format!("RGB dump size overflow: {}x{}.", width, height)))?;
+    let mut rgb = Vec::with_capacity(rgb_size);
+    for pixel in data.chunks_exact(PIXEL_STRIDE) {
+        match pix_fmt {
+            "BGRx" => rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]),
+            "RGBx" => rgb.extend_from_slice(&pixel[..RGB_STRIDE]),
+            _ => bail!("Unsupported pixel format for dump: {}", pix_fmt),
+        }
+    }
+
+    create_dir_all(PIPEWIRE_FRAME_DUMP_DIR).map_err(|err| {
+        GStreamerError(format!(
+            "Failed to create dump directory {}: {}",
+            PIPEWIRE_FRAME_DUMP_DIR, err
+        ))
+    })?;
+    let file = File::create(PIPEWIRE_FRAME_DUMP_PATH).map_err(|err| {
+        GStreamerError(format!(
+            "Failed to create dump file {}: {}",
+            PIPEWIRE_FRAME_DUMP_PATH, err
+        ))
+    })?;
+    let mut writer = BufWriter::new(file);
+    write!(writer, "P6\n{} {}\n255\n", width, height)
+        .map_err(|err| GStreamerError(format!("Failed to write PPM header: {}", err)))?;
+    writer
+        .write_all(&rgb)
+        .map_err(|err| GStreamerError(format!("Failed to write PPM pixels: {}", err)))?;
+    writer
+        .flush()
+        .map_err(|err| GStreamerError(format!("Failed to flush PPM dump: {}", err)))?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
@@ -229,7 +318,7 @@ impl Capturable for PipeWireCapturable {
 }
 
 fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Error>> {
-    let rec = PipeWireRecorder::new(capturable)?;
+    let rec = PipeWireRecorder::new_with_frame_dump(capturable, false)?;
     if let Some(sample) = rec
         .appsink
         .try_pull_sample(gst::ClockTime::from_mseconds(300))
@@ -260,11 +349,19 @@ pub struct PipeWireRecorder {
     appsink: AppSink,
     width: usize,
     height: usize,
+    dump_first_frame: bool,
     saved_raw_data: Vec<u8>, // for faster compare and copy
 }
 
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
+        Self::new_with_frame_dump(capturable, true)
+    }
+
+    fn new_with_frame_dump(
+        capturable: PipeWireCapturable,
+        dump_first_frame: bool,
+    ) -> ResultType<Self> {
         let pipeline = gst::Pipeline::new(None);
 
         let src = gst::ElementFactory::make("pipewiresrc", None)?;
@@ -349,6 +446,7 @@ impl PipeWireRecorder {
             height: 0,
             buffer_cropped: vec![],
             is_cropped: false,
+            dump_first_frame,
             saved_raw_data: Vec::new(),
         })
     }
@@ -391,8 +489,7 @@ impl Recorder for PipeWireRecorder {
                 return Ok(PixelProvider::NONE);
             }
             let buf_size = buf.get_size();
-            // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
+            if buf_size != (w * h * PIXEL_STRIDE) {
                 // for some reason the width and height of the caps do not guarantee correct buffer
                 // size, so ignore those buffers, see:
                 // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
@@ -404,6 +501,10 @@ impl Recorder for PipeWireRecorder {
                     h
                 );
             } else {
+                if self.dump_first_frame {
+                    // Dump the first raw appsink frame before RustDesk crop/encode handling.
+                    maybe_dump_pipewire_frame(&self.pix_fmt, buf.as_slice(), w, h);
+                }
                 // Copy region specified by crop into self.buffer_cropped
                 // TODO: Figure out if ffmpeg provides a zero copy alternative
                 if let Some((x_off, y_off, w_crop, h_crop)) = crop {
@@ -414,10 +515,11 @@ impl Recorder for PipeWireRecorder {
                     self.buffer_cropped.clear();
                     let data = buf.as_slice();
                     // BGRx is 4 bytes per pixel
-                    self.buffer_cropped.reserve(w_crop * h_crop * 4);
+                    self.buffer_cropped.reserve(w_crop * h_crop * PIXEL_STRIDE);
                     for y in y_off..(y_off + h_crop) {
-                        let i = 4 * (w * y + x_off);
-                        self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
+                        let i = PIXEL_STRIDE * (w * y + x_off);
+                        self.buffer_cropped
+                            .extend(&data[i..i + PIXEL_STRIDE * w_crop]);
                     }
                     self.width = w_crop;
                     self.height = h_crop;
@@ -1403,16 +1505,19 @@ fn fill_multi_matched_positions_cursor(
                 // to avoid interference from previous position.
                 mouse_move_to_(&mouse_move_to, get_cursor_pos, 300, 300);
 
-                let mut rec = PipeWireRecorder::new(PipeWireCapturable {
-                    dbus_conn: conn.clone(),
-                    fd: fd.clone(),
-                    path: pw_stream_with_cursor.path,
-                    source_type: pw_stream_with_cursor.source_type,
-                    primary: false,
-                    position: pw_stream_with_cursor.position,
-                    logical_size: pw_stream_with_cursor.size,
-                    physical_size: (0, 0),
-                })?;
+                let mut rec = PipeWireRecorder::new_with_frame_dump(
+                    PipeWireCapturable {
+                        dbus_conn: conn.clone(),
+                        fd: fd.clone(),
+                        path: pw_stream_with_cursor.path,
+                        source_type: pw_stream_with_cursor.source_type,
+                        primary: false,
+                        position: pw_stream_with_cursor.position,
+                        logical_size: pw_stream_with_cursor.size,
+                        physical_size: (0, 0),
+                    },
+                    false,
+                )?;
                 // Take first frame and copy owned buffer to avoid borrow across second capture
                 let (is_bgr, w, first_buf): (bool, usize, Vec<u8>) =
                     match rec.capture(CAPTURE_TIMEOUT_MS) {
