@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{create_dir_all, File};
-use std::io::{BufWriter, Write};
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::{
@@ -60,10 +59,9 @@ static IS_SERVER_RUNNING: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1:tr
 static HAS_DUMPED_PIPEWIRE_FRAME: AtomicBool = AtomicBool::new(false);
 
 const PIXEL_STRIDE: usize = 4;
-const RGB_STRIDE: usize = 3;
 const PIPEWIRE_TEST_LOG_PREFIX: &str = "=====================";
 const PIPEWIRE_FRAME_DUMP_DIR: &str = "/tmp/RustDesk";
-const PIPEWIRE_FRAME_DUMP_PATH: &str = "/tmp/RustDesk/pipewire-first-frame.ppm";
+const PIPEWIRE_FRAME_DUMP_PATH: &str = "/tmp/RustDesk/pipewire-first-frame.png";
 
 impl PipewireDisplayOffsetCache {
     fn displays_to_key(displays: &Arc<Displays>) -> String {
@@ -162,7 +160,7 @@ fn maybe_dump_pipewire_frame(pix_fmt: &str, data: &[u8], width: usize, height: u
         return;
     }
 
-    match dump_pipewire_frame_ppm(pix_fmt, data, width, height) {
+    match dump_pipewire_frame_png(pix_fmt, data, width, height) {
         Ok(()) => info!(
             "{} PipeWire first raw frame dumped: path={}, format={}, size={}x{}, bytes={}.",
             PIPEWIRE_TEST_LOG_PREFIX,
@@ -179,7 +177,7 @@ fn maybe_dump_pipewire_frame(pix_fmt: &str, data: &[u8], width: usize, height: u
     }
 }
 
-fn dump_pipewire_frame_ppm(
+fn dump_pipewire_frame_png(
     pix_fmt: &str,
     data: &[u8],
     width: usize,
@@ -197,15 +195,15 @@ fn dump_pipewire_frame_ppm(
         );
     }
 
-    let rgb_size = width
+    let rgba_size = width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(RGB_STRIDE))
-        .ok_or_else(|| GStreamerError(format!("RGB dump size overflow: {}x{}.", width, height)))?;
-    let mut rgb = Vec::with_capacity(rgb_size);
+        .and_then(|pixels| pixels.checked_mul(PIXEL_STRIDE))
+        .ok_or_else(|| GStreamerError(format!("RGBA dump size overflow: {}x{}.", width, height)))?;
+    let mut rgba = Vec::with_capacity(rgba_size);
     for pixel in data.chunks_exact(PIXEL_STRIDE) {
         match pix_fmt {
-            "BGRx" => rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]),
-            "RGBx" => rgb.extend_from_slice(&pixel[..RGB_STRIDE]),
+            "BGRx" => rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]),
+            "RGBx" => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
             _ => bail!("Unsupported pixel format for dump: {}", pix_fmt),
         }
     }
@@ -222,15 +220,8 @@ fn dump_pipewire_frame_ppm(
             PIPEWIRE_FRAME_DUMP_PATH, err
         ))
     })?;
-    let mut writer = BufWriter::new(file);
-    write!(writer, "P6\n{} {}\n255\n", width, height)
-        .map_err(|err| GStreamerError(format!("Failed to write PPM header: {}", err)))?;
-    writer
-        .write_all(&rgb)
-        .map_err(|err| GStreamerError(format!("Failed to write PPM pixels: {}", err)))?;
-    writer
-        .flush()
-        .map_err(|err| GStreamerError(format!("Failed to flush PPM dump: {}", err)))?;
+    repng::encode(file, width as u32, height as u32, &rgba)
+        .map_err(|err| GStreamerError(format!("Failed to write PNG dump: {}", err)))?;
     Ok(())
 }
 

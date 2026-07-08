@@ -10,7 +10,7 @@ authors = ["Ram <quadrupleslap@gmail.com>"]
 edition = "2018"
 
 [features]
-wayland = ["gstreamer", "gstreamer-app", "gstreamer-video", "dbus", "tracing", "zbus"]
+wayland = ["gstreamer", "gstreamer-app", "gstreamer-video", "dbus", "tracing", "zbus", "dep:repng"]
 mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
@@ -23,6 +23,7 @@ lazy_static = "1.4"
 hbb_common = { path = "../hbb_common" }
 webm = { git = "https://github.com/rustdesk-org/rust-webm" }
 serde = {version="1.0", features=["derive"]}
+repng = { version = "0.2", optional = true }
 
 [dependencies.winapi]
 version = "0.3"
@@ -65,4 +66,3 @@ optional = true
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 nokhwa = { git = "https://github.com/rustdesk-org/nokhwa.git", branch = "fix_from_raw_parts", features = ["input-native"] }
-
