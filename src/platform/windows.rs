@@ -25,7 +25,7 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
     },
     path::*,
     ptr::null_mut,
@@ -59,9 +59,10 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
-            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
-            TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
+            ES_SYSTEM_REQUIRED, FILE_SHARE_READ, HANDLE, PROCESS_ALL_ACCESS,
+            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
+            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, TOKEN_ELEVATION, TOKEN_GROUPS,
+            TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -1836,8 +1837,58 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
     run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
+struct TempCommandScript {
+    path: PathBuf,
+    file: Option<fs::File>,
+    cleanup: bool,
+}
+
+impl TempCommandScript {
+    fn new(path: PathBuf, file: fs::File) -> Self {
+        Self {
+            path,
+            file: Some(file),
+            cleanup: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn close(&mut self) {
+        let _ = self.file.take();
+    }
+
+    fn keep_file(&mut self) {
+        self.cleanup = false;
+        self.close();
+    }
+
+    fn remove_file(&mut self) {
+        self.close();
+        if self.cleanup {
+            allow_err!(std::fs::remove_file(&self.path));
+            self.cleanup = false;
+        }
+    }
+}
+
+impl Drop for TempCommandScript {
+    fn drop(&mut self) {
+        self.close();
+        if self.cleanup {
+            allow_err!(std::fs::remove_file(&self.path));
+        }
+    }
+}
+
 fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathBuf> {
     let mut cmds = cmds;
+    if ext == "bat" {
+        bail!("Use write_locked_cmds for batch scripts");
+    }
     let mut tmp = std::env::temp_dir();
     // When dir contains these characters, the bat file will not execute in elevated mode.
     if vec!["&", "@", "^"]
@@ -1850,17 +1901,6 @@ fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathB
     }
     tmp.push(format!("{}_{}.{}", crate::get_app_name(), tip, ext));
     let mut file = std::fs::File::create(&tmp)?;
-    if ext == "bat" {
-        let tmp2 = get_undone_file(&tmp)?;
-        std::fs::File::create(&tmp2).ok();
-        cmds = format!(
-            "
-{cmds}
-if exist \"{path}\" del /f /q \"{path}\"
-",
-            path = tmp2.to_string_lossy()
-        );
-    }
     // in case cmds mixed with \r\n and \n, make sure all ending with \r\n
     // in some windows, \r\n required for cmd file to run
     cmds = cmds.replace("\r\n", "\n").replace("\n", "\r\n");
@@ -1875,6 +1915,42 @@ if exist \"{path}\" del /f /q \"{path}\"
     return Ok(tmp);
 }
 
+fn write_locked_cmds(cmds: String, tip: &str) -> ResultType<TempCommandScript> {
+    let mut cmds = format!(
+        "
+{cmds}
+exit /b 0
+"
+    );
+    let mut tmp = std::env::temp_dir();
+    // When dir contains these characters, the bat file will not execute in elevated mode.
+    if vec!["&", "@", "^"]
+        .drain(..)
+        .any(|s| tmp.to_string_lossy().to_string().contains(s))
+    {
+        if let Ok(dir) = user_accessible_folder() {
+            tmp = dir;
+        }
+    }
+    tmp.push(format!(
+        "{}_{}_{}.bat",
+        crate::get_app_name(),
+        tip,
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&tmp)?;
+    // in case cmds mixed with \r\n and \n, make sure all ending with \r\n
+    // in some windows, \r\n required for cmd file to run
+    cmds = cmds.replace("\r\n", "\n").replace("\n", "\r\n");
+    file.write_all(cmds.as_bytes())?;
+    file.sync_all()?;
+    Ok(TempCommandScript::new(tmp, file))
+}
+
 fn to_le(v: &mut [u16]) -> &[u8] {
     for b in v.iter_mut() {
         *b = b.to_le()
@@ -1882,19 +1958,9 @@ fn to_le(v: &mut [u16]) -> &[u8] {
     unsafe { v.align_to().1 }
 }
 
-fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
-    Ok(tmp.with_file_name(format!(
-        "{}.undone",
-        tmp.file_name()
-            .ok_or(anyhow!("Failed to get filename of {:?}", tmp))?
-            .to_string_lossy()
-    )))
-}
-
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
-    let tmp = write_cmds(cmds, "bat", tip)?;
-    let tmp2 = get_undone_file(&tmp)?;
-    let tmp_fn = tmp.to_str().unwrap_or("");
+    let mut tmp = write_locked_cmds(cmds, tip)?;
+    let tmp_fn = tmp.path.to_str().unwrap_or("");
     // https://github.com/rustdesk/rustdesk/issues/6786#issuecomment-1879655410
     // Specify cmd.exe explicitly to avoid the replacement of cmd commands.
     let res = runas::Command::new("cmd.exe")
@@ -1903,11 +1969,12 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
         .force_prompt(true)
         .status();
     if !show {
-        allow_err!(std::fs::remove_file(tmp));
+        tmp.remove_file();
+    } else {
+        tmp.keep_file();
     }
-    let _ = res?;
-    if tmp2.exists() {
-        allow_err!(std::fs::remove_file(tmp2));
+    let status = res?;
+    if !status.success() {
         bail!("{} failed", tip);
     }
     Ok(())
@@ -4513,6 +4580,41 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_command_script_rejects_replacement_before_execution() {
+        let script = write_locked_cmds("echo test".to_owned(), "lock_test")
+            .expect("temporary command script should be created");
+        let overwrite = fs::OpenOptions::new().write(true).open(script.path());
+        let delete = fs::remove_file(script.path());
+        let script_text =
+            fs::read_to_string(script.path()).expect("temporary command script should be readable");
+        let undone = script.path().with_file_name(format!(
+            "{}.undone",
+            script
+                .path()
+                .file_name()
+                .expect("temporary command script should have filename")
+                .to_string_lossy()
+        ));
+
+        assert!(
+            overwrite.is_err(),
+            "temporary command script must not be writable after creation"
+        );
+        assert!(
+            delete.is_err(),
+            "temporary command script must not be deletable before execution"
+        );
+        assert!(
+            !undone.exists(),
+            "temporary command status must not use a mutable marker file"
+        );
+        assert!(
+            script_text.contains("exit /b 0"),
+            "temporary command script should report success only when it reaches the end"
+        );
+    }
 
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
