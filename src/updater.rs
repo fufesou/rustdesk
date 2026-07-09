@@ -118,6 +118,12 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    // On macOS, auto-update is handled by check_update_as_root() in the service process.
+    // The shared check_update() path is only used for manual update checks from the GUI.
+    #[cfg(target_os = "macos")]
+    if !manually {
+        return Ok(());
+    }
     #[cfg(target_os = "windows")]
     let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
@@ -366,8 +372,8 @@ pub fn check_update_as_root() -> ResultType<()> {
         log::info!("[root-update] Auto update is disabled, skipping.");
         return Ok(());
     }
-    if do_check_software_update().is_err() {
-        return Ok(());
+    if let Err(e) = do_check_software_update() {
+        bail!("[root-update] Failed to check for software update: {}", e);
     }
     let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
     if update_url.is_empty() {
