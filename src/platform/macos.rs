@@ -943,7 +943,7 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let tmp_dir = format!("/tmp/.rustdeskupdate-root-{}", std::process::id());
     let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
     let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
-    let user = crate::username();
+    let user = get_active_username();
 
     log::info!("[root-update] Starting silent root update from {}", dmg_path);
 
@@ -953,16 +953,12 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
 
     // Get user ID for launchctl commands
-    let uid = Command::new("id")
-        .args(&["-u", &user])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let uid = get_active_userid();
 
     // Write a shell script that runs detached after this function returns.
     // We cannot directly replace /Applications/RustDesk.app while it is running,
     // so we spawn a script that waits, kills processes, copies, and restarts.
-    let script_path = "/tmp/rustdesk_update.sh";
+    let script_path = format!("{}/rustdesk_update.sh", tmp_dir);
     let script = format!(
         r#"#!/bin/sh
 sleep 3
@@ -984,7 +980,7 @@ rm -f {dmg_path}
 if [ "$gui_was_running" -gt "0" ]; then
     open -a {app_bundle}
 fi
-echo "[root-update] Done!" >> /tmp/rustdesk_update.log
+echo "[root-update] Done!" >> {tmp_dir}/rustdesk_update.log
 "#,
         app_name = app_name,
         app_bundle = app_bundle,
@@ -1001,17 +997,11 @@ echo "[root-update] Done!" >> /tmp/rustdesk_update.log
     let _ = Command::new("chmod").args(&["+x", script_path]).status();
 
     Command::new("/bin/bash")
-        .arg(script_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(
-            std::fs::File::create("/tmp/rustdesk_update.log")
-                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
-        )
-        .stderr(
-            std::fs::File::create("/tmp/rustdesk_update_err.log")
-                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
-        )
-        .spawn()?;
+    .arg(script_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
 
     log::info!("[root-update] Update script launched.");
     Ok(())
