@@ -979,7 +979,7 @@ rm -f {dmg_path}
 if [ "$gui_was_running" -gt "0" ]; then
     open -a {app_bundle}
 fi
-echo "[root-update] Done!" >> /tmp/rustdesk_root_update.log
+echo "[root-update] Done!" >> {tmp_dir}/rustdesk_root_update.log
 rm -rf {tmp_dir}
 "#,
         app_name = app_name,
@@ -993,7 +993,26 @@ rm -rf {tmp_dir}
         dmg_path = dmg_path,
     );
 
-   std::fs::write(&script_path, &script)?;
+   {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script_path)
+        .and_then(|mut f| f.write_all(script.as_bytes()))?;
+   }
+   let _ = Command::new("chmod").args(&["+x", &script_path]).status();
+   Command::new("/bin/bash")
+    .arg(&script_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
+
+    log::info!("[root-update] Update script launched.");
+    Ok(())
+}
+
    let _ = Command::new("chmod").args(&["+x", &script_path]).status();
    Command::new("/bin/bash")
     .arg(&script_path)
