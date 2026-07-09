@@ -975,12 +975,12 @@ launchctl load -w {daemon_plist} || true
 if [ -n "{uid}" ]; then
     launchctl bootstrap gui/{uid} {agent_plist} || true
 fi
-rm -rf {tmp_dir}
 rm -f {dmg_path}
 if [ "$gui_was_running" -gt "0" ]; then
     open -a {app_bundle}
 fi
-echo "[root-update] Done!" >> {tmp_dir}/rustdesk_update.log
+echo "[root-update] Done!" >> /tmp/rustdesk_root_update.log
+rm -rf {tmp_dir}
 "#,
         app_name = app_name,
         app_bundle = app_bundle,
