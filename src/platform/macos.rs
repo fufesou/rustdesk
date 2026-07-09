@@ -728,6 +728,8 @@ pub fn lock_screen() {
     .ok();
 }
 
+/// Starts the macOS system service IPC listener and the background
+/// silent auto-update thread.
 pub fn start_os_service() {
     log::info!("Username: {}", crate::username());
     // Silent auto-update thread — runs as root, no osascript dialog needed
