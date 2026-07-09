@@ -1013,18 +1013,6 @@ rm -rf {tmp_dir}
     Ok(())
 }
 
-   let _ = Command::new("chmod").args(&["+x", &script_path]).status();
-   Command::new("/bin/bash")
-    .arg(&script_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()?;
-
-    log::info!("[root-update] Update script launched.");
-    Ok(())
-}
-
 pub fn extract_update_dmg(file: &str) {
     let update_temp_dir = get_update_temp_dir_string();
     let mut evt: HashMap<&str, String> =
