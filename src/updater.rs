@@ -22,8 +22,13 @@ lazy_static::lazy_static! {
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// One full day — default interval between update checks.
 pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+
+/// Minimum interval between consecutive update checks (10 minutes).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
+
+/// Retry interval when an update check fails or a session is active (30 minutes).
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 pub fn update_controlling_session_count(count: usize) {
