@@ -732,29 +732,8 @@ pub fn lock_screen() {
 /// silent auto-update thread.
 pub fn start_os_service() {
     log::info!("Username: {}", crate::username());
-    // Silent auto-update thread — runs as root, no osascript dialog needed
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        let mut interval = crate::updater::DUR_ONE_DAY;
-        loop {
-            log::info!("[root-update] Running scheduled update check...");
-            if !crate::updater::has_no_active_conns() {
-                log::info!("[root-update] Active session in progress, retrying in 10 min.");
-                interval = crate::updater::MIN_INTERVAL;
-            } else {
-                match crate::updater::check_update_as_root() {
-                    Ok(_) => {
-                        interval = crate::updater::DUR_ONE_DAY;
-                    }
-                    Err(e) => {
-                        log::error!("[root-update] Update check failed: {}", e);
-                        interval = crate::updater::RETRY_INTERVAL;
-                    }
-                }
-            }
-            std::thread::sleep(interval);
-        }
-    });
+    // Silent auto-update — runs as root via LaunchDaemon, no osascript dialog needed
+    crate::updater::start_auto_update_macos();
     if let Err(err) = crate::ipc::start("_service") {
         log::error!("Failed to start ipc_service: {}", err);
     }
