@@ -22,7 +22,9 @@ lazy_static::lazy_static! {
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
@@ -47,7 +49,7 @@ pub fn stop_auto_update() {
 }
 
 #[inline]
-fn has_no_active_conns() -> bool {
+pub fn has_no_active_conns() -> bool {
     let conns = crate::Connection::alive_conns();
     conns.is_empty() && has_no_controlling_conns()
 }
@@ -87,8 +89,6 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
         log::error!("Error checking for updates: {}", e);
     }
 
-    const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
-    const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
     let mut last_check_time = Instant::now();
     let mut check_interval = DUR_ONE_DAY;
     loop {
@@ -151,6 +151,15 @@ fn check_update(manually: bool) -> ResultType<()> {
             )
         } else {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+        };
+        #[cfg(target_os = "macos")]
+        let download_url = {
+            let arch = if std::env::consts::ARCH == "aarch64" {
+                "aarch64"
+            } else {
+                "x86_64"
+            };
+            format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch)
         };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
@@ -346,6 +355,63 @@ fn is_plain_update_filename(filename: &str) -> bool {
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     get_update_download_file_from_url(url)
+}
+
+/// Called from the service process (root) on macOS.
+/// Downloads and installs update silently without osascript dialog.
+#[cfg(target_os = "macos")]
+pub fn check_update_as_root() -> ResultType<()> {
+    if do_check_software_update().is_err() {
+        return Ok(());
+    }
+    let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
+    if update_url.is_empty() {
+        log::info!("[root-update] No update available.");
+        return Ok(());
+    }
+    let download_url = update_url.replace("tag", "download");
+    let version = download_url.split('/').last().unwrap_or_default().to_string();
+    let arch = if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x86_64" };
+    let dmg_url = format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch);
+
+    log::info!("[root-update] New version: {}, downloading from {}", version, dmg_url);
+
+    let Some(file_path) = get_download_file_from_url(&dmg_url) else {
+        bail!("[root-update] Failed to get file path from URL: {}", dmg_url);
+    };
+    let tmp_path = file_path.to_string_lossy().to_string();
+
+    let client = create_http_client_with_url_strict(&dmg_url)?;
+
+    // Check if already downloaded
+    if file_path.exists() {
+        let file_size = std::fs::metadata(&file_path)?.len();
+        let response = client.head(&dmg_url).send()?;
+        if response.status().is_success() {
+            if let Some(content_length) = response.headers().get(reqwest::header::CONTENT_LENGTH) {
+                if let Ok(total_size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
+                    if file_size == total_size {
+                        log::info!("[root-update] DMG already downloaded, installing...");
+                        return crate::platform::update_from_dmg_as_root(&tmp_path);
+                    }
+                }
+            }
+        }
+        std::fs::remove_file(&file_path)?;
+    }
+
+    // Download
+    let response = client.get(&dmg_url).send()?;
+    if !response.status().is_success() {
+        bail!("[root-update] Failed to download: {}", response.status());
+    }
+    let file_data = response.bytes()?;
+    let mut file = std::fs::File::create(&file_path)?;
+    file.write_all(&file_data)?;
+    log::info!("[root-update] Downloaded to {}", tmp_path);
+
+    // Install silently as root
+    crate::platform::update_from_dmg_as_root(&tmp_path)
 }
 
 #[cfg(test)]
