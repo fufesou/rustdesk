@@ -361,6 +361,11 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 /// Downloads and installs update silently without osascript dialog.
 #[cfg(target_os = "macos")]
 pub fn check_update_as_root() -> ResultType<()> {
+    // Allow-auto-update setting
+    if !config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE) {
+        log::info!("[root-update] Auto update is disabled, skipping.");
+        return Ok(());
+    }
     if do_check_software_update().is_err() {
         return Ok(());
     }
