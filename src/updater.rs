@@ -22,6 +22,9 @@ lazy_static::lazy_static! {
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Initial wait after startup before the first update check (30 seconds).
+pub const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
+
 /// One full day — default interval between update checks.
 pub const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
@@ -91,7 +94,7 @@ fn start_auto_update_check() -> Sender<UpdateMsg> {
 }
 
 fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
-    std::thread::sleep(Duration::from_secs(30));
+    std::thread::sleep(INITIAL_CHECK_DELAY);
     if let Err(e) = check_update(false) {
         log::error!("Error checking for updates: {}", e);
     }
@@ -361,8 +364,34 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     get_update_download_file_from_url(url)
 }
 
-/// Called from the service process (root) on macOS.
-/// Downloads and installs update silently without osascript dialog.
+/// Starts the background silent auto-update scheduler for macOS.
+/// Called from `start_os_service()` which runs as root via LaunchDaemon.
+#[cfg(target_os = "macos")]
+pub fn start_auto_update_macos() {
+    std::thread::spawn(|| {
+        std::thread::sleep(INITIAL_CHECK_DELAY);
+        let mut interval = DUR_ONE_DAY;
+        loop {
+            log::info!("[root-update] Running scheduled update check...");
+            if !has_no_active_conns() {
+                log::info!("[root-update] Active session in progress, retrying in 10 min.");
+                interval = MIN_INTERVAL;
+            } else {
+                match check_update_as_root() {
+                    Ok(_) => {
+                        interval = DUR_ONE_DAY;
+                    }
+                    Err(e) => {
+                        log::error!("[root-update] Update check failed: {}", e);
+                        interval = RETRY_INTERVAL;
+                    }
+                }
+            }
+            std::thread::sleep(interval);
+        }
+    });
+}
+
 #[cfg(target_os = "macos")]
 pub fn check_update_as_root() -> ResultType<()> {
     // Allow-auto-update setting
