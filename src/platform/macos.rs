@@ -730,6 +730,29 @@ pub fn lock_screen() {
 
 pub fn start_os_service() {
     log::info!("Username: {}", crate::username());
+    // Silent auto-update thread — runs as root, no osascript dialog needed
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let mut interval = crate::updater::DUR_ONE_DAY;
+        loop {
+            log::info!("[root-update] Running scheduled update check...");
+            if !crate::updater::has_no_active_conns() {
+                log::info!("[root-update] Active session in progress, retrying in 10 min.");
+                interval = crate::updater::MIN_INTERVAL;
+            } else {
+                match crate::updater::check_update_as_root() {
+                    Ok(_) => {
+                        interval = crate::updater::DUR_ONE_DAY;
+                    }
+                    Err(e) => {
+                        log::error!("[root-update] Update check failed: {}", e);
+                        interval = crate::updater::RETRY_INTERVAL;
+                    }
+                }
+            }
+            std::thread::sleep(interval);
+        }
+    });
     if let Err(err) = crate::ipc::start("_service") {
         log::error!("Failed to start ipc_service: {}", err);
     }
@@ -909,6 +932,88 @@ pub fn update_from_dmg(dmg_path: &str) -> ResultType<()> {
 pub fn update_to(_file: &str) -> ResultType<()> {
     let update_temp_dir = get_update_temp_dir_string();
     update_extracted(&update_temp_dir)?;
+    Ok(())
+}
+
+/// Performs a silent update from a DMG file without any osascript dialog.
+/// Must be called from a process running as root (e.g. the service binary).
+pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
+    let app_name = crate::get_app_name();
+    let app_bundle = format!("/Applications/{}.app", app_name);
+    let tmp_dir = format!("/tmp/.rustdeskupdate-root-{}", std::process::id());
+    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
+    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+    let user = crate::username();
+
+    log::info!("[root-update] Starting silent root update from {}", dmg_path);
+
+    // Extract DMG to temp dir
+    extract_dmg(dmg_path, &tmp_dir)?;
+    let src_app = format!("{}/{}.app", tmp_dir, app_name);
+    log::info!("[root-update] DMG extracted to {}", tmp_dir);
+
+    // Get user ID for launchctl commands
+    let uid = Command::new("id")
+        .args(&["-u", &user])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    // Write a shell script that runs detached after this function returns.
+    // We cannot directly replace /Applications/RustDesk.app while it is running,
+    // so we spawn a script that waits, kills processes, copies, and restarts.
+    let script_path = "/tmp/rustdesk_update.sh";
+    let script = format!(
+        r#"#!/bin/sh
+sleep 3
+# Check if the GUI was open before we kill it
+gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
+pkill -9 -x {app_name} || true
+pkill -9 -f "{app_name} --server" || true
+sleep 2
+rm -rf {app_bundle}
+ditto {src_app} {app_bundle}
+chown -R {user}:staff {app_bundle}
+xattr -r -d com.apple.quarantine {app_bundle} || true
+launchctl load -w {daemon_plist} || true
+if [ -n "{uid}" ]; then
+    launchctl bootstrap gui/{uid} {agent_plist} || true
+fi
+rm -rf {tmp_dir}
+rm -f {dmg_path}
+if [ "$gui_was_running" -gt "0" ]; then
+    open -a {app_bundle}
+fi
+echo "[root-update] Done!" >> /tmp/rustdesk_update.log
+"#,
+        app_name = app_name,
+        app_bundle = app_bundle,
+        src_app = src_app,
+        user = user,
+        uid = uid,
+        daemon_plist = daemon_plist,
+        agent_plist = agent_plist,
+        tmp_dir = tmp_dir,
+        dmg_path = dmg_path,
+    );
+
+    std::fs::write(script_path, &script)?;
+    let _ = Command::new("chmod").args(&["+x", script_path]).status();
+
+    Command::new("/bin/bash")
+        .arg(script_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(
+            std::fs::File::create("/tmp/rustdesk_update.log")
+                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
+        )
+        .stderr(
+            std::fs::File::create("/tmp/rustdesk_update_err.log")
+                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
+        )
+        .spawn()?;
+
+    log::info!("[root-update] Update script launched.");
     Ok(())
 }
 
