@@ -113,6 +113,8 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
+const WINDOWS_POWERSHELL_EXE: &str =
+    "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -1580,65 +1582,44 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
 
     let current_exe = std::env::current_exe()?;
 
-    let tmp_path = std::env::temp_dir().to_string_lossy().to_string();
     let cur_exe = current_exe.to_str().unwrap_or("").to_owned();
-    let shortcut_icon_location = get_shortcut_icon_location(&path, &cur_exe);
-    let mk_shortcut = write_cmds(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = \"{tmp_path}\\{app_name}.lnk\"
-
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    {shortcut_icon_location}
-oLink.Save
-        "
-        ),
-        "vbs",
-        "mk_shortcut",
-    )?
-    .to_str()
-    .unwrap_or("")
-    .to_owned();
-    // https://superuser.com/questions/392061/how-to-make-a-shortcut-from-cmd
-    let uninstall_shortcut = write_cmds(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = \"{tmp_path}\\Uninstall {app_name}.lnk\"
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    oLink.Arguments = \"--uninstall\"
-    oLink.IconLocation = \"msiexec.exe\"
-oLink.Save
-        "
-        ),
-        "vbs",
-        "uninstall_shortcut",
-    )?
-    .to_str()
-    .unwrap_or("")
-    .to_owned();
-    let tray_shortcut = get_tray_shortcut(&path, &exe, &cur_exe, &tmp_path)?;
+    let uninstall_shortcut_cmd = create_shortcut_cmd(
+        &format!("{path}\\Uninstall {app_name}.lnk"),
+        &exe,
+        Some("--uninstall"),
+        Some("msiexec.exe"),
+    );
+    let tray_shortcut_cmd = get_tray_shortcut(&path, &exe, &cur_exe);
     let mut reg_value_desktop_shortcuts = "0".to_owned();
     let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut reg_value_printer = "0".to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
-        shortcuts = format!(
-            "copy /Y \"{}\\{}.lnk\" \"%PUBLIC%\\Desktop\\\"",
-            tmp_path,
-            crate::get_app_name()
+        shortcuts = create_shortcut_cmd(
+            &format!("%PUBLIC%\\Desktop\\{app_name}.lnk"),
+            &exe,
+            None,
+            get_custom_icon(&path, &cur_exe).as_deref(),
         );
         reg_value_desktop_shortcuts = "1".to_owned();
     }
     if options.contains("startmenu") {
+        let start_menu_shortcut_cmd = create_shortcut_cmd(
+            &format!("{start_menu}\\{app_name}.lnk"),
+            &exe,
+            None,
+            get_custom_icon(&path, &cur_exe).as_deref(),
+        );
+        let start_menu_uninstall_shortcut_cmd = create_shortcut_cmd(
+            &format!("{start_menu}\\Uninstall {app_name}.lnk"),
+            &exe,
+            Some("--uninstall"),
+            Some("msiexec.exe"),
+        );
         shortcuts = format!(
             "{shortcuts}
-md \"{start_menu}\"
-copy /Y \"{tmp_path}\\{app_name}.lnk\" \"{start_menu}\\\"
-copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
+{start_menu_shortcut_cmd}
+{start_menu_uninstall_shortcut_cmd}
      "
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
@@ -1659,16 +1640,6 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
     // https://www.windowscentral.com/how-edit-registry-using-command-prompt-windows-10
     // https://www.tenforums.com/tutorials/70903-add-remove-allowed-apps-through-windows-firewall-windows-10-a.html
     // Note: without if exist, the bat may exit in advance on some Windows7 https://github.com/rustdesk/rustdesk/issues/895
-    let dels = format!(
-        "
-if exist \"{mk_shortcut}\" del /f /q \"{mk_shortcut}\"
-if exist \"{uninstall_shortcut}\" del /f /q \"{uninstall_shortcut}\"
-if exist \"{tray_shortcut}\" del /f /q \"{tray_shortcut}\"
-if exist \"{tmp_path}\\{app_name}.lnk\" del /f /q \"{tmp_path}\\{app_name}.lnk\"
-if exist \"{tmp_path}\\Uninstall {app_name}.lnk\" del /f /q \"{tmp_path}\\Uninstall {app_name}.lnk\"
-if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} Tray.lnk\"
-        "
-    );
     let src_exe = std::env::current_exe()?.to_str().unwrap_or("").to_string();
 
     // potential bug here: if run_cmd cancelled, but config file is changed.
@@ -1681,10 +1652,11 @@ if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} 
     let tray_shortcuts = if config::is_outgoing_only() {
         "".to_owned()
     } else {
-        format!("
-cscript \"{tray_shortcut}\"
-copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
-")
+        format!(
+            "
+{tray_shortcut_cmd}
+"
+        )
     };
 
     let install_remote_printer = if install_printer {
@@ -1720,12 +1692,9 @@ reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {version_build}
 reg add {subkey} /f /v UninstallString /t REG_SZ /d \"\\\"{exe}\\\" --uninstall\"
 reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
-cscript \"{mk_shortcut}\"
-cscript \"{uninstall_shortcut}\"
+{uninstall_shortcut_cmd}
 {tray_shortcuts}
 {shortcuts}
-copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
-{dels}
 {import_config}
 {after_install}
 {install_remote_printer}
@@ -1741,7 +1710,6 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
             Some(reg_value_printer)
         ),
         sleep = if debug { "timeout 300" } else { "" },
-        dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         import_config = get_import_config(&exe),
     );
@@ -2342,6 +2310,54 @@ fn get_shortcut_icon_location(install_dir: &str, exe: &str) -> String {
     get_custom_icon(install_dir, exe)
         .map(|p| format!("oLink.IconLocation = \"{}\"", p))
         .unwrap_or_default()
+}
+
+fn escape_cmd_double_quoted(value: &str) -> String {
+    value.replace('%', "%%").replace('^', "^^")
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", escape_cmd_double_quoted(&value.replace('\'', "''")))
+}
+
+fn create_shortcut_cmd(
+    link_file: &str,
+    target_path: &str,
+    arguments: Option<&str>,
+    icon_location: Option<&str>,
+) -> String {
+    let arguments_cmd = arguments
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "; $shortcut.Arguments = {}",
+                powershell_single_quoted(value)
+            )
+        })
+        .unwrap_or_default();
+    let icon_cmd = icon_location
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "; $shortcut.IconLocation = {}",
+                powershell_single_quoted(value)
+            )
+        })
+        .unwrap_or_default();
+    let ps_cmd = format!(
+        "$link = [Environment]::ExpandEnvironmentVariables({}); \
+         $directory = Split-Path -Parent $link; \
+         if ($directory) {{ $null = New-Item -ItemType Directory -Force -Path $directory }}; \
+         $shell = New-Object -ComObject WScript.Shell; \
+         $shortcut = $shell.CreateShortcut($link); \
+         $shortcut.TargetPath = {};{}{}; \
+         $shortcut.Save()",
+        powershell_single_quoted(link_file),
+        powershell_single_quoted(target_path),
+        arguments_cmd,
+        icon_cmd
+    );
+    format!("\"{WINDOWS_POWERSHELL_EXE}\" -NoProfile -NonInteractive -Command \"{ps_cmd}\"")
 }
 
 pub fn create_shortcut(id: &str) -> ResultType<()> {
@@ -3254,8 +3270,7 @@ pub fn install_service() -> bool {
     log::info!("Installing service...");
     let _installing = crate::platform::InstallingService::new();
     let (_, path, _, exe) = get_install_info();
-    let tmp_path = std::env::temp_dir().to_string_lossy().to_string();
-    let tray_shortcut = get_tray_shortcut(&path, &exe, &exe, &tmp_path).unwrap_or_default();
+    let tray_shortcut_cmd = get_tray_shortcut(&path, &exe, &exe);
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     Config::set_option("stop-service".into(), "".into());
     crate::ipc::EXIT_RECV_CLOSE.store(false, Ordering::Relaxed);
@@ -3263,11 +3278,9 @@ pub fn install_service() -> bool {
         "
 chcp 65001
 taskkill /F /IM {app_name}.exe{filter}
-cscript \"{tray_shortcut}\"
-copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+{tray_shortcut_cmd}
 {import_config}
 {create_service}
-if exist \"{tray_shortcut}\" del /f /q \"{tray_shortcut}\"
     ",
         app_name = crate::get_app_name(),
         import_config = get_import_config(&exe),
@@ -3721,33 +3734,16 @@ pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
     Ok(())
 }
 
-pub fn get_tray_shortcut(
-    install_dir: &str,
-    exe: &str,
-    icon_source_exe: &str,
-    tmp_path: &str,
-) -> ResultType<String> {
-    let shortcut_icon_location = get_shortcut_icon_location(install_dir, icon_source_exe);
-    Ok(write_cmds(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = \"{tmp_path}\\{app_name} Tray.lnk\"
-
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    oLink.Arguments = \"--tray\"
-    {shortcut_icon_location}
-oLink.Save
-        ",
-            app_name = crate::get_app_name(),
+fn get_tray_shortcut(install_dir: &str, exe: &str, icon_source_exe: &str) -> String {
+    create_shortcut_cmd(
+        &format!(
+            "%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{} Tray.lnk",
+            crate::get_app_name()
         ),
-        "vbs",
-        "tray_shortcut",
-    )?
-    .to_str()
-    .unwrap_or("")
-    .to_owned())
+        exe,
+        Some("--tray"),
+        get_custom_icon(install_dir, icon_source_exe).as_deref(),
+    )
 }
 
 fn get_import_config(exe: &str) -> String {
@@ -4614,6 +4610,20 @@ mod tests {
             script_text.contains("exit /b 0"),
             "temporary command script should report success only when it reaches the end"
         );
+    }
+
+    #[test]
+    fn shortcut_command_creates_final_expanded_path() {
+        let command = create_shortcut_cmd(
+            "%PROGRAMDATA%\\RustDesk\\RustDesk Tray.lnk",
+            "C:\\Program Files\\RustDesk\\RustDesk.exe",
+            Some("--tray"),
+            Some("msiexec.exe"),
+        );
+
+        assert!(command.contains("[Environment]::ExpandEnvironmentVariables"));
+        assert!(command.contains("'%%PROGRAMDATA%%\\RustDesk\\RustDesk Tray.lnk'"));
+        assert!(!command.contains("copy /Y"));
     }
 
     // Test-only reusable Win32 HANDLE RAII helper.
