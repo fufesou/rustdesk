@@ -158,15 +158,6 @@ fn check_update(manually: bool) -> ResultType<()> {
         } else {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
         };
-        #[cfg(target_os = "macos")]
-        let download_url = {
-            let arch = if std::env::consts::ARCH == "aarch64" {
-                "aarch64"
-            } else {
-                "x86_64"
-            };
-            format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch)
-        };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
