@@ -993,11 +993,10 @@ rm -rf {tmp_dir}
         dmg_path = dmg_path,
     );
 
-    std::fs::write(script_path, &script)?;
-    let _ = Command::new("chmod").args(&["+x", script_path]).status();
-
-    Command::new("/bin/bash")
-    .arg(script_path)
+   std::fs::write(&script_path, &script)?;
+   let _ = Command::new("chmod").args(&["+x", &script_path]).status();
+   Command::new("/bin/bash")
+    .arg(&script_path)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null())
