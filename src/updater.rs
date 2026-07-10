@@ -426,21 +426,21 @@ pub fn check_update_as_root() -> ResultType<()> {
     if !response.status().is_success() {
         bail!("[root-update] Failed to download: {}", response.status());
     }
-    let file_data = response.bytes()?;
-    // Create file exclusively (O_EXCL) — fails if file already exists
+    // Create file exclusively (O_EXCL) and stream response directly into it
     {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&file_path)
-            .and_then(|mut f| f.write_all(&file_data))?;
+            .open(&file_path)?;
+        std::io::copy(&mut response, &mut file)?;
     }
     log::info!("[root-update] Downloaded to {}", tmp_path);
     // Install silently as root
     let result = crate::platform::update_from_dmg_as_root(&tmp_path);
     // Clean up download directory
-    let _ = std::fs::remove_dir_all(&private_tmp);
+    if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
+        log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
+    }
     result
 }
 
