@@ -955,8 +955,13 @@ sleep 1
 pkill -9 -x {app_name} || true
 pkill -9 -f "{app_name} --server" || true
 sleep 2
+if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
+    echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
+    rm -rf {app_bundle}.new
+    exit 1
+fi
 rm -rf {app_bundle}
-ditto {src_app} {app_bundle}
+mv {app_bundle}.new {app_bundle}
 chown -R {user}:staff {app_bundle}
 xattr -r -d com.apple.quarantine {app_bundle} || true
 launchctl load -w {daemon_plist} || true
