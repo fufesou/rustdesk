@@ -1892,7 +1892,7 @@ try {
 }"#;
 
 fn encode_batch_commands(commands: &str) -> String {
-    let commands = format!("\n{commands}\nexit /b 0\n");
+    let commands = format!("\n{commands}\nexit /b %ERRORLEVEL%\n");
     let commands = commands.replace("\r\n", "\n").replace("\n", "\r\n");
     BASE64_STANDARD.encode(commands.as_bytes())
 }
@@ -4590,6 +4590,44 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_commands_are_normalized_and_terminated() {
+        let encoded = encode_batch_commands("echo first\necho second\r\n");
+        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "\r\necho first\r\necho second\r\n\r\nexit /b %ERRORLEVEL%\r\n"
+        );
+    }
+
+    #[test]
+    fn elevated_runner_uses_immutable_randomized_execution_file() {
+        let runner = elevated_script_runner("echo test");
+        assert!(runner.contains("Guid]::NewGuid"));
+        assert!(runner.contains("FileMode]::CreateNew"));
+        assert!(runner.contains("FileShare]::Read"));
+        assert!(runner.contains("File]::Delete($runnerPath)"));
+        assert!(!runner.contains('\\'));
+        assert!(!runner.contains('"'));
+    }
+
+    #[test]
+    fn shortcut_command_escapes_batch_and_powershell_values() {
+        let command = create_shortcut_cmd(ShortcutOptions {
+            link_file: "RustDesk's ^%.lnk",
+            special_folder: Some("AllUsersDesktop"),
+            target_path: "C:\\Program Files\\RustDesk's ^%\\RustDesk.exe",
+            arguments: Some("--tray ^% 'test'"),
+            icon_location: Some("C:\\Icons\\RustDesk's ^%.ico"),
+        });
+
+        assert!(command.contains("$shell.SpecialFolders.Item('AllUsersDesktop')"));
+        assert!(command.contains("'RustDesk''s ^%%.lnk'"));
+        assert!(command.contains("'C:\\Program Files\\RustDesk''s ^%%\\RustDesk.exe'"));
+        assert!(command.contains("$shortcut.Arguments = '--tray ^%% ''test'''"));
+        assert!(command.contains("$shortcut.IconLocation = 'C:\\Icons\\RustDesk''s ^%%.ico'"));
+    }
 
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
