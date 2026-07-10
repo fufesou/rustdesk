@@ -992,8 +992,8 @@ rm -rf {tmp_dir}
         .and_then(|mut f| f.write_all(script.as_bytes()))?;
    }
    let _ = Command::new("chmod").args(&["+x", &script_path]).status();
-   Command::new("/bin/bash")
-    .arg(&script_path)
+   Command::new("nohup")
+    .args(&["/bin/bash", &script_path])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null())
