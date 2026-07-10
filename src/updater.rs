@@ -421,20 +421,8 @@ pub fn check_update_as_root() -> ResultType<()> {
 
     let client = create_http_client_with_url_strict(&dmg_url)?;
 
-    // Check if already downloaded
+    // Always remove any pre-existing file — never trust a file we did not just download
     if file_path.exists() {
-        let file_size = std::fs::metadata(&file_path)?.len();
-        let response = client.head(&dmg_url).send()?;
-        if response.status().is_success() {
-            if let Some(content_length) = response.headers().get(reqwest::header::CONTENT_LENGTH) {
-                if let Ok(total_size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
-                    if file_size == total_size {
-                        log::info!("[root-update] DMG already downloaded, installing...");
-                        return crate::platform::update_from_dmg_as_root(&tmp_path);
-                    }
-                }
-            }
-        }
         std::fs::remove_file(&file_path)?;
     }
 
