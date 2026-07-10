@@ -9,6 +9,7 @@ use hbb_common::{
     allow_err,
     anyhow::anyhow,
     bail,
+    base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _},
     config::{self, Config},
     libc::{c_int, wchar_t},
     log,
@@ -25,7 +26,7 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
+        windows::{ffi::OsStringExt, process::CommandExt},
     },
     path::*,
     ptr::null_mut,
@@ -53,16 +54,15 @@ use winapi::{
             AllocateAndInitializeSid, DuplicateToken, EqualSid, FreeSid, GetTokenInformation,
         },
         shellapi::ShellExecuteW,
-        sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO},
+        sysinfoapi::{GetNativeSystemInfo, GetSystemDirectoryW, SYSTEM_INFO},
         winbase::*,
         wingdi::*,
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, FILE_SHARE_READ, HANDLE, PROCESS_ALL_ACCESS,
-            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
-            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, TOKEN_ELEVATION, TOKEN_GROUPS,
-            TOKEN_QUERY, TOKEN_TYPE,
+            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
+            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
+            TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -113,6 +113,7 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
+const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
 const WINDOWS_POWERSHELL_EXE: &str =
     "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
@@ -1558,7 +1559,7 @@ fn get_after_install(
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
     let uninstall_str = get_uninstall(false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
-    let (subkey, _path, start_menu, exe) = get_default_install_info();
+    let (subkey, _path, _, exe) = get_default_install_info();
     let mut exe = exe;
     if path.is_empty() {
         path = _path;
@@ -1583,39 +1584,43 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     let current_exe = std::env::current_exe()?;
 
     let cur_exe = current_exe.to_str().unwrap_or("").to_owned();
-    let uninstall_shortcut_cmd = create_shortcut_cmd(
-        &format!("{path}\\Uninstall {app_name}.lnk"),
-        &exe,
-        Some("--uninstall"),
-        Some("msiexec.exe"),
-    );
+    let uninstall_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
+        link_file: &format!("{path}\\Uninstall {app_name}.lnk"),
+        special_folder: None,
+        target_path: &exe,
+        arguments: Some("--uninstall"),
+        icon_location: Some("msiexec.exe"),
+    });
     let tray_shortcut_cmd = get_tray_shortcut(&path, &exe, &cur_exe);
     let mut reg_value_desktop_shortcuts = "0".to_owned();
     let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut reg_value_printer = "0".to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
-        shortcuts = create_shortcut_cmd(
-            &format!("%PUBLIC%\\Desktop\\{app_name}.lnk"),
-            &exe,
-            None,
-            get_custom_icon(&path, &cur_exe).as_deref(),
-        );
+        shortcuts = create_shortcut_cmd(ShortcutOptions {
+            link_file: &format!("{app_name}.lnk"),
+            special_folder: Some("AllUsersDesktop"),
+            target_path: &exe,
+            arguments: None,
+            icon_location: get_custom_icon(&path, &cur_exe).as_deref(),
+        });
         reg_value_desktop_shortcuts = "1".to_owned();
     }
     if options.contains("startmenu") {
-        let start_menu_shortcut_cmd = create_shortcut_cmd(
-            &format!("{start_menu}\\{app_name}.lnk"),
-            &exe,
-            None,
-            get_custom_icon(&path, &cur_exe).as_deref(),
-        );
-        let start_menu_uninstall_shortcut_cmd = create_shortcut_cmd(
-            &format!("{start_menu}\\Uninstall {app_name}.lnk"),
-            &exe,
-            Some("--uninstall"),
-            Some("msiexec.exe"),
-        );
+        let start_menu_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
+            link_file: &format!("{app_name}\\{app_name}.lnk"),
+            special_folder: Some("AllUsersPrograms"),
+            target_path: &exe,
+            arguments: None,
+            icon_location: get_custom_icon(&path, &cur_exe).as_deref(),
+        });
+        let start_menu_uninstall_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
+            link_file: &format!("{app_name}\\Uninstall {app_name}.lnk"),
+            special_folder: Some("AllUsersPrograms"),
+            target_path: &exe,
+            arguments: Some("--uninstall"),
+            icon_location: Some("msiexec.exe"),
+        });
         shortcuts = format!(
             "{shortcuts}
 {start_menu_shortcut_cmd}
@@ -1792,7 +1797,7 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     {uninstall_amyuni_idd}
     if exist \"{path}\" rd /s /q \"{path}\"
     if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
-    if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
+    if exist \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\" del /f /q \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\"
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     ",
         before_uninstall=get_before_uninstall(kill_self),
@@ -1805,57 +1810,10 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
     run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
-struct TempCommandScript {
-    path: PathBuf,
-    file: Option<fs::File>,
-    cleanup: bool,
-}
-
-impl TempCommandScript {
-    fn new(path: PathBuf, file: fs::File) -> Self {
-        Self {
-            path,
-            file: Some(file),
-            cleanup: true,
-        }
-    }
-
-    #[cfg(test)]
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn close(&mut self) {
-        let _ = self.file.take();
-    }
-
-    fn keep_file(&mut self) {
-        self.cleanup = false;
-        self.close();
-    }
-
-    fn remove_file(&mut self) {
-        self.close();
-        if self.cleanup {
-            allow_err!(std::fs::remove_file(&self.path));
-            self.cleanup = false;
-        }
-    }
-}
-
-impl Drop for TempCommandScript {
-    fn drop(&mut self) {
-        self.close();
-        if self.cleanup {
-            allow_err!(std::fs::remove_file(&self.path));
-        }
-    }
-}
-
 fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathBuf> {
     let mut cmds = cmds;
     if ext == "bat" {
-        bail!("Use write_locked_cmds for batch scripts");
+        bail!("Use run_cmds for batch scripts");
     }
     let mut tmp = std::env::temp_dir();
     // When dir contains these characters, the bat file will not execute in elevated mode.
@@ -1883,42 +1841,6 @@ fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathB
     return Ok(tmp);
 }
 
-fn write_locked_cmds(cmds: String, tip: &str) -> ResultType<TempCommandScript> {
-    let mut cmds = format!(
-        "
-{cmds}
-exit /b 0
-"
-    );
-    let mut tmp = std::env::temp_dir();
-    // When dir contains these characters, the bat file will not execute in elevated mode.
-    if vec!["&", "@", "^"]
-        .drain(..)
-        .any(|s| tmp.to_string_lossy().to_string().contains(s))
-    {
-        if let Ok(dir) = user_accessible_folder() {
-            tmp = dir;
-        }
-    }
-    tmp.push(format!(
-        "{}_{}_{}.bat",
-        crate::get_app_name(),
-        tip,
-        uuid::Uuid::new_v4()
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(&tmp)?;
-    // in case cmds mixed with \r\n and \n, make sure all ending with \r\n
-    // in some windows, \r\n required for cmd file to run
-    cmds = cmds.replace("\r\n", "\n").replace("\n", "\r\n");
-    file.write_all(cmds.as_bytes())?;
-    file.sync_all()?;
-    Ok(TempCommandScript::new(tmp, file))
-}
-
 fn to_le(v: &mut [u16]) -> &[u8] {
     for b in v.iter_mut() {
         *b = b.to_le()
@@ -1926,22 +1848,96 @@ fn to_le(v: &mut [u16]) -> &[u8] {
     unsafe { v.align_to().1 }
 }
 
+fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
+    let mut buffer = vec![0u16; MAX_PATH];
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as _) } as usize;
+    if len == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if len >= buffer.len() {
+        bail!("Windows system directory path is too long");
+    }
+    buffer.truncate(len);
+    let mut path = PathBuf::from(OsString::from_wide(&buffer));
+    path.push(relative_path);
+    Ok(path)
+}
+
+const ELEVATED_SCRIPT_ENVIRONMENT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$systemDirectory = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)
+$windowsDirectory = [System.IO.Directory]::GetParent($systemDirectory).FullName
+$cmdPath = [System.IO.Path]::Combine($systemDirectory, 'cmd.exe')
+$env:ComSpec = $cmdPath
+$env:PATH = $systemDirectory
+$env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+$env:ProgramData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonApplicationData)
+$env:RUSTDESK_PUBLIC_DESKTOP = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonDesktopDirectory)
+$env:SystemRoot = $windowsDirectory
+$env:WINDIR = $windowsDirectory
+$env:NoDefaultCurrentDirectoryInExePath = '1'"#;
+
+const ELEVATED_SCRIPT_EXECUTE: &str = r#"$env:RUSTDESK_RUNNER_PATH = $runnerPath
+$process = New-Object System.Diagnostics.Process
+try {
+    $process.StartInfo.FileName = $cmdPath
+    $quote = [char]34
+    $process.StartInfo.Arguments = '/D /E:ON /V:OFF /C ' + $quote + $quote + '%RUSTDESK_RUNNER_PATH%' + $quote + $quote
+    $process.StartInfo.UseShellExecute = $false
+    $null = $process.Start()
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+} finally {
+    $process.Dispose()
+}"#;
+
+fn encode_batch_commands(commands: &str) -> String {
+    let commands = format!("\n{commands}\nexit /b 0\n");
+    let commands = commands.replace("\r\n", "\n").replace("\n", "\r\n");
+    BASE64_STANDARD.encode(commands.as_bytes())
+}
+
+fn elevated_script_runner(commands: &str) -> String {
+    let encoded_commands = encode_batch_commands(commands);
+    let environment = ELEVATED_SCRIPT_ENVIRONMENT;
+    let execute = ELEVATED_SCRIPT_EXECUTE;
+    // runas 1.2 rewrites backslashes and quotes in quoted arguments; keep this wrapper free of both.
+    format!(
+        r#"& {{
+{environment}
+$content = [System.Convert]::FromBase64String('{encoded_commands}')
+$runnerDirectory = [System.IO.Path]::Combine($windowsDirectory, 'Temp')
+$null = [System.IO.Directory]::CreateDirectory($runnerDirectory)
+$runnerPath = [System.IO.Path]::Combine($runnerDirectory, ('rustdesk_runner_' + [System.Guid]::NewGuid().ToString('N') + '.bat'))
+$runner = [System.IO.File]::Open($runnerPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+$exitCode = 1
+try {{
+    $runner.Write($content, 0, $content.Length)
+    $runner.Flush()
+{execute}
+}} finally {{
+    $runner.Dispose()
+    [System.IO.File]::Delete($runnerPath)
+}}
+exit $exitCode
+}}"#
+    )
+}
+
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
-    let mut tmp = write_locked_cmds(cmds, tip)?;
-    let tmp_fn = tmp.path.to_str().unwrap_or("");
-    // https://github.com/rustdesk/rustdesk/issues/6786#issuecomment-1879655410
-    // Specify cmd.exe explicitly to avoid the replacement of cmd commands.
-    let res = runas::Command::new("cmd.exe")
-        .args(&["/C", &tmp_fn])
+    let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
+    let runner = elevated_script_runner(&cmds);
+    let status = runas::Command::new(&powershell_path)
+        .args(&[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &runner,
+        ])
         .show(show)
         .force_prompt(true)
-        .status();
-    if !show {
-        tmp.remove_file();
-    } else {
-        tmp.keep_file();
-    }
-    let status = res?;
+        .status()?;
     if !status.success() {
         bail!("{} failed", tip);
     }
@@ -2313,19 +2309,37 @@ fn get_shortcut_icon_location(install_dir: &str, exe: &str) -> String {
 }
 
 fn escape_cmd_double_quoted(value: &str) -> String {
-    value.replace('%', "%%").replace('^', "^^")
+    value.replace('%', "%%")
 }
 
 fn powershell_single_quoted(value: &str) -> String {
     format!("'{}'", escape_cmd_double_quoted(&value.replace('\'', "''")))
 }
 
-fn create_shortcut_cmd(
-    link_file: &str,
-    target_path: &str,
-    arguments: Option<&str>,
-    icon_location: Option<&str>,
-) -> String {
+struct ShortcutOptions<'a> {
+    link_file: &'a str,
+    special_folder: Option<&'a str>,
+    target_path: &'a str,
+    arguments: Option<&'a str>,
+    icon_location: Option<&'a str>,
+}
+
+fn special_folder_link(special_folder: &str, suffix: &str) -> String {
+    format!(
+        "[System.IO.Path]::Combine($shell.SpecialFolders.Item({}), {})",
+        powershell_single_quoted(special_folder),
+        powershell_single_quoted(suffix)
+    )
+}
+
+fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> String {
+    let ShortcutOptions {
+        link_file,
+        special_folder,
+        target_path,
+        arguments,
+        icon_location,
+    } = options;
     let arguments_cmd = arguments
         .filter(|value| !value.is_empty())
         .map(|value| {
@@ -2344,15 +2358,17 @@ fn create_shortcut_cmd(
             )
         })
         .unwrap_or_default();
+    let link_expression = special_folder
+        .map(|folder| special_folder_link(folder, link_file))
+        .unwrap_or_else(|| powershell_single_quoted(link_file));
     let ps_cmd = format!(
-        "$link = [Environment]::ExpandEnvironmentVariables({}); \
-         $directory = Split-Path -Parent $link; \
-         if ($directory) {{ $null = New-Item -ItemType Directory -Force -Path $directory }}; \
-         $shell = New-Object -ComObject WScript.Shell; \
+        "$shell = New-Object -ComObject WScript.Shell; \
+         $link = {link_expression}; \
+         $directory = [System.IO.Path]::GetDirectoryName($link); \
+         if ($directory) {{ $null = [System.IO.Directory]::CreateDirectory($directory) }}; \
          $shortcut = $shell.CreateShortcut($link); \
          $shortcut.TargetPath = {};{}{}; \
          $shortcut.Save()",
-        powershell_single_quoted(link_file),
         powershell_single_quoted(target_path),
         arguments_cmd,
         icon_cmd
@@ -3735,15 +3751,13 @@ pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
 }
 
 fn get_tray_shortcut(install_dir: &str, exe: &str, icon_source_exe: &str) -> String {
-    create_shortcut_cmd(
-        &format!(
-            "%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{} Tray.lnk",
-            crate::get_app_name()
-        ),
-        exe,
-        Some("--tray"),
-        get_custom_icon(install_dir, icon_source_exe).as_deref(),
-    )
+    create_shortcut_cmd(ShortcutOptions {
+        link_file: &format!("{} Tray.lnk", crate::get_app_name()),
+        special_folder: Some("AllUsersStartup"),
+        target_path: exe,
+        arguments: Some("--tray"),
+        icon_location: get_custom_icon(install_dir, icon_source_exe).as_deref(),
+    })
 }
 
 fn get_import_config(exe: &str) -> String {
@@ -4576,55 +4590,6 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn temp_command_script_rejects_replacement_before_execution() {
-        let script = write_locked_cmds("echo test".to_owned(), "lock_test")
-            .expect("temporary command script should be created");
-        let overwrite = fs::OpenOptions::new().write(true).open(script.path());
-        let delete = fs::remove_file(script.path());
-        let script_text =
-            fs::read_to_string(script.path()).expect("temporary command script should be readable");
-        let undone = script.path().with_file_name(format!(
-            "{}.undone",
-            script
-                .path()
-                .file_name()
-                .expect("temporary command script should have filename")
-                .to_string_lossy()
-        ));
-
-        assert!(
-            overwrite.is_err(),
-            "temporary command script must not be writable after creation"
-        );
-        assert!(
-            delete.is_err(),
-            "temporary command script must not be deletable before execution"
-        );
-        assert!(
-            !undone.exists(),
-            "temporary command status must not use a mutable marker file"
-        );
-        assert!(
-            script_text.contains("exit /b 0"),
-            "temporary command script should report success only when it reaches the end"
-        );
-    }
-
-    #[test]
-    fn shortcut_command_creates_final_expanded_path() {
-        let command = create_shortcut_cmd(
-            "%PROGRAMDATA%\\RustDesk\\RustDesk Tray.lnk",
-            "C:\\Program Files\\RustDesk\\RustDesk.exe",
-            Some("--tray"),
-            Some("msiexec.exe"),
-        );
-
-        assert!(command.contains("[Environment]::ExpandEnvironmentVariables"));
-        assert!(command.contains("'%%PROGRAMDATA%%\\RustDesk\\RustDesk Tray.lnk'"));
-        assert!(!command.contains("copy /Y"));
-    }
 
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
