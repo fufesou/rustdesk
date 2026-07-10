@@ -422,7 +422,7 @@ pub fn check_update_as_root() -> ResultType<()> {
     let file_path = std::path::PathBuf::from(format!("{}/{}", private_tmp, filename));
     let tmp_path = file_path.to_string_lossy().to_string();
     // Download
-    let response = client.get(&dmg_url).send()?;
+    let mut response = client.get(&dmg_url).send()?;
     if !response.status().is_success() {
         bail!("[root-update] Failed to download: {}", response.status());
     }
