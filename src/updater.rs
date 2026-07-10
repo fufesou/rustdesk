@@ -369,8 +369,7 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 /// live in the user --server process. Falls back to true (no connections) on IPC error.
 #[cfg(target_os = "macos")]
 fn has_no_active_conns_ipc() -> bool {
-    use tokio::runtime::Runtime;
-    let rt = match Runtime::new() {
+    let rt = match hbb_common::tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return true,
     };
