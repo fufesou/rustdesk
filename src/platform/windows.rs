@@ -26,13 +26,14 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
     },
     path::*,
     ptr::null_mut,
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 use wallpaper;
 #[cfg(not(debug_assertions))]
 use winapi::um::libloaderapi::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_USER_DIRS};
@@ -60,9 +61,10 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
-            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
-            TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
+            ES_SYSTEM_REQUIRED, FILE_SHARE_READ, HANDLE, PROCESS_ALL_ACCESS,
+            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
+            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, TOKEN_ELEVATION, TOKEN_GROUPS,
+            TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -1393,7 +1395,7 @@ pub fn check_update_broker_process() -> ResultType<()> {
     let cmds = format!(
         "
         chcp 65001
-        taskkill /F /IM {process_exe}
+        taskkill /F /IM {process_exe} || ver > nul
         copy /Y \"{origin_process_exe}\" \"{cur_exe}\"
     ",
         cur_exe = cur_exe.to_string_lossy(),
@@ -1749,8 +1751,8 @@ fn get_before_uninstall(kill_self: bool) -> String {
     chcp 65001
     sc stop {app_name}
     sc delete {app_name}
-    taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
+    taskkill /F /IM {broker_exe} || ver > nul
+    taskkill /F /IM {app_name}.exe{filter} || ver > nul
     reg delete HKEY_CLASSES_ROOT\\.{ext} /f
     reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
@@ -1897,15 +1899,16 @@ fn encode_batch_commands(commands: &str) -> String {
     BASE64_STANDARD.encode(commands.as_bytes())
 }
 
-fn elevated_script_runner(commands: &str) -> String {
-    let encoded_commands = encode_batch_commands(commands);
+fn elevated_script_runner(source_path: &str) -> String {
+    let encoded_path = BASE64_STANDARD.encode(source_path.as_bytes());
     let environment = ELEVATED_SCRIPT_ENVIRONMENT;
     let execute = ELEVATED_SCRIPT_EXECUTE;
     // runas 1.2 rewrites backslashes and quotes in quoted arguments; keep this wrapper free of both.
     format!(
         r#"& {{
 {environment}
-$content = [System.Convert]::FromBase64String('{encoded_commands}')
+$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_path}'))
+$content = [System.IO.File]::ReadAllBytes($sourcePath)
 $runnerDirectory = [System.IO.Path]::Combine($windowsDirectory, 'Temp')
 $null = [System.IO.Directory]::CreateDirectory($runnerDirectory)
 $runnerPath = [System.IO.Path]::Combine($runnerDirectory, ('rustdesk_runner_' + [System.Guid]::NewGuid().ToString('N') + '.bat'))
@@ -1926,7 +1929,37 @@ exit $exitCode
 
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
-    let runner = elevated_script_runner(&cmds);
+    let encoded_commands = encode_batch_commands(&cmds);
+    let command_bytes = BASE64_STANDARD.decode(&encoded_commands)?;
+    log::debug!(
+        "{}: preparing elevated batch ({} command bytes, PowerShell {:?})",
+        tip,
+        command_bytes.len(),
+        powershell_path
+    );
+    let mut source_path = std::env::temp_dir();
+    source_path.push(format!("rustdesk_source_{}.bat", Uuid::new_v4().simple()));
+    let mut source = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&source_path)?;
+    log::debug!("{}: created protected source batch {:?}", tip, source_path);
+    if let Err(err) = source
+        .write_all(&command_bytes)
+        .and_then(|_| source.flush())
+    {
+        log::error!(
+            "{}: failed to write source batch {:?}: {}",
+            tip,
+            source_path,
+            err
+        );
+        drop(source);
+        let _ = fs::remove_file(&source_path);
+        return Err(err.into());
+    }
+    let runner = elevated_script_runner(&source_path.to_string_lossy());
     let status = runas::Command::new(&powershell_path)
         .args(&[
             "-NoLogo",
@@ -1937,9 +1970,23 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
         ])
         .show(show)
         .force_prompt(true)
-        .status()?;
+        .status();
+    drop(source);
+    let _ = fs::remove_file(&source_path);
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            log::error!("{}: failed to launch elevated PowerShell: {}", tip, err);
+            return Err(err.into());
+        }
+    };
+    log::debug!(
+        "{}: elevated PowerShell exited with code {:?}",
+        tip,
+        status.code()
+    );
     if !status.success() {
-        bail!("{} failed", tip);
+        bail!("{} failed with exit code {:?}", tip, status.code());
     }
     Ok(())
 }
@@ -3267,8 +3314,8 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     sc stop {app_name}
     sc delete {app_name}
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-    taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
+    taskkill /F /IM {broker_exe} || ver > nul
+    taskkill /F /IM {app_name}.exe{filter} || ver > nul
     ",
         app_name = crate::get_app_name(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
@@ -3293,7 +3340,7 @@ pub fn install_service() -> bool {
     let cmds = format!(
         "
 chcp 65001
-taskkill /F /IM {app_name}.exe{filter}
+taskkill /F /IM {app_name}.exe{filter} || ver > nul
 {tray_shortcut_cmd}
 {import_config}
 {create_service}
@@ -3496,7 +3543,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
         "
 chcp 65001
 sc stop {app_name}
-taskkill /F /IM {app_name}.exe{filter}
+taskkill /F /IM {app_name}.exe{filter} || ver > nul
 {reg_cmd}
 {copy_exe}
 {rename_exe}
