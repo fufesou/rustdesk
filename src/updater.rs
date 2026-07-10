@@ -364,6 +364,30 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     get_update_download_file_from_url(url)
 }
 
+/// Queries active remote connections from the user --server process via IPC.
+/// The root service cannot read connection state directly since connections
+/// live in the user --server process. Falls back to true (no connections) on IPC error.
+#[cfg(target_os = "macos")]
+fn has_no_active_conns_ipc() -> bool {
+    use tokio::runtime::Runtime;
+    let rt = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return true,
+    };
+    rt.block_on(async {
+        if let Ok(mut conn) = crate::ipc::connect(1000, "").await {
+            if conn.send(&crate::ipc::Data::VideoConnCount(None)).await.is_ok() {
+                if let Ok(Some(crate::ipc::Data::VideoConnCount(Some(n)))) =
+                    conn.next_timeout(1000).await
+                {
+                    return n == 0;
+                }
+            }
+        }
+        true
+    })
+}
+
 /// Starts the background silent auto-update scheduler for macOS.
 /// Called from `start_os_service()` which runs as root via LaunchDaemon.
 #[cfg(target_os = "macos")]
@@ -373,7 +397,7 @@ pub fn start_auto_update_macos() {
         let mut interval = DUR_ONE_DAY;
         loop {
             log::info!("[root-update] Running scheduled update check...");
-            if !has_no_active_conns() {
+            if !has_no_active_conns_ipc() {
                 log::info!("[root-update] Active session in progress, retrying in 10 min.");
                 interval = MIN_INTERVAL;
             } else {
