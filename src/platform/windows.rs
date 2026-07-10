@@ -18,6 +18,7 @@ use hbb_common::{
     sysinfo::{Pid, System},
     timeout, tokio,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     ffi::{CString, OsString},
@@ -115,9 +116,15 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
+const CMD_RELATIVE_PATH: &str = "cmd.exe";
 const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
 const WINDOWS_POWERSHELL_EXE: &str =
     "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
+    "COR_ENABLE_PROFILING",
+    "CORECLR_ENABLE_PROFILING",
+    "DOTNET_ENABLE_PROFILING",
+];
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -1458,7 +1465,8 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
     Ok(format!(
         "
         {main_exe}
-        copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\"
+        if not exist \"{ORIGIN_PROCESS_EXE}\" ver > nul
+        if exist \"{ORIGIN_PROCESS_EXE}\" copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\"
         ",
         ORIGIN_PROCESS_EXE = win_topmost_window::ORIGIN_PROCESS_EXE,
         broker_exe = win_topmost_window::INJECTED_PROCESS_EXE,
@@ -1489,7 +1497,7 @@ pub fn remove_meta_toml_cmd(is_msi: bool, path: &str) -> String {
     if is_msi && crate::is_custom_client() {
         format!(
             "
-        del /F /Q \"{path}\\meta.toml\"
+        if exist \"{path}\\meta.toml\" del /F /Q \"{path}\\meta.toml\"
         ",
         )
     } else {
@@ -1551,8 +1559,8 @@ fn get_after_install(
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open /f
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open\\command /f
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open\\command /f /ve /t REG_SZ /d \"\\\"{exe}\\\" \\\"%%1\\\"\"
-    netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=out action=allow program=\"{exe}\" enable=yes
-    netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=in action=allow program=\"{exe}\" enable=yes
+    netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=out action=allow program=\"{exe}\" enable=yes || ver > nul
+    netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=in action=allow program=\"{exe}\" enable=yes || ver > nul
     {create_service}
     reg add HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /f /v SoftwareSASGeneration /t REG_DWORD /d 1
     ", create_service=get_create_service(&exe))
@@ -1599,7 +1607,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     let mut reg_value_printer = "0".to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
-        shortcuts = create_shortcut_cmd(ShortcutOptions {
+        shortcuts = create_best_effort_shortcut_cmd(ShortcutOptions {
             link_file: &format!("{app_name}.lnk"),
             special_folder: Some("AllUsersDesktop"),
             target_path: &exe,
@@ -1609,14 +1617,14 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         reg_value_desktop_shortcuts = "1".to_owned();
     }
     if options.contains("startmenu") {
-        let start_menu_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
+        let start_menu_shortcut_cmd = create_best_effort_shortcut_cmd(ShortcutOptions {
             link_file: &format!("{app_name}\\{app_name}.lnk"),
             special_folder: Some("AllUsersPrograms"),
             target_path: &exe,
             arguments: None,
             icon_location: get_custom_icon(&path, &cur_exe).as_deref(),
         });
-        let start_menu_uninstall_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
+        let start_menu_uninstall_shortcut_cmd = create_best_effort_shortcut_cmd(ShortcutOptions {
             link_file: &format!("{app_name}\\Uninstall {app_name}.lnk"),
             special_folder: Some("AllUsersPrograms"),
             target_path: &exe,
@@ -1667,11 +1675,10 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     };
 
     let install_remote_printer = if install_printer {
-        // No need to use `|| true` here.
-        // The script will not exit even if `--install-remote-printer` panics.
-        format!("\"{}\" --install-remote-printer", &src_exe)
+        // Printer setup is optional and must not fail the main installation.
+        format!("\"{}\" --install-remote-printer || ver > nul", &src_exe)
     } else if is_win_10_or_greater() {
-        format!("\"{}\" --uninstall-remote-printer", &src_exe)
+        format!("\"{}\" --uninstall-remote-printer || ver > nul", &src_exe)
     } else {
         "".to_owned()
     };
@@ -1683,7 +1690,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         "
 {uninstall_str}
 chcp 65001
-md \"{path}\"
+if not exist \"{path}\" md \"{path}\"
 {copy_exe}
 reg add {subkey} /f
 reg add {subkey} /f /v DisplayIcon /t REG_SZ /d \"{display_icon}\"
@@ -1783,9 +1790,10 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     let mut uninstall_printer_cmd = "".to_string();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_path) = exe.to_str() {
-            uninstall_cert_cmd = format!("\"{}\" --uninstall-cert", exe_path);
+            uninstall_cert_cmd = format!("\"{}\" --uninstall-cert || ver > nul", exe_path);
             if uninstall_printer {
-                uninstall_printer_cmd = format!("\"{}\" --uninstall-remote-printer", &exe_path);
+                uninstall_printer_cmd =
+                    format!("\"{}\" --uninstall-remote-printer || ver > nul", &exe_path);
             }
         }
     }
@@ -1893,33 +1901,115 @@ try {
     $process.Dispose()
 }"#;
 
-fn encode_batch_commands(commands: &str) -> String {
-    let commands = format!("\n{commands}\nexit /b %ERRORLEVEL%\n");
+fn prepare_batch_commands(commands: &str) -> String {
+    const MSI_REBOOT_SUCCESS_EXIT_CODES: [&str; 2] = ["1641", "3010"];
+
     let commands = commands.replace("\r\n", "\n").replace("\n", "\r\n");
-    BASE64_STANDARD.encode(commands.as_bytes())
+    let mut guarded = String::from("\r\nset \"ERRORLEVEL=\"\r\nset \"RUSTDESK_EXIT_CODE=0\"\r\n");
+    for line in commands.split("\r\n") {
+        guarded.push_str(line);
+        guarded.push_str("\r\n");
+        if !line.trim().is_empty() {
+            if is_best_effort_batch_command(line) {
+                guarded.push_str("ver > nul\r\n");
+            } else {
+                if is_msiexec_batch_command(line) {
+                    for success_code in MSI_REBOOT_SUCCESS_EXIT_CODES {
+                        guarded.push_str(&format!(
+                            "if \"%ERRORLEVEL%\"==\"{success_code}\" ver > nul\r\n"
+                        ));
+                    }
+                }
+                guarded.push_str(
+                    "if not \"%ERRORLEVEL%\"==\"0\" if \"%RUSTDESK_EXIT_CODE%\"==\"0\" set \"RUSTDESK_EXIT_CODE=%ERRORLEVEL%\"\r\n",
+                );
+            }
+        }
+    }
+    guarded.push_str("\r\nexit /b %RUSTDESK_EXIT_CODE%\r\n");
+    guarded
 }
 
-fn elevated_script_runner(source_path: &str) -> String {
+fn is_best_effort_batch_command(command: &str) -> bool {
+    let command = command.trim_start().to_ascii_lowercase();
+    command == "chcp 65001"
+        || command.starts_with("sc stop ")
+        || command.starts_with("sc delete ")
+        || command.starts_with("reg delete ")
+        || command.starts_with("netsh advfirewall firewall delete ")
+        || command.starts_with("rem ")
+        || command.starts_with("::")
+        || command.contains("|| ver > nul")
+}
+
+fn is_msiexec_batch_command(command: &str) -> bool {
+    let command = command.trim_start().to_ascii_lowercase();
+    let command = command
+        .strip_prefix("chcp 65001 &&")
+        .unwrap_or(&command)
+        .trim_start();
+    let executable = if let Some(quoted) = command.strip_prefix('"') {
+        quoted.split('"').next().unwrap_or_default()
+    } else {
+        command.split_ascii_whitespace().next().unwrap_or_default()
+    };
+    matches!(
+        executable.rsplit(['\\', '/']).next(),
+        Some("msiexec" | "msiexec.exe")
+    )
+}
+
+fn elevated_script_runner(source_path: &str, expected_hash: &str) -> String {
     let encoded_path = BASE64_STANDARD.encode(source_path.as_bytes());
     let environment = ELEVATED_SCRIPT_ENVIRONMENT;
     let execute = ELEVATED_SCRIPT_EXECUTE;
-    // runas 1.2 rewrites backslashes and quotes in quoted arguments; keep this wrapper free of both.
     format!(
         r#"& {{
 {environment}
 $sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_path}'))
-$content = [System.IO.File]::ReadAllBytes($sourcePath)
+$source = New-Object System.IO.FileStream($sourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+try {{
+    $reader = New-Object System.IO.BinaryReader($source)
+    try {{
+        $content = $reader.ReadBytes([int]$source.Length)
+    }} finally {{
+        $reader.Dispose()
+    }}
+}} finally {{
+    $source.Dispose()
+}}
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {{
+    $actualHash = [System.Convert]::ToBase64String($sha256.ComputeHash($content))
+}} finally {{
+    $sha256.Dispose()
+}}
+if ($actualHash -cne '{expected_hash}') {{
+    throw 'Elevated batch content hash mismatch'
+}}
 $runnerDirectory = [System.IO.Path]::Combine($windowsDirectory, 'Temp')
 $null = [System.IO.Directory]::CreateDirectory($runnerDirectory)
 $runnerPath = [System.IO.Path]::Combine($runnerDirectory, ('rustdesk_runner_' + [System.Guid]::NewGuid().ToString('N') + '.bat'))
-$runner = [System.IO.File]::Open($runnerPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+$security = New-Object System.Security.AccessControl.FileSecurity
+$security.SetSecurityDescriptorSddlForm('O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)')
+$bufferSize = 4096
 $exitCode = 1
+$runner = $null
+$runnerLock = $null
 try {{
-    $runner.Write($content, 0, $content.Length)
-    $runner.Flush()
+    $runner = New-Object System.IO.FileStream($runnerPath, [System.IO.FileMode]::CreateNew, [System.Security.AccessControl.FileSystemRights]::Write, [System.IO.FileShare]::Read, $bufferSize, [System.IO.FileOptions]::None, $security)
+    try {{
+        $runner.Write($content, 0, $content.Length)
+        $runner.Flush()
+        $runnerLock = [System.IO.File]::Open($runnerPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    }} finally {{
+        $runner.Dispose()
+        $runner = $null
+    }}
 {execute}
 }} finally {{
-    $runner.Dispose()
+    if ($null -ne $runner) {{ $runner.Dispose() }}
+    if ($null -ne $runnerLock) {{ $runnerLock.Dispose() }}
     [System.IO.File]::Delete($runnerPath)
 }}
 exit $exitCode
@@ -1927,16 +2017,32 @@ exit $exitCode
     )
 }
 
-fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
-    let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
-    let encoded_commands = encode_batch_commands(&cmds);
-    let command_bytes = BASE64_STANDARD.decode(&encoded_commands)?;
-    log::debug!(
-        "{}: preparing elevated batch ({} command bytes, PowerShell {:?})",
-        tip,
-        command_bytes.len(),
-        powershell_path
-    );
+fn elevated_powershell_args(powershell_path: &Path, command: &str) -> Vec<String> {
+    let mut command_utf16: Vec<u16> = command.encode_utf16().collect();
+    let encoded_command = BASE64_STANDARD.encode(to_le(&mut command_utf16));
+    let mut args = vec![
+        "/D".to_owned(),
+        "/E:ON".to_owned(),
+        "/V:OFF".to_owned(),
+        "/C".to_owned(),
+    ];
+    for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
+        args.push("set".to_owned());
+        args.push(format!("{variable}=0&"));
+    }
+    // Forward slashes avoid runas 1.2 doubling backslashes in quoted arguments.
+    args.push(powershell_path.to_string_lossy().replace('\\', "/"));
+    args.extend([
+        "-NoLogo".to_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-EncodedCommand".to_owned(),
+        encoded_command,
+    ]);
+    args
+}
+
+fn create_locked_batch(command_bytes: &[u8], tip: &str) -> ResultType<(PathBuf, fs::File)> {
     let mut source_path = std::env::temp_dir();
     source_path.push(format!("rustdesk_source_{}.bat", Uuid::new_v4().simple()));
     let mut source = fs::OpenOptions::new()
@@ -1959,29 +2065,51 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
         let _ = fs::remove_file(&source_path);
         return Err(err.into());
     }
-    let runner = elevated_script_runner(&source_path.to_string_lossy());
-    let status = runas::Command::new(&powershell_path)
-        .args(&[
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &runner,
-        ])
+    Ok((source_path, source))
+}
+
+fn run_elevated_powershell(
+    powershell_path: &Path,
+    command: &str,
+    show: bool,
+) -> ResultType<std::process::ExitStatus> {
+    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    let args = elevated_powershell_args(powershell_path, command);
+    Ok(runas::Command::new(&cmd_path)
+        .args(&args)
         .show(show)
         .force_prompt(true)
-        .status();
+        .status()?)
+}
+
+fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
+    let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
+    let command_bytes = prepare_batch_commands(&cmds).into_bytes();
+    let expected_hash = BASE64_STANDARD.encode(Sha256::digest(&command_bytes));
+    log::debug!(
+        "{}: preparing elevated batch ({} command bytes, PowerShell {:?})",
+        tip,
+        command_bytes.len(),
+        powershell_path
+    );
+    let (source_path, source) = create_locked_batch(&command_bytes, tip)?;
+    let runner = elevated_script_runner(&source_path.to_string_lossy(), &expected_hash);
+    let status = run_elevated_powershell(&powershell_path, &runner, show);
     drop(source);
     let _ = fs::remove_file(&source_path);
     let status = match status {
         Ok(status) => status,
         Err(err) => {
-            log::error!("{}: failed to launch elevated PowerShell: {}", tip, err);
+            log::error!(
+                "{}: failed to launch elevated installer bootstrap: {}",
+                tip,
+                err
+            );
             return Err(err.into());
         }
     };
     log::debug!(
-        "{}: elevated PowerShell exited with code {:?}",
+        "{}: elevated installer bootstrap exited with code {:?}",
         tip,
         status.code()
     );
@@ -2355,12 +2483,8 @@ fn get_shortcut_icon_location(install_dir: &str, exe: &str) -> String {
         .unwrap_or_default()
 }
 
-fn escape_cmd_double_quoted(value: &str) -> String {
-    value.replace('%', "%%")
-}
-
 fn powershell_single_quoted(value: &str) -> String {
-    format!("'{}'", escape_cmd_double_quoted(&value.replace('\'', "''")))
+    format!("'{}'", value.replace('\'', "''").replace('%', "%%"))
 }
 
 struct ShortcutOptions<'a> {
@@ -2379,35 +2503,20 @@ fn special_folder_link(special_folder: &str, suffix: &str) -> String {
     )
 }
 
+fn shortcut_property(name: &str, value: Option<&str>) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("; $shortcut.{name} = {}", powershell_single_quoted(value)))
+        .unwrap_or_default()
+}
+
 fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> String {
-    let ShortcutOptions {
-        link_file,
-        special_folder,
-        target_path,
-        arguments,
-        icon_location,
-    } = options;
-    let arguments_cmd = arguments
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            format!(
-                "; $shortcut.Arguments = {}",
-                powershell_single_quoted(value)
-            )
-        })
-        .unwrap_or_default();
-    let icon_cmd = icon_location
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            format!(
-                "; $shortcut.IconLocation = {}",
-                powershell_single_quoted(value)
-            )
-        })
-        .unwrap_or_default();
-    let link_expression = special_folder
-        .map(|folder| special_folder_link(folder, link_file))
-        .unwrap_or_else(|| powershell_single_quoted(link_file));
+    let arguments_cmd = shortcut_property("Arguments", options.arguments);
+    let icon_cmd = shortcut_property("IconLocation", options.icon_location);
+    let link_expression = options
+        .special_folder
+        .map(|folder| special_folder_link(folder, options.link_file))
+        .unwrap_or_else(|| powershell_single_quoted(options.link_file));
     let ps_cmd = format!(
         "$shell = New-Object -ComObject WScript.Shell; \
          $link = {link_expression}; \
@@ -2416,11 +2525,15 @@ fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> String {
          $shortcut = $shell.CreateShortcut($link); \
          $shortcut.TargetPath = {};{}{}; \
          $shortcut.Save()",
-        powershell_single_quoted(target_path),
+        powershell_single_quoted(options.target_path),
         arguments_cmd,
         icon_cmd
     );
     format!("\"{WINDOWS_POWERSHELL_EXE}\" -NoProfile -NonInteractive -Command \"{ps_cmd}\"")
+}
+
+fn create_best_effort_shortcut_cmd(options: ShortcutOptions<'_>) -> String {
+    format!("{} || ver > nul", create_shortcut_cmd(options))
 }
 
 pub fn create_shortcut(id: &str) -> ResultType<()> {
@@ -4037,7 +4150,10 @@ impl Drop for WallPaperRemover {
 
 fn get_uninstall_amyuni_idd() -> String {
     match std::env::current_exe() {
-        Ok(path) => format!("\"{}\" --uninstall-amyuni-idd", path.to_str().unwrap_or("")),
+        Ok(path) => format!(
+            "\"{}\" --uninstall-amyuni-idd || ver > nul",
+            path.to_str().unwrap_or("")
+        ),
         Err(e) => {
             log::warn!("Failed to get current exe path, cannot get command of uninstalling idd, Zzerror: {:?}", e);
             "".to_string()
@@ -4640,23 +4756,120 @@ mod tests {
 
     #[test]
     fn batch_commands_are_normalized_and_terminated() {
-        let encoded = encode_batch_commands("echo first\necho second\r\n");
-        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
         assert_eq!(
-            String::from_utf8(decoded).unwrap(),
-            "\r\necho first\r\necho second\r\n\r\nexit /b %ERRORLEVEL%\r\n"
+            prepare_batch_commands("echo first\necho second\r\n"),
+            "\r\nset \"ERRORLEVEL=\"\r\nset \"RUSTDESK_EXIT_CODE=0\"\r\necho first\r\nif not \"%ERRORLEVEL%\"==\"0\" if \"%RUSTDESK_EXIT_CODE%\"==\"0\" set \"RUSTDESK_EXIT_CODE=%ERRORLEVEL%\"\r\necho second\r\nif not \"%ERRORLEVEL%\"==\"0\" if \"%RUSTDESK_EXIT_CODE%\"==\"0\" set \"RUSTDESK_EXIT_CODE=%ERRORLEVEL%\"\r\n\r\n\r\nexit /b %RUSTDESK_EXIT_CODE%\r\n"
         );
     }
 
     #[test]
     fn elevated_runner_uses_immutable_randomized_execution_file() {
-        let runner = elevated_script_runner("echo test");
+        let runner = elevated_script_runner("source.bat", "expected-hash");
         assert!(runner.contains("Guid]::NewGuid"));
         assert!(runner.contains("FileMode]::CreateNew"));
         assert!(runner.contains("FileShare]::Read"));
+        assert!(runner.contains("FileShare]::ReadWrite"));
+        assert!(runner.contains("System.IO.BinaryReader"));
+        assert!(runner.contains("SHA256]::Create()"));
+        assert!(runner.contains("$actualHash -cne 'expected-hash'"));
+        assert!(runner.contains("O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"));
+        assert!(runner.contains("FileSystemRights]::Write"));
+        assert!(runner.contains("FileOptions]::None, $security"));
+        assert!(runner.contains("$runnerLock = [System.IO.File]::Open"));
+        assert!(runner.contains("$runnerLock.Dispose()"));
         assert!(runner.contains("File]::Delete($runnerPath)"));
-        assert!(!runner.contains('\\'));
-        assert!(!runner.contains('"'));
+        assert!(
+            runner.find("$runner.Dispose()").unwrap()
+                < runner.find("$process = New-Object").unwrap()
+        );
+    }
+
+    #[test]
+    fn native_bootstrap_disables_managed_profiling_before_powershell() {
+        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
+        let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
+        let command = "[Console]::Out.Write($env:COR_ENABLE_PROFILING + '|' + $env:CORECLR_ENABLE_PROFILING + '|' + $env:DOTNET_ENABLE_PROFILING)";
+        let args = elevated_powershell_args(&powershell_path, command);
+        let output = std::process::Command::new(cmd_path)
+            .args(args)
+            .env("COR_ENABLE_PROFILING", "1")
+            .env("CORECLR_ENABLE_PROFILING", "1")
+            .env("DOTNET_ENABLE_PROFILING", "1")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0|0|0");
+    }
+
+    #[test]
+    fn batch_commands_ignore_only_explicit_cleanup_failures() {
+        let batch = prepare_batch_commands(
+            "sc stop RustDesk\nreg delete HKCR\\RustDesk /f\nnetsh advfirewall firewall add rule name=RustDesk\nnetsh advfirewall firewall delete rule name=RustDesk\ncopy /Y source target\nchcp 65001 && msiexec /i update.msi\n",
+        );
+        assert!(!batch.contains("sc stop RustDesk\r\nif not \"%ERRORLEVEL%\""));
+        assert!(!batch.contains("reg delete HKCR\\RustDesk /f\r\nif not \"%ERRORLEVEL%\""));
+        assert!(batch.contains("sc stop RustDesk\r\nver > nul"));
+        assert!(batch.contains("reg delete HKCR\\RustDesk /f\r\nver > nul"));
+        assert!(batch.contains(
+            "netsh advfirewall firewall add rule name=RustDesk\r\nif not \"%ERRORLEVEL%\"==\"0\""
+        ));
+        assert!(batch.contains("netsh advfirewall firewall delete rule name=RustDesk\r\nver > nul"));
+        assert!(batch.contains(
+            "copy /Y source target\r\nif not \"%ERRORLEVEL%\"==\"0\" if \"%RUSTDESK_EXIT_CODE%\"==\"0\""
+        ));
+        assert!(batch.contains(
+            "chcp 65001 && msiexec /i update.msi\r\nif \"%ERRORLEVEL%\"==\"1641\" ver > nul"
+        ));
+    }
+
+    #[test]
+    fn batch_commands_accept_msi_reboot_success_codes() {
+        let batch = prepare_batch_commands("msiexec /i update.msi");
+        assert!(batch.contains("if \"%ERRORLEVEL%\"==\"1641\" ver > nul"));
+        assert!(batch.contains(
+            "if \"%ERRORLEVEL%\"==\"3010\" ver > nul\r\nif not \"%ERRORLEVEL%\"==\"0\" if \"%RUSTDESK_EXIT_CODE%\"==\"0\""
+        ));
+        assert!(is_msiexec_batch_command(
+            "chcp 65001 && \"C:\\Windows\\System32\\MsiExec.exe\" /i update.msi"
+        ));
+        assert!(!is_msiexec_batch_command(
+            "powershell -Command \"$shortcut.IconLocation = 'msiexec.exe'\""
+        ));
+    }
+
+    #[test]
+    fn guarded_batch_propagates_early_failures() {
+        for exit_code in [7, -1] {
+            let batch = prepare_batch_commands(&format!("cmd /d /c exit {exit_code}\nver > nul"));
+            let path = std::env::temp_dir().join(format!(
+                "rustdesk_guarded_batch_{}.bat",
+                Uuid::new_v4().simple()
+            ));
+            fs::write(&path, batch).unwrap();
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C"])
+                .arg(&path)
+                .env("ERRORLEVEL", "1\"==\"0\" exit /b 42 & rem \"")
+                .status()
+                .unwrap();
+            fs::remove_file(path).unwrap();
+            assert_eq!(status.code(), Some(exit_code));
+        }
+    }
+
+    #[test]
+    fn install_copy_skips_unavailable_system_broker() {
+        let commands = copy_exe_cmd(
+            "C:\\source\\rustdesk.exe",
+            "C:\\target\\rustdesk.exe",
+            "C:\\target",
+        )
+        .unwrap();
+
+        assert!(commands
+            .contains("if not exist \"C:\\Windows\\System32\\RuntimeBroker.exe\" ver > nul"));
+        assert!(commands.contains("if exist \"C:\\Windows\\System32\\RuntimeBroker.exe\" copy /Y"));
     }
 
     #[test]
