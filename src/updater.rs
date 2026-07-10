@@ -414,30 +414,34 @@ pub fn check_update_as_root() -> ResultType<()> {
 
     log::info!("[root-update] New version: {}, downloading from {}", version, dmg_url);
 
-    let Some(file_path) = get_download_file_from_url(&dmg_url) else {
-        bail!("[root-update] Failed to get file path from URL: {}", dmg_url);
-    };
-    let tmp_path = file_path.to_string_lossy().to_string();
-
     let client = create_http_client_with_url_strict(&dmg_url)?;
-
-    // Always remove any pre-existing file — never trust a file we did not just download
-    if file_path.exists() {
-        std::fs::remove_file(&file_path)?;
-    }
-
+    // Use a private root-owned temp directory to prevent symlink attacks
+    let private_tmp = format!("/tmp/.rustdeskdownload-{}", std::process::id());
+    std::fs::create_dir_all(&private_tmp)?;
+    let filename = dmg_url.split('/').last().unwrap_or("rustdesk.dmg");
+    let file_path = std::path::PathBuf::from(format!("{}/{}", private_tmp, filename));
+    let tmp_path = file_path.to_string_lossy().to_string();
     // Download
     let response = client.get(&dmg_url).send()?;
     if !response.status().is_success() {
         bail!("[root-update] Failed to download: {}", response.status());
     }
     let file_data = response.bytes()?;
-    let mut file = std::fs::File::create(&file_path)?;
-    file.write_all(&file_data)?;
+    // Create file exclusively (O_EXCL) — fails if file already exists
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .and_then(|mut f| f.write_all(&file_data))?;
+    }
     log::info!("[root-update] Downloaded to {}", tmp_path);
-
     // Install silently as root
-    crate::platform::update_from_dmg_as_root(&tmp_path)
+    let result = crate::platform::update_from_dmg_as_root(&tmp_path);
+    // Clean up download directory
+    let _ = std::fs::remove_dir_all(&private_tmp);
+    result
 }
 
 #[cfg(test)]
