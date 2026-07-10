@@ -939,12 +939,19 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     // Write a shell script that runs detached after this function returns.
     // We cannot directly replace /Applications/RustDesk.app while it is running,
     // so we spawn a script that waits, kills processes, copies, and restarts.
+    let daemon_label = format!("com.carriez.{}_service", app_name);
+    let agent_label = format!("com.carriez.{}_server", app_name);
     let script_path = format!("{}/rustdesk_update.sh", tmp_dir);
     let script = format!(
         r#"#!/bin/sh
 sleep 3
 # Check if the GUI was open before we kill it
 gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
+launchctl bootout system/{daemon_label} 2>/dev/null || launchctl unload -w {daemon_plist} 2>/dev/null || true
+if [ -n "{uid}" ]; then
+    launchctl bootout gui/{uid}/{agent_label} 2>/dev/null || launchctl unload -w {agent_plist} 2>/dev/null || true
+fi
+sleep 1
 pkill -9 -x {app_name} || true
 pkill -9 -f "{app_name} --server" || true
 sleep 2
@@ -972,6 +979,8 @@ rm -rf {tmp_dir}
         agent_plist = agent_plist,
         tmp_dir = tmp_dir,
         dmg_path = dmg_path,
+        daemon_label = daemon_label,
+        agent_label = agent_label,
     );
 
    {
