@@ -367,14 +367,15 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 /// Queries active remote connections from the user --server process via IPC.
 /// The root service cannot read connection state directly since connections
 /// live in the user --server process. Falls back to true (no connections) on IPC error.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "flutter"))]
 fn has_no_active_conns_ipc() -> bool {
     let rt = match hbb_common::tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return true,
     };
     rt.block_on(async {
-        if let Ok(mut conn) = crate::ipc::connect(1000, "").await {
+        let uid = crate::platform::get_active_userid();
+        if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, "", &uid).await {
             if conn.send(&crate::ipc::Data::VideoConnCount(None)).await.is_ok() {
                 if let Ok(Some(crate::ipc::Data::VideoConnCount(Some(n)))) =
                     conn.next_timeout(1000).await
@@ -396,7 +397,11 @@ pub fn start_auto_update_macos() {
         let mut interval = DUR_ONE_DAY;
         loop {
             log::info!("[root-update] Running scheduled update check...");
-            if !has_no_active_conns_ipc() {
+            #[cfg(feature = "flutter")]
+            let no_active_conns = has_no_active_conns_ipc();
+            #[cfg(not(feature = "flutter"))]
+            let no_active_conns = has_no_active_conns();
+            if !no_active_conns {
                 log::info!("[root-update] Active session in progress, retrying in 10 min.");
                 interval = MIN_INTERVAL;
             } else {
@@ -422,6 +427,10 @@ pub fn check_update_as_root() -> ResultType<()> {
         log::info!("[root-update] Auto update is disabled, skipping.");
         return Ok(());
     }
+    if crate::is_custom_client() {
+        log::info!("[root-update] Custom client detected, skipping stock update.");
+        return Ok(());
+    }
     if let Err(e) = do_check_software_update() {
         bail!("[root-update] Failed to check for software update: {}", e);
     }
@@ -434,19 +443,29 @@ pub fn check_update_as_root() -> ResultType<()> {
     let version = download_url.split('/').last().unwrap_or_default().to_string();
     let arch = if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x86_64" };
     let dmg_url = format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch);
-
     log::info!("[root-update] New version: {}, downloading from {}", version, dmg_url);
-
+    // Validate URL against GitHub release allowlist before downloading as root
+    let Some(file_path_validated) = get_update_download_file_from_url(&dmg_url) else {
+        bail!("[root-update] URL failed allowlist check: {}", dmg_url);
+    };
+    drop(file_path_validated);
     let client = create_http_client_with_url_strict(&dmg_url)?;
     // Use a private root-owned temp directory to prevent symlink attacks
     let private_tmp = format!("/tmp/.rustdeskdownload-{}", std::process::id());
-    std::fs::create_dir_all(&private_tmp)?;
+    // Create exclusively with restricted permissions — reject if pre-existing
+    std::fs::create_dir(&private_tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o700))?;
+    }
     let filename = dmg_url.split('/').last().unwrap_or("rustdesk.dmg");
     let file_path = std::path::PathBuf::from(format!("{}/{}", private_tmp, filename));
     let tmp_path = file_path.to_string_lossy().to_string();
     // Download
     let mut response = client.get(&dmg_url).send()?;
     if !response.status().is_success() {
+        let _ = std::fs::remove_dir_all(&private_tmp);
         bail!("[root-update] Failed to download: {}", response.status());
     }
     // Create file exclusively (O_EXCL) and stream response directly into it
@@ -454,10 +473,20 @@ pub fn check_update_as_root() -> ResultType<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&file_path)?;
-        std::io::copy(&mut response, &mut file)?;
+            .open(&file_path)
+            .map_err(|e| { let _ = std::fs::remove_dir_all(&private_tmp); e })?;
+        std::io::copy(&mut response, &mut file)
+            .map_err(|e| { let _ = std::fs::remove_dir_all(&private_tmp); e })?;
     }
     log::info!("[root-update] Downloaded to {}", tmp_path);
+    // Recheck active sessions before installing — download can take minutes
+    #[cfg(feature = "flutter")]
+    if !has_no_active_conns_ipc() {
+        if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
+            log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
+        }
+        bail!("[root-update] Active session started during download, deferring update.");
+    }
     // Install silently as root
     let result = crate::platform::update_from_dmg_as_root(&tmp_path);
     // Clean up download directory
