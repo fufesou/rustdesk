@@ -118,9 +118,14 @@ const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 const CMD_RELATIVE_PATH: &str = "cmd.exe";
 const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
+const ELEVATED_SOURCE_PATH_ENV: &str = "RUSTDESK_P";
+const ELEVATED_SOURCE_HASH_ENV: &str = "RUSTDESK_H";
 // cmd.exe rejects command lines longer than 8,191 characters. Keep the full
 // elevated runner in a locked file instead of passing it through argv.
 const CMD_EXE_MAX_COMMAND_LINE_CHARS: usize = 8_191;
+// ShellExecuteExW uses the shorter INTERNET_MAX_URL_LENGTH-sized command line
+// on legacy Windows versions, including Windows 7.
+const SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2_048;
 const WINDOWS_POWERSHELL_EXE: &str =
     "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
@@ -2002,42 +2007,29 @@ exit $exitCode
     )
 }
 
-fn elevated_script_loader(source_path: &str, expected_hash: &str) -> String {
-    let encoded_path = BASE64_STANDARD.encode(source_path.as_bytes());
+fn elevated_script_loader() -> String {
+    let source_path_env = ELEVATED_SOURCE_PATH_ENV;
+    let source_hash_env = ELEVATED_SOURCE_HASH_ENV;
     // Do not replace this verifier with PowerShell -File. The source is in user
     // TEMP and must be authenticated before its contents execute at high integrity.
+    // Keep it compact because runas passes the encoded loader through the shorter
+    // ShellExecuteExW command line. Open objects live until the process exits.
     format!(
-        r#"& {{
-$ErrorActionPreference = 'Stop'
-$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_path}'))
-$source = New-Object System.IO.FileStream($sourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-try {{
-    $reader = New-Object System.IO.BinaryReader($source)
-    try {{
-        $content = $reader.ReadBytes([int]$source.Length)
-    }} finally {{
-        $reader.Dispose()
-    }}
-}} finally {{
-    $source.Dispose()
-}}
-$sha256 = [System.Security.Cryptography.SHA256]::Create()
-try {{
-    $actualHash = [System.Convert]::ToBase64String($sha256.ComputeHash($content))
-}} finally {{
-    $sha256.Dispose()
-}}
-if ($actualHash -cne '{expected_hash}') {{
-    throw 'Elevated script content hash mismatch'
-}}
-Invoke-Expression ([System.Text.Encoding]::UTF8.GetString($content))
-}}"#
+        r#"$ErrorActionPreference='Stop';$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:{source_path_env}));$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);$r=New-Object IO.BinaryReader($s);$c=$r.ReadBytes([int]$s.Length);$h=[Convert]::ToBase64String(([Security.Cryptography.SHA256]::Create()).ComputeHash($c));if($h-cne$env:{source_hash_env}){{throw 'Elevated script content hash mismatch'}};Invoke-Expression ([Text.Encoding]::UTF8.GetString($c))"#
     )
 }
 
-fn elevated_powershell_args(powershell_path: &Path, command: &str) -> Vec<String> {
-    let mut command_utf16: Vec<u16> = command.encode_utf16().collect();
-    let encoded_command = BASE64_STANDARD.encode(to_le(&mut command_utf16));
+fn elevated_powershell_args(
+    powershell_path: &Path,
+    command: &str,
+    environment: &[(&str, &str)],
+) -> ResultType<Vec<String>> {
+    if command.find(&[' ', '\t'][..]).is_none() {
+        bail!("elevated PowerShell command must contain whitespace for runas quoting");
+    }
+    if command.find(&['"', '\\', '%', '\r', '\n'][..]).is_some() {
+        bail!("elevated PowerShell command contains characters unsafe for runas quoting");
+    }
     let mut args = vec![
         "/D".to_owned(),
         "/E:ON".to_owned(),
@@ -2048,16 +2040,46 @@ fn elevated_powershell_args(powershell_path: &Path, command: &str) -> Vec<String
         args.push("set".to_owned());
         args.push(format!("{variable}=0&"));
     }
+    for (name, value) in environment {
+        args.push("set".to_owned());
+        args.push(format!("{name}={value}&"));
+    }
     // Forward slashes avoid runas 1.2 doubling backslashes in quoted arguments.
     args.push(powershell_path.to_string_lossy().replace('\\', "/"));
     args.extend([
         "-NoLogo".to_owned(),
         "-NoProfile".to_owned(),
         "-NonInteractive".to_owned(),
-        "-EncodedCommand".to_owned(),
-        encoded_command,
+        "-Command".to_owned(),
+        command.to_owned(),
     ]);
-    args
+    Ok(args)
+}
+
+// Keep this synchronized with runas 1.2.0 src/impl_windows.rs. ShellExecuteExW
+// receives this serialized parameter string, not the original argument vector.
+fn runas_parameter_chars(args: &[String]) -> usize {
+    const SEPARATOR_CHARS: usize = 1;
+    const QUOTE_PAIR_CHARS: usize = 2;
+
+    args.iter()
+        .map(|arg| {
+            if arg.is_empty() {
+                return SEPARATOR_CHARS + QUOTE_PAIR_CHARS;
+            }
+            if arg.find(&[' ', '\t', '"'][..]).is_none() {
+                return SEPARATOR_CHARS + arg.encode_utf16().count();
+            }
+            SEPARATOR_CHARS
+                + QUOTE_PAIR_CHARS
+                + arg
+                    .chars()
+                    .map(|character| {
+                        character.len_utf16() + usize::from(matches!(character, '\\' | '"'))
+                    })
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 // runas may quote arguments and double quotes or backslashes. Count every UTF-16
@@ -2100,19 +2122,24 @@ fn create_locked_script(script_bytes: &[u8], tip: &str) -> ResultType<(PathBuf, 
     Ok((source_path, source))
 }
 
-fn run_elevated_powershell(
-    powershell_path: &Path,
-    command: &str,
-    show: bool,
-) -> ResultType<std::process::ExitStatus> {
+fn run_elevated_powershell(args: &[String], show: bool) -> ResultType<std::process::ExitStatus> {
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    let args = elevated_powershell_args(powershell_path, command);
-    let command_line_chars = runas_parameter_char_upper_bound(&args);
+    let shell_execute_chars = runas_parameter_chars(args);
+    let command_line_chars = runas_parameter_char_upper_bound(args);
     log::debug!(
-        "elevated PowerShell bootstrap uses at most {} of {} cmd.exe parameter characters",
+        "elevated PowerShell bootstrap uses {} of {} ShellExecuteExW parameter characters and at most {} of {} cmd.exe parameter characters",
+        shell_execute_chars,
+        SHELL_EXECUTE_MAX_PARAMETER_CHARS,
         command_line_chars,
         CMD_EXE_MAX_COMMAND_LINE_CHARS
     );
+    if shell_execute_chars > SHELL_EXECUTE_MAX_PARAMETER_CHARS {
+        bail!(
+            "elevated PowerShell bootstrap needs {} ShellExecuteExW parameter characters; limit is {}",
+            shell_execute_chars,
+            SHELL_EXECUTE_MAX_PARAMETER_CHARS
+        );
+    }
     if command_line_chars > CMD_EXE_MAX_COMMAND_LINE_CHARS {
         bail!(
             "elevated PowerShell bootstrap needs {} cmd.exe parameter characters; limit is {}",
@@ -2121,7 +2148,7 @@ fn run_elevated_powershell(
         );
     }
     Ok(runas::Command::new(&cmd_path)
-        .args(&args)
+        .args(args)
         .show(show)
         .force_prompt(true)
         .status()?)
@@ -2141,8 +2168,14 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
         powershell_path
     );
     let (source_path, source) = create_locked_script(runner_bytes, tip)?;
-    let loader = elevated_script_loader(&source_path.to_string_lossy(), &expected_hash);
-    let status = run_elevated_powershell(&powershell_path, &loader, show);
+    let encoded_source_path = BASE64_STANDARD.encode(source_path.to_string_lossy().as_bytes());
+    let environment = [
+        (ELEVATED_SOURCE_PATH_ENV, encoded_source_path.as_str()),
+        (ELEVATED_SOURCE_HASH_ENV, expected_hash.as_str()),
+    ];
+    let loader = elevated_script_loader();
+    let args = elevated_powershell_args(&powershell_path, &loader, &environment)?;
+    let status = run_elevated_powershell(&args, show);
     drop(source);
     let _ = fs::remove_file(&source_path);
     let status = match status {
@@ -2566,7 +2599,8 @@ fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> String {
         .map(|folder| special_folder_link(folder, options.link_file))
         .unwrap_or_else(|| powershell_single_quoted(options.link_file));
     let ps_cmd = format!(
-        "$shell = New-Object -ComObject WScript.Shell; \
+        "$ErrorActionPreference = 'Stop'; \
+         $shell = New-Object -ComObject WScript.Shell; \
          $link = {link_expression}; \
          $directory = [System.IO.Path]::GetDirectoryName($link); \
          if ($directory) {{ $null = [System.IO.Directory]::CreateDirectory($directory) }}; \
@@ -4802,6 +4836,19 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 mod tests {
     use super::*;
 
+    fn elevated_script_test_args(
+        powershell_path: &Path,
+        source_path: &str,
+        expected_hash: &str,
+    ) -> Vec<String> {
+        let encoded_source_path = BASE64_STANDARD.encode(source_path.as_bytes());
+        let environment = [
+            (ELEVATED_SOURCE_PATH_ENV, encoded_source_path.as_str()),
+            (ELEVATED_SOURCE_HASH_ENV, expected_hash),
+        ];
+        elevated_powershell_args(powershell_path, &elevated_script_loader(), &environment).unwrap()
+    }
+
     #[test]
     fn batch_commands_are_normalized_and_terminated() {
         assert_eq!(
@@ -4813,15 +4860,16 @@ mod tests {
     #[test]
     fn elevated_runner_uses_immutable_randomized_execution_file() {
         let runner = elevated_batch_runner(b"echo protected");
-        let loader = elevated_script_loader("source.ps1", "expected-hash");
+        let loader = elevated_script_loader();
         assert!(runner.contains("Guid]::NewGuid"));
         assert!(runner.contains("FileMode]::CreateNew"));
         assert!(runner.contains("FileShare]::Read"));
         assert!(runner.contains("FileShare]::ReadWrite"));
-        assert!(loader.contains("System.IO.BinaryReader"));
+        assert!(loader.contains("IO.BinaryReader"));
         assert!(loader.contains("FileShare]::ReadWrite"));
         assert!(loader.contains("SHA256]::Create()"));
-        assert!(loader.contains("$actualHash -cne 'expected-hash'"));
+        assert!(loader.contains("$h-cne$env:RUSTDESK_H"));
+        assert!(loader.contains("$env:RUSTDESK_P"));
         assert!(loader.contains("Invoke-Expression"));
         assert!(runner.contains("O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"));
         assert!(runner.contains("FileSystemRights]::Write"));
@@ -4846,8 +4894,11 @@ mod tests {
         );
         let expected_hash = BASE64_STANDARD.encode(Sha256::digest(script.as_bytes()));
         let (source_path, source) = create_locked_script(script.as_bytes(), "test").unwrap();
-        let loader = elevated_script_loader(&source_path.to_string_lossy(), &expected_hash);
-        let args = elevated_powershell_args(&powershell_path, &loader);
+        let args = elevated_script_test_args(
+            &powershell_path,
+            &source_path.to_string_lossy(),
+            &expected_hash,
+        );
         let output = std::process::Command::new(cmd_path)
             .args(args)
             .env("COR_ENABLE_PROFILING", "1")
@@ -4872,18 +4923,33 @@ mod tests {
         let source_path = format!("C:\\{}", "a".repeat(WIN7_MAX_PATH_CHARS - 3));
         let runner = elevated_batch_runner(&vec![b'x'; REGRESSION_BATCH_BYTES]);
         let expected_hash = BASE64_STANDARD.encode(Sha256::digest(runner.as_bytes()));
-        let loader = elevated_script_loader(&source_path, &expected_hash);
-        let direct_args = elevated_powershell_args(powershell_path, &runner);
-        let loader_args = elevated_powershell_args(powershell_path, &loader);
-        let direct_chars = runas_parameter_char_upper_bound(&direct_args);
+        let loader_args = elevated_script_test_args(powershell_path, &source_path, &expected_hash);
         let loader_chars = runas_parameter_char_upper_bound(&loader_args);
-
-        assert!(direct_chars > CMD_EXE_MAX_COMMAND_LINE_CHARS);
 
         assert!(
             loader_chars <= CMD_EXE_MAX_COMMAND_LINE_CHARS,
             "elevated bootstrap uses {loader_chars} cmd.exe command-line characters"
         );
+    }
+
+    #[test]
+    fn elevated_bootstrap_fits_win7_shell_execute_limit() {
+        const WIN7_MAX_PATH_CHARS: usize = 260;
+
+        let powershell_path =
+            Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let runner = elevated_batch_runner(b"echo protected");
+        let expected_hash = BASE64_STANDARD.encode(Sha256::digest(runner.as_bytes()));
+        for (path_kind, path_character) in [("ASCII", "a"), ("Unicode", "测")] {
+            let source_path = format!("C:\\{}", path_character.repeat(WIN7_MAX_PATH_CHARS - 3));
+            let args = elevated_script_test_args(powershell_path, &source_path, &expected_hash);
+            let parameter_chars = runas_parameter_chars(&args);
+
+            assert!(
+                parameter_chars <= SHELL_EXECUTE_MAX_PARAMETER_CHARS,
+                "{path_kind} path uses {parameter_chars} ShellExecuteExW parameter characters"
+            );
+        }
     }
 
     #[test]
@@ -4966,6 +5032,7 @@ mod tests {
             icon_location: Some("C:\\Icons\\RustDesk's ^%.ico"),
         });
 
+        assert!(command.contains("$ErrorActionPreference = 'Stop'"));
         assert!(command.contains("$shell.SpecialFolders.Item('AllUsersDesktop')"));
         assert!(command.contains("'RustDesk''s ^%%.lnk'"));
         assert!(command.contains("'C:\\Program Files\\RustDesk''s ^%%\\RustDesk.exe'"));
