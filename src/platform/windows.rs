@@ -120,6 +120,8 @@ const CMD_RELATIVE_PATH: &str = "cmd.exe";
 const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
 const ELEVATED_SOURCE_PATH_ENV: &str = "RUSTDESK_P";
 const ELEVATED_SOURCE_HASH_ENV: &str = "RUSTDESK_H";
+const ELEVATED_LOADER_FAILURE_EXIT_CODE: i32 = -10_001;
+const ELEVATED_RUNNER_FAILURE_EXIT_CODE: i32 = -10_002;
 // cmd.exe rejects command lines longer than 8,191 characters. Keep the full
 // elevated runner in a locked file instead of passing it through argv.
 const CMD_EXE_MAX_COMMAND_LINE_CHARS: usize = 8_191;
@@ -1968,41 +1970,35 @@ fn is_msiexec_batch_command(command: &str) -> bool {
 }
 
 fn elevated_batch_runner(command_bytes: &[u8]) -> String {
-    // Embedding the batch in the protected runner makes command size affect only
-    // the temporary file, never the cmd.exe command line.
     let encoded_commands = BASE64_STANDARD.encode(command_bytes);
     let environment = ELEVATED_SCRIPT_ENVIRONMENT;
     let execute = ELEVATED_SCRIPT_EXECUTE;
+    let failure_exit_code = ELEVATED_RUNNER_FAILURE_EXIT_CODE;
     format!(
         r#"& {{
+try {{
 {environment}
 $content = [System.Convert]::FromBase64String('{encoded_commands}')
 $runnerDirectory = [System.IO.Path]::Combine($windowsDirectory, 'Temp')
 $null = [System.IO.Directory]::CreateDirectory($runnerDirectory)
 $runnerPath = [System.IO.Path]::Combine($runnerDirectory, ('rustdesk_runner_' + [System.Guid]::NewGuid().ToString('N') + '.bat'))
-$security = New-Object System.Security.AccessControl.FileSecurity
-$security.SetSecurityDescriptorSddlForm('O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)')
-$bufferSize = 4096
 $exitCode = 1
 $runner = $null
-$runnerLock = $null
 try {{
-    $runner = New-Object System.IO.FileStream($runnerPath, [System.IO.FileMode]::CreateNew, [System.Security.AccessControl.FileSystemRights]::Write, [System.IO.FileShare]::Read, $bufferSize, [System.IO.FileOptions]::None, $security)
-    try {{
-        $runner.Write($content, 0, $content.Length)
-        $runner.Flush()
-        $runnerLock = [System.IO.File]::Open($runnerPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    }} finally {{
-        $runner.Dispose()
-        $runner = $null
-    }}
+    $runner = New-Object System.IO.FileStream($runnerPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    $runner.Write($content, 0, $content.Length)
+    $runner.Flush()
 {execute}
 }} finally {{
-    if ($null -ne $runner) {{ $runner.Dispose() }}
-    if ($null -ne $runnerLock) {{ $runnerLock.Dispose() }}
-    [System.IO.File]::Delete($runnerPath)
+    if ($null -ne $runner) {{
+        $runner.Dispose()
+        [System.IO.File]::Delete($runnerPath)
+    }}
 }}
 exit $exitCode
+}} catch {{
+    exit {failure_exit_code}
+}}
 }}"#
     )
 }
@@ -2010,12 +2006,13 @@ exit $exitCode
 fn elevated_script_loader() -> String {
     let source_path_env = ELEVATED_SOURCE_PATH_ENV;
     let source_hash_env = ELEVATED_SOURCE_HASH_ENV;
+    let failure_exit_code = ELEVATED_LOADER_FAILURE_EXIT_CODE;
     // Do not replace this verifier with PowerShell -File. The source is in user
     // TEMP and must be authenticated before its contents execute at high integrity.
     // Keep it compact because runas passes the encoded loader through the shorter
     // ShellExecuteExW command line. Open objects live until the process exits.
     format!(
-        r#"$ErrorActionPreference='Stop';$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:{source_path_env}));$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);$r=New-Object IO.BinaryReader($s);$c=$r.ReadBytes([int]$s.Length);$h=[Convert]::ToBase64String(([Security.Cryptography.SHA256]::Create()).ComputeHash($c));if($h-cne$env:{source_hash_env}){{throw 'Elevated script content hash mismatch'}};Invoke-Expression ([Text.Encoding]::UTF8.GetString($c))"#
+        r#"try{{$ErrorActionPreference='Stop';$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:{source_path_env}));$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);$r=New-Object IO.BinaryReader($s);$c=$r.ReadBytes([int]$s.Length);$h=[Convert]::ToBase64String(([Security.Cryptography.SHA256]::Create()).ComputeHash($c));if($h-cne$env:{source_hash_env}){{throw 'Elevated script content hash mismatch'}};Invoke-Expression ([Text.Encoding]::UTF8.GetString($c))}}catch{{exit {failure_exit_code}}}"#
     )
 }
 
@@ -2090,36 +2087,70 @@ fn runas_parameter_char_upper_bound(args: &[String]) -> usize {
         .sum()
 }
 
-fn create_locked_script(script_bytes: &[u8], tip: &str) -> ResultType<(PathBuf, fs::File)> {
-    let mut source_path = std::env::temp_dir();
-    source_path.push(format!(
+struct LockedTempFile {
+    path: PathBuf,
+    handle: Option<fs::File>,
+}
+
+impl LockedTempFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LockedTempFile {
+    fn drop(&mut self) {
+        drop(self.handle.take());
+        if let Err(err) = fs::remove_file(&self.path) {
+            log::warn!(
+                "Failed to remove protected bootstrap script {:?}: {}",
+                self.path,
+                err
+            );
+        }
+    }
+}
+
+fn create_locked_script(script_bytes: &[u8], tip: &str) -> ResultType<LockedTempFile> {
+    let mut script_path = std::env::temp_dir();
+    script_path.push(format!(
         "rustdesk_bootstrap_{}.ps1",
         Uuid::new_v4().simple()
     ));
-    let mut source = fs::OpenOptions::new()
+    let mut script = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .share_mode(FILE_SHARE_READ)
-        .open(&source_path)?;
+        .open(&script_path)?;
     // Holding this write handle without write/delete sharing prevents replacement
     // until the elevated process has verified and finished using the script.
     log::debug!(
         "{}: created protected bootstrap script {:?}",
         tip,
-        source_path
+        script_path
     );
-    if let Err(err) = source.write_all(script_bytes).and_then(|_| source.flush()) {
+    if let Err(err) = script.write_all(script_bytes).and_then(|_| script.flush()) {
         log::error!(
             "{}: failed to write protected bootstrap script {:?}: {}",
             tip,
-            source_path,
+            script_path,
             err
         );
-        drop(source);
-        let _ = fs::remove_file(&source_path);
+        drop(script);
+        if let Err(cleanup_err) = fs::remove_file(&script_path) {
+            log::warn!(
+                "{}: failed to remove incomplete bootstrap script {:?}: {}",
+                tip,
+                script_path,
+                cleanup_err
+            );
+        }
         return Err(err.into());
     }
-    Ok((source_path, source))
+    Ok(LockedTempFile {
+        path: script_path,
+        handle: Some(script),
+    })
 }
 
 fn run_elevated_powershell(args: &[String], show: bool) -> ResultType<std::process::ExitStatus> {
@@ -2154,12 +2185,32 @@ fn run_elevated_powershell(args: &[String], show: bool) -> ResultType<std::proce
         .status()?)
 }
 
+fn elevated_failure_stage(exit_code: Option<i32>) -> &'static str {
+    match exit_code {
+        Some(ELEVATED_LOADER_FAILURE_EXIT_CODE) => "PowerShell loader",
+        Some(ELEVATED_RUNNER_FAILURE_EXIT_CODE) => "protected batch runner",
+        Some(_) => "installer batch",
+        None => "elevated bootstrap process",
+    }
+}
+
+fn validate_elevated_status(status: std::process::ExitStatus, tip: &str) -> ResultType<()> {
+    let exit_code = status.code();
+    if status.success() {
+        log::debug!("{}: elevated installer bootstrap exited successfully", tip);
+        return Ok(());
+    }
+    let stage = elevated_failure_stage(exit_code);
+    log::error!("{}: {} failed with exit code {:?}", tip, stage, exit_code);
+    bail!("{}: {} failed with exit code {:?}", tip, stage, exit_code)
+}
+
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
     let command_bytes = prepare_batch_commands(&cmds).into_bytes();
     let runner = elevated_batch_runner(&command_bytes);
     let runner_bytes = runner.as_bytes();
-    let expected_hash = BASE64_STANDARD.encode(Sha256::digest(runner_bytes));
+    let runner_hash = BASE64_STANDARD.encode(Sha256::digest(runner_bytes));
     log::debug!(
         "{}: preparing elevated batch ({} command bytes, {} protected runner bytes, PowerShell {:?})",
         tip,
@@ -2167,17 +2218,15 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
         runner_bytes.len(),
         powershell_path
     );
-    let (source_path, source) = create_locked_script(runner_bytes, tip)?;
-    let encoded_source_path = BASE64_STANDARD.encode(source_path.to_string_lossy().as_bytes());
+    let source = create_locked_script(runner_bytes, tip)?;
+    let encoded_source_path = BASE64_STANDARD.encode(source.path().to_string_lossy().as_bytes());
     let environment = [
         (ELEVATED_SOURCE_PATH_ENV, encoded_source_path.as_str()),
-        (ELEVATED_SOURCE_HASH_ENV, expected_hash.as_str()),
+        (ELEVATED_SOURCE_HASH_ENV, runner_hash.as_str()),
     ];
     let loader = elevated_script_loader();
     let args = elevated_powershell_args(&powershell_path, &loader, &environment)?;
     let status = run_elevated_powershell(&args, show);
-    drop(source);
-    let _ = fs::remove_file(&source_path);
     let status = match status {
         Ok(status) => status,
         Err(err) => {
@@ -2189,15 +2238,7 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
             return Err(err.into());
         }
     };
-    log::debug!(
-        "{}: elevated installer bootstrap exited with code {:?}",
-        tip,
-        status.code()
-    );
-    if !status.success() {
-        bail!("{} failed with exit code {:?}", tip, status.code());
-    }
-    Ok(())
+    validate_elevated_status(status, tip)
 }
 
 pub fn toggle_blank_screen(v: bool) {
@@ -4850,6 +4891,21 @@ mod tests {
     }
 
     #[test]
+    fn locked_bootstrap_prevents_modification_and_cleans_up() {
+        let script_path;
+        {
+            let source = create_locked_script(b"exit 0", "test").unwrap();
+            script_path = source.path().to_path_buf();
+            assert!(script_path.exists());
+            assert!(fs::OpenOptions::new()
+                .write(true)
+                .open(&script_path)
+                .is_err());
+        }
+        assert!(!script_path.exists());
+    }
+
+    #[test]
     fn batch_commands_are_normalized_and_terminated() {
         assert_eq!(
             prepare_batch_commands("echo first\necho second\r\n"),
@@ -4858,29 +4914,77 @@ mod tests {
     }
 
     #[test]
-    fn elevated_runner_uses_immutable_randomized_execution_file() {
+    fn elevated_runner_uses_win7_compatible_locked_batch_file() {
         let runner = elevated_batch_runner(b"echo protected");
         let loader = elevated_script_loader();
         assert!(runner.contains("Guid]::NewGuid"));
         assert!(runner.contains("FileMode]::CreateNew"));
+        assert!(runner.contains("FileAccess]::Write"));
         assert!(runner.contains("FileShare]::Read"));
-        assert!(runner.contains("FileShare]::ReadWrite"));
+        assert!(runner.contains("$runner.Write($content"));
+        assert!(runner.contains("$env:RUSTDESK_RUNNER_PATH = $runnerPath"));
+        assert!(!runner.contains("FileSecurity"));
+        assert!(!runner.contains("FileSystemRights"));
         assert!(loader.contains("IO.BinaryReader"));
         assert!(loader.contains("FileShare]::ReadWrite"));
         assert!(loader.contains("SHA256]::Create()"));
         assert!(loader.contains("$h-cne$env:RUSTDESK_H"));
         assert!(loader.contains("$env:RUSTDESK_P"));
         assert!(loader.contains("Invoke-Expression"));
-        assert!(runner.contains("O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"));
-        assert!(runner.contains("FileSystemRights]::Write"));
-        assert!(runner.contains("FileOptions]::None, $security"));
-        assert!(runner.contains("$runnerLock = [System.IO.File]::Open"));
-        assert!(runner.contains("$runnerLock.Dispose()"));
-        assert!(runner.contains("File]::Delete($runnerPath)"));
         assert!(
-            runner.find("$runner.Dispose()").unwrap()
-                < runner.find("$process = New-Object").unwrap()
+            runner.find("$process = New-Object").unwrap()
+                < runner.find("$runner.Dispose()").unwrap()
         );
+    }
+
+    #[test]
+    fn elevated_runner_ignores_inherited_public_desktop_environment() {
+        let runner = elevated_batch_runner(b"echo protected");
+
+        assert!(runner.contains("SpecialFolder]::CommonDesktopDirectory"));
+        assert!(!runner.contains("$env:PUBLIC"));
+    }
+
+    #[test]
+    fn elevated_bootstrap_distinguishes_internal_failure_stages() {
+        let loader = elevated_script_loader();
+        let runner = elevated_batch_runner(b"echo protected");
+
+        assert!(loader.contains(&format!(
+            "catch{{exit {ELEVATED_LOADER_FAILURE_EXIT_CODE}}}"
+        )));
+        assert!(runner.contains(&format!(
+            "catch {{\n    exit {ELEVATED_RUNNER_FAILURE_EXIT_CODE}\n}}"
+        )));
+        assert_eq!(
+            elevated_failure_stage(Some(ELEVATED_LOADER_FAILURE_EXIT_CODE)),
+            "PowerShell loader"
+        );
+        assert_eq!(
+            elevated_failure_stage(Some(ELEVATED_RUNNER_FAILURE_EXIT_CODE)),
+            "protected batch runner"
+        );
+        assert_eq!(elevated_failure_stage(Some(1)), "installer batch");
+        assert_eq!(elevated_failure_stage(None), "elevated bootstrap process");
+    }
+
+    #[test]
+    fn native_bootstrap_reports_loader_failure_exit_code() {
+        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
+        let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
+        let source = create_locked_script(b"exit 0", "test").unwrap();
+        let unexpected_hash = BASE64_STANDARD.encode(Sha256::digest(b"different content"));
+        let args = elevated_script_test_args(
+            &powershell_path,
+            &source.path().to_string_lossy(),
+            &unexpected_hash,
+        );
+        let status = std::process::Command::new(cmd_path)
+            .args(args)
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(ELEVATED_LOADER_FAILURE_EXIT_CODE));
     }
 
     #[test]
@@ -4893,10 +4997,10 @@ mod tests {
             "[Console]::Out.Write($env:COR_ENABLE_PROFILING + '|' + $env:CORECLR_ENABLE_PROFILING + '|' + $env:DOTNET_ENABLE_PROFILING); exit {SCRIPT_EXIT_CODE}"
         );
         let expected_hash = BASE64_STANDARD.encode(Sha256::digest(script.as_bytes()));
-        let (source_path, source) = create_locked_script(script.as_bytes(), "test").unwrap();
+        let source = create_locked_script(script.as_bytes(), "test").unwrap();
         let args = elevated_script_test_args(
             &powershell_path,
-            &source_path.to_string_lossy(),
+            &source.path().to_string_lossy(),
             &expected_hash,
         );
         let output = std::process::Command::new(cmd_path)
@@ -4906,11 +5010,38 @@ mod tests {
             .env("DOTNET_ENABLE_PROFILING", "1")
             .output()
             .unwrap();
-        drop(source);
-        fs::remove_file(source_path).unwrap();
 
         assert_eq!(output.status.code(), Some(SCRIPT_EXIT_CODE));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "0|0|0");
+    }
+
+    #[test]
+    fn native_bootstrap_runs_batch_and_preserves_exit_code() {
+        const BATCH_EXIT_CODE: i32 = 23;
+        const REGRESSION_BATCH_BYTES: usize = 14 * 1_024;
+
+        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
+        let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
+        let commands = format!(
+            "@echo off\n{}cmd.exe /D /C exit {BATCH_EXIT_CODE}",
+            "\n".repeat(REGRESSION_BATCH_BYTES)
+        );
+        let command_bytes = prepare_batch_commands(&commands).into_bytes();
+        assert!(command_bytes.len() > REGRESSION_BATCH_BYTES);
+        let runner = elevated_batch_runner(&command_bytes);
+        let runner_hash = BASE64_STANDARD.encode(Sha256::digest(runner.as_bytes()));
+        let source = create_locked_script(runner.as_bytes(), "test").unwrap();
+        let args = elevated_script_test_args(
+            &powershell_path,
+            &source.path().to_string_lossy(),
+            &runner_hash,
+        );
+        let output = std::process::Command::new(cmd_path)
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(BATCH_EXIT_CODE));
     }
 
     #[test]
