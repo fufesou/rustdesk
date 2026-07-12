@@ -958,6 +958,10 @@ sleep 2
 if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
     echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
     rm -rf {app_bundle}.new
+    launchctl load -w {daemon_plist} || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
     exit 1
 fi
 rm -rf {app_bundle}
