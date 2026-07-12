@@ -382,7 +382,7 @@ pub enum Data {
     #[cfg(windows)]
     SyncWinCpuUsage(Option<f64>),
     FileTransferLog((String, String)),
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     ControlledSessionCount(usize),
     CmErr(String),
     // CM-side file reading responses (Windows only)
