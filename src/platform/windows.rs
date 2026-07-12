@@ -89,7 +89,8 @@ use windows::Win32::{
         PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::Shell::{
-        FOLDERID_ProgramData, FOLDERID_PublicDesktop, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+        FOLDERID_CommonPrograms, FOLDERID_CommonStartup, FOLDERID_ProgramData,
+        FOLDERID_PublicDesktop, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
     },
 };
 use windows_service::{
@@ -120,8 +121,9 @@ pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
 const CMD_RELATIVE_PATH: &str = "cmd.exe";
 const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
-const UNSAFE_BATCH_PATH_CHARS: &[&str] = &["&", "@", "^", "%", "(", ")"];
+const UNSAFE_BATCH_PATH_CHARS: &[&str] = &["&", "@", "^", "%", "!", "(", ")"];
 const UTF8_CODE_PAGE: u32 = 65001;
+const BATCH_RUNNER_EXIT_CODE_VARIABLE: &str = "RUSTDESK_BATCH_RUNNER_EXIT_CODE";
 const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
     "COR_ENABLE_PROFILING",
     "CORECLR_ENABLE_PROFILING",
@@ -1739,17 +1741,18 @@ pub fn run_after_install() -> ResultType<()> {
 }
 
 pub fn run_before_uninstall() -> ResultType<()> {
-    run_cmds(get_before_uninstall(true), true, "before_install")
+    let commands = format!(
+        "{}\n{}",
+        get_before_uninstall(),
+        finish_batch_after_killing_process_cmd(get_current_pid(), None)
+    );
+    run_cmds(commands, true, "before_install")
 }
 
-fn get_before_uninstall(kill_self: bool) -> String {
+fn get_before_uninstall() -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
-    let filter = if kill_self {
-        "".to_string()
-    } else {
-        format!(" /FI \"PID ne {}\"", get_current_pid())
-    };
+    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     format!(
         "
     chcp 65001
@@ -1763,6 +1766,28 @@ fn get_before_uninstall(kill_self: bool) -> String {
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     )
+}
+
+fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) -> String {
+    let cleanup = install_path
+        .map(|path| {
+            format!("if exist \"{path}\" rd /s /q \"{path}\" & if exist \"{path}\" exit /b 1 & ")
+        })
+        .unwrap_or_default();
+    // The lock owner dies on this line, so cmd.exe must exit without reading another script line.
+    format!(
+        "taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b %RUSTDESK_EXIT_CODE%"
+    )
+}
+
+fn remove_common_programs_shortcuts_cmd(app_name: &str) -> String {
+    let path = format!("%RUSTDESK_COMMON_PROGRAMS%\\{app_name}");
+    format!("if exist \"{path}\" rd /s /q \"{path}\"")
+}
+
+fn remove_common_startup_shortcut_cmd(app_name: &str) -> String {
+    let path = format!("%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk");
+    format!("if exist \"{path}\" del /f /q \"{path}\"")
 }
 
 /// Constructs the uninstall command string for the application.
@@ -1794,7 +1819,21 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
             }
         }
     }
-    let (subkey, path, start_menu, _) = get_install_info();
+    let (subkey, path, _, _) = get_install_info();
+    let app_name = crate::get_app_name();
+    let common_programs_cleanup = remove_common_programs_shortcuts_cmd(&app_name);
+    let common_startup_cleanup = remove_common_startup_shortcut_cmd(&app_name);
+    let (remove_install_dir, finish_uninstall) = if kill_self {
+        (
+            String::new(),
+            finish_batch_after_killing_process_cmd(get_current_pid(), Some(&path)),
+        )
+    } else {
+        (
+            format!("if exist \"{path}\" rd /s /q \"{path}\""),
+            String::new(),
+        )
+    };
     format!(
         "
     {before_uninstall}
@@ -1802,14 +1841,13 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     {uninstall_cert_cmd}
     reg delete {subkey} /f || ver > nul
     {uninstall_amyuni_idd}
-    if exist \"{path}\" rd /s /q \"{path}\"
-    if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
+    {remove_install_dir}
+    {common_programs_cleanup}
     if exist \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\" del /f /q \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\"
-    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-    ",
-        before_uninstall=get_before_uninstall(kill_self),
+    {common_startup_cleanup}
+    {finish_uninstall}",
+        before_uninstall=get_before_uninstall(),
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
-        app_name = crate::get_app_name(),
     )
 }
 
@@ -1862,6 +1900,8 @@ fn trusted_batch_environment() -> ResultType<String> {
         .ok_or_else(|| anyhow!("Windows directory has no parent"))?;
     let program_data = get_known_folder_path(&FOLDERID_ProgramData)?;
     let public_desktop = get_known_folder_path(&FOLDERID_PublicDesktop)?;
+    let common_programs = get_known_folder_path(&FOLDERID_CommonPrograms)?;
+    let common_startup = get_known_folder_path(&FOLDERID_CommonStartup)?;
     let profiling_environment = MANAGED_PROFILING_ENABLE_VARIABLES
         .iter()
         .map(|variable| format!("set \"{variable}=0\""))
@@ -1876,6 +1916,8 @@ set "PATH={}"
 set "PATHEXT=.COM;.EXE;.BAT;.CMD"
 set "ProgramData={}"
 set "RUSTDESK_PUBLIC_DESKTOP={}"
+set "RUSTDESK_COMMON_PROGRAMS={}"
+set "RUSTDESK_COMMON_STARTUP={}"
 set "SystemRoot={}"
 set "WINDIR={}"
 {profiling_environment}
@@ -1886,6 +1928,8 @@ cd /d "{}" || exit /b 1"#,
         path_for_batch(system_dir)?,
         path_for_batch(&program_data)?,
         path_for_batch(&public_desktop)?,
+        path_for_batch(&common_programs)?,
+        path_for_batch(&common_startup)?,
         path_for_batch(windows_dir)?,
         path_for_batch(windows_dir)?,
         path_for_batch(system_dir)?,
@@ -2010,12 +2054,47 @@ fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> Res
     Ok(())
 }
 
+fn batch_runner_args(path: &Path) -> Vec<OsString> {
+    // CALL lets the outer cmd.exe remove the script after a self-uninstall kills its Rust owner.
+    let path = path.as_os_str().to_os_string();
+    [
+        OsString::from("/D"),
+        OsString::from("/E:ON"),
+        OsString::from("/V:ON"),
+        OsString::from("/C"),
+        OsString::from("set"),
+        OsString::from("ERRORLEVEL="),
+        OsString::from("&"),
+        OsString::from("set"),
+        OsString::from(format!("{BATCH_RUNNER_EXIT_CODE_VARIABLE}=")),
+        OsString::from("&"),
+        OsString::from("call"),
+        path.clone(),
+        OsString::from("&"),
+        OsString::from("set"),
+        OsString::from(format!("{BATCH_RUNNER_EXIT_CODE_VARIABLE}=!ERRORLEVEL!")),
+        OsString::from("&"),
+        OsString::from("del"),
+        OsString::from("/f"),
+        OsString::from("/q"),
+        path,
+        OsString::from(">"),
+        OsString::from("nul"),
+        OsString::from("2>&1"),
+        OsString::from("&"),
+        OsString::from("exit"),
+        OsString::from("/b"),
+        OsString::from(format!("!{BATCH_RUNNER_EXIT_CODE_VARIABLE}!")),
+    ]
+    .into()
+}
+
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    let args = batch_runner_args(script.path());
     let status = match runas::Command::new(&cmd_path)
-        .args(&["/D", "/E:ON", "/V:OFF", "/C"])
-        .arg(script.path())
+        .args(&args)
         .show(show)
         .force_prompt(true)
         .status()
@@ -3322,17 +3401,18 @@ impl Drop for WakeLock {
 pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     log::info!("Uninstalling service...");
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    let app_name = crate::get_app_name();
+    let startup_shortcut_cleanup = remove_common_startup_shortcut_cmd(&app_name);
     Config::set_option("stop-service".into(), "Y".into());
     let cmds = format!(
         "
     chcp 65001
     sc stop {app_name} || ver > nul
     sc delete {app_name} || ver > nul
-    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
+    {startup_shortcut_cleanup}
     taskkill /F /IM {broker_exe} || ver > nul
     taskkill /F /IM {app_name}.exe{filter} || ver > nul
     ",
-        app_name = crate::get_app_name(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     );
     if let Err(err) = run_cmds(cmds, false, "uninstall") {
@@ -3851,9 +3931,8 @@ fn get_create_service(exe: &str) -> String {
     }
     let stop = Config::get_option("stop-service") == "Y";
     if stop {
-        format!("
-if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-", app_name = crate::get_app_name())
+        let cleanup = remove_common_startup_shortcut_cmd(&crate::get_app_name());
+        format!("\n{cleanup}\n")
     } else {
         format!("
 sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
@@ -4764,10 +4843,14 @@ mod tests {
         assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
         assert!(fs::remove_file(&path).is_err());
         assert!(fs::rename(&path, &replacement).is_err());
-        let status = run_batch(&script);
+        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .args(batch_runner_args(script.path()))
+            .status()
+            .unwrap();
 
         assert!(status.success());
         assert!(ensure_command_completed(&status, &tip).is_ok());
+        assert!(path.exists());
         drop(script);
         drop(other);
         assert!(!path.exists());
@@ -4775,7 +4858,7 @@ mod tests {
         assert!(!replacement.exists());
 
         const UNPAIRED_HIGH_SURROGATE: u16 = 0xD800;
-        for character in ["&", "@", "^", "%", "(", ")"] {
+        for character in ["&", "@", "^", "%", "!", "(", ")"] {
             let path = PathBuf::from(format!("C:\\Temp{character}dir"));
             assert!(!is_batch_path_safe(&path), "accepted {character:?}");
         }
@@ -4820,6 +4903,42 @@ mod tests {
             .unwrap();
 
         assert!(status.success());
+    }
+
+    #[test]
+    fn self_termination_is_deferred_to_terminal_batch_line() {
+        let before_uninstall = get_before_uninstall();
+        let current_pid_filter = format!("/FI \"PID ne {}\"", get_current_pid());
+        assert!(before_uninstall.contains(&current_pid_filter));
+
+        let command = finish_batch_after_killing_process_cmd(42, Some("C:\\RustDesk"));
+        assert_eq!(
+            command,
+            "taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & if exist \"C:\\RustDesk\" rd /s /q \"C:\\RustDesk\" & if exist \"C:\\RustDesk\" exit /b 1 & exit /b %RUSTDESK_EXIT_CODE%"
+        );
+        assert_eq!(
+            finish_batch_after_killing_process_cmd(42, None),
+            "taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & exit /b %RUSTDESK_EXIT_CODE%"
+        );
+        assert!(command.ends_with("exit /b %RUSTDESK_EXIT_CODE%"));
+    }
+
+    #[test]
+    fn batch_runner_preserves_exit_code_and_removes_unlocked_script() {
+        let mut script = write_cmds("exit /b 7".to_owned(), "outer_cleanup").unwrap();
+        let path = script.path().to_path_buf();
+        let args = batch_runner_args(&path);
+        drop(script.handle.take());
+
+        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .args(args)
+            .env("ERRORLEVEL", "hostile")
+            .env(BATCH_RUNNER_EXIT_CODE_VARIABLE, "hostile")
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(7));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -4896,6 +5015,21 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_cleanup_uses_known_folder_environment() {
+        let programs = remove_common_programs_shortcuts_cmd("RustDesk");
+        let startup = remove_common_startup_shortcut_cmd("RustDesk");
+
+        assert_eq!(
+            programs,
+            "if exist \"%RUSTDESK_COMMON_PROGRAMS%\\RustDesk\" rd /s /q \"%RUSTDESK_COMMON_PROGRAMS%\\RustDesk\""
+        );
+        assert_eq!(
+            startup,
+            "if exist \"%RUSTDESK_COMMON_STARTUP%\\RustDesk Tray.lnk\" del /f /q \"%RUSTDESK_COMMON_STARTUP%\\RustDesk Tray.lnk\""
+        );
+    }
+
+    #[test]
     fn trusted_batch_environment_uses_system_paths() {
         let environment = trusted_batch_environment().unwrap();
         let system_dir = get_system_executable(CMD_RELATIVE_PATH)
@@ -4915,6 +5049,19 @@ mod tests {
         assert!(environment.contains("setlocal EnableExtensions DisableDelayedExpansion"));
         assert!(environment.contains(&format!("set \"PATH={system_dir}\"")));
         assert!(environment.contains("set \"RUSTDESK_PUBLIC_DESKTOP="));
+        for (variable, folder) in [
+            (
+                "RUSTDESK_COMMON_PROGRAMS",
+                windows::Win32::UI::Shell::FOLDERID_CommonPrograms,
+            ),
+            (
+                "RUSTDESK_COMMON_STARTUP",
+                windows::Win32::UI::Shell::FOLDERID_CommonStartup,
+            ),
+        ] {
+            let path = path_for_batch(&get_known_folder_path(&folder).unwrap()).unwrap();
+            assert!(environment.contains(&format!("set \"{variable}={path}\"")));
+        }
         assert!(environment.contains("set \"NoDefaultCurrentDirectoryInExePath=1\""));
         for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
             assert!(environment.contains(&format!("set \"{variable}=0\"")));
