@@ -364,10 +364,11 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     get_update_download_file_from_url(url)
 }
 
-/// Queries active remote connections from the user --server process via IPC.
+/// Queries all active connections (remote, file-transfer, port-forward, camera, terminal)
+/// from the user --server process via IPC.
 /// The root service cannot read connection state directly since connections
 /// live in the user --server process. Falls back to true (no connections) on IPC error.
-#[cfg(all(target_os = "macos", feature = "flutter"))]
+#[cfg(target_os = "macos")]
 fn has_no_active_conns_ipc() -> bool {
     let rt = match hbb_common::tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -376,8 +377,8 @@ fn has_no_active_conns_ipc() -> bool {
     rt.block_on(async {
         let uid = crate::platform::get_active_userid();
         if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, "", &uid).await {
-            if conn.send(&crate::ipc::Data::VideoConnCount(None)).await.is_ok() {
-                if let Ok(Some(crate::ipc::Data::VideoConnCount(Some(n)))) =
+            if conn.send(&crate::ipc::Data::ControlledSessionCount(0)).await.is_ok() {
+                if let Ok(Some(crate::ipc::Data::ControlledSessionCount(n))) =
                     conn.next_timeout(1000).await
                 {
                     return n == 0;
@@ -397,10 +398,7 @@ pub fn start_auto_update_macos() {
         let mut interval = DUR_ONE_DAY;
         loop {
             log::info!("[root-update] Running scheduled update check...");
-            #[cfg(feature = "flutter")]
             let no_active_conns = has_no_active_conns_ipc();
-            #[cfg(not(feature = "flutter"))]
-            let no_active_conns = has_no_active_conns();
             if !no_active_conns {
                 log::info!("[root-update] Active session in progress, retrying in 10 min.");
                 interval = MIN_INTERVAL;
@@ -480,7 +478,6 @@ pub fn check_update_as_root() -> ResultType<()> {
     }
     log::info!("[root-update] Downloaded to {}", tmp_path);
     // Recheck active sessions before installing — download can take minutes
-    #[cfg(feature = "flutter")]
     if !has_no_active_conns_ipc() {
         if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
             log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
