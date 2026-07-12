@@ -375,8 +375,12 @@ fn has_no_active_conns_ipc() -> bool {
         Err(_) => return true,
     };
     rt.block_on(async {
-        let uid = crate::platform::get_active_userid();
-        if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, "", &uid).await {
+        let uid_str = crate::platform::get_active_userid();
+        let uid = match uid_str.trim().parse::<u32>() {
+            Ok(uid) => uid,
+            Err(_) => return true,
+        };
+        if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
             if conn.send(&crate::ipc::Data::ControlledSessionCount(0)).await.is_ok() {
                 if let Ok(Some(crate::ipc::Data::ControlledSessionCount(n))) =
                     conn.next_timeout(1000).await
