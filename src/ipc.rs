@@ -472,6 +472,8 @@ pub enum Data {
     #[cfg(target_os = "windows")]
     PortForwardSessionCount(Option<usize>),
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
+    #[cfg(target_os = "macos")]
+    HasNoActiveConns(Option<bool>),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Whiteboard((String, crate::whiteboard::CustomEvent)),
     ControlPermissionsRemoteModify(Option<bool>),
@@ -997,6 +999,16 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .send(&Data::ControlledSessionCount(
                         crate::Connection::alive_conns().len()
                     ))
+                    .await
+            );
+        }
+        #[cfg(target_os = "macos")]
+        Data::HasNoActiveConns(None) => {
+            allow_err!(
+                stream
+                    .send(&Data::HasNoActiveConns(Some(
+                        crate::updater::has_no_active_conns()
+                    )))
                     .await
             );
         }
