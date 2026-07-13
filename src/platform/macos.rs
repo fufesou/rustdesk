@@ -965,7 +965,9 @@ if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
     echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
     touch /tmp/.rustdeskupdate_failed
     rm -rf {app_bundle}.new
-    launchctl load -w {daemon_plist} || echo "[root-update] WARNING: failed to reload daemon after ditto failure" >> /tmp/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || \
+        echo "[root-update] WARNING: failed to reload daemon after ditto failure" >> /tmp/.rustdeskupdate_failed
     if [ -n "{uid}" ]; then
         launchctl bootstrap gui/{uid} {agent_plist} || true
     fi
