@@ -446,7 +446,9 @@ pub fn check_update_as_root() -> ResultType<()> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with(".rustdeskupdate-root-") {
+            if name_str.starts_with(".rustdeskupdate-root-")
+                || name_str.starts_with(".rustdeskdownload-")
+            {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
