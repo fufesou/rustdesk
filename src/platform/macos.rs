@@ -963,6 +963,7 @@ pkill -9 -f "{app_name} --server" || true
 sleep 2
 if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
     echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
+    touch /tmp/.rustdeskupdate_failed
     rm -rf {app_bundle}.new
     launchctl load -w {daemon_plist} || true
     if [ -n "{uid}" ]; then
