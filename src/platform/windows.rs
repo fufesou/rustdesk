@@ -1747,6 +1747,11 @@ pub fn run_before_uninstall() -> ResultType<()> {
     run_cmds(commands, true, "before_install")
 }
 
+// This helper deliberately has no `kill_self` flag. The Rust process calling `run_cmds` owns the
+// deny-write handle that protects the temporary batch file. Killing that process here would release
+// the handle while cmd.exe still has later commands to read, reopening the replacement race. Always
+// exclude the current PID at this stage; callers that require self-termination append
+// `finish_batch_after_killing_process_cmd` after all other uninstall commands.
 fn get_before_uninstall() -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
@@ -1772,7 +1777,9 @@ fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) 
             format!("if exist \"{path}\" rd /s /q \"{path}\" & if exist \"{path}\" exit /b 1 & ")
         })
         .unwrap_or_default();
-    // Delete the marker while the directory is locked, then stop reading after the owner dies.
+    // Keep this as one terminal batch line. cmd.exe parses it while the Rust process still holds the
+    // script lock, then deletes the completion marker, kills that exact lock-owning PID, performs the
+    // optional final directory cleanup, and exits without reading another line from the unlocked file.
     format!(
         "del /f /q \"%~f0.undone\" > nul 2>&1 & if exist \"%~f0.undone\" exit /b 1 & taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b 0"
     )
@@ -1781,9 +1788,9 @@ fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) 
 /// Constructs the uninstall command string for the application.
 ///
 /// # Parameters
-/// - `kill_self`: The command will kill the process of current app name. If `true`, it will kill
-///   the current process as well. If `false`, it will exclude the current process from the kill
-///   command.
+/// - `kill_self`: If `true`, keeps the current process alive while it protects the batch file, then
+///   kills its exact PID in the terminal batch command and removes the install directory. If `false`,
+///   excludes the current process throughout and removes the install directory before returning.
 /// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
 ///
 /// # Details
@@ -2415,6 +2422,17 @@ fn get_custom_icon(install_dir: &str, exe: &str) -> Option<String> {
     None
 }
 
+// Installer shortcuts must be created after elevation because a medium-integrity process cannot
+// write to the all-users Desktop, Programs, or Startup folders. The previous installer implementation
+// wrote predictable VBS files to the user's temporary directory and later executed them with
+// elevated cscript.exe, exposing those scripts to the same replacement race as the installer batch
+// file. PowerShell keeps installer shortcut commands inline in the already locked elevated batch,
+// so there is no second executable temporary script to protect. WScript.Shell remains the underlying
+// COM shortcut API; PowerShell is only its command host. Calling that COM API directly from Rust in
+// the current installer process would run before elevation, while doing so after elevation would
+// require a new elevated Rust helper or a change to the installer elevation flow. The non-installer
+// shortcut path reuses the same command builder and invokes system PowerShell directly, also avoiding
+// a temporary VBS file.
 struct ShortcutOptions<'a> {
     link_file: &'a str,
     special_folder: Option<&'a str>,
