@@ -9,10 +9,12 @@ use hbb_common::{
     allow_err,
     anyhow::anyhow,
     bail,
+    base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _},
     config::{self, Config},
     libc::{c_int, wchar_t},
     log,
     message_proto::{DisplayInfo, Resolution, WindowsSession},
+    sha2::{Digest, Sha256},
     sleep,
     sysinfo::{Pid, System},
     timeout, tokio,
@@ -54,16 +56,15 @@ use winapi::{
             AllocateAndInitializeSid, DuplicateToken, EqualSid, FreeSid, GetTokenInformation,
         },
         shellapi::ShellExecuteW,
-        sysinfoapi::{GetNativeSystemInfo, GetSystemDirectoryW, SYSTEM_INFO},
+        sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO},
         winbase::*,
         wingdi::*,
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, FILE_SHARE_READ, FILE_SHARE_WRITE, HANDLE, PROCESS_ALL_ACCESS,
-            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
-            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, TOKEN_ELEVATION, TOKEN_GROUPS,
-            TOKEN_QUERY, TOKEN_TYPE,
+            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
+            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
+            TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -74,24 +75,41 @@ use winapi::{
     },
 };
 use windows::Win32::{
-    Foundation::{CloseHandle as WinCloseHandle, HANDLE as WinHANDLE},
+    Foundation::{
+        CloseHandle as WinCloseHandle, HANDLE as WinHANDLE, MAX_PATH as WIN_MAX_PATH,
+        RPC_E_CHANGED_MODE, WAIT_FAILED as WIN_WAIT_FAILED, WAIT_OBJECT_0 as WIN_WAIT_OBJECT_0,
+    },
     Security::{
         GetTokenInformation as WinGetTokenInformation, IsWellKnownSid, TokenUser,
         WinLocalSystemSid, TOKEN_QUERY as WIN_TOKEN_QUERY, TOKEN_USER,
+    },
+    Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS as WIN_FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_READ as WIN_FILE_SHARE_READ, FILE_SHARE_WRITE as WIN_FILE_SHARE_WRITE,
+    },
+    System::Com::{
+        CoInitializeEx as WinCoInitializeEx, CoTaskMemFree as WinCoTaskMemFree,
+        CoUninitialize as WinCoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     },
     System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     },
+    System::SystemInformation::GetSystemDirectoryW as WinGetSystemDirectoryW,
     System::Threading::{
-        OpenProcess as WinOpenProcess, OpenProcessToken as WinOpenProcessToken,
+        GetExitCodeProcess as WinGetExitCodeProcess, OpenProcess as WinOpenProcess,
+        OpenProcessToken as WinOpenProcessToken,
         QueryFullProcessImageNameW as WinQueryFullProcessImageNameW,
+        WaitForSingleObject as WinWaitForSingleObject, CREATE_NO_WINDOW as WIN_CREATE_NO_WINDOW,
+        INFINITE as WIN_INFINITE,
         PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::Shell::{
         FOLDERID_CommonPrograms, FOLDERID_CommonStartup, FOLDERID_PublicDesktop,
-        SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+        SHGetKnownFolderPath, ShellExecuteExW, KF_FLAG_DEFAULT, SEE_MASK_NOASYNC,
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     },
+    UI::WindowsAndMessaging::{SW_HIDE as WIN_SW_HIDE, SW_SHOWNORMAL as WIN_SW_SHOWNORMAL},
 };
 use windows_service::{
     define_windows_service,
@@ -128,6 +146,12 @@ const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
     "CORECLR_ENABLE_PROFILING",
     "DOTNET_ENABLE_PROFILING",
 ];
+const ELEVATED_BATCH_PATH_ENV: &str = "RUSTDESK_P";
+const ELEVATED_BATCH_HASH_ENV: &str = "RUSTDESK_H";
+const ELEVATED_CMD_PATH_ENV: &str = "RUSTDESK_C";
+// ShellExecuteExW has an INTERNET_MAX_URL_LENGTH-sized parameter limit on Windows 7.
+const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2_048;
+type BatchHash = [u8; 32];
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -1747,11 +1771,9 @@ pub fn run_before_uninstall() -> ResultType<()> {
     run_cmds(commands, true, "before_install")
 }
 
-// This helper deliberately has no `kill_self` flag. The Rust process calling `run_cmds` owns the
-// deny-write handle that protects the temporary batch file. Killing that process here would release
-// the handle while cmd.exe still has later commands to read, reopening the replacement race. Always
-// exclude the current PID at this stage; callers that require self-termination append
-// `finish_batch_after_killing_process_cmd` after all other uninstall commands.
+// This helper deliberately has no `kill_self` flag. Always exclude the current PID from the broad
+// image-name termination step; callers that require self-termination append the exact-PID terminal
+// command only after every preceding uninstall command has run.
 fn get_before_uninstall() -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
@@ -1777,9 +1799,9 @@ fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) 
             format!("if exist \"{path}\" rd /s /q \"{path}\" & if exist \"{path}\" exit /b 1 & ")
         })
         .unwrap_or_default();
-    // Keep this as one terminal batch line. cmd.exe parses it while the Rust process still holds the
-    // script lock, then deletes the completion marker, kills that exact lock-owning PID, performs the
-    // optional final directory cleanup, and exits without reading another line from the unlocked file.
+    // Keep this as one terminal batch line so marker deletion, exact-PID termination, optional final
+    // directory cleanup, and the resulting exit status have an explicit order. The elevated verifier
+    // owns the script lock independently, so terminating the Rust caller cannot unlock the batch.
     format!(
         "del /f /q \"%~f0.undone\" > nul 2>&1 & if exist \"%~f0.undone\" exit /b 1 & taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b 0"
     )
@@ -1788,9 +1810,9 @@ fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) 
 /// Constructs the uninstall command string for the application.
 ///
 /// # Parameters
-/// - `kill_self`: If `true`, keeps the current process alive while it protects the batch file, then
-///   kills its exact PID in the terminal batch command and removes the install directory. If `false`,
-///   excludes the current process throughout and removes the install directory before returning.
+/// - `kill_self`: If `true`, keeps the current process alive through the preceding uninstall work,
+///   then kills its exact PID in the terminal batch command and removes the install directory. If
+///   `false`, excludes the current process throughout and removes the install directory inline.
 /// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
 ///
 /// # Details
@@ -1853,8 +1875,8 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
 // Resolve security-sensitive executables through Windows instead of inherited PATH or SystemRoot
 // values, which may have been configured by the medium-integrity user before UAC elevation.
 fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
-    let mut buffer = vec![0u16; MAX_PATH];
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as _) } as usize;
+    let mut buffer = vec![0u16; WIN_MAX_PATH as usize];
+    let len = unsafe { WinGetSystemDirectoryW(Some(&mut buffer)) } as usize;
     if len == 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -1870,14 +1892,9 @@ fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
 // Resolve shell locations through Windows instead of inherited PUBLIC or PROGRAMDATA values. Known
 // folders may also be redirected, so reconstructing these paths would be incorrect.
 fn get_known_folder_path(folder_id: &windows::core::GUID) -> ResultType<PathBuf> {
-    #[link(name = "ole32")]
-    extern "system" {
-        fn CoTaskMemFree(memory: *mut c_void);
-    }
-
     let raw = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None)? };
     let path = unsafe { raw.to_string() };
-    unsafe { CoTaskMemFree(raw.0.cast()) };
+    unsafe { WinCoTaskMemFree(Some(raw.0.cast())) };
     Ok(PathBuf::from(path?))
 }
 
@@ -1987,14 +2004,15 @@ fn remove_temp_file(path: &Path) {
     }
 }
 
-// Owns the locks that protect an elevated temporary batch across the UAC handoff. The script handle
-// permits later readers but denies write and delete sharing, while the directory handle denies rename
-// and deletion of the validated directory. Keep this guard alive while cmd.exe can still read
-// unparsed script content; the self-termination path releases it only from the parsed terminal line.
-// Drop releases the handles before removing the script and its completion marker.
+// Owns the medium-integrity side of the temporary batch handoff. The initial write handle prevents
+// changes while the complete content and its hash are prepared; the directory handle prevents the
+// validated directory from being renamed before elevation starts. The elevated verifier separately
+// opens the script with deny-write/delete sharing before checking that hash and executing it. Drop
+// releases any remaining handles before removing the script and its completion marker.
 struct LockedTempScript {
     path: PathBuf,
     undone_path: PathBuf,
+    expected_hash: BatchHash,
     handle: Option<fs::File>,
     _directory_handle: fs::File,
 }
@@ -2006,6 +2024,19 @@ impl LockedTempScript {
 
     fn undone_path(&self) -> &Path {
         &self.undone_path
+    }
+
+    fn expected_hash(&self) -> &BatchHash {
+        &self.expected_hash
+    }
+
+    fn release_write_lock(&mut self) -> ResultType<()> {
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(|| anyhow!("Temporary script write lock is unavailable"))?;
+        drop(handle);
+        Ok(())
     }
 }
 
@@ -2030,16 +2061,27 @@ fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
 // the caller detect ordinary early termination; it is not a security boundary and does not mean
 // every individual legacy command succeeded.
 fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<String> {
-    let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
-    let undone_path = path_for_batch(undone_path)?;
+    // Collapse existing CRLF first; replacing every LF directly would produce CRCRLF.
+    let normalized_commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
+    let completion_marker = path_for_batch(undone_path)?;
     Ok(format!(
-        "{commands}\r\nif exist \"{undone_path}\" del /f /q \"{undone_path}\"\r\nif exist \"{undone_path}\" exit /b 1\r\nexit /b 0\r\n"
+        concat!(
+            "{normalized_commands}\r\n",
+            // Reaching the epilogue means cmd.exe parsed all ordinary commands.
+            "if exist \"{completion_marker}\" del /f /q \"{completion_marker}\"\r\n",
+            // A remaining marker means completion cannot be confirmed.
+            "if exist \"{completion_marker}\" exit /b 1\r\n",
+            // Preserve legacy behavior: individual command failures do not fail the whole batch.
+            "exit /b 0\r\n",
+        ),
+        normalized_commands = normalized_commands,
+        completion_marker = completion_marker,
     ))
 }
 
-// Create both artifacts exclusively, flush the complete script, and return the open lock owner. The
-// caller must retain the guard until cmd.exe has no unparsed script content; normally `run_cmds` holds
-// it until exit, while `finish_batch_after_killing_process_cmd` implements the terminal exception.
+// Create both artifacts exclusively, hash and flush the complete script, and return its initial lock
+// owner. `run_cmds` releases this write handle only after constructing the elevated verifier command;
+// any change during that unavoidable handoff gap is rejected by the verifier's hash check.
 fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     let path = unique_temp_batch_path()?;
     let directory = path
@@ -2047,18 +2089,21 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
         .ok_or_else(|| anyhow!("Temporary script path has no parent"))?;
     let directory_handle = fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(WIN_FILE_SHARE_READ.0 | WIN_FILE_SHARE_WRITE.0)
+        .custom_flags(WIN_FILE_FLAG_BACKUP_SEMANTICS.0)
         .open(directory)?;
     let undone_path = get_undone_file(&path)?;
+    let bytes = prepare_batch_commands(&commands, &undone_path)?;
+    let expected_hash = Sha256::digest(bytes.as_bytes()).into();
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(WIN_FILE_SHARE_READ.0)
         .open(&path)?;
     let mut script = LockedTempScript {
         path,
         undone_path,
+        expected_hash,
         handle: Some(file),
         _directory_handle: directory_handle,
     };
@@ -2066,7 +2111,6 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
         .write(true)
         .create_new(true)
         .open(script.undone_path())?;
-    let bytes = prepare_batch_commands(&commands, script.undone_path())?;
     let file = script
         .handle
         .as_mut()
@@ -2077,6 +2121,180 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     Ok(script)
 }
 
+// Keep the read stream open from integrity verification until cmd.exe exits. FileShare.Read lets
+// cmd.exe read the same file but denies every medium-integrity writer and rename/delete attempt. The
+// elevated process also removes the batch, so cleanup survives terminal uninstall commands that kill
+// the original Rust caller. Keep this to Windows PowerShell 2 syntax and these basic .NET types for
+// Windows 7; folder discovery and construction of a second elevated runner do not belong here.
+fn verified_batch_powershell() -> String {
+    format!(
+        concat!(
+            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;",
+            "try{{$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,",
+            "[IO.FileAccess]::Read,[IO.FileShare]::Read);",
+            "$a=[Security.Cryptography.SHA256]::Create();",
+            "try{{$h=[Convert]::ToBase64String($a.ComputeHash($s))}}",
+            "finally{{$a.Dispose()}};",
+            "if($h-cne$env:{hash_env}){{throw 'Batch hash mismatch'}};",
+            "& $env:{cmd_env} /D /E:ON /V:OFF /C $p;$e=$LASTEXITCODE",
+            "}}finally{{if($s){{$s.Dispose()}};[IO.File]::Delete($p)}};exit $e"
+        ),
+        path_env = ELEVATED_BATCH_PATH_ENV,
+        hash_env = ELEVATED_BATCH_HASH_ENV,
+        cmd_env = ELEVATED_CMD_PATH_ENV,
+    )
+}
+
+fn powershell_command_for_cmd(command: &str) -> ResultType<&str> {
+    if command.contains(['"', '%', '\r', '\n']) {
+        bail!("PowerShell verifier contains characters unsafe for cmd.exe");
+    }
+    Ok(command)
+}
+
+fn path_for_cmd_command(path: &Path) -> ResultType<&str> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| anyhow!("Path is not valid Unicode: {:?}", path))?;
+    if value.contains(['"', '%', '\r', '\n']) {
+        bail!("Path is unsafe for a cmd.exe command: {:?}", path);
+    }
+    Ok(value)
+}
+
+// cmd.exe is the elevated native bootstrap so managed-profiler variables can be disabled before
+// Windows PowerShell starts. The fixed PowerShell 2 payload rejects cmd-expanding characters before
+// it is quoted as one -Command value, and all executable paths come from the system directory API.
+fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> ResultType<String> {
+    if !is_batch_path_safe(batch_path) {
+        bail!(
+            "Temporary batch path is unsafe for cmd.exe: {:?}",
+            batch_path
+        );
+    }
+    let expected_hash = BASE64_STANDARD.encode(expected_hash);
+    let command = verified_batch_powershell();
+    let command = powershell_command_for_cmd(&command)?;
+    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
+    let mut bootstrap = MANAGED_PROFILING_ENABLE_VARIABLES
+        .iter()
+        .map(|name| format!("set \"{name}=0\""))
+        .collect::<Vec<_>>();
+    bootstrap.extend([
+        format!(
+            "set \"{ELEVATED_BATCH_PATH_ENV}={}\"",
+            path_for_cmd_command(batch_path)?
+        ),
+        format!("set \"{ELEVATED_BATCH_HASH_ENV}={expected_hash}\""),
+        format!(
+            "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
+            path_for_cmd_command(&cmd_path)?
+        ),
+        format!(
+            "\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"{command}\"",
+            path_for_cmd_command(&powershell_path)?
+        ),
+    ]);
+    Ok(bootstrap.join(" & "))
+}
+
+fn verified_batch_parameters(script: &LockedTempScript) -> ResultType<String> {
+    Ok(format!(
+        "/D /E:ON /V:OFF /S /C {}",
+        verified_batch_bootstrap(script.path(), script.expected_hash())?
+    ))
+}
+
+struct WinHandleGuard(WinHANDLE);
+
+impl WinHandleGuard {
+    fn new(handle: WinHANDLE) -> ResultType<Self> {
+        if handle.is_invalid() {
+            bail!("Windows did not return a valid handle");
+        }
+        Ok(Self(handle))
+    }
+
+    fn get(&self) -> WinHANDLE {
+        self.0
+    }
+}
+
+impl Drop for WinHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            if let Err(err) = unsafe { WinCloseHandle(self.0) } {
+                log::warn!("Failed to close Windows handle: {}", err);
+            }
+        }
+    }
+}
+
+struct ShellComGuard;
+
+impl Drop for ShellComGuard {
+    fn drop(&mut self) {
+        unsafe { WinCoUninitialize() };
+    }
+}
+
+fn initialize_shell_com() -> ResultType<Option<ShellComGuard>> {
+    let result =
+        unsafe { WinCoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    if result == RPC_E_CHANGED_MODE {
+        return Ok(None);
+    }
+    result.ok()?;
+    Ok(Some(ShellComGuard))
+}
+
+// ShellExecuteExW supplies the legitimate UAC prompt and a process handle. Waiting on that handle
+// preserves the installer's synchronous error reporting without delegating quoting to runas::Command.
+fn run_elevated_and_wait(executable: &Path, parameters: &str, show: bool) -> ResultType<u32> {
+    let parameter_chars = parameters.encode_utf16().count();
+    log::debug!(
+        "Elevated command uses {} of {} Windows 7 ShellExecuteExW parameter characters",
+        parameter_chars,
+        WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS
+    );
+    if parameter_chars >= WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS {
+        bail!(
+            "Elevated command needs {} ShellExecuteExW parameter characters; Windows 7 limit is {}",
+            parameter_chars,
+            WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS
+        );
+    }
+    let _com = initialize_shell_com()?;
+    let executable = wide_string(path_for_cmd_command(executable)?);
+    let parameters = wide_string(parameters);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: windows::core::w!("runas"),
+        lpFile: windows::core::PCWSTR(executable.as_ptr()),
+        lpParameters: windows::core::PCWSTR(parameters.as_ptr()),
+        nShow: if show {
+            WIN_SW_SHOWNORMAL.0
+        } else {
+            WIN_SW_HIDE.0
+        },
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info)? };
+    let process = WinHandleGuard::new(info.hProcess)?;
+    let wait_result = unsafe { WinWaitForSingleObject(process.get(), WIN_INFINITE) };
+    if wait_result == WIN_WAIT_FAILED {
+        return Err(windows::core::Error::from_win32().into());
+    }
+    if wait_result != WIN_WAIT_OBJECT_0 {
+        bail!("Unexpected process wait result: {}", wait_result.0);
+    }
+    let mut exit_code = 0;
+    unsafe { WinGetExitCodeProcess(process.get(), &mut exit_code)? };
+    Ok(exit_code)
+}
+
 fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> ResultType<()> {
     if !status.success() {
         bail!("{} failed with exit code {:?}", tip, status.code());
@@ -2085,17 +2303,16 @@ fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> Res
 }
 
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
-    let script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
+    let mut script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    // /D disables registry AutoRun commands, /E:ON enables the extensions used by the script, and
-    // /V:OFF prevents inherited delayed expansion before the batch prologue takes control.
-    let status = runas::Command::new(&cmd_path)
-        .args(&["/D", "/E:ON", "/V:OFF", "/C"])
-        .arg(script.path())
-        .show(show)
-        .force_prompt(true)
-        .status()?;
-    ensure_command_completed(&status, tip)?;
+    let parameters = verified_batch_parameters(&script)?;
+    // Release before UAC because the verifier's deny-write share mode cannot overlap this write
+    // handle. The already computed hash makes this handoff gap fail closed if the file changes.
+    script.release_write_lock()?;
+    let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show)?;
+    if exit_code != 0 {
+        bail!("{} failed with exit code {}", tip, exit_code);
+    }
     if script.undone_path().exists() {
         bail!("{} did not complete", tip);
     }
@@ -2546,7 +2763,7 @@ pub fn create_shortcut(id: &str) -> ResultType<()> {
     process
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(command)
-        .creation_flags(CREATE_NO_WINDOW);
+        .creation_flags(WIN_CREATE_NO_WINDOW.0);
     for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
         process.env(variable, "0");
     }
@@ -4743,41 +4960,25 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 mod tests {
     use super::*;
 
-    // Test-only reusable Win32 HANDLE RAII helper.
-    // If a future non-test path needs the same pattern, move it out of this test module.
-    //
-    // This struct is similar to `hbb_common::platform::windows::RAIIHandle`,
-    // but `RAIIHandle` depends on `WinApi` crate, while this `HandleGuard` only depends on `windows` crate.
-    struct HandleGuard(WinHANDLE);
-
-    impl HandleGuard {
-        #[inline]
-        fn new(handle: WinHANDLE) -> Self {
-            Self(handle)
-        }
-
-        #[inline]
-        fn get(&self) -> WinHANDLE {
-            self.0
-        }
-    }
-
-    impl Drop for HandleGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if !self.0.is_invalid() {
-                    let _ = WinCloseHandle(self.0);
-                }
-            }
-        }
-    }
-
     fn run_batch(script: &LockedTempScript) -> std::process::ExitStatus {
         std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
             .args(["/D", "/E:ON", "/V:OFF", "/C"])
             .arg(script.path())
             .status()
             .unwrap()
+    }
+
+    fn spawn_verified_batch(script: &mut LockedTempScript) -> std::process::Child {
+        let parameters = verified_batch_parameters(script).unwrap();
+        script.release_write_lock().unwrap();
+        let mut command =
+            std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap());
+        command
+            .raw_arg(parameters)
+            .creation_flags(WIN_CREATE_NO_WINDOW.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().unwrap()
     }
 
     #[test]
@@ -4792,14 +4993,16 @@ mod tests {
 
         let expected = unsafe {
             // Keep this test consistent: use only the `windows` crate APIs/types.
-            let process = HandleGuard::new(
+            let process = WinHandleGuard::new(
                 WinOpenProcess(WIN_PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
                     .expect("WinOpenProcess should succeed for current process"),
-            );
+            )
+            .expect("WinOpenProcess should return a valid handle");
             let mut token = WinHANDLE::default();
             WinOpenProcessToken(process.get(), WIN_TOKEN_QUERY, &mut token)
                 .expect("WinOpenProcessToken should succeed for current process");
-            let token = HandleGuard::new(token);
+            let token = WinHandleGuard::new(token)
+                .expect("WinOpenProcessToken should return a valid handle");
 
             let mut token_user_size = 0u32;
             let _ = WinGetTokenInformation(token.get(), TokenUser, None, 0, &mut token_user_size);
@@ -4866,6 +5069,121 @@ mod tests {
         }
         let invalid_unicode = PathBuf::from(OsString::from_wide(&[UNPAIRED_HIGH_SURROGATE]));
         assert!(!is_batch_path_safe(&invalid_unicode));
+    }
+
+    #[test]
+    fn batch_stays_read_only_after_original_lock_owner_exits() {
+        const READY_POLL_ATTEMPTS: usize = 500;
+        const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        let ping_path = path_for_batch(&get_system_executable("PING.EXE").unwrap()).unwrap();
+        let mut script = write_cmds(
+            format!(
+                "{}\necho ready > \"%~f0.ready\"\n\"{ping_path}\" -n 4 127.0.0.1 > nul",
+                trusted_batch_environment().unwrap()
+            ),
+            "lock_owner_exit",
+        )
+        .unwrap();
+        let ready_path = script.path().with_extension("bat.ready");
+        let script_path = script.path().to_path_buf();
+        let mut child = spawn_verified_batch(&mut script);
+        for _ in 0..READY_POLL_ATTEMPTS {
+            if ready_path.exists() {
+                break;
+            }
+            std::thread::sleep(READY_POLL_INTERVAL);
+        }
+        let reached_blocking_command = ready_path.exists();
+        let write_result = fs::OpenOptions::new().write(true).open(script.path());
+        let status = child.wait().unwrap();
+        remove_temp_file(&ready_path);
+        assert!(
+            reached_blocking_command,
+            "batch did not reach the blocking command; status: {status:?}"
+        );
+        assert!(status.success());
+        assert!(
+            write_result.is_err(),
+            "batch became writable after its original lock owner exited"
+        );
+        assert!(!script_path.exists());
+    }
+
+    #[test]
+    fn changed_batch_is_rejected_before_execution() {
+        let mut script =
+            write_cmds("echo executed > \"%~f0.executed\"".to_owned(), "tampered").unwrap();
+        let executed_path = script.path().with_extension("bat.executed");
+        let parameters = verified_batch_parameters(&script).unwrap();
+        script.release_write_lock().unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(script.path())
+            .unwrap();
+        file.write_all(b"rem changed\r\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .raw_arg(parameters)
+            .creation_flags(WIN_CREATE_NO_WINDOW.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        let executed = executed_path.exists();
+        let script_exists = script.path().exists();
+        remove_temp_file(&executed_path);
+        assert!(!status.success());
+        assert!(!executed);
+        assert!(!script_exists);
+    }
+
+    #[test]
+    fn verified_batch_bootstrap_fits_windows_7_shell_execute_limit() {
+        const WIN7_MAX_PATH_CHARS: usize = 260;
+        let path = PathBuf::from(format!(
+            "C:\\{}",
+            "a".repeat(WIN7_MAX_PATH_CHARS - "C:\\".len())
+        ));
+        let hash: BatchHash = Sha256::digest(b"batch").into();
+        let bootstrap = verified_batch_bootstrap(&path, &hash).unwrap();
+        let encoded_hash = BASE64_STANDARD.encode(hash);
+        let parameters = format!("/D /E:ON /V:OFF /S /C {bootstrap}");
+        let parameter_chars = parameters.encode_utf16().count();
+        let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
+        let powershell_launch = format!(
+            "\"{}\" -NoLogo",
+            path_for_cmd_command(&powershell_path).unwrap()
+        );
+        let powershell_start = bootstrap.find(&powershell_launch).unwrap();
+        let assert_before_powershell = |assignment: String| {
+            let assignment_start = bootstrap
+                .find(&assignment)
+                .unwrap_or_else(|| panic!("missing {assignment}"));
+            assert!(assignment_start < powershell_start, "late {assignment}");
+        };
+
+        assert!(
+            parameter_chars < WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS,
+            "bootstrap uses {parameter_chars} parameter characters"
+        );
+        for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
+            assert_before_powershell(format!("set \"{variable}=0\""));
+        }
+        assert_before_powershell(format!(
+            "set \"{ELEVATED_BATCH_PATH_ENV}={}\"",
+            path.to_string_lossy()
+        ));
+        assert_before_powershell(format!("set \"{ELEVATED_BATCH_HASH_ENV}={encoded_hash}\""));
+        assert_before_powershell(format!(
+            "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
+            path_for_cmd_command(&get_system_executable(CMD_RELATIVE_PATH).unwrap()).unwrap()
+        ));
+        assert!(powershell_command_for_cmd("Write-Output \"unsafe\"").is_err());
+        assert!(path_for_cmd_command(Path::new("C:\\bad\"path")).is_err());
     }
 
     #[test]
