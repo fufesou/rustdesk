@@ -373,13 +373,13 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 pub fn has_no_active_conns_ipc() -> bool {
     let rt = match hbb_common::tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     rt.block_on(async {
         let uid_str = crate::platform::get_active_userid();
         let uid = match uid_str.trim().parse::<u32>() {
             Ok(uid) => uid,
-            Err(_) => return true,
+            Err(_) => return false,
         };
         if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
             if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
@@ -400,7 +400,14 @@ pub fn has_no_active_conns_ipc() -> bool {
 pub fn start_auto_update_macos() {
     std::thread::spawn(|| {
         std::thread::sleep(INITIAL_CHECK_DELAY);
-        let mut interval = DUR_ONE_DAY;
+        // Check if previous update attempt failed — use retry interval to avoid rapid loop
+        let mut interval = if std::path::Path::new("/tmp/.rustdeskupdate_failed").exists() {
+            let _ = std::fs::remove_file("/tmp/.rustdeskupdate_failed");
+            log::info!("[root-update] Previous update attempt failed, using retry interval.");
+            RETRY_INTERVAL
+        } else {
+            DUR_ONE_DAY
+        };
         loop {
             log::info!("[root-update] Running scheduled update check...");
             let no_active_conns = has_no_active_conns_ipc();
