@@ -964,8 +964,23 @@ if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
     fi
     exit 1
 fi
-rm -rf {app_bundle}
-mv {app_bundle}.new {app_bundle}
+if ! rm -rf {app_bundle}; then
+    echo "[root-update] rm failed, rolling back" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle}.new {app_bundle} || true
+    launchctl load -w {daemon_plist} || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
+if ! mv {app_bundle}.new {app_bundle}; then
+    echo "[root-update] mv failed, no rollback possible" >> {tmp_dir}/rustdesk_root_update.log
+    launchctl load -w {daemon_plist} || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
 chown -R {user}:staff {app_bundle}
 xattr -r -d com.apple.quarantine {app_bundle} || true
 launchctl load -w {daemon_plist} || true
