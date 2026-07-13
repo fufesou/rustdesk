@@ -2122,7 +2122,8 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
 // cmd.exe read the same file but denies every medium-integrity writer and rename/delete attempt. The
 // elevated process also removes the batch, so cleanup survives terminal uninstall commands that kill
 // the original Rust caller. Keep this to Windows PowerShell 2 syntax and these basic .NET types for
-// Windows 7; folder discovery and construction of a second elevated runner do not belong here.
+// Windows 7. PowerShell 2 does not expose HashAlgorithm.Dispose and truncates `exit` values to one
+// byte, so use Clear and Environment.Exit to release the hash and preserve full verifier codes.
 fn verified_batch_powershell() -> String {
     format!(
         concat!(
@@ -2131,14 +2132,14 @@ fn verified_batch_powershell() -> String {
             "[IO.FileAccess]::Read,[IO.FileShare]::Read)}}catch{{$e={open_failure}}};",
             "if($e -eq 0){{try{{$a=[Security.Cryptography.SHA256]::Create();",
             "try{{$h=[Convert]::ToBase64String($a.ComputeHash($s))}}",
-            "finally{{$a.Dispose()}}}}catch{{$e={hash_failure}}}}};",
+            "finally{{$a.Clear()}}}}catch{{$e={hash_failure}}}}};",
             "if($e -eq 0 -and $h -cne $env:{hash_env}){{$e={hash_mismatch}}};",
             "if($e -eq 0){{try{{& $env:{cmd_env} /D /E:ON /V:OFF /C $p;",
             "$e=$LASTEXITCODE}}catch{{$e={start_failure}}}}}",
             "}}finally{{try{{if($s){{$s.Dispose()}}}}",
             "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
             "try{{[IO.File]::Delete($p)}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}}",
-            "}};exit $e"
+            "}};[Environment]::Exit([int]$e)"
         ),
         path_env = ELEVATED_BATCH_PATH_ENV,
         hash_env = ELEVATED_BATCH_HASH_ENV,
@@ -5182,6 +5183,15 @@ mod tests {
         );
         assert!(!executed);
         assert!(!script_exists);
+    }
+
+    #[test]
+    fn verified_batch_powershell_uses_windows_7_compatible_apis() {
+        let command = verified_batch_powershell();
+
+        assert!(command.contains("finally{$a.Clear()}"));
+        assert!(!command.contains("$a.Dispose()"));
+        assert!(command.ends_with("[Environment]::Exit([int]$e)"));
     }
 
     #[test]
