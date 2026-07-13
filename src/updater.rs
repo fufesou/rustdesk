@@ -400,14 +400,13 @@ pub fn has_no_active_conns_ipc() -> bool {
 pub fn start_auto_update_macos() {
     std::thread::spawn(|| {
         std::thread::sleep(INITIAL_CHECK_DELAY);
-        // Check if previous update attempt failed — use retry interval to avoid rapid loop
-        let mut interval = if std::path::Path::new("/tmp/.rustdeskupdate_failed").exists() {
+        // If previous update attempt failed, wait RETRY_INTERVAL before first check
+        if std::path::Path::new("/tmp/.rustdeskupdate_failed").exists() {
             let _ = std::fs::remove_file("/tmp/.rustdeskupdate_failed");
-            log::info!("[root-update] Previous update attempt failed, using retry interval.");
-            RETRY_INTERVAL
-        } else {
-            DUR_ONE_DAY
-        };
+            log::info!("[root-update] Previous update attempt failed, waiting before retry.");
+            std::thread::sleep(RETRY_INTERVAL);
+        }
+        let mut interval = DUR_ONE_DAY;
         loop {
             log::info!("[root-update] Running scheduled update check...");
             let no_active_conns = has_no_active_conns_ipc();
