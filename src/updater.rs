@@ -441,6 +441,16 @@ pub fn check_update_as_root() -> ResultType<()> {
         log::info!("[root-update] Custom client detected, skipping stock update.");
         return Ok(());
     }
+    // Clean up leftover temp dirs from previous failed updates
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".rustdeskupdate-root-") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     if let Err(e) = do_check_software_update() {
         bail!("[root-update] Failed to check for software update: {}", e);
     }
