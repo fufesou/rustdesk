@@ -17,6 +17,7 @@ import android.app.PendingIntent.FLAG_UPDATE_CURRENT
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.content.res.Configuration.ORIENTATION_LANDSCAPE
 import android.graphics.Color
@@ -150,7 +151,7 @@ class MainService : Service() {
                         if (incomingVoiceCall) {
                             voiceCallRequestNotification(id, "Voice Call Request", username, peerId)
                         } else {
-                            if (!audioRecordHandle.switchOutVoiceCall(mediaProjection)) {
+                            if (!switchOutVoiceCall()) {
                                 Log.e(logTag, "switchOutVoiceCall fail")
                                 MainActivity.flutterMethodChannel?.invokeMethod("msgbox", mapOf(
                                     "type" to "custom-nook-nocancel-hasclose-error",
@@ -159,7 +160,7 @@ class MainService : Service() {
                             }
                         }
                     } else {
-                        if (!audioRecordHandle.switchToVoiceCall(mediaProjection)) {
+                        if (!switchToVoiceCall()) {
                             Log.e(logTag, "switchToVoiceCall fail")
                             MainActivity.flutterMethodChannel?.invokeMethod("msgbox", mapOf(
                                 "type" to "custom-nook-nocancel-hasclose-error",
@@ -214,6 +215,21 @@ class MainService : Service() {
 
     // video
     private var mediaProjection: MediaProjection? = null
+    private val foregroundServiceLock = Any()
+    private var mediaProjectionForegroundService = false
+    private var microphoneForegroundService = false
+    private val mediaProjectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.d(logTag, "MediaProjection stopped")
+            stopCapture()
+            virtualDisplay?.release()
+            virtualDisplay = null
+            mediaProjection = null
+            _isReady = false
+            clearForegroundServiceTypes()
+            checkMediaPermission()
+        }
+    }
     private var surface: Surface? = null
     private val sendVP9Thread = Executors.newSingleThreadExecutor()
     private var videoEncoder: MediaCodec? = null
@@ -327,8 +343,6 @@ class MainService : Service() {
         Log.d("whichService", "this service: ${Thread.currentThread()}")
         super.onStartCommand(intent, flags, startId)
         if (intent?.action == ACT_INIT_MEDIA_PROJECTION_AND_SERVICE) {
-            createForegroundNotification()
-
             if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
                 FFI.startService()
             }
@@ -337,10 +351,18 @@ class MainService : Service() {
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
             intent.getParcelableExtra<Intent>(EXT_MEDIA_PROJECTION_RES_INTENT)?.let {
-                mediaProjection =
+                if (!setMediaProjectionForegroundService(true)) {
+                    _isReady = false
+                    checkMediaPermission()
+                    return@let
+                }
+                releaseMediaProjection()
+                val projection =
                     mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
-                checkMediaPermission()
+                projection.registerCallback(mediaProjectionCallback, Handler(Looper.getMainLooper()))
+                mediaProjection = projection
                 _isReady = true
+                checkMediaPermission()
             } ?: let {
                 Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
                 requestMediaProjection()
@@ -395,12 +417,52 @@ class MainService : Service() {
         }
     }
 
+    private fun releaseMediaProjection() {
+        mediaProjection?.unregisterCallback(mediaProjectionCallback)
+        mediaProjection?.stop()
+        mediaProjection = null
+    }
+
+    private fun startMicrophoneCapture(startAudio: () -> Boolean): Boolean {
+        if (!setMicrophoneForegroundService(true)) {
+            return false
+        }
+        if (startAudio()) {
+            return true
+        }
+        setMicrophoneForegroundService(false)
+        return false
+    }
+
+    private fun stopMicrophoneCapture(stopAudio: () -> Boolean): Boolean {
+        if (!stopAudio()) {
+            return false
+        }
+        return setMicrophoneForegroundService(false)
+    }
+
+    private fun switchToVoiceCall(): Boolean {
+        return startMicrophoneCapture {
+            audioRecordHandle.switchToVoiceCall(mediaProjection)
+        }
+    }
+
+    private fun switchOutVoiceCall(): Boolean {
+        return stopMicrophoneCapture {
+            audioRecordHandle.switchOutVoiceCall(mediaProjection)
+        }
+    }
+
     fun onVoiceCallStarted(): Boolean {
-        return audioRecordHandle.onVoiceCallStarted(mediaProjection)
+        return startMicrophoneCapture {
+            audioRecordHandle.onVoiceCallStarted(mediaProjection)
+        }
     }
 
     fun onVoiceCallClosed(): Boolean {
-        return audioRecordHandle.onVoiceCallClosed(mediaProjection)
+        return stopMicrophoneCapture {
+            audioRecordHandle.onVoiceCallClosed(mediaProjection)
+        }
     }
 
     fun startCapture(): Boolean {
@@ -486,7 +548,8 @@ class MainService : Service() {
             virtualDisplay = null
         }
 
-        mediaProjection = null
+        releaseMediaProjection()
+        resetForegroundServiceTypes()
         checkMediaPermission()
         stopForeground(true)
         stopService(Intent(this, FloatingWindowService::class.java))
@@ -616,8 +679,14 @@ class MainService : Service() {
         notificationBuilder = NotificationCompat.Builder(this, notificationChannel)
     }
 
-    @SuppressLint("UnspecifiedImmutableFlag")
     private fun createForegroundNotification() {
+        synchronized(foregroundServiceLock) {
+            createForegroundNotificationLocked()
+        }
+    }
+
+    @SuppressLint("UnspecifiedImmutableFlag")
+    private fun createForegroundNotificationLocked() {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
             action = Intent.ACTION_MAIN
@@ -642,7 +711,74 @@ class MainService : Service() {
             .setColor(ContextCompat.getColor(this, R.color.primary))
             .setWhen(System.currentTimeMillis())
             .build()
-        startForeground(DEFAULT_NOTIFY_ID, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(DEFAULT_NOTIFY_ID, notification, foregroundServiceTypeLocked())
+        } else {
+            startForeground(DEFAULT_NOTIFY_ID, notification)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun foregroundServiceTypeLocked(): Int {
+        var serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        }
+        if (mediaProjectionForegroundService) {
+            serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && microphoneForegroundService) {
+            serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        return serviceType
+    }
+
+    private fun setMediaProjectionForegroundService(enabled: Boolean): Boolean {
+        return synchronized(foregroundServiceLock) {
+            updateForegroundServiceTypesLocked(enabled, microphoneForegroundService)
+        }
+    }
+
+    private fun setMicrophoneForegroundService(enabled: Boolean): Boolean {
+        return synchronized(foregroundServiceLock) {
+            updateForegroundServiceTypesLocked(mediaProjectionForegroundService, enabled)
+        }
+    }
+
+    private fun clearForegroundServiceTypes(): Boolean {
+        return synchronized(foregroundServiceLock) {
+            updateForegroundServiceTypesLocked(false, false)
+        }
+    }
+
+    private fun resetForegroundServiceTypes() {
+        synchronized(foregroundServiceLock) {
+            mediaProjectionForegroundService = false
+            microphoneForegroundService = false
+        }
+    }
+
+    private fun updateForegroundServiceTypesLocked(
+        mediaProjectionEnabled: Boolean,
+        microphoneEnabled: Boolean,
+    ): Boolean {
+        if (mediaProjectionForegroundService == mediaProjectionEnabled &&
+            microphoneForegroundService == microphoneEnabled) {
+            return true
+        }
+        val previousMediaProjection = mediaProjectionForegroundService
+        val previousMicrophone = microphoneForegroundService
+        mediaProjectionForegroundService = mediaProjectionEnabled
+        microphoneForegroundService = microphoneEnabled
+        return try {
+            createForegroundNotificationLocked()
+            true
+        } catch (error: SecurityException) {
+            mediaProjectionForegroundService = previousMediaProjection
+            microphoneForegroundService = previousMicrophone
+            Log.e(logTag, "Failed to update foreground service types", error)
+            false
+        }
     }
 
     private fun loginRequestNotification(

@@ -1,4 +1,9 @@
 <resources>
     <string name="app_name">RustDesk</string>
     <string name="accessibility_service_description">Allow other devices to control your phone using virtual touch, when RustDesk screen sharing is established</string>
+    <string name="foreground_service_special_use_subtype">Keeps the RustDesk remote desktop host available for authorized unattended connections and foreground notifications without starting screen capture before user approval.</string>
+    <string name="all_files_access_title">Allow access to all files?</string>
+    <string name="all_files_access_message">RustDesk requests access to all files so its remote file transfer and file management features can work with files and folders across this device. During an authorized remote session, a connected user may browse, send, receive, create, rename, and delete files. Continue to Android settings to grant access. You can deny or revoke this access at any time.</string>
+    <string name="all_files_access_cancel">Cancel</string>
+    <string name="all_files_access_continue">Continue</string>
 </resources>

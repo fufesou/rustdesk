@@ -2,6 +2,7 @@ package com.carriez.flutter_hbb
 
 import android.Manifest.permission.*
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.media.AudioRecord
@@ -69,18 +70,44 @@ fun isSupportVoiceCall(): Boolean {
 }
 
 fun requestPermission(context: Context, type: String) {
+    if (type == MANAGE_EXTERNAL_STORAGE) {
+        showAllFilesAccessDisclosure(context, type)
+        return
+    }
+    requestAndroidPermission(context, type)
+}
+
+private fun showAllFilesAccessDisclosure(context: Context, type: String) {
+    AlertDialog.Builder(context)
+        .setTitle(R.string.all_files_access_title)
+        .setMessage(R.string.all_files_access_message)
+        .setNegativeButton(R.string.all_files_access_cancel) { _, _ ->
+            notifyPermissionResult(type, false)
+        }
+        .setPositiveButton(R.string.all_files_access_continue) { _, _ ->
+            requestAndroidPermission(context, type)
+        }
+        .setOnCancelListener {
+            notifyPermissionResult(type, false)
+        }
+        .show()
+}
+
+private fun requestAndroidPermission(context: Context, type: String) {
     XXPermissions.with(context)
         .permission(type)
         .request { _, all ->
-            if (all) {
-                Handler(Looper.getMainLooper()).post {
-                    MainActivity.flutterMethodChannel?.invokeMethod(
-                        "on_android_permission_result",
-                        mapOf("type" to type, "result" to all)
-                    )
-                }
-            }
+            notifyPermissionResult(type, all)
         }
+}
+
+private fun notifyPermissionResult(type: String, granted: Boolean) {
+    Handler(Looper.getMainLooper()).post {
+        MainActivity.flutterMethodChannel?.invokeMethod(
+            "on_android_permission_result",
+            mapOf("type" to type, "result" to granted)
+        )
+    }
 }
 
 fun startAction(context: Context, action: String) {
