@@ -4869,6 +4869,14 @@ mod tests {
         assert!(command.contains("'RustDesk''s %%.lnk'"));
         assert!(command.contains("'C:\\Program Files\\RustDesk''s %%\\RustDesk.exe'"));
         assert!(powershell_single_quoted("line\nbreak").is_err());
+        assert!(create_shortcut_cmd(ShortcutOptions {
+            link_file: "RustDesk.lnk",
+            special_folder: None,
+            target_path: "C:\\Program Files\\RustDesk.exe",
+            arguments: Some("--connect \"quoted\""),
+            icon_location: None,
+        })
+        .is_err());
     }
 
     #[test]
@@ -4877,15 +4885,27 @@ mod tests {
         let chcp_path =
             path_for_batch(&get_system_executable(CHCP_RELATIVE_PATH).unwrap()).unwrap();
         let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
-        let system_dir = path_for_batch(cmd_path.parent().unwrap()).unwrap();
+        let system_dir_path = cmd_path.parent().unwrap();
+        let windows_dir = path_for_batch(system_dir_path.parent().unwrap()).unwrap();
+        let system_dir = path_for_batch(system_dir_path).unwrap();
+        let cmd_path = path_for_batch(&cmd_path).unwrap();
         let code_page = environment
             .find(&format!("\"{chcp_path}\" {UTF8_CODE_PAGE}"))
             .unwrap();
         let first_known_folder = environment.find("set \"RUSTDESK_PUBLIC_DESKTOP=").unwrap();
+        let assert_value = |name: &str, value: &str| {
+            let expected = format!("set \"{name}={value}\"");
+            assert!(
+                environment.lines().any(|line| line == expected),
+                "missing {expected}"
+            );
+        };
 
         assert!(code_page < first_known_folder);
         assert!(environment.contains("setlocal EnableExtensions DisableDelayedExpansion"));
-        assert!(environment.contains(&format!("set \"PATH={system_dir}\"")));
+        assert_value("ComSpec", &cmd_path);
+        assert_value("PATH", &system_dir);
+        assert_value("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         for (variable, folder) in [
             ("RUSTDESK_PUBLIC_DESKTOP", FOLDERID_PublicDesktop),
             ("RUSTDESK_COMMON_PROGRAMS", FOLDERID_CommonPrograms),
@@ -4893,6 +4913,11 @@ mod tests {
         ] {
             let path = path_for_batch(&get_known_folder_path(&folder).unwrap()).unwrap();
             assert!(environment.contains(&format!("set \"{variable}={path}\"")));
+        }
+        assert_value("SystemRoot", &windows_dir);
+        assert_value("WINDIR", &windows_dir);
+        for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
+            assert_value(variable, "0");
         }
         assert!(environment.contains("set \"NoDefaultCurrentDirectoryInExePath=1\""));
     }
