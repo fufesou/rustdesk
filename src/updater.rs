@@ -367,9 +367,10 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 /// Queries all active connections (remote, file-transfer, port-forward, camera, terminal)
 /// from the user --server process via IPC.
 /// The root service cannot read connection state directly since connections
-/// live in the user --server process. Falls back to true (no connections) on IPC error.
+/// live in the user --server process. Falls back to false (assumes sessions active)
+/// on IPC error to avoid updating during an unknown session state.
 #[cfg(target_os = "macos")]
-fn has_no_active_conns_ipc() -> bool {
+pub fn has_no_active_conns_ipc() -> bool {
     let rt = match hbb_common::tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return true,
