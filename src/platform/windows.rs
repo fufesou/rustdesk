@@ -1814,7 +1814,10 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
         }
     }
     let (subkey, path, _, _) = get_install_info();
-    let (remove_install_dir, finish_uninstall) = if kill_self {
+    // `install_me` passes false: its source installer can remove the old target inline and continue.
+    // Standalone `--uninstall` passes true and runs from that target, so the terminal command must
+    // kill this process before removing the install directory.
+    let (remove_install_dir_inline, terminal_self_kill_and_remove_install_dir) = if kill_self {
         (
             String::new(),
             finish_batch_after_killing_process_cmd(get_current_pid(), Some(&path)),
@@ -1832,11 +1835,11 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     {uninstall_cert_cmd}
     reg delete {subkey} /f
     {uninstall_amyuni_idd}
-    {remove_install_dir}
+    {remove_install_dir_inline}
     if exist \"%RUSTDESK_COMMON_PROGRAMS%\\{app_name}\" rd /s /q \"%RUSTDESK_COMMON_PROGRAMS%\\{app_name}\"
     if exist \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\" del /f /q \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\"
     if exist \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\" del /f /q \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\"
-    {finish_uninstall}",
+    {terminal_self_kill_and_remove_install_dir}",
         before_uninstall=get_before_uninstall(),
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
         app_name = crate::get_app_name(),
