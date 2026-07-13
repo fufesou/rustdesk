@@ -2018,18 +2018,6 @@ struct LockedTempScript {
 }
 
 impl LockedTempScript {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn undone_path(&self) -> &Path {
-        &self.undone_path
-    }
-
-    fn expected_hash(&self) -> &BatchHash {
-        &self.expected_hash
-    }
-
     fn release_write_lock(&mut self) -> ResultType<()> {
         let handle = self
             .handle
@@ -2110,14 +2098,14 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(script.undone_path())?;
+        .open(&script.undone_path)?;
     let file = script
         .handle
         .as_mut()
         .ok_or_else(|| anyhow!("Temporary script handle is unavailable"))?;
     file.write_all(bytes.as_bytes())?;
     file.sync_all()?;
-    log::debug!("{}: created temporary script {:?}", tip, script.path());
+    log::debug!("{}: created temporary script {:?}", tip, script.path);
     Ok(script)
 }
 
@@ -2202,33 +2190,8 @@ fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> Res
 fn verified_batch_parameters(script: &LockedTempScript) -> ResultType<String> {
     Ok(format!(
         "/D /E:ON /V:OFF /S /C {}",
-        verified_batch_bootstrap(script.path(), script.expected_hash())?
+        verified_batch_bootstrap(&script.path, &script.expected_hash)?
     ))
-}
-
-struct WinHandleGuard(WinHANDLE);
-
-impl WinHandleGuard {
-    fn new(handle: WinHANDLE) -> ResultType<Self> {
-        if handle.is_invalid() {
-            bail!("Windows did not return a valid handle");
-        }
-        Ok(Self(handle))
-    }
-
-    fn get(&self) -> WinHANDLE {
-        self.0
-    }
-}
-
-impl Drop for WinHandleGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            if let Err(err) = unsafe { WinCloseHandle(self.0) } {
-                log::warn!("Failed to close Windows handle: {}", err);
-            }
-        }
-    }
 }
 
 struct ShellComGuard;
@@ -2282,8 +2245,12 @@ fn run_elevated_and_wait(executable: &Path, parameters: &str, show: bool) -> Res
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut info)? };
-    let process = WinHandleGuard::new(info.hProcess)?;
-    let wait_result = unsafe { WinWaitForSingleObject(process.get(), WIN_INFINITE) };
+    if info.hProcess.is_invalid() {
+        bail!("Windows did not return a valid process handle");
+    }
+    // SEE_MASK_NOCLOSEPROCESS transfers ownership of hProcess to the caller.
+    let process = unsafe { windows::core::Owned::new(info.hProcess) };
+    let wait_result = unsafe { WinWaitForSingleObject(*process, WIN_INFINITE) };
     if wait_result == WIN_WAIT_FAILED {
         return Err(windows::core::Error::from_win32().into());
     }
@@ -2291,7 +2258,7 @@ fn run_elevated_and_wait(executable: &Path, parameters: &str, show: bool) -> Res
         bail!("Unexpected process wait result: {}", wait_result.0);
     }
     let mut exit_code = 0;
-    unsafe { WinGetExitCodeProcess(process.get(), &mut exit_code)? };
+    unsafe { WinGetExitCodeProcess(*process, &mut exit_code)? };
     Ok(exit_code)
 }
 
@@ -2313,7 +2280,7 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     if exit_code != 0 {
         bail!("{} failed with exit code {}", tip, exit_code);
     }
-    if script.undone_path().exists() {
+    if script.undone_path.exists() {
         bail!("{} did not complete", tip);
     }
     Ok(())
@@ -4960,10 +4927,39 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 mod tests {
     use super::*;
 
+    // Test-only reusable Win32 HANDLE RAII helper.
+    // If a future non-test path needs the same pattern, move it out of this test module.
+    //
+    // This struct is similar to `hbb_common::platform::windows::RAIIHandle`,
+    // but `RAIIHandle` depends on `WinApi` crate, while this `HandleGuard` only depends on `windows` crate.
+    struct HandleGuard(WinHANDLE);
+
+    impl HandleGuard {
+        #[inline]
+        fn new(handle: WinHANDLE) -> Self {
+            Self(handle)
+        }
+
+        #[inline]
+        fn get(&self) -> WinHANDLE {
+            self.0
+        }
+    }
+
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.0.is_invalid() {
+                    let _ = WinCloseHandle(self.0);
+                }
+            }
+        }
+    }
+
     fn run_batch(script: &LockedTempScript) -> std::process::ExitStatus {
         std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
             .args(["/D", "/E:ON", "/V:OFF", "/C"])
-            .arg(script.path())
+            .arg(&script.path)
             .status()
             .unwrap()
     }
@@ -4993,16 +4989,14 @@ mod tests {
 
         let expected = unsafe {
             // Keep this test consistent: use only the `windows` crate APIs/types.
-            let process = WinHandleGuard::new(
+            let process = HandleGuard::new(
                 WinOpenProcess(WIN_PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
                     .expect("WinOpenProcess should succeed for current process"),
-            )
-            .expect("WinOpenProcess should return a valid handle");
+            );
             let mut token = WinHANDLE::default();
             WinOpenProcessToken(process.get(), WIN_TOKEN_QUERY, &mut token)
                 .expect("WinOpenProcessToken should succeed for current process");
-            let token = WinHandleGuard::new(token)
-                .expect("WinOpenProcessToken should return a valid handle");
+            let token = HandleGuard::new(token);
 
             let mut token_user_size = 0u32;
             let _ = WinGetTokenInformation(token.get(), TokenUser, None, 0, &mut token_user_size);
@@ -5042,10 +5036,10 @@ mod tests {
             canonical_batch_directory(&temp_dir).unwrap()
         );
         let script = write_cmds("ver > nul".to_owned(), "locked_batch").unwrap();
-        let path = script.path().to_path_buf();
-        let undone_path = script.undone_path().to_path_buf();
+        let path = script.path.to_path_buf();
+        let undone_path = script.undone_path.to_path_buf();
         let other = write_cmds("ver > nul".to_owned(), "other_batch").unwrap();
-        let other_path = other.path().to_path_buf();
+        let other_path = other.path.to_path_buf();
 
         assert_ne!(path, other_path);
         assert!(is_batch_path_safe(path.parent().unwrap()));
@@ -5085,8 +5079,8 @@ mod tests {
             "lock_owner_exit",
         )
         .unwrap();
-        let ready_path = script.path().with_extension("bat.ready");
-        let script_path = script.path().to_path_buf();
+        let ready_path = script.path.with_extension("bat.ready");
+        let script_path = script.path.to_path_buf();
         let mut child = spawn_verified_batch(&mut script);
         for _ in 0..READY_POLL_ATTEMPTS {
             if ready_path.exists() {
@@ -5095,7 +5089,7 @@ mod tests {
             std::thread::sleep(READY_POLL_INTERVAL);
         }
         let reached_blocking_command = ready_path.exists();
-        let write_result = fs::OpenOptions::new().write(true).open(script.path());
+        let write_result = fs::OpenOptions::new().write(true).open(&script.path);
         let status = child.wait().unwrap();
         remove_temp_file(&ready_path);
         assert!(
@@ -5114,12 +5108,12 @@ mod tests {
     fn changed_batch_is_rejected_before_execution() {
         let mut script =
             write_cmds("echo executed > \"%~f0.executed\"".to_owned(), "tampered").unwrap();
-        let executed_path = script.path().with_extension("bat.executed");
+        let executed_path = script.path.with_extension("bat.executed");
         let parameters = verified_batch_parameters(&script).unwrap();
         script.release_write_lock().unwrap();
         let mut file = fs::OpenOptions::new()
             .append(true)
-            .open(script.path())
+            .open(&script.path)
             .unwrap();
         file.write_all(b"rem changed\r\n").unwrap();
         file.sync_all().unwrap();
@@ -5134,7 +5128,7 @@ mod tests {
             .unwrap();
 
         let executed = executed_path.exists();
-        let script_exists = script.path().exists();
+        let script_exists = script.path.exists();
         remove_temp_file(&executed_path);
         assert!(!status.success());
         assert!(!executed);
@@ -5143,10 +5137,9 @@ mod tests {
 
     #[test]
     fn verified_batch_bootstrap_fits_windows_7_shell_execute_limit() {
-        const WIN7_MAX_PATH_CHARS: usize = 260;
         let path = PathBuf::from(format!(
             "C:\\{}",
-            "a".repeat(WIN7_MAX_PATH_CHARS - "C:\\".len())
+            "a".repeat(WIN_MAX_PATH as usize - "C:\\".len())
         ));
         let hash: BatchHash = Sha256::digest(b"batch").into();
         let bootstrap = verified_batch_bootstrap(&path, &hash).unwrap();
@@ -5194,7 +5187,7 @@ mod tests {
             "legacy_command_failure",
         )
         .unwrap();
-        let undone = script.undone_path().to_path_buf();
+        let undone = script.undone_path.to_path_buf();
 
         assert!(undone.exists());
         let status = run_batch(&script);
@@ -5202,7 +5195,7 @@ mod tests {
         assert!(!undone.exists());
 
         let incomplete = write_cmds("exit /b 0".to_owned(), "incomplete").unwrap();
-        let incomplete_marker = incomplete.undone_path().to_path_buf();
+        let incomplete_marker = incomplete.undone_path.to_path_buf();
         assert!(run_batch(&incomplete).success());
         assert!(incomplete_marker.exists());
         drop(incomplete);
