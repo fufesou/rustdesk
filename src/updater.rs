@@ -381,15 +381,15 @@ fn has_no_active_conns_ipc() -> bool {
             Err(_) => return true,
         };
         if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
-            if conn.send(&crate::ipc::Data::ControlledSessionCount(0)).await.is_ok() {
-                if let Ok(Some(crate::ipc::Data::ControlledSessionCount(n))) =
+            if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
+                if let Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(result)))) =
                     conn.next_timeout(1000).await
                 {
-                    return n == 0;
+                    return result;
                 }
             }
         }
-        true
+        false // assume sessions may be active if IPC fails — safer than true
     })
 }
 
