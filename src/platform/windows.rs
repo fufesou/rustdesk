@@ -149,6 +149,14 @@ const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
 const ELEVATED_BATCH_PATH_ENV: &str = "RUSTDESK_P";
 const ELEVATED_BATCH_HASH_ENV: &str = "RUSTDESK_H";
 const ELEVATED_CMD_PATH_ENV: &str = "RUSTDESK_C";
+// Keep internal elevated-batch failures outside the range normally returned by installer commands.
+const ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE: u32 = 0x5253_0001;
+const ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE: u32 = 0x5253_0002;
+const ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE: u32 = 0x5253_0003;
+const ELEVATED_BATCH_START_FAILURE_EXIT_CODE: u32 = 0x5253_0004;
+const ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
+const ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0006;
+const ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
 // ShellExecuteExW has an INTERNET_MAX_URL_LENGTH-sized parameter limit on Windows 7.
 const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2_048;
 type BatchHash = [u8; 32];
@@ -1929,7 +1937,7 @@ fn trusted_batch_environment() -> ResultType<String> {
     Ok(format!(
         r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
-"{}" {UTF8_CODE_PAGE} > nul || exit /b 1
+"{}" {UTF8_CODE_PAGE} > nul || exit /b {ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE}
 set "ComSpec={}"
 set "PATH={}"
 set "PATHEXT=.COM;.EXE;.BAT;.CMD"
@@ -2058,12 +2066,13 @@ fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<Stri
             // Reaching the epilogue means cmd.exe parsed all ordinary commands.
             "if exist \"{completion_marker}\" del /f /q \"{completion_marker}\"\r\n",
             // A remaining marker means completion cannot be confirmed.
-            "if exist \"{completion_marker}\" exit /b 1\r\n",
+            "if exist \"{completion_marker}\" exit /b {completion_failure}\r\n",
             // Preserve legacy behavior: individual command failures do not fail the whole batch.
             "exit /b 0\r\n",
         ),
         normalized_commands = normalized_commands,
         completion_marker = completion_marker,
+        completion_failure = ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE,
     ))
 }
 
@@ -2117,19 +2126,28 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
 fn verified_batch_powershell() -> String {
     format!(
         concat!(
-            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;",
+            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;$e=0;try{{",
             "try{{$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,",
-            "[IO.FileAccess]::Read,[IO.FileShare]::Read);",
-            "$a=[Security.Cryptography.SHA256]::Create();",
+            "[IO.FileAccess]::Read,[IO.FileShare]::Read)}}catch{{$e={open_failure}}};",
+            "if($e -eq 0){{try{{$a=[Security.Cryptography.SHA256]::Create();",
             "try{{$h=[Convert]::ToBase64String($a.ComputeHash($s))}}",
-            "finally{{$a.Dispose()}};",
-            "if($h-cne$env:{hash_env}){{throw 'Batch hash mismatch'}};",
-            "& $env:{cmd_env} /D /E:ON /V:OFF /C $p;$e=$LASTEXITCODE",
-            "}}finally{{if($s){{$s.Dispose()}};[IO.File]::Delete($p)}};exit $e"
+            "finally{{$a.Dispose()}}}}catch{{$e={hash_failure}}}}};",
+            "if($e -eq 0 -and $h -cne $env:{hash_env}){{$e={hash_mismatch}}};",
+            "if($e -eq 0){{try{{& $env:{cmd_env} /D /E:ON /V:OFF /C $p;",
+            "$e=$LASTEXITCODE}}catch{{$e={start_failure}}}}}",
+            "}}finally{{try{{if($s){{$s.Dispose()}}}}",
+            "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
+            "try{{[IO.File]::Delete($p)}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}}",
+            "}};exit $e"
         ),
         path_env = ELEVATED_BATCH_PATH_ENV,
         hash_env = ELEVATED_BATCH_HASH_ENV,
         cmd_env = ELEVATED_CMD_PATH_ENV,
+        open_failure = ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE,
+        hash_failure = ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE,
+        hash_mismatch = ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE,
+        start_failure = ELEVATED_BATCH_START_FAILURE_EXIT_CODE,
+        cleanup_failure = ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE,
     )
 }
 
@@ -2245,11 +2263,13 @@ fn run_elevated_and_wait(executable: &Path, parameters: &str, show: bool) -> Res
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut info)? };
-    if info.hProcess.is_invalid() {
+    // Copy the packed field before calling methods that would borrow it on some Windows targets.
+    let process_handle = info.hProcess;
+    if process_handle.is_invalid() {
         bail!("Windows did not return a valid process handle");
     }
     // SEE_MASK_NOCLOSEPROCESS transfers ownership of hProcess to the caller.
-    let process = unsafe { windows::core::Owned::new(info.hProcess) };
+    let process = unsafe { windows::core::Owned::new(process_handle) };
     let wait_result = unsafe { WinWaitForSingleObject(*process, WIN_INFINITE) };
     if wait_result == WIN_WAIT_FAILED {
         return Err(windows::core::Error::from_win32().into());
@@ -2269,6 +2289,26 @@ fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> Res
     Ok(())
 }
 
+fn elevated_batch_failure_reason(exit_code: u32, completion_marker_exists: bool) -> &'static str {
+    match exit_code {
+        ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE => "failed to open temporary script for verification",
+        ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE => "failed to hash temporary script",
+        ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE => "temporary script hash mismatch",
+        ELEVATED_BATCH_START_FAILURE_EXIT_CODE => "failed to start the verified batch",
+        ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE => {
+            "failed to remove temporary script after execution"
+        }
+        ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE => "failed to switch elevated batch to UTF-8",
+        ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE => {
+            "failed to remove the batch completion marker"
+        }
+        _ if completion_marker_exists => {
+            "batch or verifier failed before removing the completion marker"
+        }
+        _ => "elevated command failed after removing the completion marker",
+    }
+}
+
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let mut script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
@@ -2277,10 +2317,16 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     // handle. The already computed hash makes this handoff gap fail closed if the file changes.
     script.release_write_lock()?;
     let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show)?;
+    let completion_marker_exists = script.undone_path.exists();
     if exit_code != 0 {
-        bail!("{} failed with exit code {}", tip, exit_code);
+        bail!(
+            "{} failed with exit code {}: {}",
+            tip,
+            exit_code,
+            elevated_batch_failure_reason(exit_code, completion_marker_exists)
+        );
     }
-    if script.undone_path.exists() {
+    if completion_marker_exists {
         bail!("{} did not complete", tip);
     }
     Ok(())
@@ -5130,7 +5176,10 @@ mod tests {
         let executed = executed_path.exists();
         let script_exists = script.path.exists();
         remove_temp_file(&executed_path);
-        assert!(!status.success());
+        assert_eq!(
+            status.code(),
+            Some(ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE as i32)
+        );
         assert!(!executed);
         assert!(!script_exists);
     }
