@@ -1847,6 +1847,8 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
     run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
+// Resolve security-sensitive executables through Windows instead of inherited PATH or SystemRoot
+// values, which may have been configured by the medium-integrity user before UAC elevation.
 fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
     let mut buffer = vec![0u16; MAX_PATH];
     let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as _) } as usize;
@@ -1862,6 +1864,8 @@ fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
     Ok(path)
 }
 
+// Resolve shell locations through Windows instead of inherited PUBLIC or PROGRAMDATA values. Known
+// folders may also be redirected, so reconstructing these paths would be incorrect.
 fn get_known_folder_path(folder_id: &windows::core::GUID) -> ResultType<PathBuf> {
     #[link(name = "ole32")]
     extern "system" {
@@ -1874,6 +1878,8 @@ fn get_known_folder_path(folder_id: &windows::core::GUID) -> ResultType<PathBuf>
     Ok(PathBuf::from(path?))
 }
 
+// This prepares an already quoted path for batch interpolation. CR or LF would add another command,
+// and percent signs expand even inside double quotes. This is not a general cmd argument escaper.
 fn path_for_batch(path: &Path) -> ResultType<String> {
     let value = path
         .to_str()
@@ -1884,6 +1890,10 @@ fn path_for_batch(path: &Path) -> ResultType<String> {
     Ok(value.replace('%', "%%"))
 }
 
+// Build a deterministic prologue for every elevated batch instead of trusting its inherited
+// environment. Pin executable lookup and shell folders to Windows API results, prevent current-
+// directory and managed-profiler injection, and disable delayed expansion. This does not make
+// arbitrary command text safe; every interpolated value still needs context-specific escaping.
 fn trusted_batch_environment() -> ResultType<String> {
     let chcp_path = get_system_executable(CHCP_RELATIVE_PATH)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
@@ -1923,6 +1933,8 @@ set "NoDefaultCurrentDirectoryInExePath=1""#,
     ))
 }
 
+// cmd.exe parses the batch path before opening the file, so quoting the file contents cannot protect
+// metacharacters in that path. Reject non-Unicode paths and every character unsafe in this context.
 fn is_batch_path_safe(path: &Path) -> bool {
     path.to_str().is_some_and(|path| {
         !UNSAFE_BATCH_PATH_CHARS
@@ -1931,6 +1943,9 @@ fn is_batch_path_safe(path: &Path) -> bool {
     })
 }
 
+// Resolve aliases and reparse points before validating the directory. Windows canonicalization may
+// add a verbatim path prefix that cmd.exe does not handle consistently, so convert it back while
+// preserving UNC semantics.
 fn canonical_batch_directory(path: &Path) -> ResultType<PathBuf> {
     let path = fs::canonicalize(path)?;
     let Some(value) = path.to_str() else {
@@ -1947,6 +1962,8 @@ fn canonical_batch_directory(path: &Path) -> ResultType<PathBuf> {
     Ok(path)
 }
 
+// The UUID prevents predictable-name collisions, but it is not the authorization boundary. Security
+// still depends on exclusive creation and retaining the deny-write handle in `write_cmds`.
 fn unique_temp_batch_path() -> ResultType<PathBuf> {
     let temp_dir = std::env::temp_dir();
     let mut directory = canonical_batch_directory(&temp_dir)?;
@@ -1967,6 +1984,11 @@ fn remove_temp_file(path: &Path) {
     }
 }
 
+// Owns the locks that protect an elevated temporary batch across the UAC handoff. The script handle
+// permits later readers but denies write and delete sharing, while the directory handle denies rename
+// and deletion of the validated directory. Keep this guard alive while cmd.exe can still read
+// unparsed script content; the self-termination path releases it only from the parsed terminal line.
+// Drop releases the handles before removing the script and its completion marker.
 struct LockedTempScript {
     path: PathBuf,
     undone_path: PathBuf,
@@ -2001,6 +2023,9 @@ fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
     )))
 }
 
+// Normalize line endings for cmd.exe and append a completion epilogue. The pre-created marker lets
+// the caller detect ordinary early termination; it is not a security boundary and does not mean
+// every individual legacy command succeeded.
 fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<String> {
     let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
     let undone_path = path_for_batch(undone_path)?;
@@ -2009,6 +2034,9 @@ fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<Stri
     ))
 }
 
+// Create both artifacts exclusively, flush the complete script, and return the open lock owner. The
+// caller must retain the guard until cmd.exe has no unparsed script content; normally `run_cmds` holds
+// it until exit, while `finish_batch_after_killing_process_cmd` implements the terminal exception.
 fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     let path = unique_temp_batch_path()?;
     let directory = path
@@ -2056,6 +2084,8 @@ fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> Res
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    // /D disables registry AutoRun commands, /E:ON enables the extensions used by the script, and
+    // /V:OFF prevents inherited delayed expansion before the batch prologue takes control.
     let status = runas::Command::new(&cmd_path)
         .args(&["/D", "/E:ON", "/V:OFF", "/C"])
         .arg(script.path())
@@ -2484,6 +2514,8 @@ fn shortcut_powershell(options: ShortcutOptions<'_>) -> ResultType<String> {
 
 fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> ResultType<String> {
     let command = shortcut_powershell(options)?;
+    // This PowerShell command is embedded inside cmd.exe's outer double quotes. Reject inner quotes
+    // instead of trying to compose two interpreters' incompatible escaping rules.
     if command.contains('"') {
         bail!("Shortcut value contains a double quote");
     }
