@@ -933,6 +933,12 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
 
+    // Final session check after extraction — minimize race window
+    if !crate::updater::has_no_active_conns_ipc() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!("[root-update] Active session detected after extraction, deferring update.");
+    }
+
     // Get user ID for launchctl commands
     let uid = get_active_userid();
 
