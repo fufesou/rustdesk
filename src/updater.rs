@@ -475,7 +475,6 @@ pub fn check_update_as_root() -> ResultType<()> {
     let private_tmp = format!("/tmp/.rustdeskdownload-{}", std::process::id());
     // Create exclusively with restricted permissions — reject if pre-existing
     std::fs::create_dir(&private_tmp)?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o700))?;
