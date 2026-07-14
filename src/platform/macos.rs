@@ -927,7 +927,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let user = get_active_username();
 
     log::info!("[root-update] Starting silent root update from {}", dmg_path);
-
+    // Check sessions before extracting to avoid unnecessary work
+    if !crate::updater::has_no_active_conns_ipc() {
+        bail!("[root-update] Active session detected, deferring update.");
+    }
     // Extract DMG to temp dir
     extract_dmg(dmg_path, &tmp_dir)?;
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
