@@ -83,10 +83,7 @@ use windows::Win32::{
         GetTokenInformation as WinGetTokenInformation, IsWellKnownSid, TokenUser,
         WinLocalSystemSid, TOKEN_QUERY as WIN_TOKEN_QUERY, TOKEN_USER,
     },
-    Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS as WIN_FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_SHARE_READ as WIN_FILE_SHARE_READ, FILE_SHARE_WRITE as WIN_FILE_SHARE_WRITE,
-    },
+    Storage::FileSystem::FILE_SHARE_READ as WIN_FILE_SHARE_READ,
     System::Com::{
         CoInitializeEx as WinCoInitializeEx, CoTaskMemFree as WinCoTaskMemFree,
         CoUninitialize as WinCoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
@@ -149,6 +146,9 @@ const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
 const ELEVATED_BATCH_PATH_ENV: &str = "RUSTDESK_P";
 const ELEVATED_BATCH_HASH_ENV: &str = "RUSTDESK_H";
 const ELEVATED_CMD_PATH_ENV: &str = "RUSTDESK_C";
+const ELEVATED_BATCH_MARKER_ENV: &str = "RUSTDESK_M";
+const ELEVATED_BATCH_RUNNER_DIRECTORY_ENV: &str = "RUSTDESK_R";
+const ELEVATED_BATCH_LENGTH_ENV: &str = "RUSTDESK_L";
 // Keep internal elevated-batch failures outside the range normally returned by installer commands.
 const ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE: u32 = 0x5253_0001;
 const ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE: u32 = 0x5253_0002;
@@ -157,9 +157,13 @@ const ELEVATED_BATCH_START_FAILURE_EXIT_CODE: u32 = 0x5253_0004;
 const ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
 const ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0006;
 const ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
+const ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
+const ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE: u32 = 0x5253_0009;
 // ShellExecuteExW has an INTERNET_MAX_URL_LENGTH-sized parameter limit on Windows 7.
 const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2_048;
-type BatchHash = [u8; 32];
+const VERIFIED_BATCH_COPY_BUFFER_SIZE: usize = 8_192;
+const SHA256_HASH_LENGTH: usize = 32;
+type BatchHash = [u8; SHA256_HASH_LENGTH];
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -1776,7 +1780,7 @@ pub fn run_before_uninstall() -> ResultType<()> {
         get_before_uninstall(),
         finish_batch_after_killing_process_cmd(get_current_pid(), None)
     );
-    run_cmds(commands, true, "before_install")
+    run_cmds(commands, true, "before_uninstall")
 }
 
 // This helper deliberately has no `kill_self` flag. Always exclude the current PID from the broad
@@ -1807,11 +1811,13 @@ fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) 
             format!("if exist \"{path}\" rd /s /q \"{path}\" & if exist \"{path}\" exit /b 1 & ")
         })
         .unwrap_or_default();
-    // Keep this as one terminal batch line so marker deletion, exact-PID termination, optional final
-    // directory cleanup, and the resulting exit status have an explicit order. The elevated verifier
-    // owns the script lock independently, so terminating the Rust caller cannot unlock the batch.
+    let marker = format!("%{ELEVATED_BATCH_MARKER_ENV}%");
+    // The verified batch runs from a protected copy, so `%~f0` names that copy rather than the
+    // original completion marker. The verifier supplies its path through this environment-variable
+    // reference. Keep this as one terminal line so marker deletion, exact-PID termination, optional
+    // directory cleanup, and the resulting exit status have an explicit order.
     format!(
-        "del /f /q \"%~f0.undone\" > nul 2>&1 & if exist \"%~f0.undone\" exit /b 1 & taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b 0"
+        "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b 0"
     )
 }
 
@@ -1991,7 +1997,7 @@ fn canonical_batch_directory(path: &Path) -> ResultType<PathBuf> {
 }
 
 // The UUID prevents predictable-name collisions, but it is not the authorization boundary. Security
-// still depends on exclusive creation and retaining the deny-write handle in `write_cmds`.
+// depends on exclusive creation, hashing, and the elevated verifier's protected execution copy.
 fn unique_temp_batch_path() -> ResultType<PathBuf> {
     let temp_dir = std::env::temp_dir();
     let mut directory = canonical_batch_directory(&temp_dir)?;
@@ -2013,16 +2019,15 @@ fn remove_temp_file(path: &Path) {
 }
 
 // Owns the medium-integrity side of the temporary batch handoff. The initial write handle prevents
-// changes while the complete content and its hash are prepared; the directory handle prevents the
-// validated directory from being renamed before elevation starts. The elevated verifier separately
-// opens the script with deny-write/delete sharing before checking that hash and executing it. Drop
-// releases any remaining handles before removing the script and its completion marker.
+// changes while the complete content and hash are prepared. After release, any replacement either
+// fails the hash check or supplies the same bytes; the elevated verifier executes only its own locked
+// copy, so protection no longer depends on this process remaining alive.
 struct LockedTempScript {
     path: PathBuf,
     undone_path: PathBuf,
     expected_hash: BatchHash,
+    expected_length: u64,
     handle: Option<fs::File>,
-    _directory_handle: fs::File,
 }
 
 impl LockedTempScript {
@@ -2077,21 +2082,14 @@ fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<Stri
 }
 
 // Create both artifacts exclusively, hash and flush the complete script, and return its initial lock
-// owner. `run_cmds` releases this write handle only after constructing the elevated verifier command;
-// any change during that unavoidable handoff gap is rejected by the verifier's hash check.
+// owner. `run_cmds` releases this handle only after constructing the elevated verifier command; the
+// verifier rejects changed bytes and runs a separate protected copy of verified bytes.
 fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     let path = unique_temp_batch_path()?;
-    let directory = path
-        .parent()
-        .ok_or_else(|| anyhow!("Temporary script path has no parent"))?;
-    let directory_handle = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(WIN_FILE_SHARE_READ.0 | WIN_FILE_SHARE_WRITE.0)
-        .custom_flags(WIN_FILE_FLAG_BACKUP_SEMANTICS.0)
-        .open(directory)?;
     let undone_path = get_undone_file(&path)?;
     let bytes = prepare_batch_commands(&commands, &undone_path)?;
     let expected_hash = Sha256::digest(bytes.as_bytes()).into();
+    let expected_length = bytes.len() as u64;
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2101,8 +2099,8 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
         path,
         undone_path,
         expected_hash,
+        expected_length,
         handle: Some(file),
-        _directory_handle: directory_handle,
     };
     fs::OpenOptions::new()
         .write(true)
@@ -2118,35 +2116,57 @@ fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
     Ok(script)
 }
 
-// Keep the read stream open from integrity verification until cmd.exe exits. FileShare.Read lets
-// cmd.exe read the same file but denies every medium-integrity writer and rename/delete attempt. The
-// elevated process also removes the batch, so cleanup survives terminal uninstall commands that kill
-// the original Rust caller. Keep this to Windows PowerShell 2 syntax and these basic .NET types for
-// Windows 7. PowerShell 2 does not expose HashAlgorithm.Dispose and truncates `exit` values to one
-// byte, so use Clear and Environment.Exit to release the hash and preserve full verifier codes.
+// Copy the input once to an exclusively created runner in the trusted local Windows Temp directory,
+// hash that runner through the same locked handle, and retain the handle with FileShare.Read until
+// cmd.exe exits. The bytes checked are thus exactly the bytes executed, even when the input Temp is
+// remote. Windows 7 PowerShell 2 commonly uses CLR 2, where Stream.CopyTo is unavailable, so use a
+// Read/Write loop and only basic .NET types supported there.
 fn verified_batch_powershell() -> String {
     format!(
         concat!(
-            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;$e=0;try{{",
+            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;$r=$null;$q=$null;$e=0;try{{",
             "try{{$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,",
             "[IO.FileAccess]::Read,[IO.FileShare]::Read)}}catch{{$e={open_failure}}};",
+            "if($e -eq 0){{try{{$l=[Int64]$env:{length_env};",
+            "$d=[IO.Directory]::CreateDirectory($env:{runner_env});",
+            "$t=[IO.Path]::Combine($env:{runner_env},",
+            "[Guid]::NewGuid().ToString('N')+'.bat');",
+            "$r=New-Object IO.FileStream($t,[IO.FileMode]::CreateNew,",
+            "[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read);$q=$t;",
+            "$b=New-Object byte[] {copy_buffer_size};$z=[Int64]0;",
+            "while($e -eq 0 -and ($n=$s.Read($b,0,$b.Length))-gt 0){{$z+=$n;",
+            "if($z -gt $l){{$e={size_mismatch}}}else{{$r.Write($b,0,$n)}}}};",
+            "if($e -eq 0 -and $z -ne $l){{$e={size_mismatch}}};",
+            "if($e -eq 0){{$r.Flush()}}}}catch{{$e={copy_failure}}}}};",
             "if($e -eq 0){{try{{$a=[Security.Cryptography.SHA256]::Create();",
-            "try{{$h=[Convert]::ToBase64String($a.ComputeHash($s))}}",
+            "try{{$r.Position=0;$h=[Convert]::ToBase64String($a.ComputeHash($r))}}",
+            // PowerShell 2 / CLR 2 does not expose SHA256Managed.Dispose; Clear releases its resources.
             "finally{{$a.Clear()}}}}catch{{$e={hash_failure}}}}};",
             "if($e -eq 0 -and $h -cne $env:{hash_env}){{$e={hash_mismatch}}};",
-            "if($e -eq 0){{try{{& $env:{cmd_env} /D /E:ON /V:OFF /C $p;",
+            "if($e -eq 0){{try{{$env:{marker_env}=$p+'.undone';",
+            "& $env:{cmd_env} /D /E:ON /V:OFF /C $q;",
             "$e=$LASTEXITCODE}}catch{{$e={start_failure}}}}}",
-            "}}finally{{try{{if($s){{$s.Dispose()}}}}",
+            "}}finally{{try{{if($r){{$r.Dispose()}}}}",
             "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
+            "try{{if($q){{[IO.File]::Delete($q)}}}}",
+            "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
+            "try{{if($s){{$s.Dispose()}}}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
             "try{{[IO.File]::Delete($p)}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}}",
+            // PowerShell 2 truncates `exit` values; Environment.Exit preserves the full 32-bit code.
             "}};[Environment]::Exit([int]$e)"
         ),
         path_env = ELEVATED_BATCH_PATH_ENV,
         hash_env = ELEVATED_BATCH_HASH_ENV,
+        marker_env = ELEVATED_BATCH_MARKER_ENV,
+        runner_env = ELEVATED_BATCH_RUNNER_DIRECTORY_ENV,
+        length_env = ELEVATED_BATCH_LENGTH_ENV,
         cmd_env = ELEVATED_CMD_PATH_ENV,
+        copy_buffer_size = VERIFIED_BATCH_COPY_BUFFER_SIZE,
         open_failure = ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE,
         hash_failure = ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE,
         hash_mismatch = ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE,
+        copy_failure = ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE,
+        size_mismatch = ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE,
         start_failure = ELEVATED_BATCH_START_FAILURE_EXIT_CODE,
         cleanup_failure = ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE,
     )
@@ -2172,7 +2192,11 @@ fn path_for_cmd_command(path: &Path) -> ResultType<&str> {
 // cmd.exe is the elevated native bootstrap so managed-profiler variables can be disabled before
 // Windows PowerShell starts. The fixed PowerShell 2 payload rejects cmd-expanding characters before
 // it is quoted as one -Command value, and all executable paths come from the system directory API.
-fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> ResultType<String> {
+fn verified_batch_bootstrap(
+    batch_path: &Path,
+    expected_hash: &BatchHash,
+    expected_length: u64,
+) -> ResultType<String> {
     if !is_batch_path_safe(batch_path) {
         bail!(
             "Temporary batch path is unsafe for cmd.exe: {:?}",
@@ -2183,6 +2207,14 @@ fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> Res
     let command = verified_batch_powershell();
     let command = powershell_command_for_cmd(&command)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    // Do not place the executed copy in inherited Temp: it may name an attacker-controlled remote
+    // filesystem whose sharing behavior cannot be trusted. The Windows directory comes from the
+    // system API, and an elevated administrator can create its Temp directory if it is absent.
+    let runner_directory = cmd_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("Windows system directory has no Windows directory parent"))?
+        .join("Temp");
     let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
     let mut bootstrap = MANAGED_PROFILING_ENABLE_VARIABLES
         .iter()
@@ -2194,9 +2226,14 @@ fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> Res
             path_for_cmd_command(batch_path)?
         ),
         format!("set \"{ELEVATED_BATCH_HASH_ENV}={expected_hash}\""),
+        format!("set \"{ELEVATED_BATCH_LENGTH_ENV}={expected_length}\""),
         format!(
             "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
             path_for_cmd_command(&cmd_path)?
+        ),
+        format!(
+            "set \"{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV}={}\"",
+            path_for_cmd_command(&runner_directory)?
         ),
         format!(
             "\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"{command}\"",
@@ -2209,7 +2246,7 @@ fn verified_batch_bootstrap(batch_path: &Path, expected_hash: &BatchHash) -> Res
 fn verified_batch_parameters(script: &LockedTempScript) -> ResultType<String> {
     Ok(format!(
         "/D /E:ON /V:OFF /S /C {}",
-        verified_batch_bootstrap(&script.path, &script.expected_hash)?
+        verified_batch_bootstrap(&script.path, &script.expected_hash, script.expected_length,)?
     ))
 }
 
@@ -2296,6 +2333,9 @@ fn elevated_batch_failure_reason(exit_code: u32, completion_marker_exists: bool)
         ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE => "failed to hash temporary script",
         ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE => "temporary script hash mismatch",
         ELEVATED_BATCH_START_FAILURE_EXIT_CODE => "failed to start the verified batch",
+        ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE if completion_marker_exists => {
+            "batch or verifier failed before removing the completion marker"
+        }
         ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE => {
             "failed to remove temporary script after execution"
         }
@@ -2303,6 +2343,8 @@ fn elevated_batch_failure_reason(exit_code: u32, completion_marker_exists: bool)
         ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE => {
             "failed to remove the batch completion marker"
         }
+        ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE => "failed to create protected batch copy",
+        ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE => "temporary script length mismatch",
         _ if completion_marker_exists => {
             "batch or verifier failed before removing the completion marker"
         }
@@ -2314,8 +2356,9 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let mut script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
     let parameters = verified_batch_parameters(&script)?;
-    // Release before UAC because the verifier's deny-write share mode cannot overlap this write
-    // handle. The already computed hash makes this handoff gap fail closed if the file changes.
+    // Release before UAC because it cannot overlap the verifier's deny-write handle. A handoff change
+    // fails the hash check, and execution protection moves to the verifier's locked copy so it does
+    // not depend on this process surviving the UAC flow.
     script.release_write_lock()?;
     let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show)?;
     let completion_marker_exists = script.undone_path.exists();
@@ -5007,6 +5050,9 @@ mod tests {
         std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
             .args(["/D", "/E:ON", "/V:OFF", "/C"])
             .arg(&script.path)
+            .creation_flags(WIN_CREATE_NO_WINDOW.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .unwrap()
     }
@@ -5113,22 +5159,23 @@ mod tests {
     }
 
     #[test]
-    fn batch_stays_read_only_after_original_lock_owner_exits() {
+    fn elevated_verifier_owns_locks_after_caller_release() {
         const READY_POLL_ATTEMPTS: usize = 500;
         const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
         let ping_path = path_for_batch(&get_system_executable("PING.EXE").unwrap()).unwrap();
         let mut script = write_cmds(
             format!(
-                "{}\necho ready > \"%~f0.ready\"\n\"{ping_path}\" -n 4 127.0.0.1 > nul",
-                trusted_batch_environment().unwrap()
+                "{}\necho ready > \"%{ELEVATED_BATCH_MARKER_ENV}%.ready\"\n\"{ping_path}\" -n 4 127.0.0.1 > nul",
+                trusted_batch_environment().unwrap(),
             ),
-            "lock_owner_exit",
+            "elevated_lock_owner",
         )
         .unwrap();
-        let ready_path = script.path.with_extension("bat.ready");
+        let ready_path = PathBuf::from(format!("{}.ready", script.undone_path.to_string_lossy()));
         let script_path = script.path.to_path_buf();
         let mut child = spawn_verified_batch(&mut script);
+        assert!(script.handle.is_none());
         for _ in 0..READY_POLL_ATTEMPTS {
             if ready_path.exists() {
                 break;
@@ -5137,6 +5184,7 @@ mod tests {
         }
         let reached_blocking_command = ready_path.exists();
         let write_result = fs::OpenOptions::new().write(true).open(&script.path);
+        let remove_result = fs::remove_file(&script.path);
         let status = child.wait().unwrap();
         remove_temp_file(&ready_path);
         assert!(
@@ -5146,23 +5194,33 @@ mod tests {
         assert!(status.success());
         assert!(
             write_result.is_err(),
-            "batch became writable after its original lock owner exited"
+            "input batch became writable after the caller released its handle"
+        );
+        assert!(
+            remove_result.is_err(),
+            "input batch became replaceable while the elevated verifier used it"
         );
         assert!(!script_path.exists());
     }
 
     #[test]
     fn changed_batch_is_rejected_before_execution() {
-        let mut script =
-            write_cmds("echo executed > \"%~f0.executed\"".to_owned(), "tampered").unwrap();
-        let executed_path = script.path.with_extension("bat.executed");
+        let mut script = write_cmds(
+            format!("echo safe > \"%{ELEVATED_BATCH_MARKER_ENV}%.executed\""),
+            "tampered",
+        )
+        .unwrap();
+        let executed_path =
+            PathBuf::from(format!("{}.executed", script.undone_path.to_string_lossy()));
         let parameters = verified_batch_parameters(&script).unwrap();
         script.release_write_lock().unwrap();
         let mut file = fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .open(&script.path)
             .unwrap();
-        file.write_all(b"rem changed\r\n").unwrap();
+        file.seek(io::SeekFrom::Start("echo ".len() as u64))
+            .unwrap();
+        file.write_all(b"evil").unwrap();
         file.sync_all().unwrap();
         drop(file);
 
@@ -5186,11 +5244,85 @@ mod tests {
     }
 
     #[test]
+    fn oversized_batch_is_rejected_before_copying_all_bytes() {
+        let mut script = write_cmds(
+            format!("echo executed > \"%{ELEVATED_BATCH_MARKER_ENV}%.executed\""),
+            "oversized",
+        )
+        .unwrap();
+        let executed_path =
+            PathBuf::from(format!("{}.executed", script.undone_path.to_string_lossy()));
+        let parameters = verified_batch_parameters(&script).unwrap();
+        script.release_write_lock().unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&script.path)
+            .unwrap();
+        file.write_all(b"rem extra\r\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .raw_arg(parameters)
+            .creation_flags(WIN_CREATE_NO_WINDOW.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        let executed = executed_path.exists();
+        remove_temp_file(&executed_path);
+        assert_eq!(
+            status.code(),
+            Some(ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE as i32)
+        );
+        assert!(!executed);
+        assert!(!script.path.exists());
+    }
+
+    // Newer PowerShell versions hide both Win7 failures, so pin the compatible generated APIs.
+    #[test]
     fn verified_batch_powershell_uses_windows_7_compatible_apis() {
         let command = verified_batch_powershell();
 
         assert!(command.contains("finally{$a.Clear()}"));
         assert!(!command.contains("$a.Dispose()"));
+        assert!(command
+            .contains("[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read"));
+        let copy_position = command
+            .find("while($e -eq 0 -and ($n=$s.Read($b,0,$b.Length))-gt 0)")
+            .unwrap();
+        let hash_position = command.find("$a.ComputeHash($r)").unwrap();
+        assert!(copy_position < hash_position);
+        assert!(!command.contains("$a.ComputeHash($s)"));
+        assert!(!command.contains(".CopyTo("));
+        assert!(command.contains(&format!("$env:{ELEVATED_BATCH_MARKER_ENV}=$p+'.undone'")));
+        let runner_path_position = command
+            .find(&format!(
+                "$t=[IO.Path]::Combine($env:{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV},"
+            ))
+            .unwrap();
+        let runner_open_position = command
+            .find("$r=New-Object IO.FileStream($t,[IO.FileMode]::CreateNew")
+            .unwrap();
+        let runner_owned_position = command.find(";$q=$t;").unwrap();
+        assert!(runner_path_position < runner_open_position);
+        assert!(runner_open_position < runner_owned_position);
+        assert!(!command.contains("$q=[IO.Path]::Combine("));
+        assert!(!command.contains("[IO.Path]::GetDirectoryName($p)"));
+        assert!(command.contains(&format!("$l=[Int64]$env:{ELEVATED_BATCH_LENGTH_ENV}")));
+        assert!(command.contains(&format!(
+            "if($z -gt $l){{$e={ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE}}}"
+        )));
+        assert!(command.contains(&format!(
+            "if($e -eq 0 -and $z -ne $l){{$e={ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE}}}"
+        )));
+        assert!(command.contains(&format!(
+            "& $env:{ELEVATED_CMD_PATH_ENV} /D /E:ON /V:OFF /C $q"
+        )));
+        assert!(!command.contains(&format!(
+            "& $env:{ELEVATED_CMD_PATH_ENV} /D /E:ON /V:OFF /C $p"
+        )));
         assert!(command.ends_with("[Environment]::Exit([int]$e)"));
     }
 
@@ -5200,11 +5332,19 @@ mod tests {
             "C:\\{}",
             "a".repeat(WIN_MAX_PATH as usize - "C:\\".len())
         ));
-        let hash: BatchHash = Sha256::digest(b"batch").into();
-        let bootstrap = verified_batch_bootstrap(&path, &hash).unwrap();
+        let batch = b"batch";
+        let hash: BatchHash = Sha256::digest(batch).into();
+        let expected_length = batch.len() as u64;
+        let bootstrap = verified_batch_bootstrap(&path, &hash, expected_length).unwrap();
         let encoded_hash = BASE64_STANDARD.encode(hash);
         let parameters = format!("/D /E:ON /V:OFF /S /C {bootstrap}");
         let parameter_chars = parameters.encode_utf16().count();
+        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
+        let runner_directory = cmd_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("Temp");
         let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
         let powershell_launch = format!(
             "\"{}\" -NoLogo",
@@ -5231,8 +5371,15 @@ mod tests {
         ));
         assert_before_powershell(format!("set \"{ELEVATED_BATCH_HASH_ENV}={encoded_hash}\""));
         assert_before_powershell(format!(
+            "set \"{ELEVATED_BATCH_LENGTH_ENV}={expected_length}\""
+        ));
+        assert_before_powershell(format!(
             "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
-            path_for_cmd_command(&get_system_executable(CMD_RELATIVE_PATH).unwrap()).unwrap()
+            path_for_cmd_command(&cmd_path).unwrap()
+        ));
+        assert_before_powershell(format!(
+            "set \"{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV}={}\"",
+            path_for_cmd_command(&runner_directory).unwrap()
         ));
         assert!(powershell_command_for_cmd("Write-Output \"unsafe\"").is_err());
         assert!(path_for_cmd_command(Path::new("C:\\bad\"path")).is_err());
@@ -5257,6 +5404,10 @@ mod tests {
         let incomplete_marker = incomplete.undone_path.to_path_buf();
         assert!(run_batch(&incomplete).success());
         assert!(incomplete_marker.exists());
+        assert_eq!(
+            elevated_batch_failure_reason(ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE, true),
+            "batch or verifier failed before removing the completion marker"
+        );
         drop(incomplete);
         assert!(!incomplete_marker.exists());
     }
@@ -5268,13 +5419,18 @@ mod tests {
         assert!(before_uninstall.contains(&current_pid_filter));
 
         let command = finish_batch_after_killing_process_cmd(42, Some("C:\\RustDesk"));
+        let marker = format!("%{ELEVATED_BATCH_MARKER_ENV}%");
         assert_eq!(
             command,
-            "del /f /q \"%~f0.undone\" > nul 2>&1 & if exist \"%~f0.undone\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & if exist \"C:\\RustDesk\" rd /s /q \"C:\\RustDesk\" & if exist \"C:\\RustDesk\" exit /b 1 & exit /b 0"
+            format!(
+                "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & if exist \"C:\\RustDesk\" rd /s /q \"C:\\RustDesk\" & if exist \"C:\\RustDesk\" exit /b 1 & exit /b 0"
+            )
         );
         assert_eq!(
             finish_batch_after_killing_process_cmd(42, None),
-            "del /f /q \"%~f0.undone\" > nul 2>&1 & if exist \"%~f0.undone\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & exit /b 0"
+            format!(
+                "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & exit /b 0"
+            )
         );
     }
 
