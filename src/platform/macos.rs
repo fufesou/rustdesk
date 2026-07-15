@@ -956,9 +956,15 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
 sleep 3
 # Check if the GUI was open before we kill it
 gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
-# Recheck sessions immediately before bootout — abort if new session started
-if [ -S "/tmp/.com.apple.launchd.$(stat -f %u /dev/console 2>/dev/null)/Listeners" ] 2>/dev/null; then
-    true  # socket exists, continue
+# Recheck for active connections immediately before bootout — abort if new session started
+server_pid=$(pgrep -f "{app_name} --server" | head -1)
+if [ -n "$server_pid" ]; then
+    conn_count=$(lsof -p "$server_pid" -i TCP 2>/dev/null | grep -c ESTABLISHED || echo 0)
+    if [ "$conn_count" -gt "0" ]; then
+        echo "[root-update] Active connection detected before bootout, aborting" >> {tmp_dir}/rustdesk_root_update.log
+        touch /tmp/.rustdeskupdate_failed
+        exit 1
+    fi
 fi
 launchctl bootout system/{daemon_label} 2>/dev/null || launchctl unload -w {daemon_plist} 2>/dev/null || true
 if [ -n "{uid}" ]; then
