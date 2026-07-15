@@ -925,7 +925,7 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
         .args(&["-d", "/tmp/.rustdeskupdate-root-XXXXXX"])
         .output()?;
     let tmp_dir = String::from_utf8(tmp_dir_output.stdout)
-        .map_err(|e| anyhow::anyhow!("[root-update] mktemp output error: {}", e))?
+        .map_err(|e| anyhow!("[root-update] mktemp output error: {}", e))?
         .trim()
         .to_string();
     if tmp_dir.is_empty() {
