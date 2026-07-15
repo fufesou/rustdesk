@@ -416,7 +416,15 @@ pub fn start_auto_update_macos() {
             } else {
                 match check_update_as_root() {
                     Ok(_) => {
-                        interval = DUR_ONE_DAY;
+                        // Wait briefly for detached script to report early failure
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                        if std::path::Path::new("/tmp/.rustdeskupdate_failed").exists() {
+                            let _ = std::fs::remove_file("/tmp/.rustdeskupdate_failed");
+                            log::warn!("[root-update] Script reported failure, using retry interval.");
+                            interval = RETRY_INTERVAL;
+                        } else {
+                            interval = DUR_ONE_DAY;
+                        }
                     }
                     Err(e) => {
                         log::error!("[root-update] Update check failed: {}", e);
