@@ -28,6 +28,7 @@ class StateGlobal {
   final updateUrl = ''.obs;
 
   String _inputSource = '';
+  final inputSourceRevision = 0.obs;
 
   // Track relative mouse mode state for each peer connection.
   // Key: peerId, Value: true if relative mouse mode is active.
@@ -130,6 +131,7 @@ class StateGlobal {
   setInputSource(SessionID sessionId, String v) async {
     await bind.mainSetInputSource(sessionId: sessionId, value: v);
     _inputSource = bind.mainGetInputSource();
+    inputSourceRevision.value++;
   }
 
   StateGlobal._() {
