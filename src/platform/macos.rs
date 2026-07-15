@@ -921,7 +921,20 @@ pub fn update_to(_file: &str) -> ResultType<()> {
 pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let app_name = crate::get_app_name();
     let app_bundle = format!("/Applications/{}.app", app_name);
-    let tmp_dir = format!("/tmp/.rustdeskupdate-root-{}", std::process::id());
+    let tmp_dir_output = std::process::Command::new("mktemp")
+        .args(&["-d", "/tmp/.rustdeskupdate-root-XXXXXX"])
+        .output()?;
+    let tmp_dir = String::from_utf8(tmp_dir_output.stdout)
+        .map_err(|e| anyhow::anyhow!("[root-update] mktemp output error: {}", e))?
+        .trim()
+        .to_string();
+    if tmp_dir.is_empty() {
+        bail!("[root-update] Failed to create temp directory");
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
     let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
     let user = get_active_username();
@@ -1070,12 +1083,7 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     if target_path.exists() {
         std::fs::remove_dir_all(target_path)?;
     }
-    // Create exclusively with restricted permissions — prevents symlink substitution
-    std::fs::create_dir(target_path)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    std::fs::create_dir_all(target_path)?;
 
     let status = Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
