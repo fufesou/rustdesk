@@ -969,16 +969,6 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
 sleep 3
 # Check if the GUI was open before we kill it
 gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
-# Recheck for active connections immediately before bootout — abort if new session started
-server_pid=$(pgrep -f "{app_name} --server" | head -1)
-if [ -n "$server_pid" ]; then
-    conn_count=$(lsof -p "$server_pid" -i TCP 2>/dev/null | grep -c ESTABLISHED || echo 0)
-    if [ "$conn_count" -gt "0" ]; then
-        echo "[root-update] Active connection detected before bootout, aborting" >> {tmp_dir}/rustdesk_root_update.log
-        touch /tmp/.rustdeskupdate_failed
-        exit 1
-    fi
-fi
 launchctl bootout system/{daemon_label} 2>/dev/null || launchctl unload -w {daemon_plist} 2>/dev/null || true
 if [ -n "{uid}" ]; then
     launchctl bootout gui/{uid}/{agent_label} 2>/dev/null || launchctl unload -w {agent_plist} 2>/dev/null || true
@@ -999,12 +989,22 @@ if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
     fi
     exit 1
 fi
-mv {app_bundle} {app_bundle}.bak
-if ! mv {app_bundle}.new {app_bundle}; then
-    echo "[root-update] mv failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
-    mv {app_bundle}.bak {app_bundle} || true
+if ! mv {app_bundle} {app_bundle}.bak; then
+    echo "[root-update] backup mv failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
     touch /tmp/.rustdeskupdate_failed
-    launchctl load -w {daemon_plist} || true
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
+if ! mv {app_bundle}.new {app_bundle}; then
+    echo "[root-update] replacement mv failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: restore failed, app missing" >> {tmp_dir}/rustdesk_root_update.log
+    fi
+    touch /tmp/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
     if [ -n "{uid}" ]; then
         launchctl bootstrap gui/{uid} {agent_plist} || true
     fi
@@ -1013,6 +1013,9 @@ fi
 rm -rf {app_bundle}.bak
 chown -R {user}:staff {app_bundle}
 xattr -r -d com.apple.quarantine {app_bundle} || true
+# Restore root ownership on root-executed binaries — prevent privilege escalation
+chown root:wheel {app_bundle}/Contents/MacOS/service
+chmod 755 {app_bundle}/Contents/MacOS/service
 launchctl load -w {daemon_plist} || true
 if [ -n "{uid}" ]; then
     launchctl bootstrap gui/{uid} {agent_plist} || true
@@ -1080,10 +1083,10 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let mount_point = "/Volumes/RustDeskUpdate";
     let target_path = Path::new(target_dir);
 
-    if target_path.exists() {
-        std::fs::remove_dir_all(target_path)?;
+    // Directory already created safely by mktemp — do not remove or recreate
+    if !target_path.exists() {
+        bail!("[root-update] Temp directory does not exist: {:?}", target_path);
     }
-    std::fs::create_dir_all(target_path)?;
 
     let status = Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
