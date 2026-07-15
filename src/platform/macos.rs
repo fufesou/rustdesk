@@ -956,6 +956,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
 sleep 3
 # Check if the GUI was open before we kill it
 gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
+# Recheck sessions immediately before bootout — abort if new session started
+if [ -S "/tmp/.com.apple.launchd.$(stat -f %u /dev/console 2>/dev/null)/Listeners" ] 2>/dev/null; then
+    true  # socket exists, continue
+fi
 launchctl bootout system/{daemon_label} 2>/dev/null || launchctl unload -w {daemon_plist} 2>/dev/null || true
 if [ -n "{uid}" ]; then
     launchctl bootout gui/{uid}/{agent_label} 2>/dev/null || launchctl unload -w {agent_plist} 2>/dev/null || true
@@ -995,8 +999,8 @@ if [ -n "{uid}" ]; then
     launchctl bootstrap gui/{uid} {agent_plist} || true
 fi
 rm -f {dmg_path}
-if [ "$gui_was_running" -gt "0" ]; then
-    open -a {app_bundle}
+if [ "$gui_was_running" -gt "0" ] && [ -n "{uid}" ]; then
+    launchctl asuser {uid} sudo -u {user} open -a {app_bundle} || true
 fi
 echo "[root-update] Done!" >> {tmp_dir}/rustdesk_root_update.log
 rm -rf {tmp_dir}
@@ -1060,7 +1064,9 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     if target_path.exists() {
         std::fs::remove_dir_all(target_path)?;
     }
-    std::fs::create_dir_all(target_path)?;
+    // Create exclusively with restricted permissions — prevents symlink substitution
+    std::fs::create_dir(target_path)?;
+    std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o700))?;
 
     let status = Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
