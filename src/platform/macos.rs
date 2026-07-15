@@ -1072,7 +1072,10 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     }
     // Create exclusively with restricted permissions — prevents symlink substitution
     std::fs::create_dir(target_path)?;
-    std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o700))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     let status = Command::new("hdiutil")
         .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
