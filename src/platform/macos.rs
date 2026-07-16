@@ -976,6 +976,19 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
 
+    // Write new plist definitions from new binary before spawning script
+    let new_service = format!("{}/Contents/MacOS/service", src_app);
+    if std::path::Path::new(&new_service).exists() {
+        match std::process::Command::new(&new_service)
+            .arg("--write-plists")
+            .env_clear()
+            .output()
+        {
+            Ok(_) => log::info!("[root-update] New plist definitions written from new binary"),
+            Err(e) => log::warn!("[root-update] write-plists failed: {}", e),
+        }
+    }
+
     // Final session check after extraction — minimize race window
     if !crate::updater::has_no_active_conns_ipc() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1097,9 +1110,6 @@ if ! chown root:wheel {app_bundle} || \
     fi
     exit 1
 fi
-# Install new plist definitions from updated binary
-{app_bundle}/Contents/MacOS/service --write-plists 2>/dev/null || \
-    echo "[root-update] WARNING: failed to write new plist definitions" >> {tmp_dir}/rustdesk_root_update.log
 # Check daemon reload BEFORE removing backup — critical for unattended access
 if ! launchctl load -w {daemon_plist} 2>/dev/null && \
    ! launchctl bootstrap system {daemon_plist} 2>/dev/null; then
