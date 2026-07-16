@@ -982,10 +982,36 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
         match std::process::Command::new(&new_service)
             .arg("--write-plists")
             .env_clear()
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
         {
-            Ok(_) => log::info!("[root-update] New plist definitions written from new binary"),
-            Err(e) => log::warn!("[root-update] write-plists failed: {}", e),
+            Ok(mut child) => {
+                // Wait up to 10 seconds for write-plists to complete
+                let start = std::time::Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            log::info!("[root-update] New plist definitions written from new binary");
+                            break;
+                        }
+                        Ok(None) => {
+                            if start.elapsed().as_secs() > 10 {
+                                log::warn!("[root-update] write-plists timed out, killing");
+                                let _ = child.kill();
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Err(e) => {
+                            log::warn!("[root-update] write-plists wait error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("[root-update] write-plists spawn failed: {}", e),
         }
     }
 
