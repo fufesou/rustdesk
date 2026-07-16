@@ -411,15 +411,25 @@ pub fn has_no_active_conns_ipc() -> bool {
         for uid in uids {
             if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
                 if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
-                    if let Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(false)))) =
-                        conn.next_timeout(1000).await
-                    {
-                        return false; // This user has active connections
+                    match conn.next_timeout(1000).await {
+                        Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(true)))) => {
+                            // Explicit no active connections — safe to continue
+                        }
+                        Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(false)))) => {
+                            return false; // Explicit active connections
+                        }
+                        _ => {
+                            return false; // Timeout/error/unexpected — fail closed
+                        }
                     }
+                } else {
+                    return false; // Send failed — fail closed
                 }
+            } else {
+                return false; // Connection failed — fail closed
             }
         }
-        true // All users have no active connections
+        true // All users explicitly confirmed no active connections
     })
 }
 
