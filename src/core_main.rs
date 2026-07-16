@@ -332,7 +332,12 @@ pub fn core_main() -> Option<Vec<String>> {
         #[cfg(target_os = "macos")]
         {
             use crate::platform;
-            if args[0] == "--update" {
+            if args[0] == "--write-plists" {
+                if let Err(e) = platform::write_plists() {
+                    log::error!("Failed to write plists: {}", e);
+                }
+                return None;
+            } else if args[0] == "--update" {
                 if args.len() > 1 && args[1].ends_with(".dmg") {
                     // Version check is unnecessary unless downgrading to an older version
                     // that lacks "update dmg" support. This is a special case since we cannot
