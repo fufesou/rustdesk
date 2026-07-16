@@ -365,10 +365,11 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 }
 
 /// Queries all active connections (remote, file-transfer, port-forward, camera, terminal)
-/// from the user --server process via IPC.
+/// from every logged-in user's --server process via IPC.
 /// The root service cannot read connection state directly since connections
-/// live in the user --server process. Falls back to false (assumes sessions active)
-/// on IPC error to avoid updating during an unknown session state.
+/// live in user --server processes. Handles fast user switching by querying
+/// all users returned by `who`. Falls back to false (assumes sessions active)
+/// on any IPC error to avoid updating during an unknown session state.
 #[cfg(target_os = "macos")]
 pub fn has_no_active_conns_ipc() -> bool {
     let rt = match hbb_common::tokio::runtime::Runtime::new() {
@@ -376,21 +377,49 @@ pub fn has_no_active_conns_ipc() -> bool {
         Err(_) => return false,
     };
     rt.block_on(async {
-        let uid_str = crate::platform::get_active_userid();
-        let uid = match uid_str.trim().parse::<u32>() {
-            Ok(uid) => uid,
+        // Get ALL logged-in users via `who` — handles fast user switching
+        let output = match std::process::Command::new("who").output() {
+            Ok(o) => o,
             Err(_) => return false,
         };
-        if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
-            if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
-                if let Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(result)))) =
-                    conn.next_timeout(1000).await
-                {
-                    return result;
+        let who_output = String::from_utf8_lossy(&output.stdout);
+        let mut uids = std::collections::HashSet::new();
+        for line in who_output.lines() {
+            let username = match line.split_whitespace().next() {
+                Some(u) => u,
+                None => continue,
+            };
+            if let Ok(id_output) = std::process::Command::new("id")
+                .arg("-u")
+                .arg(username)
+                .output()
+            {
+                let uid_str = String::from_utf8_lossy(&id_output.stdout);
+                if let Ok(uid) = uid_str.trim().parse::<u32>() {
+                    uids.insert(uid);
                 }
             }
         }
-        false // assume sessions may be active if IPC fails — safer than true
+        // Fall back to console user if who returns nothing
+        if uids.is_empty() {
+            let uid_str = crate::platform::get_active_userid();
+            if let Ok(uid) = uid_str.trim().parse::<u32>() {
+                uids.insert(uid);
+            }
+        }
+        // Check each user's server — fail closed if any has active connections
+        for uid in uids {
+            if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
+                if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
+                    if let Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(false)))) =
+                        conn.next_timeout(1000).await
+                    {
+                        return false; // This user has active connections
+                    }
+                }
+            }
+        }
+        true // All users have no active connections
     })
 }
 
