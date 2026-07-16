@@ -976,43 +976,11 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
 
-    // Write new plist definitions from new binary before spawning script
-    let new_service = format!("{}/Contents/MacOS/service", src_app);
-    if std::path::Path::new(&new_service).exists() {
-        match std::process::Command::new(&new_service)
-            .arg("--write-plists")
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
-                // Wait up to 10 seconds for write-plists to complete
-                let start = std::time::Instant::now();
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => {
-                            log::info!("[root-update] New plist definitions written from new binary");
-                            break;
-                        }
-                        Ok(None) => {
-                            if start.elapsed().as_secs() > 10 {
-                                log::warn!("[root-update] write-plists timed out, killing");
-                                let _ = child.kill();
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Err(e) => {
-                            log::warn!("[root-update] write-plists wait error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => log::warn!("[root-update] write-plists spawn failed: {}", e),
-        }
+    // Write new plist definitions — same approach as manual updater
+    if let Err(e) = write_plists() {
+        log::warn!("[root-update] Failed to write plist definitions: {}", e);
+    } else {
+        log::info!("[root-update] Plist definitions written");
     }
 
     // Final session check after extraction — minimize race window
