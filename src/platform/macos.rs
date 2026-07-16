@@ -1049,8 +1049,12 @@ if ! chown -R {user}:staff {app_bundle}; then
     exit 1
 fi
 xattr -r -d com.apple.quarantine {app_bundle} || true
-# Keep root-executed files AND parent directory root-owned — prevent privilege escalation
-if ! chown root:wheel {app_bundle}/Contents/MacOS || \
+# Keep root-executed files AND entire ancestor chain root-owned — prevent privilege escalation
+if ! chown root:wheel {app_bundle} || \
+   ! chmod 755 {app_bundle} || \
+   ! chown root:wheel {app_bundle}/Contents || \
+   ! chmod 755 {app_bundle}/Contents || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS || \
    ! chmod 755 {app_bundle}/Contents/MacOS || \
    ! chown root:wheel {app_bundle}/Contents/MacOS/service || \
    ! chmod 755 {app_bundle}/Contents/MacOS/service || \
@@ -1066,17 +1070,22 @@ if ! chown root:wheel {app_bundle}/Contents/MacOS || \
     fi
     exit 1
 fi
-# Only remove backup after ALL hardening succeeds
-rm -rf {app_bundle}.bak
-# Check daemon reload — critical for unattended access
+# Check daemon reload BEFORE removing backup — critical for unattended access
 if ! launchctl load -w {daemon_plist} 2>/dev/null && \
    ! launchctl bootstrap system {daemon_plist} 2>/dev/null; then
-    echo "[root-update] CRITICAL: daemon reload failed" >> {tmp_dir}/rustdesk_root_update.log
+    echo "[root-update] CRITICAL: daemon reload failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} /tmp/.rustdesk_failed_install 2>/dev/null || true
+    mv {app_bundle}.bak {app_bundle} || true
     touch /tmp/.rustdeskupdate_failed
     exit 1
 fi
+# Only remove backup after daemon confirmed running
+rm -rf {app_bundle}.bak
 if [ -n "{uid}" ]; then
-    launchctl bootstrap gui/{uid} {agent_plist} || true
+    if ! launchctl bootstrap gui/{uid} {agent_plist} 2>/dev/null; then
+        echo "[root-update] WARNING: agent bootstrap failed" >> {tmp_dir}/rustdesk_root_update.log
+        touch /tmp/.rustdeskupdate_failed
+    fi
 fi
 rm -f {dmg_path}
 if [ "$gui_was_running" -gt "0" ] && [ -n "{uid}" ]; then
