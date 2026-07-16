@@ -981,10 +981,16 @@ sleep 1
 pkill -9 -x {app_name} || true
 pkill -9 -f "{app_name} --server" || true
 sleep 2
-if ! ditto {src_app} {app_bundle}.new 2>/dev/null; then
+staged_bundle="{tmp_dir}/staged.app"
+if [ -e "$staged_bundle" ] || [ -L "$staged_bundle" ]; then
+    echo "[root-update] staged bundle path already exists, aborting" >> {tmp_dir}/rustdesk_root_update.log
+    touch /tmp/.rustdeskupdate_failed
+    exit 1
+fi
+if ! ditto {src_app} "$staged_bundle" 2>/dev/null; then
     echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
     touch /tmp/.rustdeskupdate_failed
-    rm -rf {app_bundle}.new
+    rm -rf "$staged_bundle"
     launchctl load -w {daemon_plist} 2>/dev/null || \
         launchctl bootstrap system {daemon_plist} 2>/dev/null || \
         echo "[root-update] WARNING: failed to reload daemon after ditto failure" >> /tmp/.rustdeskupdate_failed
@@ -996,13 +1002,14 @@ fi
 if ! mv {app_bundle} {app_bundle}.bak; then
     echo "[root-update] backup mv failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
     touch /tmp/.rustdeskupdate_failed
+    rm -rf "$staged_bundle"
     launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
     if [ -n "{uid}" ]; then
         launchctl bootstrap gui/{uid} {agent_plist} || true
     fi
     exit 1
 fi
-if ! mv {app_bundle}.new {app_bundle}; then
+if ! mv "$staged_bundle" {app_bundle}; then
     echo "[root-update] replacement mv failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
     if ! mv {app_bundle}.bak {app_bundle}; then
         echo "[root-update] CRITICAL: restore failed, app missing" >> {tmp_dir}/rustdesk_root_update.log
@@ -1014,17 +1021,45 @@ if ! mv {app_bundle}.new {app_bundle}; then
     fi
     exit 1
 fi
-rm -rf {app_bundle}.bak
-chown -R {user}:staff {app_bundle}
+# Apply ownership — keep backup until hardening verified
+if ! chown -R {user}:staff {app_bundle}; then
+    echo "[root-update] chown failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} /tmp/.rustdesk_failed_install 2>/dev/null || true
+    mv {app_bundle}.bak {app_bundle} || true
+    touch /tmp/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
 xattr -r -d com.apple.quarantine {app_bundle} || true
 # Keep root-executed files AND parent directory root-owned — prevent privilege escalation
-chown root:wheel {app_bundle}/Contents/MacOS
-chmod 755 {app_bundle}/Contents/MacOS
-chown root:wheel {app_bundle}/Contents/MacOS/service
-chmod 755 {app_bundle}/Contents/MacOS/service
-chown root:wheel {app_bundle}/Contents/MacOS/{app_name}
-chmod 755 {app_bundle}/Contents/MacOS/{app_name}
-launchctl load -w {daemon_plist} || true
+if ! chown root:wheel {app_bundle}/Contents/MacOS || \
+   ! chmod 755 {app_bundle}/Contents/MacOS || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS/service || \
+   ! chmod 755 {app_bundle}/Contents/MacOS/service || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS/{app_name} || \
+   ! chmod 755 {app_bundle}/Contents/MacOS/{app_name}; then
+    echo "[root-update] hardening failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} /tmp/.rustdesk_failed_install 2>/dev/null || true
+    mv {app_bundle}.bak {app_bundle} || true
+    touch /tmp/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
+# Only remove backup after ALL hardening succeeds
+rm -rf {app_bundle}.bak
+# Check daemon reload — critical for unattended access
+if ! launchctl load -w {daemon_plist} 2>/dev/null && \
+   ! launchctl bootstrap system {daemon_plist} 2>/dev/null; then
+    echo "[root-update] CRITICAL: daemon reload failed" >> {tmp_dir}/rustdesk_root_update.log
+    touch /tmp/.rustdeskupdate_failed
+    exit 1
+fi
 if [ -n "{uid}" ]; then
     launchctl bootstrap gui/{uid} {agent_plist} || true
 fi
