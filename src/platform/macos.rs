@@ -976,6 +976,12 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
 
+    // Backup current plists before overwriting — needed for restore on reload failure
+    let daemon_plist_bak = format!("{}/daemon_plist.bak", tmp_dir);
+    let agent_plist_bak = format!("{}/agent_plist.bak", tmp_dir);
+    let _ = std::fs::copy(&daemon_plist, &daemon_plist_bak);
+    let _ = std::fs::copy(&agent_plist, &agent_plist_bak);
+
     // Write new plist definitions — same approach as manual updater
     if let Err(e) = write_plists() {
         log::warn!("[root-update] Failed to write plist definitions: {}", e);
@@ -1110,6 +1116,10 @@ if ! launchctl load -w {daemon_plist} 2>/dev/null && \
     echo "[root-update] CRITICAL: daemon reload failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
     mv {app_bundle} /tmp/.rustdesk_failed_install 2>/dev/null || true
     mv {app_bundle}.bak {app_bundle} || true
+    cp {daemon_plist_bak} {daemon_plist} 2>/dev/null || true
+    cp {agent_plist_bak} {agent_plist} 2>/dev/null || true
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || true
     touch /tmp/.rustdeskupdate_failed
     exit 1
 fi
@@ -1139,6 +1149,8 @@ rm -rf {tmp_dir}
         dmg_path = dmg_path,
         daemon_label = daemon_label,
         agent_label = agent_label,
+        daemon_plist_bak = daemon_plist_bak,
+        agent_plist_bak = agent_plist_bak,
     );
 
    {
