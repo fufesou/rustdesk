@@ -312,6 +312,33 @@ fn correct_app_name(s: &str) -> String {
     s
 }
 
+pub fn write_plists() -> ResultType<()> {
+    let daemon_plist_path = format!(
+        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
+        crate::get_app_name()
+    );
+    let agent_plist_path = format!(
+        "/Library/LaunchAgents/com.carriez.{}_server.plist",
+        crate::get_app_name()
+    );
+    let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
+        bail!("daemon.plist not found in embedded resources");
+    };
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+        bail!("Failed to read daemon.plist");
+    };
+    let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
+        bail!("agent.plist not found in embedded resources");
+    };
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+        bail!("Failed to read agent.plist");
+    };
+    std::fs::write(&daemon_plist_path, daemon_plist_body)?;
+    std::fs::write(&agent_plist_path, agent_plist_body)?;
+    log::info!("[write-plists] Wrote daemon and agent plists");
+    Ok(())
+}
+
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     // to-do: do together with win/linux about refactory start/stop service
     if !is_installed_daemon(false) {
@@ -1070,6 +1097,9 @@ if ! chown root:wheel {app_bundle} || \
     fi
     exit 1
 fi
+# Install new plist definitions from updated binary
+{app_bundle}/Contents/MacOS/service --write-plists 2>/dev/null || \
+    echo "[root-update] WARNING: failed to write new plist definitions" >> {tmp_dir}/rustdesk_root_update.log
 # Check daemon reload BEFORE removing backup — critical for unattended access
 if ! launchctl load -w {daemon_plist} 2>/dev/null && \
    ! launchctl bootstrap system {daemon_plist} 2>/dev/null; then
