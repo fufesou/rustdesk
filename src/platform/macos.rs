@@ -999,6 +999,21 @@ if ! ditto {src_app} "$staged_bundle" 2>/dev/null; then
     fi
     exit 1
 fi
+# Validate staged bundle before atomic swap
+if [ ! -d "$staged_bundle/Contents/MacOS" ] || \
+   [ ! -f "$staged_bundle/Contents/MacOS/{app_name}" ] || \
+   [ ! -f "$staged_bundle/Contents/MacOS/service" ] || \
+   [ ! -f "$staged_bundle/Contents/Info.plist" ]; then
+    echo "[root-update] staged bundle validation failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
+    touch /tmp/.rustdeskupdate_failed
+    rm -rf "$staged_bundle"
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    if [ -n "{uid}" ]; then
+        launchctl bootstrap gui/{uid} {agent_plist} || true
+    fi
+    exit 1
+fi
 if ! mv {app_bundle} {app_bundle}.bak; then
     echo "[root-update] backup mv failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
     touch /tmp/.rustdeskupdate_failed
