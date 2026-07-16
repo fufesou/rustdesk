@@ -9,7 +9,7 @@ use hbb_common::{
     allow_err,
     anyhow::anyhow,
     bail,
-    base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _},
+    base64::{engine::general_purpose::STANDARD, Engine as _},
     config::{self, Config},
     libc::{c_int, wchar_t},
     log,
@@ -27,14 +27,13 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, fs::OpenOptionsExt, process::CommandExt},
+        windows::{ffi::OsStringExt, process::CommandExt},
     },
     path::*,
     ptr::null_mut,
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
-use uuid::Uuid;
 use wallpaper;
 #[cfg(not(debug_assertions))]
 use winapi::um::libloaderapi::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_USER_DIRS};
@@ -74,39 +73,29 @@ use winapi::{
         winuser::*,
     },
 };
+use windows::core::PCWSTR;
 use windows::Win32::{
-    Foundation::{
-        CloseHandle as WinCloseHandle, HANDLE as WinHANDLE, MAX_PATH as WIN_MAX_PATH,
-        RPC_E_CHANGED_MODE, WAIT_FAILED as WIN_WAIT_FAILED, WAIT_OBJECT_0 as WIN_WAIT_OBJECT_0,
-    },
+    Foundation::{CloseHandle as WinCloseHandle, HANDLE as WinHANDLE},
     Security::{
         GetTokenInformation as WinGetTokenInformation, IsWellKnownSid, TokenUser,
         WinLocalSystemSid, TOKEN_QUERY as WIN_TOKEN_QUERY, TOKEN_USER,
-    },
-    Storage::FileSystem::FILE_SHARE_READ as WIN_FILE_SHARE_READ,
-    System::Com::{
-        CoInitializeEx as WinCoInitializeEx, CoTaskMemFree as WinCoTaskMemFree,
-        CoUninitialize as WinCoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     },
     System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     },
-    System::SystemInformation::GetSystemDirectoryW as WinGetSystemDirectoryW,
     System::Threading::{
-        GetExitCodeProcess as WinGetExitCodeProcess, OpenProcess as WinOpenProcess,
-        OpenProcessToken as WinOpenProcessToken,
+        OpenProcess as WinOpenProcess, OpenProcessToken as WinOpenProcessToken,
         QueryFullProcessImageNameW as WinQueryFullProcessImageNameW,
-        WaitForSingleObject as WinWaitForSingleObject, CREATE_NO_WINDOW as WIN_CREATE_NO_WINDOW,
-        INFINITE as WIN_INFINITE,
         PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
     },
-    UI::Shell::{
-        FOLDERID_CommonPrograms, FOLDERID_CommonStartup, FOLDERID_PublicDesktop,
-        SHGetKnownFolderPath, ShellExecuteExW, KF_FLAG_DEFAULT, SEE_MASK_NOASYNC,
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    },
-    UI::WindowsAndMessaging::{SW_HIDE as WIN_SW_HIDE, SW_SHOWNORMAL as WIN_SW_SHOWNORMAL},
+    UI::Shell::{FOLDERID_ProgramData, FOLDERID_Public, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+};
+
+use windows::Win32::{
+    Foundation,
+    System::{Com, SystemInformation, Threading},
+    UI::{Shell, WindowsAndMessaging},
 };
 use windows_service::{
     define_windows_service,
@@ -133,37 +122,14 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
-const CHCP_RELATIVE_PATH: &str = "chcp.com";
+const CERTUTIL_RELATIVE_PATH: &str = "certutil.exe";
 const CMD_RELATIVE_PATH: &str = "cmd.exe";
-const POWERSHELL_RELATIVE_PATH: &str = "WindowsPowerShell\\v1.0\\powershell.exe";
-const UNSAFE_BATCH_PATH_CHARS: &[&str] = &["&", "@", "^", "%", "!", "(", ")", "\r", "\n"];
+const FINDSTR_RELATIVE_PATH: &str = "findstr.exe";
 const UTF8_CODE_PAGE: u32 = 65001;
-const MANAGED_PROFILING_ENABLE_VARIABLES: [&str; 3] = [
-    "COR_ENABLE_PROFILING",
-    "CORECLR_ENABLE_PROFILING",
-    "DOTNET_ENABLE_PROFILING",
-];
-const ELEVATED_BATCH_PATH_ENV: &str = "RUSTDESK_P";
-const ELEVATED_BATCH_HASH_ENV: &str = "RUSTDESK_H";
-const ELEVATED_CMD_PATH_ENV: &str = "RUSTDESK_C";
-const ELEVATED_BATCH_MARKER_ENV: &str = "RUSTDESK_M";
-const ELEVATED_BATCH_RUNNER_DIRECTORY_ENV: &str = "RUSTDESK_R";
-const ELEVATED_BATCH_LENGTH_ENV: &str = "RUSTDESK_L";
-// Keep internal elevated-batch failures outside the range normally returned by installer commands.
-const ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE: u32 = 0x5253_0001;
-const ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE: u32 = 0x5253_0002;
-const ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE: u32 = 0x5253_0003;
-const ELEVATED_BATCH_START_FAILURE_EXIT_CODE: u32 = 0x5253_0004;
-const ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
-const ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0006;
-const ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
-const ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
-const ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE: u32 = 0x5253_0009;
-// ShellExecuteExW has an INTERNET_MAX_URL_LENGTH-sized parameter limit on Windows 7.
-const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2_048;
-const VERIFIED_BATCH_COPY_BUFFER_SIZE: usize = 8_192;
+const BATCH_SETUP_FAILURE_EXIT_CODE: u32 = 1;
+const INSTALL_HANDOFF_FAILURE_EXIT_CODE: u32 = 10;
 const SHA256_HASH_LENGTH: usize = 32;
-type BatchHash = [u8; SHA256_HASH_LENGTH];
+const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2048;
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -1604,10 +1570,55 @@ fn get_after_install(
     ", create_service=get_create_service(&exe))
 }
 
+fn embedded_vbs_commands(commands: String, name: &str) -> String {
+    let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut utf16: Vec<u16> = commands.encode_utf16().collect();
+    let encoded = STANDARD.encode(to_le(&mut utf16));
+    let encoded_path = format!("%~f0.{name}.b64");
+    let script_path = format!("%~f0.{name}.vbs");
+    format!(
+        "> \"{encoded_path}\" echo {encoded}\r\n\
+         certutil -f -decode \"{encoded_path}\" \"{script_path}\" > nul || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
+         cscript //B //NoLogo \"{script_path}\" \"%RUSTDESK_OUTPUT_DIR%\" || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}"
+    )
+}
+
+fn embedded_tray_vbs_commands(app_name: &str, exe: &str, shortcut_icon_location: &str) -> String {
+    embedded_vbs_commands(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+sLinkFile = WScript.Arguments(0) & \"\\{app_name} Tray.lnk\"
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    oLink.Arguments = \"--tray\"
+    {shortcut_icon_location}
+oLink.Save
+            ",
+        ),
+        "tray_shortcut",
+    )
+}
+
+fn validate_install_value(value: &str) -> ResultType<()> {
+    if value.contains(['\0', '"', '%', '^', '\r', '\n', '&', '|', '<', '>']) {
+        bail!("Installer path or name contains characters unsafe for cmd.exe");
+    }
+    Ok(())
+}
+
+fn validate_install_name(value: &str) -> ResultType<()> {
+    validate_install_value(value)?;
+    if value.contains(['(', ')']) {
+        bail!("Application name contains grouping operators unsafe for cmd.exe");
+    }
+    Ok(())
+}
+
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
     let uninstall_str = get_uninstall(false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
-    let (subkey, _path, _, exe) = get_default_install_info();
+    let (subkey, _path, start_menu, exe) = get_default_install_info();
     let mut exe = exe;
     if path.is_empty() {
         path = _path;
@@ -1630,49 +1641,73 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     let app_name = crate::get_app_name();
 
     let current_exe = std::env::current_exe()?;
-
-    let cur_exe = current_exe.to_str().unwrap_or("").to_owned();
-    let uninstall_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
-        link_file: &format!("{path}\\Uninstall {app_name}.lnk"),
-        special_folder: None,
-        target_path: &exe,
-        arguments: Some("--uninstall"),
-        icon_location: Some("msiexec.exe"),
-    })?;
-    let tray_shortcut_cmd = get_tray_shortcut(&path, &exe, &cur_exe)?;
+    let cur_exe = current_exe
+        .to_str()
+        .ok_or_else(|| anyhow!("Current executable path is not valid Unicode"))?
+        .to_owned();
+    for value in [&path, &exe, &cur_exe] {
+        validate_install_value(value)?;
+    }
+    validate_install_name(&app_name)?;
+    let config_path = Config::file();
+    validate_install_value(
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Configuration path is not valid Unicode"))?,
+    )?;
+    if let Some(icon) = get_custom_icon(&path, &cur_exe) {
+        validate_install_value(&icon)?;
+    }
+    let tmp_path = "%RUSTDESK_OUTPUT_DIR%".to_owned();
+    let shortcut_icon_location = get_shortcut_icon_location(&path, &cur_exe);
+    let mk_shortcut_commands = embedded_vbs_commands(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+sLinkFile = WScript.Arguments(0) & \"\\{app_name}.lnk\"
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    {shortcut_icon_location}
+oLink.Save
+            "
+        ),
+        "mk_shortcut",
+    );
+    let uninstall_shortcut_commands = embedded_vbs_commands(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+sLinkFile = WScript.Arguments(0) & \"\\Uninstall {app_name}.lnk\"
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    oLink.Arguments = \"--uninstall\"
+    oLink.IconLocation = \"msiexec.exe\"
+oLink.Save
+            "
+        ),
+        "uninstall_shortcut",
+    );
+    let tray_shortcut_commands =
+        embedded_tray_vbs_commands(&app_name, &exe, &shortcut_icon_location);
     let mut reg_value_desktop_shortcuts = "0".to_owned();
     let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut reg_value_printer = "0".to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
-        shortcuts = create_shortcut_cmd(ShortcutOptions {
-            link_file: &format!("{app_name}.lnk"),
-            special_folder: Some("AllUsersDesktop"),
-            target_path: &exe,
-            arguments: None,
-            icon_location: get_custom_icon(&path, &cur_exe).as_deref(),
-        })?;
+        shortcuts = format!(
+            "copy /Y \"{}\\{}.lnk\" \"%PUBLIC%\\Desktop\\\"",
+            tmp_path,
+            crate::get_app_name()
+        );
         reg_value_desktop_shortcuts = "1".to_owned();
     }
     if options.contains("startmenu") {
-        let start_menu_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
-            link_file: &format!("{app_name}\\{app_name}.lnk"),
-            special_folder: Some("AllUsersPrograms"),
-            target_path: &exe,
-            arguments: None,
-            icon_location: get_custom_icon(&path, &cur_exe).as_deref(),
-        })?;
-        let start_menu_uninstall_shortcut_cmd = create_shortcut_cmd(ShortcutOptions {
-            link_file: &format!("{app_name}\\Uninstall {app_name}.lnk"),
-            special_folder: Some("AllUsersPrograms"),
-            target_path: &exe,
-            arguments: Some("--uninstall"),
-            icon_location: Some("msiexec.exe"),
-        })?;
         shortcuts = format!(
             "{shortcuts}
-{start_menu_shortcut_cmd}
-{start_menu_uninstall_shortcut_cmd}"
+md \"{start_menu}\"
+copy /Y \"{tmp_path}\\{app_name}.lnk\" \"{start_menu}\\\"
+copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
+     "
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
@@ -1691,7 +1726,15 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     // https://docs.microsoft.com/zh-cn/windows/win32/msi/uninstall-registry-key?redirectedfrom=MSDNa
     // https://www.windowscentral.com/how-edit-registry-using-command-prompt-windows-10
     // https://www.tenforums.com/tutorials/70903-add-remove-allowed-apps-through-windows-firewall-windows-10-a.html
-    let src_exe = std::env::current_exe()?.to_str().unwrap_or("").to_string();
+    // Note: without if exist, the bat may exit in advance on some Windows7 https://github.com/rustdesk/rustdesk/issues/895
+    let dels = format!(
+        "
+if exist \"{tmp_path}\\{app_name}.lnk\" del /f /q \"{tmp_path}\\{app_name}.lnk\"
+if exist \"{tmp_path}\\Uninstall {app_name}.lnk\" del /f /q \"{tmp_path}\\Uninstall {app_name}.lnk\"
+if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} Tray.lnk\"
+        "
+    );
+    let src_exe = cur_exe.clone();
 
     // potential bug here: if run_cmd cancelled, but config file is changed.
     if let Some(lic) = get_license() {
@@ -1703,7 +1746,10 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     let tray_shortcuts = if config::is_outgoing_only() {
         "".to_owned()
     } else {
-        format!("\n{tray_shortcut_cmd}\n")
+        format!("
+{tray_shortcut_commands}
+copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+")
     };
 
     let install_remote_printer = if install_printer {
@@ -1739,9 +1785,12 @@ reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {version_build}
 reg add {subkey} /f /v UninstallString /t REG_SZ /d \"\\\"{exe}\\\" --uninstall\"
 reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
-{uninstall_shortcut_cmd}
+{mk_shortcut_commands}
+{uninstall_shortcut_commands}
 {tray_shortcuts}
 {shortcuts}
+copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
+{dels}
 {import_config}
 {after_install}
 {install_remote_printer}
@@ -1757,6 +1806,7 @@ reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
             Some(reg_value_printer)
         ),
         sleep = if debug { "timeout 300" } else { "" },
+        dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         import_config = get_import_config(&exe),
     );
@@ -1775,21 +1825,17 @@ pub fn run_after_install() -> ResultType<()> {
 }
 
 pub fn run_before_uninstall() -> ResultType<()> {
-    let commands = format!(
-        "{}\n{}",
-        get_before_uninstall(),
-        finish_batch_after_killing_process_cmd(get_current_pid(), None)
-    );
-    run_cmds(commands, true, "before_uninstall")
+    run_cmds(get_before_uninstall(true), true, "before_install")
 }
 
-// This helper deliberately has no `kill_self` flag. Always exclude the current PID from the broad
-// image-name termination step; callers that require self-termination append the exact-PID terminal
-// command only after every preceding uninstall command has run.
-fn get_before_uninstall() -> String {
+fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
-    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    let filter = if kill_self {
+        "".to_string()
+    } else {
+        format!(" /FI \"PID ne {}\"", get_current_pid())
+    };
     format!(
         "
     chcp 65001
@@ -1805,28 +1851,12 @@ fn get_before_uninstall() -> String {
     )
 }
 
-fn finish_batch_after_killing_process_cmd(pid: u32, install_path: Option<&str>) -> String {
-    let cleanup = install_path
-        .map(|path| {
-            format!("if exist \"{path}\" rd /s /q \"{path}\" & if exist \"{path}\" exit /b 1 & ")
-        })
-        .unwrap_or_default();
-    let marker = format!("%{ELEVATED_BATCH_MARKER_ENV}%");
-    // The verified batch runs from a protected copy, so `%~f0` names that copy rather than the
-    // original completion marker. The verifier supplies its path through this environment-variable
-    // reference. Keep this as one terminal line so marker deletion, exact-PID termination, optional
-    // directory cleanup, and the resulting exit status have an explicit order.
-    format!(
-        "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID {pid} > nul 2>&1 || exit /b 1 & {cleanup}exit /b 0"
-    )
-}
-
 /// Constructs the uninstall command string for the application.
 ///
 /// # Parameters
-/// - `kill_self`: If `true`, keeps the current process alive through the preceding uninstall work,
-///   then kills its exact PID in the terminal batch command and removes the install directory. If
-///   `false`, excludes the current process throughout and removes the install directory inline.
+/// - `kill_self`: The command will kill the process of current app name. If `true`, it will kill
+///   the current process as well. If `false`, it will exclude the current process from the kill
+///   command.
 /// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
 ///
 /// # Details
@@ -1849,21 +1879,7 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
             }
         }
     }
-    let (subkey, path, _, _) = get_install_info();
-    // `install_me` passes false: its source installer can remove the old target inline and continue.
-    // Standalone `--uninstall` passes true and runs from that target, so the terminal command must
-    // kill this process before removing the install directory.
-    let (remove_install_dir_inline, terminal_self_kill_and_remove_install_dir) = if kill_self {
-        (
-            String::new(),
-            finish_batch_after_killing_process_cmd(get_current_pid(), Some(&path)),
-        )
-    } else {
-        (
-            format!("if exist \"{path}\" rd /s /q \"{path}\""),
-            String::new(),
-        )
-    };
+    let (subkey, path, start_menu, _) = get_install_info();
     format!(
         "
     {before_uninstall}
@@ -1871,12 +1887,12 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     {uninstall_cert_cmd}
     reg delete {subkey} /f
     {uninstall_amyuni_idd}
-    {remove_install_dir_inline}
-    if exist \"%RUSTDESK_COMMON_PROGRAMS%\\{app_name}\" rd /s /q \"%RUSTDESK_COMMON_PROGRAMS%\\{app_name}\"
-    if exist \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\" del /f /q \"%RUSTDESK_PUBLIC_DESKTOP%\\{app_name}.lnk\"
-    if exist \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\" del /f /q \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\"
-    {terminal_self_kill_and_remove_install_dir}",
-        before_uninstall=get_before_uninstall(),
+    if exist \"{path}\" rd /s /q \"{path}\"
+    if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
+    if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
+    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
+    ",
+        before_uninstall=get_before_uninstall(kill_self),
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
         app_name = crate::get_app_name(),
     )
@@ -1886,11 +1902,9 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
     run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
-// Resolve security-sensitive executables through Windows instead of inherited PATH or SystemRoot
-// values, which may have been configured by the medium-integrity user before UAC elevation.
 fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
-    let mut buffer = vec![0u16; WIN_MAX_PATH as usize];
-    let len = unsafe { WinGetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    let mut buffer = vec![0u16; Foundation::MAX_PATH as usize];
+    let len = unsafe { SystemInformation::GetSystemDirectoryW(Some(&mut buffer)) } as usize;
     if len == 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -1903,350 +1917,171 @@ fn get_system_executable(relative_path: &str) -> ResultType<PathBuf> {
     Ok(path)
 }
 
-// Resolve shell locations through Windows instead of inherited PUBLIC or PROGRAMDATA values. Known
-// folders may also be redirected, so reconstructing these paths would be incorrect.
-fn get_known_folder_path(folder_id: &windows::core::GUID) -> ResultType<PathBuf> {
-    let raw = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None)? };
-    let path = unsafe { raw.to_string() };
-    unsafe { WinCoTaskMemFree(Some(raw.0.cast())) };
+fn get_known_folder(id: &windows::core::GUID) -> ResultType<PathBuf> {
+    let value = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }?;
+    let path = unsafe { value.to_string() };
+    unsafe { Com::CoTaskMemFree(Some(value.0.cast())) };
     Ok(PathBuf::from(path?))
 }
 
-// This prepares an already quoted path for batch interpolation. CR or LF would add another command,
-// and percent signs expand even inside double quotes. This is not a general cmd argument escaper.
-fn path_for_batch(path: &Path) -> ResultType<String> {
+fn path_for_cmd_environment(path: &Path) -> ResultType<&str> {
     let value = path
         .to_str()
         .ok_or_else(|| anyhow!("Path is not valid Unicode: {:?}", path))?;
-    if value.contains(['\r', '\n']) {
-        bail!("Path contains a line break: {:?}", path);
-    }
-    Ok(value.replace('%', "%%"))
-}
-
-// Build a deterministic prologue for every elevated batch instead of trusting its inherited
-// environment. Pin executable lookup and shell folders to Windows API results, prevent current-
-// directory and managed-profiler injection, and disable delayed expansion. This does not make
-// arbitrary command text safe; every interpolated value still needs context-specific escaping.
-fn trusted_batch_environment() -> ResultType<String> {
-    let chcp_path = get_system_executable(CHCP_RELATIVE_PATH)?;
-    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    let system_dir = cmd_path
-        .parent()
-        .ok_or_else(|| anyhow!("Windows system directory has no parent"))?;
-    let windows_dir = system_dir
-        .parent()
-        .ok_or_else(|| anyhow!("Windows directory has no parent"))?;
-    let public_desktop = get_known_folder_path(&FOLDERID_PublicDesktop)?;
-    let common_programs = get_known_folder_path(&FOLDERID_CommonPrograms)?;
-    let common_startup = get_known_folder_path(&FOLDERID_CommonStartup)?;
-    Ok(format!(
-        r#"@echo off
-setlocal EnableExtensions DisableDelayedExpansion
-"{}" {UTF8_CODE_PAGE} > nul || exit /b {ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE}
-set "ComSpec={}"
-set "PATH={}"
-set "PATHEXT=.COM;.EXE;.BAT;.CMD"
-set "RUSTDESK_PUBLIC_DESKTOP={}"
-set "RUSTDESK_COMMON_PROGRAMS={}"
-set "RUSTDESK_COMMON_STARTUP={}"
-set "SystemRoot={}"
-set "WINDIR={}"
-set "COR_ENABLE_PROFILING=0"
-set "CORECLR_ENABLE_PROFILING=0"
-set "DOTNET_ENABLE_PROFILING=0"
-set "NoDefaultCurrentDirectoryInExePath=1""#,
-        path_for_batch(&chcp_path)?,
-        path_for_batch(&cmd_path)?,
-        path_for_batch(system_dir)?,
-        path_for_batch(&public_desktop)?,
-        path_for_batch(&common_programs)?,
-        path_for_batch(&common_startup)?,
-        path_for_batch(windows_dir)?,
-        path_for_batch(windows_dir)?,
-    ))
-}
-
-// cmd.exe parses the batch path before opening the file, so quoting the file contents cannot protect
-// metacharacters in that path. Reject non-Unicode paths and every character unsafe in this context.
-fn is_batch_path_safe(path: &Path) -> bool {
-    path.to_str().is_some_and(|path| {
-        !UNSAFE_BATCH_PATH_CHARS
-            .iter()
-            .any(|value| path.contains(value))
-    })
-}
-
-// Resolve aliases and reparse points before validating the directory. Windows canonicalization may
-// add a verbatim path prefix that cmd.exe does not handle consistently, so convert it back while
-// preserving UNC semantics.
-fn canonical_batch_directory(path: &Path) -> ResultType<PathBuf> {
-    let path = fs::canonicalize(path)?;
-    let Some(value) = path.to_str() else {
-        return Ok(path);
-    };
-    if let Some(value) = value.strip_prefix(r"\\?\UNC\") {
-        return Ok(PathBuf::from(format!(r"\\{value}")));
-    }
-    if let Some(value) = value.strip_prefix(r"\\?\") {
-        if Path::new(value).has_root() {
-            return Ok(PathBuf::from(value));
-        }
-    }
-    Ok(path)
-}
-
-// The UUID prevents predictable-name collisions, but it is not the authorization boundary. Security
-// depends on exclusive creation, hashing, and the elevated verifier's protected execution copy.
-fn unique_temp_batch_path() -> ResultType<PathBuf> {
-    let temp_dir = std::env::temp_dir();
-    let mut directory = canonical_batch_directory(&temp_dir)?;
-    if !is_batch_path_safe(&directory) {
-        directory = canonical_batch_directory(&user_accessible_folder()?)?;
-    }
-    if !is_batch_path_safe(&directory) {
-        bail!("No command-safe temporary directory is available");
-    }
-    Ok(directory.join(format!("rustdesk_script_{}.bat", Uuid::new_v4().simple())))
-}
-
-fn remove_temp_file(path: &Path) {
-    if let Err(err) = fs::remove_file(path) {
-        if err.kind() != io::ErrorKind::NotFound {
-            log::warn!("Failed to remove temporary script {:?}: {}", path, err);
-        }
-    }
-}
-
-// Owns the medium-integrity side of the temporary batch handoff. The initial write handle prevents
-// changes while the complete content and hash are prepared. After release, any replacement either
-// fails the hash check or supplies the same bytes; the elevated verifier executes only its own locked
-// copy, so protection no longer depends on this process remaining alive.
-struct LockedTempScript {
-    path: PathBuf,
-    undone_path: PathBuf,
-    expected_hash: BatchHash,
-    expected_length: u64,
-    handle: Option<fs::File>,
-}
-
-impl LockedTempScript {
-    fn release_write_lock(&mut self) -> ResultType<()> {
-        let handle = self
-            .handle
-            .take()
-            .ok_or_else(|| anyhow!("Temporary script write lock is unavailable"))?;
-        drop(handle);
-        Ok(())
-    }
-}
-
-impl Drop for LockedTempScript {
-    fn drop(&mut self) {
-        drop(self.handle.take());
-        remove_temp_file(&self.path);
-        remove_temp_file(&self.undone_path);
-    }
-}
-
-fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
-    Ok(tmp.with_file_name(format!(
-        "{}.undone",
-        tmp.file_name()
-            .ok_or(anyhow!("Failed to get filename of {:?}", tmp))?
-            .to_string_lossy()
-    )))
-}
-
-// Normalize line endings for cmd.exe and append a completion epilogue. The pre-created marker lets
-// the caller detect ordinary early termination; it is not a security boundary and does not mean
-// every individual legacy command succeeded.
-fn prepare_batch_commands(commands: &str, undone_path: &Path) -> ResultType<String> {
-    // Collapse existing CRLF first; replacing every LF directly would produce CRCRLF.
-    let normalized_commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
-    let completion_marker = path_for_batch(undone_path)?;
-    Ok(format!(
-        concat!(
-            "{normalized_commands}\r\n",
-            // Reaching the epilogue means cmd.exe parsed all ordinary commands.
-            "if exist \"{completion_marker}\" del /f /q \"{completion_marker}\"\r\n",
-            // A remaining marker means completion cannot be confirmed.
-            "if exist \"{completion_marker}\" exit /b {completion_failure}\r\n",
-            // Preserve legacy behavior: individual command failures do not fail the whole batch.
-            "exit /b 0\r\n",
-        ),
-        normalized_commands = normalized_commands,
-        completion_marker = completion_marker,
-        completion_failure = ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE,
-    ))
-}
-
-// Create both artifacts exclusively, hash and flush the complete script, and return its initial lock
-// owner. `run_cmds` releases this handle only after constructing the elevated verifier command; the
-// verifier rejects changed bytes and runs a separate protected copy of verified bytes.
-fn write_cmds(commands: String, tip: &str) -> ResultType<LockedTempScript> {
-    let path = unique_temp_batch_path()?;
-    let undone_path = get_undone_file(&path)?;
-    let bytes = prepare_batch_commands(&commands, &undone_path)?;
-    let expected_hash = Sha256::digest(bytes.as_bytes()).into();
-    let expected_length = bytes.len() as u64;
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(WIN_FILE_SHARE_READ.0)
-        .open(&path)?;
-    let mut script = LockedTempScript {
-        path,
-        undone_path,
-        expected_hash,
-        expected_length,
-        handle: Some(file),
-    };
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&script.undone_path)?;
-    let file = script
-        .handle
-        .as_mut()
-        .ok_or_else(|| anyhow!("Temporary script handle is unavailable"))?;
-    file.write_all(bytes.as_bytes())?;
-    file.sync_all()?;
-    log::debug!("{}: created temporary script {:?}", tip, script.path);
-    Ok(script)
-}
-
-// Copy the input once to an exclusively created runner in the trusted local Windows Temp directory,
-// hash that runner through the same locked handle, and retain the handle with FileShare.Read until
-// cmd.exe exits. The bytes checked are thus exactly the bytes executed, even when the input Temp is
-// remote. Windows 7 PowerShell 2 commonly uses CLR 2, where Stream.CopyTo is unavailable, so use a
-// Read/Write loop and only basic .NET types supported there.
-fn verified_batch_powershell() -> String {
-    format!(
-        concat!(
-            "$ErrorActionPreference='Stop';$p=$env:{path_env};$s=$null;$r=$null;$q=$null;$e=0;try{{",
-            "try{{$s=New-Object IO.FileStream($p,[IO.FileMode]::Open,",
-            "[IO.FileAccess]::Read,[IO.FileShare]::Read)}}catch{{$e={open_failure}}};",
-            "if($e -eq 0){{try{{$l=[Int64]$env:{length_env};",
-            "$d=[IO.Directory]::CreateDirectory($env:{runner_env});",
-            "$t=[IO.Path]::Combine($env:{runner_env},",
-            "[Guid]::NewGuid().ToString('N')+'.bat');",
-            "$r=New-Object IO.FileStream($t,[IO.FileMode]::CreateNew,",
-            "[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read);$q=$t;",
-            "$b=New-Object byte[] {copy_buffer_size};$z=[Int64]0;",
-            "while($e -eq 0 -and ($n=$s.Read($b,0,$b.Length))-gt 0){{$z+=$n;",
-            "if($z -gt $l){{$e={size_mismatch}}}else{{$r.Write($b,0,$n)}}}};",
-            "if($e -eq 0 -and $z -ne $l){{$e={size_mismatch}}};",
-            "if($e -eq 0){{$r.Flush()}}}}catch{{$e={copy_failure}}}}};",
-            "if($e -eq 0){{try{{$a=[Security.Cryptography.SHA256]::Create();",
-            "try{{$r.Position=0;$h=[Convert]::ToBase64String($a.ComputeHash($r))}}",
-            // PowerShell 2 / CLR 2 does not expose SHA256Managed.Dispose; Clear releases its resources.
-            "finally{{$a.Clear()}}}}catch{{$e={hash_failure}}}}};",
-            "if($e -eq 0 -and $h -cne $env:{hash_env}){{$e={hash_mismatch}}};",
-            "if($e -eq 0){{try{{$env:{marker_env}=$p+'.undone';",
-            "& $env:{cmd_env} /D /E:ON /V:OFF /C $q;",
-            "$e=$LASTEXITCODE}}catch{{$e={start_failure}}}}}",
-            "}}finally{{try{{if($r){{$r.Dispose()}}}}",
-            "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
-            "try{{if($q){{[IO.File]::Delete($q)}}}}",
-            "catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
-            "try{{if($s){{$s.Dispose()}}}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}};",
-            "try{{[IO.File]::Delete($p)}}catch{{if($e -eq 0){{$e={cleanup_failure}}}}}",
-            // PowerShell 2 truncates `exit` values; Environment.Exit preserves the full 32-bit code.
-            "}};[Environment]::Exit([int]$e)"
-        ),
-        path_env = ELEVATED_BATCH_PATH_ENV,
-        hash_env = ELEVATED_BATCH_HASH_ENV,
-        marker_env = ELEVATED_BATCH_MARKER_ENV,
-        runner_env = ELEVATED_BATCH_RUNNER_DIRECTORY_ENV,
-        length_env = ELEVATED_BATCH_LENGTH_ENV,
-        cmd_env = ELEVATED_CMD_PATH_ENV,
-        copy_buffer_size = VERIFIED_BATCH_COPY_BUFFER_SIZE,
-        open_failure = ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE,
-        hash_failure = ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE,
-        hash_mismatch = ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE,
-        copy_failure = ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE,
-        size_mismatch = ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE,
-        start_failure = ELEVATED_BATCH_START_FAILURE_EXIT_CODE,
-        cleanup_failure = ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE,
-    )
-}
-
-fn powershell_command_for_cmd(command: &str) -> ResultType<&str> {
-    if command.contains(['"', '%', '\r', '\n']) {
-        bail!("PowerShell verifier contains characters unsafe for cmd.exe");
-    }
-    Ok(command)
-}
-
-fn path_for_cmd_command(path: &Path) -> ResultType<&str> {
-    let value = path
-        .to_str()
-        .ok_or_else(|| anyhow!("Path is not valid Unicode: {:?}", path))?;
-    if value.contains(['"', '%', '\r', '\n']) {
-        bail!("Path is unsafe for a cmd.exe command: {:?}", path);
+    if value.contains(['\0', '"', '%', '\r', '\n']) {
+        bail!("Path is unsafe for an elevated cmd.exe handoff: {:?}", path);
     }
     Ok(value)
 }
 
-// cmd.exe is the elevated native bootstrap so managed-profiler variables can be disabled before
-// Windows PowerShell starts. The fixed PowerShell 2 payload rejects cmd-expanding characters before
-// it is quoted as one -Command value, and all executable paths come from the system directory API.
-fn verified_batch_bootstrap(
-    batch_path: &Path,
-    expected_hash: &BatchHash,
-    expected_length: u64,
-) -> ResultType<String> {
-    if !is_batch_path_safe(batch_path) {
-        bail!(
-            "Temporary batch path is unsafe for cmd.exe: {:?}",
-            batch_path
-        );
-    }
-    let expected_hash = BASE64_STANDARD.encode(expected_hash);
-    let command = verified_batch_powershell();
-    let command = powershell_command_for_cmd(&command)?;
-    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    // Do not place the executed copy in inherited Temp: it may name an attacker-controlled remote
-    // filesystem whose sharing behavior cannot be trusted. The Windows directory comes from the
-    // system API, and an elevated administrator can create its Temp directory if it is absent.
-    let runner_directory = cmd_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| anyhow!("Windows system directory has no Windows directory parent"))?
-        .join("Temp");
-    let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH)?;
-    let mut bootstrap = MANAGED_PROFILING_ENABLE_VARIABLES
-        .iter()
-        .map(|name| format!("set \"{name}=0\""))
-        .collect::<Vec<_>>();
-    bootstrap.extend([
-        format!(
-            "set \"{ELEVATED_BATCH_PATH_ENV}={}\"",
-            path_for_cmd_command(batch_path)?
-        ),
-        format!("set \"{ELEVATED_BATCH_HASH_ENV}={expected_hash}\""),
-        format!("set \"{ELEVATED_BATCH_LENGTH_ENV}={expected_length}\""),
-        format!(
-            "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
-            path_for_cmd_command(&cmd_path)?
-        ),
-        format!(
-            "set \"{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV}={}\"",
-            path_for_cmd_command(&runner_directory)?
-        ),
-        format!(
-            "\"{}\" -NoLogo -NoProfile -NonInteractive -Command \"{command}\"",
-            path_for_cmd_command(&powershell_path)?
-        ),
-    ]);
-    Ok(bootstrap.join(" & "))
+fn path_for_cmd_assignment(path: &Path) -> ResultType<String> {
+    Ok(path_for_cmd_environment(path)?.replace('^', "^^"))
 }
 
-fn verified_batch_parameters(script: &LockedTempScript) -> ResultType<String> {
+type BatchHash = [u8; SHA256_HASH_LENGTH];
+
+struct InstallCommandScript {
+    path: PathBuf,
+    expected_hash: BatchHash,
+}
+
+impl Drop for InstallCommandScript {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                log::warn!(
+                    "Failed to remove temporary installer file {:?}: {err}",
+                    self.path
+                );
+            }
+        }
+    }
+}
+
+fn prepare_install_commands(commands: &str) -> ResultType<String> {
+    let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
     Ok(format!(
-        "/D /E:ON /V:OFF /S /C {}",
-        verified_batch_bootstrap(&script.path, &script.expected_hash, script.expected_length,)?
+        "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n{}\r\n\
+         chcp {UTF8_CODE_PAGE} > nul || exit /b \
+         {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
+         if exist \"%~f0.dir\" exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
+         md \"%~f0.dir\" || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
+         set \"RUSTDESK_OUTPUT_DIR=%~f0.dir\"\r\n{commands}\r\nexit /b 0\r\n",
+        trusted_install_environment()?
+    ))
+}
+
+fn write_install_script(cmds: String) -> ResultType<InstallCommandScript> {
+    let directory = std::env::temp_dir();
+    path_for_cmd_environment(&directory)?;
+    let commands = prepare_install_commands(&cmds)?;
+    let expected_hash = Sha256::digest(commands.as_bytes()).into();
+    let path = directory.join(format!(
+        "rustdesk_install_{}.bat",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let script = InstallCommandScript {
+        path,
+        expected_hash,
+    };
+    file.write_all(commands.as_bytes())?;
+    file.sync_all()?;
+    Ok(script)
+}
+
+fn write_vbs(cmds: String, tip: &str) -> ResultType<PathBuf> {
+    let mut tmp = std::env::temp_dir();
+    if vec!["&", "@", "^"]
+        .drain(..)
+        .any(|s| tmp.to_string_lossy().to_string().contains(s))
+    {
+        if let Ok(dir) = user_accessible_folder() {
+            tmp = dir;
+        }
+    }
+    tmp.push(format!("{}_{}.vbs", crate::get_app_name(), tip));
+    let mut file = fs::File::create(&tmp)?;
+    let cmds = cmds.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut utf16: Vec<u16> = cmds.encode_utf16().collect();
+    file.write_all(to_le(&mut utf16))?;
+    file.sync_all()?;
+    Ok(tmp)
+}
+
+fn to_le(v: &mut [u16]) -> &[u8] {
+    for b in v.iter_mut() {
+        *b = b.to_le()
+    }
+    unsafe { v.align_to().1 }
+}
+
+fn trusted_install_environment() -> ResultType<String> {
+    let system = get_system_executable("")?;
+    let program_data = get_known_folder(&FOLDERID_ProgramData)?;
+    let public = get_known_folder(&FOLDERID_Public)?;
+    let windows = system
+        .parent()
+        .ok_or_else(|| anyhow!("System directory has no parent"))?;
+    let cmd = system.join(CMD_RELATIVE_PATH);
+    let system = path_for_cmd_assignment(&system)?;
+    let windows = path_for_cmd_assignment(windows)?;
+    let cmd = path_for_cmd_assignment(&cmd)?;
+    let program_data = path_for_cmd_assignment(&program_data)?;
+    let public = path_for_cmd_assignment(&public)?;
+    Ok(format!(
+        "set \"ComSpec={cmd}\" & set \"PATH={system}\" & \
+         set \"SystemRoot={windows}\" & set \"WINDIR={windows}\" & \
+         set \"ProgramData={program_data}\" & set \"PUBLIC={public}\" & \
+         set \"PATHEXT=.COM;.EXE;.BAT;.CMD\" & \
+         set \"NoDefaultCurrentDirectoryInExePath=1\""
+    ))
+}
+
+fn install_hash_string(hash: &BatchHash) -> String {
+    hash.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn verified_install_bootstrap(
+    script: &InstallCommandScript,
+    runner_directory: &Path,
+) -> ResultType<String> {
+    let source = path_for_cmd_assignment(&script.path)?;
+    let runner = runner_directory.join(format!(
+        "rustdesk_install_{}.bat",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let runner = path_for_cmd_assignment(&runner)?;
+    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
+    let certutil_path = get_system_executable(CERTUTIL_RELATIVE_PATH)?;
+    let findstr_path = get_system_executable(FINDSTR_RELATIVE_PATH)?;
+    let cmd = path_for_cmd_assignment(&cmd_path)?;
+    let certutil = path_for_cmd_assignment(&certutil_path)?;
+    let findstr = path_for_cmd_assignment(&findstr_path)?;
+    Ok(format!(
+        "setlocal DisableDelayedExpansion & set \"S={source}\" & set \"R={runner}\" & \
+         set \"Q={cmd}\" & set \"C=0\" & setlocal EnableDelayedExpansion & \
+         if exist \"!R!\" (set \"E={INSTALL_HANDOFF_FAILURE_EXIT_CODE}\") else (\
+         set \"C=1\" & copy /Y \"!S!\" \"!R!\" > nul && \
+         \"{certutil}\" -hashfile \"!R!\" SHA256 > \"!R!.hash\" && \
+         \"{findstr}\" /L /I /X /C:\"{}\" \"!R!.hash\" > nul && \
+         \"!Q!\" /D /E:ON /V:OFF /C \"\"!R!\"\" & set \"E=!errorlevel!\") & \
+         if \"!C!\"==\"1\" (rd /s /q \"!R!.dir\" > nul 2>&1 & \
+         del /f /q \"!R!\" \"!R!.*\" > nul 2>&1) & exit /b !E!",
+        install_hash_string(&script.expected_hash),
+    ))
+}
+
+fn verified_install_parameters(script: &InstallCommandScript) -> ResultType<String> {
+    let system_directory = get_system_executable("")?;
+    Ok(format!(
+        "/D /E:ON /V:ON /C {}",
+        verified_install_bootstrap(script, &system_directory)?
     ))
 }
 
@@ -2254,124 +2089,93 @@ struct ShellComGuard;
 
 impl Drop for ShellComGuard {
     fn drop(&mut self) {
-        unsafe { WinCoUninitialize() };
+        unsafe { Com::CoUninitialize() };
     }
 }
 
 fn initialize_shell_com() -> ResultType<Option<ShellComGuard>> {
-    let result =
-        unsafe { WinCoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    if result == RPC_E_CHANGED_MODE {
+    let result = unsafe {
+        Com::CoInitializeEx(
+            None,
+            Com::COINIT_APARTMENTTHREADED | Com::COINIT_DISABLE_OLE1DDE,
+        )
+    };
+    if result == Foundation::RPC_E_CHANGED_MODE {
         return Ok(None);
     }
-    result.ok()?;
+    if result.is_err() {
+        bail!(
+            "Failed to initialize COM: HRESULT 0x{:08X}",
+            result.0 as u32
+        );
+    }
     Ok(Some(ShellComGuard))
 }
 
-// ShellExecuteExW supplies the legitimate UAC prompt and a process handle. Waiting on that handle
-// preserves the installer's synchronous error reporting without delegating quoting to runas::Command.
+struct ProcessHandle(WinHANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        if let Err(err) = unsafe { WinCloseHandle(self.0) } {
+            log::warn!("Failed to close elevated process handle: {err}");
+        }
+    }
+}
+
+fn elevated_working_directory(executable: &Path) -> ResultType<&Path> {
+    executable
+        .parent()
+        .ok_or_else(|| anyhow!("Elevated executable has no parent directory"))
+}
+
 fn run_elevated_and_wait(executable: &Path, parameters: &str, show: bool) -> ResultType<u32> {
     let parameter_chars = parameters.encode_utf16().count();
-    log::debug!(
-        "Elevated command uses {} of {} Windows 7 ShellExecuteExW parameter characters",
-        parameter_chars,
-        WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS
-    );
     if parameter_chars >= WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS {
-        bail!(
-            "Elevated command needs {} ShellExecuteExW parameter characters; Windows 7 limit is {}",
-            parameter_chars,
-            WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS
-        );
+        bail!("Elevated command is too long: {parameter_chars} UTF-16 characters");
     }
     let _com = initialize_shell_com()?;
-    let executable = wide_string(path_for_cmd_command(executable)?);
+    let verb = wide_string("runas");
+    let working_directory = wide_string(path_for_cmd_environment(elevated_working_directory(
+        executable,
+    )?)?);
+    let executable = wide_string(path_for_cmd_environment(executable)?);
     let parameters = wide_string(parameters);
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
-        lpVerb: windows::core::w!("runas"),
-        lpFile: windows::core::PCWSTR(executable.as_ptr()),
-        lpParameters: windows::core::PCWSTR(parameters.as_ptr()),
-        nShow: if show {
-            WIN_SW_SHOWNORMAL.0
-        } else {
-            WIN_SW_HIDE.0
-        },
-        ..Default::default()
+    let mut info = Shell::SHELLEXECUTEINFOW::default();
+    info.cbSize = mem::size_of::<Shell::SHELLEXECUTEINFOW>() as u32;
+    info.fMask = Shell::SEE_MASK_NOCLOSEPROCESS | Shell::SEE_MASK_NOASYNC;
+    info.lpVerb = PCWSTR(verb.as_ptr());
+    info.lpFile = PCWSTR(executable.as_ptr());
+    info.lpParameters = PCWSTR(parameters.as_ptr());
+    info.lpDirectory = PCWSTR(working_directory.as_ptr());
+    info.nShow = if show {
+        WindowsAndMessaging::SW_SHOWNORMAL.0
+    } else {
+        WindowsAndMessaging::SW_HIDE.0
     };
-    unsafe { ShellExecuteExW(&mut info)? };
-    // Copy the packed field before calling methods that would borrow it on some Windows targets.
-    let process_handle = info.hProcess;
-    if process_handle.is_invalid() {
-        bail!("Windows did not return a valid process handle");
+    unsafe { Shell::ShellExecuteExW(&mut info) }?;
+    if info.hProcess.0.is_null() {
+        bail!("Windows did not return an elevated process handle");
     }
-    // SEE_MASK_NOCLOSEPROCESS transfers ownership of hProcess to the caller.
-    let process = unsafe { windows::core::Owned::new(process_handle) };
-    let wait_result = unsafe { WinWaitForSingleObject(*process, WIN_INFINITE) };
-    if wait_result == WIN_WAIT_FAILED {
-        return Err(windows::core::Error::from_win32().into());
+    let process = ProcessHandle(info.hProcess);
+    let wait_result = unsafe { Threading::WaitForSingleObject(process.0, Threading::INFINITE) };
+    if wait_result == Foundation::WAIT_FAILED {
+        return Err(io::Error::last_os_error().into());
     }
-    if wait_result != WIN_WAIT_OBJECT_0 {
-        bail!("Unexpected process wait result: {}", wait_result.0);
+    if wait_result != Foundation::WAIT_OBJECT_0 {
+        bail!("Unexpected elevated process wait result: {}", wait_result.0);
     }
     let mut exit_code = 0;
-    unsafe { WinGetExitCodeProcess(*process, &mut exit_code)? };
+    unsafe { Threading::GetExitCodeProcess(process.0, &mut exit_code) }?;
     Ok(exit_code)
 }
 
-fn ensure_command_completed(status: &std::process::ExitStatus, tip: &str) -> ResultType<()> {
-    if !status.success() {
-        bail!("{} failed with exit code {:?}", tip, status.code());
-    }
-    Ok(())
-}
-
-fn elevated_batch_failure_reason(exit_code: u32, completion_marker_exists: bool) -> &'static str {
-    match exit_code {
-        ELEVATED_BATCH_OPEN_FAILURE_EXIT_CODE => "failed to open temporary script for verification",
-        ELEVATED_BATCH_HASH_FAILURE_EXIT_CODE => "failed to hash temporary script",
-        ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE => "temporary script hash mismatch",
-        ELEVATED_BATCH_START_FAILURE_EXIT_CODE => "failed to start the verified batch",
-        ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE if completion_marker_exists => {
-            "batch or verifier failed before removing the completion marker"
-        }
-        ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE => {
-            "failed to remove temporary script after execution"
-        }
-        ELEVATED_BATCH_CODE_PAGE_FAILURE_EXIT_CODE => "failed to switch elevated batch to UTF-8",
-        ELEVATED_BATCH_COMPLETION_FAILURE_EXIT_CODE => {
-            "failed to remove the batch completion marker"
-        }
-        ELEVATED_BATCH_COPY_FAILURE_EXIT_CODE => "failed to create protected batch copy",
-        ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE => "temporary script length mismatch",
-        _ if completion_marker_exists => {
-            "batch or verifier failed before removing the completion marker"
-        }
-        _ => "elevated command failed after removing the completion marker",
-    }
-}
-
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
-    let mut script = write_cmds(format!("{}\n{}", trusted_batch_environment()?, cmds), tip)?;
+    let script = write_install_script(cmds)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    let parameters = verified_batch_parameters(&script)?;
-    // Release before UAC because it cannot overlap the verifier's deny-write handle. A handoff change
-    // fails the hash check, and execution protection moves to the verifier's locked copy so it does
-    // not depend on this process surviving the UAC flow.
-    script.release_write_lock()?;
+    let parameters = verified_install_parameters(&script)?;
     let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show)?;
-    let completion_marker_exists = script.undone_path.exists();
     if exit_code != 0 {
-        bail!(
-            "{} failed with exit code {}: {}",
-            tip,
-            exit_code,
-            elevated_batch_failure_reason(exit_code, completion_marker_exists)
-        );
-    }
-    if completion_marker_exists {
-        bail!("{} did not complete", tip);
+        bail!("{tip} failed with elevated exit code {exit_code}");
     }
     Ok(())
 }
@@ -2729,102 +2533,53 @@ fn get_custom_icon(install_dir: &str, exe: &str) -> Option<String> {
     None
 }
 
-// Installer shortcuts must be created after elevation because a medium-integrity process cannot
-// write to the all-users Desktop, Programs, or Startup folders. The previous installer implementation
-// wrote predictable VBS files to the user's temporary directory and later executed them with
-// elevated cscript.exe, exposing those scripts to the same replacement race as the installer batch
-// file. PowerShell keeps installer shortcut commands inline in the already locked elevated batch,
-// so there is no second executable temporary script to protect. WScript.Shell remains the underlying
-// COM shortcut API; PowerShell is only its command host. Calling that COM API directly from Rust in
-// the current installer process would run before elevation, while doing so after elevation would
-// require a new elevated Rust helper or a change to the installer elevation flow. The non-installer
-// shortcut path reuses the same command builder and invokes system PowerShell directly, also avoiding
-// a temporary VBS file.
-struct ShortcutOptions<'a> {
-    link_file: &'a str,
-    special_folder: Option<&'a str>,
-    target_path: &'a str,
-    arguments: Option<&'a str>,
-    icon_location: Option<&'a str>,
-}
-
-fn powershell_single_quoted(value: &str) -> ResultType<String> {
-    if value.contains(['\r', '\n']) {
-        bail!("Shortcut value contains a line break");
+#[inline]
+fn get_shortcut_icon_location(install_dir: &str, exe: &str) -> String {
+    if exe.is_empty() {
+        return "".to_owned();
     }
-    Ok(format!("'{}'", value.replace('\'', "''")))
-}
 
-fn shortcut_property(name: &str, value: Option<&str>) -> ResultType<String> {
-    match value.filter(|value| !value.is_empty()) {
-        Some(value) => Ok(format!(
-            "; $shortcut.{name} = {}",
-            powershell_single_quoted(value)?
-        )),
-        None => Ok(String::new()),
-    }
-}
-
-fn shortcut_powershell(options: ShortcutOptions<'_>) -> ResultType<String> {
-    let arguments = shortcut_property("Arguments", options.arguments)?;
-    let icon = shortcut_property("IconLocation", options.icon_location)?;
-    let link = match options.special_folder {
-        Some(folder) => format!(
-            "[System.IO.Path]::Combine($shell.SpecialFolders.Item({}), {})",
-            powershell_single_quoted(folder)?,
-            powershell_single_quoted(options.link_file)?
-        ),
-        None => powershell_single_quoted(options.link_file)?,
-    };
-    Ok(format!(
-        "$ErrorActionPreference = 'Stop'; \
-         $shell = New-Object -ComObject WScript.Shell; \
-         $link = {link}; \
-         $directory = [System.IO.Path]::GetDirectoryName($link); \
-         if ($directory) {{ $null = [System.IO.Directory]::CreateDirectory($directory) }}; \
-         $shortcut = $shell.CreateShortcut($link); \
-         $shortcut.TargetPath = {}{arguments}{icon}; \
-         $shortcut.Save()",
-        powershell_single_quoted(options.target_path)?,
-    ))
-}
-
-fn create_shortcut_cmd(options: ShortcutOptions<'_>) -> ResultType<String> {
-    let command = shortcut_powershell(options)?;
-    // This PowerShell command is embedded inside cmd.exe's outer double quotes. Reject inner quotes
-    // instead of trying to compose two interpreters' incompatible escaping rules.
-    if command.contains('"') {
-        bail!("Shortcut value contains a double quote");
-    }
-    let powershell_path = path_for_batch(&get_system_executable(POWERSHELL_RELATIVE_PATH)?)?;
-    Ok(format!(
-        "\"{powershell_path}\" -NoLogo -NoProfile -NonInteractive -Command \"{}\"",
-        command.replace('%', "%%")
-    ))
+    get_custom_icon(install_dir, exe)
+        .map(|p| format!("oLink.IconLocation = \"{}\"", p))
+        .unwrap_or_default()
 }
 
 pub fn create_shortcut(id: &str) -> ResultType<()> {
+    if !crate::common::is_valid_untrusted_peer_id(id) {
+        bail!("Invalid peer id for shortcut");
+    }
+
     let exe = std::env::current_exe()?.to_str().unwrap_or("").to_owned();
     // https://github.com/rustdesk/rustdesk/issues/13735
     // Replace ':' with '_' for filename since ':' is not allowed in Windows filenames
     // https://github.com/rustdesk/hbb_common/blob/8b0e25867375ba9e6bff548acf44fe6d6ffa7c0e/src/config.rs#L1384
     let filename = id.replace(':', "_");
-    let command = shortcut_powershell(ShortcutOptions {
-        link_file: &format!("{filename}.lnk"),
-        special_folder: Some("Desktop"),
-        target_path: &exe,
-        arguments: Some(&format!("--connect {id}")),
-        icon_location: get_custom_icon("", &exe).as_deref(),
-    })?;
-    let mut process = std::process::Command::new(get_system_executable(POWERSHELL_RELATIVE_PATH)?);
-    process
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-        .arg(command)
-        .creation_flags(WIN_CREATE_NO_WINDOW.0);
-    for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
-        process.env(variable, "0");
-    }
-    ensure_command_completed(&process.status()?, "Shortcut creation")
+    let shortcut_icon_location = get_shortcut_icon_location("", &exe);
+    let shortcut = write_vbs(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+strDesktop = oWS.SpecialFolders(\"Desktop\")
+Set objFSO = CreateObject(\"Scripting.FileSystemObject\")
+sLinkFile = objFSO.BuildPath(strDesktop, \"{filename}.lnk\")
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    oLink.Arguments = \"--connect {id}\"
+    {shortcut_icon_location}
+oLink.Save
+        "
+        ),
+        "connect_shortcut",
+    )?
+    .to_str()
+    .unwrap_or("")
+    .to_owned();
+    std::process::Command::new("cscript")
+        .arg(&shortcut)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    allow_err!(std::fs::remove_file(shortcut));
+    Ok(())
 }
 
 pub fn enable_lowlevel_keyboard(hwnd: HWND) {
@@ -3682,7 +3437,7 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     chcp 65001
     sc stop {app_name}
     sc delete {app_name}
-    if exist \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\" del /f /q \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\"
+    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
     ",
@@ -3698,32 +3453,52 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     std::process::exit(0);
 }
 
+fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
+    let app_name = crate::get_app_name();
+    validate_install_name(&app_name)?;
+    for value in [path, exe] {
+        validate_install_value(value)?;
+    }
+    let config_path = Config::file();
+    validate_install_value(
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Configuration path is not valid Unicode"))?,
+    )?;
+    if let Some(icon) = get_custom_icon(path, exe) {
+        validate_install_value(&icon)?;
+    }
+    let shortcut_icon_location = get_shortcut_icon_location(path, exe);
+    let tray_shortcut_commands =
+        embedded_tray_vbs_commands(&app_name, exe, &shortcut_icon_location);
+    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    Ok(format!(
+        "
+chcp 65001
+taskkill /F /IM {app_name}.exe{filter}
+{tray_shortcut_commands}
+copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+{import_config}
+{create_service}
+    ",
+        import_config = get_import_config(exe),
+        create_service = get_create_service(exe),
+    ))
+}
+
 pub fn install_service() -> bool {
     log::info!("Installing service...");
     let _installing = crate::platform::InstallingService::new();
     let (_, path, _, exe) = get_install_info();
-    let tray_shortcut_cmd = match get_tray_shortcut(&path, &exe, &exe) {
-        Ok(command) => command,
+    let cmds = match get_install_service_commands(&path, &exe) {
+        Ok(cmds) => cmds,
         Err(err) => {
-            log::error!("Failed to prepare tray shortcut: {}", err);
+            log::error!("Failed to prepare service installation: {err}");
             return true;
         }
     };
-    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     Config::set_option("stop-service".into(), "".into());
     crate::ipc::EXIT_RECV_CLOSE.store(false, Ordering::Relaxed);
-    let cmds = format!(
-        "
-chcp 65001
-taskkill /F /IM {app_name}.exe{filter}
-{tray_shortcut_cmd}
-{import_config}
-{create_service}
-    ",
-        app_name = crate::get_app_name(),
-        import_config = get_import_config(&exe),
-        create_service = get_create_service(&exe),
-    );
     if let Err(err) = run_cmds(cmds, false, "install") {
         Config::set_option("stop-service".into(), "Y".into());
         crate::ipc::EXIT_RECV_CLOSE.store(true, Ordering::Relaxed);
@@ -4172,20 +3947,6 @@ pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
     Ok(())
 }
 
-pub fn get_tray_shortcut(
-    install_dir: &str,
-    exe: &str,
-    icon_source_exe: &str,
-) -> ResultType<String> {
-    create_shortcut_cmd(ShortcutOptions {
-        link_file: &format!("{} Tray.lnk", crate::get_app_name()),
-        special_folder: Some("AllUsersStartup"),
-        target_path: exe,
-        arguments: Some("--tray"),
-        icon_location: get_custom_icon(install_dir, icon_source_exe).as_deref(),
-    })
-}
-
 fn get_import_config(exe: &str) -> String {
     if config::is_outgoing_only() {
         return "".to_string();
@@ -4210,7 +3971,7 @@ fn get_create_service(exe: &str) -> String {
     let stop = Config::get_option("stop-service") == "Y";
     if stop {
         format!("
-if exist \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\" del /f /q \"%RUSTDESK_COMMON_STARTUP%\\{app_name} Tray.lnk\"
+if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
 ", app_name = crate::get_app_name())
     } else {
         format!("
@@ -5046,30 +4807,6 @@ mod tests {
         }
     }
 
-    fn run_batch(script: &LockedTempScript) -> std::process::ExitStatus {
-        std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
-            .args(["/D", "/E:ON", "/V:OFF", "/C"])
-            .arg(&script.path)
-            .creation_flags(WIN_CREATE_NO_WINDOW.0)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-    }
-
-    fn spawn_verified_batch(script: &mut LockedTempScript) -> std::process::Child {
-        let parameters = verified_batch_parameters(script).unwrap();
-        script.release_write_lock().unwrap();
-        let mut command =
-            std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap());
-        command
-            .raw_arg(parameters)
-            .creation_flags(WIN_CREATE_NO_WINDOW.0)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.spawn().unwrap()
-    }
-
     #[test]
     fn test_is_process_running_as_system_invalid_pid_errors() {
         assert!(is_process_running_as_system(u32::MAX).is_err());
@@ -5122,386 +4859,6 @@ mod tests {
     }
 
     #[test]
-    fn temporary_batches_are_safe_unique_locked_and_cleaned_up() {
-        let temp_dir = std::env::temp_dir();
-        assert_eq!(
-            canonical_batch_directory(&temp_dir.join(".")).unwrap(),
-            canonical_batch_directory(&temp_dir).unwrap()
-        );
-        let script = write_cmds("ver > nul".to_owned(), "locked_batch").unwrap();
-        let path = script.path.to_path_buf();
-        let undone_path = script.undone_path.to_path_buf();
-        let other = write_cmds("ver > nul".to_owned(), "other_batch").unwrap();
-        let other_path = other.path.to_path_buf();
-
-        assert_ne!(path, other_path);
-        assert!(is_batch_path_safe(path.parent().unwrap()));
-        assert!(undone_path.exists());
-        assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
-        assert!(fs::remove_file(&path).is_err());
-        let status = run_batch(&script);
-
-        assert!(status.success());
-        assert!(path.exists());
-        assert!(!undone_path.exists());
-        drop(script);
-        drop(other);
-        assert!(!path.exists());
-        assert!(!other_path.exists());
-
-        const UNPAIRED_HIGH_SURROGATE: u16 = 0xD800;
-        for character in UNSAFE_BATCH_PATH_CHARS {
-            let path = PathBuf::from(format!("C:\\Temp{character}dir"));
-            assert!(!is_batch_path_safe(&path), "accepted {character:?}");
-        }
-        let invalid_unicode = PathBuf::from(OsString::from_wide(&[UNPAIRED_HIGH_SURROGATE]));
-        assert!(!is_batch_path_safe(&invalid_unicode));
-    }
-
-    #[test]
-    fn elevated_verifier_owns_locks_after_caller_release() {
-        const READY_POLL_ATTEMPTS: usize = 500;
-        const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-        let ping_path = path_for_batch(&get_system_executable("PING.EXE").unwrap()).unwrap();
-        let mut script = write_cmds(
-            format!(
-                "{}\necho ready > \"%{ELEVATED_BATCH_MARKER_ENV}%.ready\"\n\"{ping_path}\" -n 4 127.0.0.1 > nul",
-                trusted_batch_environment().unwrap(),
-            ),
-            "elevated_lock_owner",
-        )
-        .unwrap();
-        let ready_path = PathBuf::from(format!("{}.ready", script.undone_path.to_string_lossy()));
-        let script_path = script.path.to_path_buf();
-        let mut child = spawn_verified_batch(&mut script);
-        assert!(script.handle.is_none());
-        for _ in 0..READY_POLL_ATTEMPTS {
-            if ready_path.exists() {
-                break;
-            }
-            std::thread::sleep(READY_POLL_INTERVAL);
-        }
-        let reached_blocking_command = ready_path.exists();
-        let write_result = fs::OpenOptions::new().write(true).open(&script.path);
-        let remove_result = fs::remove_file(&script.path);
-        let status = child.wait().unwrap();
-        remove_temp_file(&ready_path);
-        assert!(
-            reached_blocking_command,
-            "batch did not reach the blocking command; status: {status:?}"
-        );
-        assert!(status.success());
-        assert!(
-            write_result.is_err(),
-            "input batch became writable after the caller released its handle"
-        );
-        assert!(
-            remove_result.is_err(),
-            "input batch became replaceable while the elevated verifier used it"
-        );
-        assert!(!script_path.exists());
-    }
-
-    #[test]
-    fn changed_batch_is_rejected_before_execution() {
-        let mut script = write_cmds(
-            format!("echo safe > \"%{ELEVATED_BATCH_MARKER_ENV}%.executed\""),
-            "tampered",
-        )
-        .unwrap();
-        let executed_path =
-            PathBuf::from(format!("{}.executed", script.undone_path.to_string_lossy()));
-        let parameters = verified_batch_parameters(&script).unwrap();
-        script.release_write_lock().unwrap();
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(&script.path)
-            .unwrap();
-        file.seek(io::SeekFrom::Start("echo ".len() as u64))
-            .unwrap();
-        file.write_all(b"evil").unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-
-        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
-            .raw_arg(parameters)
-            .creation_flags(WIN_CREATE_NO_WINDOW.0)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-
-        let executed = executed_path.exists();
-        let script_exists = script.path.exists();
-        remove_temp_file(&executed_path);
-        assert_eq!(
-            status.code(),
-            Some(ELEVATED_BATCH_HASH_MISMATCH_EXIT_CODE as i32)
-        );
-        assert!(!executed);
-        assert!(!script_exists);
-    }
-
-    #[test]
-    fn oversized_batch_is_rejected_before_copying_all_bytes() {
-        let mut script = write_cmds(
-            format!("echo executed > \"%{ELEVATED_BATCH_MARKER_ENV}%.executed\""),
-            "oversized",
-        )
-        .unwrap();
-        let executed_path =
-            PathBuf::from(format!("{}.executed", script.undone_path.to_string_lossy()));
-        let parameters = verified_batch_parameters(&script).unwrap();
-        script.release_write_lock().unwrap();
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&script.path)
-            .unwrap();
-        file.write_all(b"rem extra\r\n").unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-
-        let status = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
-            .raw_arg(parameters)
-            .creation_flags(WIN_CREATE_NO_WINDOW.0)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-
-        let executed = executed_path.exists();
-        remove_temp_file(&executed_path);
-        assert_eq!(
-            status.code(),
-            Some(ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE as i32)
-        );
-        assert!(!executed);
-        assert!(!script.path.exists());
-    }
-
-    // Newer PowerShell versions hide both Win7 failures, so pin the compatible generated APIs.
-    #[test]
-    fn verified_batch_powershell_uses_windows_7_compatible_apis() {
-        let command = verified_batch_powershell();
-
-        assert!(command.contains("finally{$a.Clear()}"));
-        assert!(!command.contains("$a.Dispose()"));
-        assert!(command
-            .contains("[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read"));
-        let copy_position = command
-            .find("while($e -eq 0 -and ($n=$s.Read($b,0,$b.Length))-gt 0)")
-            .unwrap();
-        let hash_position = command.find("$a.ComputeHash($r)").unwrap();
-        assert!(copy_position < hash_position);
-        assert!(!command.contains("$a.ComputeHash($s)"));
-        assert!(!command.contains(".CopyTo("));
-        assert!(command.contains(&format!("$env:{ELEVATED_BATCH_MARKER_ENV}=$p+'.undone'")));
-        let runner_path_position = command
-            .find(&format!(
-                "$t=[IO.Path]::Combine($env:{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV},"
-            ))
-            .unwrap();
-        let runner_open_position = command
-            .find("$r=New-Object IO.FileStream($t,[IO.FileMode]::CreateNew")
-            .unwrap();
-        let runner_owned_position = command.find(";$q=$t;").unwrap();
-        assert!(runner_path_position < runner_open_position);
-        assert!(runner_open_position < runner_owned_position);
-        assert!(!command.contains("$q=[IO.Path]::Combine("));
-        assert!(!command.contains("[IO.Path]::GetDirectoryName($p)"));
-        assert!(command.contains(&format!("$l=[Int64]$env:{ELEVATED_BATCH_LENGTH_ENV}")));
-        assert!(command.contains(&format!(
-            "if($z -gt $l){{$e={ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE}}}"
-        )));
-        assert!(command.contains(&format!(
-            "if($e -eq 0 -and $z -ne $l){{$e={ELEVATED_BATCH_SIZE_MISMATCH_EXIT_CODE}}}"
-        )));
-        assert!(command.contains(&format!(
-            "& $env:{ELEVATED_CMD_PATH_ENV} /D /E:ON /V:OFF /C $q"
-        )));
-        assert!(!command.contains(&format!(
-            "& $env:{ELEVATED_CMD_PATH_ENV} /D /E:ON /V:OFF /C $p"
-        )));
-        assert!(command.ends_with("[Environment]::Exit([int]$e)"));
-    }
-
-    #[test]
-    fn verified_batch_bootstrap_fits_windows_7_shell_execute_limit() {
-        let path = PathBuf::from(format!(
-            "C:\\{}",
-            "a".repeat(WIN_MAX_PATH as usize - "C:\\".len())
-        ));
-        let batch = b"batch";
-        let hash: BatchHash = Sha256::digest(batch).into();
-        let expected_length = batch.len() as u64;
-        let bootstrap = verified_batch_bootstrap(&path, &hash, expected_length).unwrap();
-        let encoded_hash = BASE64_STANDARD.encode(hash);
-        let parameters = format!("/D /E:ON /V:OFF /S /C {bootstrap}");
-        let parameter_chars = parameters.encode_utf16().count();
-        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
-        let runner_directory = cmd_path
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("Temp");
-        let powershell_path = get_system_executable(POWERSHELL_RELATIVE_PATH).unwrap();
-        let powershell_launch = format!(
-            "\"{}\" -NoLogo",
-            path_for_cmd_command(&powershell_path).unwrap()
-        );
-        let powershell_start = bootstrap.find(&powershell_launch).unwrap();
-        let assert_before_powershell = |assignment: String| {
-            let assignment_start = bootstrap
-                .find(&assignment)
-                .unwrap_or_else(|| panic!("missing {assignment}"));
-            assert!(assignment_start < powershell_start, "late {assignment}");
-        };
-
-        assert!(
-            parameter_chars < WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS,
-            "bootstrap uses {parameter_chars} parameter characters"
-        );
-        for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
-            assert_before_powershell(format!("set \"{variable}=0\""));
-        }
-        assert_before_powershell(format!(
-            "set \"{ELEVATED_BATCH_PATH_ENV}={}\"",
-            path.to_string_lossy()
-        ));
-        assert_before_powershell(format!("set \"{ELEVATED_BATCH_HASH_ENV}={encoded_hash}\""));
-        assert_before_powershell(format!(
-            "set \"{ELEVATED_BATCH_LENGTH_ENV}={expected_length}\""
-        ));
-        assert_before_powershell(format!(
-            "set \"{ELEVATED_CMD_PATH_ENV}={}\"",
-            path_for_cmd_command(&cmd_path).unwrap()
-        ));
-        assert_before_powershell(format!(
-            "set \"{ELEVATED_BATCH_RUNNER_DIRECTORY_ENV}={}\"",
-            path_for_cmd_command(&runner_directory).unwrap()
-        ));
-        assert!(powershell_command_for_cmd("Write-Output \"unsafe\"").is_err());
-        assert!(path_for_cmd_command(Path::new("C:\\bad\"path")).is_err());
-    }
-
-    #[test]
-    fn batch_completion_marker_preserves_legacy_command_failures() {
-        let cmd_path = path_for_batch(&get_system_executable(CMD_RELATIVE_PATH).unwrap()).unwrap();
-        let script = write_cmds(
-            format!("\"{cmd_path}\" /D /C exit 7"),
-            "legacy_command_failure",
-        )
-        .unwrap();
-        let undone = script.undone_path.to_path_buf();
-
-        assert!(undone.exists());
-        let status = run_batch(&script);
-        assert!(status.success());
-        assert!(!undone.exists());
-
-        let incomplete = write_cmds("exit /b 0".to_owned(), "incomplete").unwrap();
-        let incomplete_marker = incomplete.undone_path.to_path_buf();
-        assert!(run_batch(&incomplete).success());
-        assert!(incomplete_marker.exists());
-        assert_eq!(
-            elevated_batch_failure_reason(ELEVATED_BATCH_CLEANUP_FAILURE_EXIT_CODE, true),
-            "batch or verifier failed before removing the completion marker"
-        );
-        drop(incomplete);
-        assert!(!incomplete_marker.exists());
-    }
-
-    #[test]
-    fn self_termination_is_deferred_to_terminal_batch_line() {
-        let before_uninstall = get_before_uninstall();
-        let current_pid_filter = format!("/FI \"PID ne {}\"", get_current_pid());
-        assert!(before_uninstall.contains(&current_pid_filter));
-
-        let command = finish_batch_after_killing_process_cmd(42, Some("C:\\RustDesk"));
-        let marker = format!("%{ELEVATED_BATCH_MARKER_ENV}%");
-        assert_eq!(
-            command,
-            format!(
-                "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & if exist \"C:\\RustDesk\" rd /s /q \"C:\\RustDesk\" & if exist \"C:\\RustDesk\" exit /b 1 & exit /b 0"
-            )
-        );
-        assert_eq!(
-            finish_batch_after_killing_process_cmd(42, None),
-            format!(
-                "del /f /q \"{marker}\" > nul 2>&1 & if exist \"{marker}\" exit /b 1 & taskkill /F /PID 42 > nul 2>&1 || exit /b 1 & exit /b 0"
-            )
-        );
-    }
-
-    #[test]
-    fn shortcut_command_escapes_values() {
-        let command = create_shortcut_cmd(ShortcutOptions {
-            link_file: "RustDesk's %.lnk",
-            special_folder: Some("AllUsersDesktop"),
-            target_path: "C:\\Program Files\\RustDesk's %\\RustDesk.exe",
-            arguments: None,
-            icon_location: None,
-        })
-        .unwrap();
-
-        assert!(command.contains("'RustDesk''s %%.lnk'"));
-        assert!(command.contains("'C:\\Program Files\\RustDesk''s %%\\RustDesk.exe'"));
-        assert!(powershell_single_quoted("line\nbreak").is_err());
-        assert!(create_shortcut_cmd(ShortcutOptions {
-            link_file: "RustDesk.lnk",
-            special_folder: None,
-            target_path: "C:\\Program Files\\RustDesk.exe",
-            arguments: Some("--connect \"quoted\""),
-            icon_location: None,
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn trusted_batch_environment_uses_system_paths() {
-        let environment = trusted_batch_environment().unwrap();
-        let chcp_path =
-            path_for_batch(&get_system_executable(CHCP_RELATIVE_PATH).unwrap()).unwrap();
-        let cmd_path = get_system_executable(CMD_RELATIVE_PATH).unwrap();
-        let system_dir_path = cmd_path.parent().unwrap();
-        let windows_dir = path_for_batch(system_dir_path.parent().unwrap()).unwrap();
-        let system_dir = path_for_batch(system_dir_path).unwrap();
-        let cmd_path = path_for_batch(&cmd_path).unwrap();
-        let code_page = environment
-            .find(&format!("\"{chcp_path}\" {UTF8_CODE_PAGE}"))
-            .unwrap();
-        let first_known_folder = environment.find("set \"RUSTDESK_PUBLIC_DESKTOP=").unwrap();
-        let assert_value = |name: &str, value: &str| {
-            let expected = format!("set \"{name}={value}\"");
-            assert!(
-                environment.lines().any(|line| line == expected),
-                "missing {expected}"
-            );
-        };
-
-        assert!(code_page < first_known_folder);
-        assert!(environment.contains("setlocal EnableExtensions DisableDelayedExpansion"));
-        assert_value("ComSpec", &cmd_path);
-        assert_value("PATH", &system_dir);
-        assert_value("PATHEXT", ".COM;.EXE;.BAT;.CMD");
-        for (variable, folder) in [
-            ("RUSTDESK_PUBLIC_DESKTOP", FOLDERID_PublicDesktop),
-            ("RUSTDESK_COMMON_PROGRAMS", FOLDERID_CommonPrograms),
-            ("RUSTDESK_COMMON_STARTUP", FOLDERID_CommonStartup),
-        ] {
-            let path = path_for_batch(&get_known_folder_path(&folder).unwrap()).unwrap();
-            assert!(environment.contains(&format!("set \"{variable}={path}\"")));
-        }
-        assert_value("SystemRoot", &windows_dir);
-        assert_value("WINDIR", &windows_dir);
-        for variable in MANAGED_PROFILING_ENABLE_VARIABLES {
-            assert_value(variable, "0");
-        }
-        assert!(environment.contains("set \"NoDefaultCurrentDirectoryInExePath=1\""));
-    }
-
-    #[test]
     fn test_uninstall_cert() {
         println!("uninstall driver certs: {:?}", cert::uninstall_cert());
     }
@@ -5512,6 +4869,119 @@ mod tests {
         assert_eq!(chr, Some('a'));
         let chr = get_char_from_vk(VK_ESCAPE as u32); // VK_ESC
         assert_eq!(chr, None)
+    }
+
+    #[test]
+    fn install_values_reject_cmd_control_characters() {
+        assert!(validate_install_value(r"C:\safe ! path").is_ok());
+        assert!(validate_install_value(r"C:\Program Files (x86)\RustDesk").is_ok());
+        assert!(validate_install_name("RustDesk Custom").is_ok());
+        for character in ['\0', '"', '%', '^', '\r', '\n', '&', '|', '<', '>'] {
+            let value = format!(r"C:\unsafe{character}path");
+            assert!(
+                validate_install_value(&value).is_err(),
+                "cmd.exe control character was accepted: {character:?}"
+            );
+        }
+        for character in ['(', ')'] {
+            assert!(validate_install_name(&format!("RustDesk{character}")).is_err());
+        }
+    }
+
+    #[test]
+    fn service_install_does_not_use_mutable_temp_vbs() {
+        let (_, path, _, exe) = get_install_info();
+        let commands = get_install_service_commands(&path, &exe)
+            .expect("service install commands should be generated");
+        let legacy_script = format!("{}_tray_shortcut.vbs", crate::get_app_name());
+        assert!(commands.contains("%~f0.tray_shortcut.b64"));
+        assert!(commands.contains("%~f0.tray_shortcut.vbs"));
+        assert!(commands.contains("%RUSTDESK_OUTPUT_DIR%"));
+        assert!(
+            !commands.contains(&legacy_script),
+            "service install must not execute a mutable temporary VBS"
+        );
+    }
+
+    #[test]
+    fn native_install_handoff_verifies_before_execution() {
+        let marker = std::env::temp_dir().join(format!(
+            "rustdesk_install_marker_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let runner_dir = std::env::temp_dir().join(format!(
+            "rustdesk_install_!&^@()runner_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&runner_dir).expect("runner directory should be created");
+        let vbs_commands = embedded_vbs_commands(
+            "If WScript.Arguments.Count <> 1 Then WScript.Quit 1".to_owned(),
+            "test",
+        );
+        assert!(vbs_commands.contains("certutil"));
+        assert!(vbs_commands.contains("-decode"));
+        assert!(vbs_commands.contains("cscript"));
+        assert!(!vbs_commands.to_ascii_lowercase().contains("powershell"));
+        let script = write_install_script(format!(
+            "if \"%PROGRAMDATA%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
+             if \"%PUBLIC%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
+             {vbs_commands}\r\n\
+             > \"{}\" echo verified",
+            marker.display()
+        ))
+        .expect("install script should be created");
+        let bootstrap = verified_install_bootstrap(&script, &runner_dir)
+            .expect("native verifier bootstrap should be generated");
+        let parameters =
+            verified_install_parameters(&script).expect("elevated parameters should be generated");
+        assert!(bootstrap.contains("certutil.exe"));
+        assert!(bootstrap.contains("findstr.exe"));
+        assert!(!bootstrap.to_ascii_lowercase().contains("powershell"));
+        assert!(parameters.encode_utf16().count() < WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS);
+
+        let output = run_install_bootstrap_for_test(&bootstrap);
+        assert!(
+            output.status.success(),
+            "unchanged script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(marker.exists(), "verified install script must execute");
+        std::fs::remove_file(&marker).expect("test marker should be removed");
+        assert_replaced_install_script_is_rejected(&script, &runner_dir, &marker);
+        std::fs::remove_dir(runner_dir).expect("runner directory should be empty");
+    }
+
+    fn assert_replaced_install_script_is_rejected(
+        script: &InstallCommandScript,
+        runner_dir: &Path,
+        marker: &Path,
+    ) {
+        std::fs::write(
+            &script.path,
+            format!("> \"{}\" echo hijacked\r\n", marker.display()),
+        )
+        .expect("install script should be replaceable");
+        let replaced = verified_install_bootstrap(&script, &runner_dir)
+            .expect("replacement verifier should be generated");
+        let output = run_install_bootstrap_for_test(&replaced);
+        assert!(
+            !output.status.success(),
+            "replaced script unexpectedly passed verification"
+        );
+        assert!(!marker.exists(), "replaced script must not execute");
+    }
+
+    fn run_install_bootstrap_for_test(bootstrap: &str) -> std::process::Output {
+        let cmd = get_system_executable(CMD_RELATIVE_PATH).expect("system cmd.exe should resolve");
+        let mut command = std::process::Command::new(cmd);
+        command
+            .env("PROGRAMDATA", "rustdesk_untrusted")
+            .env("PUBLIC", "rustdesk_untrusted");
+        command.raw_arg(format!("/D /E:ON /V:ON /C {bootstrap}"));
+        command
+            .creation_flags(Threading::CREATE_NO_WINDOW.0)
+            .output()
+            .expect("native verifier should run")
     }
 
     #[cfg(not(target_pointer_width = "64"))]
