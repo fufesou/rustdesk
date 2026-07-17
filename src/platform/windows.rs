@@ -123,11 +123,19 @@ const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 const CERTUTIL_RELATIVE_PATH: &str = "certutil.exe";
+const CHCP_RELATIVE_PATH: &str = "chcp.com";
 const CMD_RELATIVE_PATH: &str = "cmd.exe";
 const FINDSTR_RELATIVE_PATH: &str = "findstr.exe";
 const UTF8_CODE_PAGE: u32 = 65001;
-const BATCH_SETUP_FAILURE_EXIT_CODE: u32 = 1;
-const INSTALL_HANDOFF_FAILURE_EXIT_CODE: u32 = 10;
+const INSTALL_HANDOFF_RUNNER_EXISTS_EXIT_CODE: u32 = 0x5253_0001;
+const INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE: u32 = 0x5253_0002;
+const INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE: u32 = 0x5253_0003;
+const INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE: u32 = 0x5253_0004;
+const BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
+const BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE: u32 = 0x5253_0006;
+const BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
+const BATCH_VBS_DECODE_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
+const BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE: u32 = 0x5253_0009;
 const SHA256_HASH_LENGTH: usize = 32;
 const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2048;
 
@@ -1578,8 +1586,8 @@ fn embedded_vbs_commands(commands: String, name: &str) -> String {
     let script_path = format!("%~f0.{name}.vbs");
     format!(
         "> \"{encoded_path}\" echo {encoded}\r\n\
-         certutil -f -decode \"{encoded_path}\" \"{script_path}\" > nul || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
-         cscript //B //NoLogo \"{script_path}\" \"%RUSTDESK_OUTPUT_DIR%\" || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}"
+         certutil -f -decode \"{encoded_path}\" \"{script_path}\" > nul || exit /b {BATCH_VBS_DECODE_FAILURE_EXIT_CODE}\r\n\
+         cscript //B //NoLogo \"{script_path}\" \"%RUSTDESK_OUTPUT_DIR%\" || exit /b {BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE}"
     )
 }
 
@@ -1960,12 +1968,13 @@ impl Drop for InstallCommandScript {
 
 fn prepare_install_commands(commands: &str) -> ResultType<String> {
     let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
+    let chcp = path_for_cmd_assignment(&get_system_executable(CHCP_RELATIVE_PATH)?)?;
     Ok(format!(
         "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n{}\r\n\
-         chcp {UTF8_CODE_PAGE} > nul || exit /b \
-         {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
-         if exist \"%~f0.dir\" exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
-         md \"%~f0.dir\" || exit /b {BATCH_SETUP_FAILURE_EXIT_CODE}\r\n\
+         \"{chcp}\" {UTF8_CODE_PAGE} > nul || exit /b \
+         {BATCH_CODE_PAGE_FAILURE_EXIT_CODE}\r\n\
+         if exist \"%~f0.dir\" exit /b {BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE}\r\n\
+         md \"%~f0.dir\" || exit /b {BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE}\r\n\
          set \"RUSTDESK_OUTPUT_DIR=%~f0.dir\"\r\n{commands}\r\nexit /b 0\r\n",
         trusted_install_environment()?
     ))
@@ -2065,12 +2074,16 @@ fn verified_install_bootstrap(
     let findstr = path_for_cmd_assignment(&findstr_path)?;
     Ok(format!(
         "setlocal DisableDelayedExpansion & set \"S={source}\" & set \"R={runner}\" & \
-         set \"Q={cmd}\" & set \"C=0\" & setlocal EnableDelayedExpansion & \
-         if exist \"!R!\" (set \"E={INSTALL_HANDOFF_FAILURE_EXIT_CODE}\") else (\
-         set \"C=1\" & copy /Y \"!S!\" \"!R!\" > nul && \
-         \"{certutil}\" -hashfile \"!R!\" SHA256 > \"!R!.hash\" && \
-         \"{findstr}\" /L /I /X /C:\"{}\" \"!R!.hash\" > nul && \
-         \"!Q!\" /D /E:ON /V:OFF /C \"\"!R!\"\" & set \"E=!errorlevel!\") & \
+         set \"Q={cmd}\" & set \"C=0\" & set \"E=0\" & setlocal EnableDelayedExpansion & \
+         if exist \"!R!\" (set \"E={INSTALL_HANDOFF_RUNNER_EXISTS_EXIT_CODE}\") else (\
+         set \"C=1\" & copy /Y \"!S!\" \"!R!\" > nul || \
+         (set \"E={INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE}\") & \
+         if \"!E!\"==\"0\" (\"{certutil}\" -hashfile \"!R!\" SHA256 > \"!R!.hash\" || \
+         set \"E={INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE}\") & \
+         if \"!E!\"==\"0\" (\"{findstr}\" /L /I /X /C:\"{}\" \"!R!.hash\" > nul || \
+         set \"E={INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE}\") & \
+         if \"!E!\"==\"0\" (\"!Q!\" /D /E:ON /V:OFF /C \"\"!R!\"\" & \
+         set \"E=!errorlevel!\")) & \
          if \"!C!\"==\"1\" (rd /s /q \"!R!.dir\" > nul 2>&1 & \
          del /f /q \"!R!\" \"!R!.*\" > nul 2>&1) & exit /b !E!",
         install_hash_string(&script.expected_hash),
@@ -2175,9 +2188,29 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let parameters = verified_install_parameters(&script)?;
     let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show)?;
     if exit_code != 0 {
-        bail!("{tip} failed with elevated exit code {exit_code}");
+        bail!(
+            "{tip} failed with elevated exit code {exit_code}: {}",
+            elevated_install_failure_reason(exit_code)
+        );
     }
     Ok(())
+}
+
+fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
+    match exit_code {
+        INSTALL_HANDOFF_RUNNER_EXISTS_EXIT_CODE => "protected runner already exists",
+        INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE => "failed to copy protected runner",
+        INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE => "failed to hash protected runner",
+        INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE => "protected runner hash mismatch",
+        BATCH_CODE_PAGE_FAILURE_EXIT_CODE => "failed to set the installer code page",
+        BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE => "installer output directory already exists",
+        BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE => {
+            "failed to create the installer output directory"
+        }
+        BATCH_VBS_DECODE_FAILURE_EXIT_CODE => "failed to decode an embedded shortcut script",
+        BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE => "failed to execute an embedded shortcut script",
+        _ => "installer command failed",
+    }
 }
 
 pub fn toggle_blank_screen(v: bool) {
@@ -4889,6 +4922,18 @@ mod tests {
     }
 
     #[test]
+    fn install_batch_uses_absolute_system_chcp() {
+        let commands =
+            prepare_install_commands("exit /b 0").expect("install commands should be prepared");
+        let chcp_path = path_for_cmd_assignment(
+            &get_system_executable("chcp.com").expect("system chcp.com should resolve"),
+        )
+        .expect("system chcp.com path should be safe for cmd.exe");
+
+        assert!(commands.contains(&format!("\"{chcp_path}\" {UTF8_CODE_PAGE} > nul")));
+    }
+
+    #[test]
     fn service_install_does_not_use_mutable_temp_vbs() {
         let (_, path, _, exe) = get_install_info();
         let commands = get_install_service_commands(&path, &exe)
@@ -4967,6 +5012,10 @@ mod tests {
         assert!(
             !output.status.success(),
             "replaced script unexpectedly passed verification"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE as i32)
         );
         assert!(!marker.exists(), "replaced script must not execute");
     }
