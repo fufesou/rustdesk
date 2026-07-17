@@ -2050,10 +2050,11 @@ fn trusted_install_environment() -> ResultType<String> {
     ))
 }
 
-fn install_hash_string(hash: &BatchHash) -> String {
+fn install_hash_pattern(hash: &BatchHash) -> String {
     hash.iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+        .collect::<Vec<_>>()
+        .join(" *")
 }
 
 fn verified_install_bootstrap(
@@ -2080,13 +2081,13 @@ fn verified_install_bootstrap(
          (set \"E={INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE}\") & \
          if \"!E!\"==\"0\" (\"{certutil}\" -hashfile \"!R!\" SHA256 > \"!R!.hash\" || \
          set \"E={INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE}\") & \
-         if \"!E!\"==\"0\" (\"{findstr}\" /L /I /X /C:\"{}\" \"!R!.hash\" > nul || \
+         if \"!E!\"==\"0\" (\"{findstr}\" /R /I /X /C:\"{}\" \"!R!.hash\" > nul || \
          set \"E={INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE}\") & \
          if \"!E!\"==\"0\" (\"!Q!\" /D /E:ON /V:OFF /C \"\"!R!\"\" & \
          set \"E=!errorlevel!\")) & \
          if \"!C!\"==\"1\" (rd /s /q \"!R!.dir\" > nul 2>&1 & \
          del /f /q \"!R!\" \"!R!.*\" > nul 2>&1) & exit /b !E!",
-        install_hash_string(&script.expected_hash),
+        install_hash_pattern(&script.expected_hash),
     ))
 }
 
@@ -4977,6 +4978,13 @@ mod tests {
         .expect("install script should be created");
         let bootstrap = verified_install_bootstrap(&script, &runner_dir)
             .expect("native verifier bootstrap should be generated");
+        let win7_hash_pattern = script
+            .expected_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" *");
+        assert!(bootstrap.contains(&format!("/R /I /X /C:\"{win7_hash_pattern}\"")));
         let parameters =
             verified_install_parameters(&script).expect("elevated parameters should be generated");
         assert!(bootstrap.contains("certutil.exe"));
