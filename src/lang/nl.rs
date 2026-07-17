@@ -765,5 +765,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "Alle monitoren"),
         ("#{} monitor", "Monitor {}"),
         ("conn-e2ee-unavailable-tip", "End-to-endversleuteling kon niet worden geverifieerd.\nHet externe apparaat wordt mogelijk nog ingesteld. Probeer het later opnieuw.\nAls dit blijft gebeuren, is de server mogelijk niet vertrouwd.\nToch doorgaan?"),
+        ("Verifying update", ""),
+        ("Please wait while {} verifies the update.", ""),
     ].iter().cloned().collect();
 }

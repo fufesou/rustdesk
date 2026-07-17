@@ -22,17 +22,18 @@ use hbb_common::{
     bail, log,
     message_proto::{DisplayInfo, Resolution},
     sysinfo::{Pid, Process, ProcessRefreshKind, System},
+    update_metadata::{UpdateArtifactQuery, UpdateMetadataPolicy, VerifiedUpdateArtifact},
 };
 use include_dir::{include_dir, Dir};
 use objc::rc::autoreleasepool;
 use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
-    collections::HashMap,
-    os::unix::process::CommandExt,
+    io::{Read, Seek, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Mutex,
+    process::Command,
+    sync::{Mutex, OnceLock},
 };
 
 // macOS boolean_t is defined as `int` in <mach/boolean.h>
@@ -41,16 +42,99 @@ type BooleanT = hbb_common::libc::c_int;
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
+static UPDATE_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
+const UPDATE_TEMP_DMG_CREATE_ATTEMPTS: usize = 16;
+const UPDATE_DMG_MOUNT_POINT: &str = "/Volumes/RustDeskUpdate";
+const STALE_UPDATE_TEMP_DIR_SECS: u64 = 24 * 60 * 60;
+const UPDATE_METADATA_SIDECAR_MAX_BYTES: usize = 1024 * 1024;
+const UPDATE_SIGNATURE_SIDECAR_MAX_BYTES: usize = 4 * 1024;
 
 #[inline]
 fn get_update_temp_dir() -> PathBuf {
+    UPDATE_TEMP_DIR.get_or_init(new_update_temp_dir).clone()
+}
+
+fn new_update_temp_dir() -> PathBuf {
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    Path::new("/tmp").join(format!(
+        ".rustdeskupdate-{}-{}-{}",
+        euid,
+        std::process::id(),
+        hbb_common::rand::random::<u64>()
+    ))
+}
+
+fn legacy_update_temp_dir() -> PathBuf {
     let euid = unsafe { hbb_common::libc::geteuid() };
     Path::new("/tmp").join(format!(".rustdeskupdate-{}", euid))
+}
+
+fn stale_update_temp_dir_prefix() -> String {
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    format!(".rustdeskupdate-{}-", euid)
+}
+
+fn is_stale_update_temp_dir_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(&stale_update_temp_dir_prefix()) else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(random), None)
+            if !pid.is_empty()
+                && !random.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && random.bytes().all(|b| b.is_ascii_digit())
+    )
 }
 
 #[inline]
 fn get_update_temp_dir_string() -> String {
     get_update_temp_dir().to_string_lossy().into_owned()
+}
+
+fn ensure_real_update_temp_dir(path: &Path) -> ResultType<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("Update temp path is not a real directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn create_update_temp_dmg_file() -> ResultType<(std::fs::File, PathBuf)> {
+    let update_temp_dir = get_update_temp_dir();
+    std::fs::create_dir_all(&update_temp_dir)?;
+    ensure_real_update_temp_dir(&update_temp_dir)?;
+    std::fs::set_permissions(&update_temp_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let dmg_dir = update_temp_dir.join("dmgdir");
+    std::fs::create_dir_all(&dmg_dir)?;
+    ensure_real_update_temp_dir(&dmg_dir)?;
+    std::fs::set_permissions(&dmg_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    for _ in 0..UPDATE_TEMP_DMG_CREATE_ATTEMPTS {
+        let file_path = dmg_dir.join(format!(
+            "{}-{}-{}.dmg",
+            crate::get_app_name(),
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let file_res = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&file_path);
+        match file_res {
+            Ok(file) => {
+                return Ok((file, file_path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    bail!("Failed to create update DMG file");
 }
 
 /// Global mutex to serialize CoreGraphics cursor operations.
@@ -250,29 +334,34 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     false
 }
 
-fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync: bool) {
+fn update_daemon_agent(
+    agent_plist_file: String,
+    update_source_dir: String,
+    sync: bool,
+) -> ResultType<()> {
     let update_script_file = "update.scpt";
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
-        return;
+        bail!("Failed to find {}", update_script_file);
     };
     let Some(update_script_body) = update_script.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read {}", update_script_file);
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
-        return;
+        bail!("Failed to find daemon.plist");
     };
     let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read daemon.plist");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
-        return;
+        bail!("Failed to find agent.plist");
     };
     let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read agent.plist");
     };
 
-    let func = move || {
+    let current_pid = std::process::id().to_string();
+    let func = move || -> ResultType<()> {
         let mut binding = std::process::Command::new("osascript");
         let cmd = binding
             .arg("-e")
@@ -280,25 +369,40 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
             .arg(daemon_plist_body)
             .arg(agent_plist_body)
             .arg(&get_active_username())
-            .arg(std::process::id().to_string())
+            .arg(&current_pid)
             .arg(update_source_dir);
-        match cmd.status() {
+        match cmd.output() {
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
+                bail!("run osascript failed: {}", e);
             }
-            Ok(status) if !status.success() => {
-                log::warn!("run osascript failed with status: {}", status);
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             _ => {
                 let installed = std::path::Path::new(&agent_plist_file).exists();
                 log::info!("Agent file {} installed: {}", &agent_plist_file, installed);
             }
         }
+        Ok(())
     };
     if sync {
-        func();
+        func()
     } else {
-        std::thread::spawn(func);
+        std::thread::spawn(move || {
+            hbb_common::allow_err!(func());
+        });
+        Ok(())
     }
 }
 
@@ -819,21 +923,64 @@ pub fn quit_gui() {
 
 #[inline]
 pub fn try_remove_temp_update_dir(dir: Option<&str>) {
-    let target_path_buf = dir.map(PathBuf::from).unwrap_or_else(get_update_temp_dir);
-    let target_path = target_path_buf.as_path();
-    if target_path.exists() {
-        std::fs::remove_dir_all(target_path).ok();
+    if let Some(dir) = dir {
+        remove_temp_update_dir(Path::new(dir));
+    } else {
+        remove_temp_update_dir(&legacy_update_temp_dir());
+        remove_stale_update_temp_dirs();
+    }
+}
+
+fn remove_stale_update_temp_dirs() {
+    let current_update_temp_dir = get_update_temp_dir();
+    let legacy_update_temp_dir = legacy_update_temp_dir();
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current_update_temp_dir || path == legacy_update_temp_dir {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_stale_update_temp_dir_name(name) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || !is_old_update_temp_dir(&metadata) {
+            continue;
+        }
+        remove_temp_update_dir(&path);
+    }
+}
+
+fn is_old_update_temp_dir(metadata: &std::fs::Metadata) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_secs() >= STALE_UPDATE_TEMP_DIR_SECS)
+        .unwrap_or(false)
+}
+
+fn remove_temp_update_dir(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(hbb_common::libc::ENOTDIR) => {}
+        Err(e) => {
+            log::warn!("Failed to remove update temp dir {}: {}", path.display(), e);
+        }
     }
 }
 
 pub fn update_me() -> ResultType<()> {
-    let is_installed_daemon = is_installed_daemon(false);
-    let option_stop_service = "stop-service";
-    let is_service_stopped = hbb_common::config::option2bool(
-        option_stop_service,
-        &crate::ui_interface::get_option(option_stop_service),
-    );
-
     let cmd = std::env::current_exe()?;
     // RustDesk.app/Contents/MacOS/RustDesk
     let app_dir = cmd
@@ -844,53 +991,86 @@ pub fn update_me() -> ResultType<()> {
     let Some(app_dir) = app_dir else {
         bail!("Unknown app directory of current exe file: {:?}", cmd);
     };
+    update_me_from_app_dir(app_dir)
+}
+
+fn update_me_from_app_dir(app_dir: String) -> ResultType<()> {
+    let is_installed_daemon = is_installed_daemon(false);
+    let option_stop_service = "stop-service";
+    let is_service_stopped = hbb_common::config::option2bool(
+        option_stop_service,
+        &crate::ui_interface::get_option(option_stop_service),
+    );
 
     let app_name = crate::get_app_name();
     if is_installed_daemon && !is_service_stopped {
         let agent = format!("{}_server.plist", crate::get_full_name());
         let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
-        update_daemon_agent(agent_plist_file, app_dir, true);
+        update_daemon_agent(agent_plist_file, app_dir, true)?;
     } else {
         // `kill -9` may not work without "administrator privileges"
         let update_body = r#"
-on run {app_name, cur_pid, app_dir, user_name}
-    set app_bundle to "/Applications/" & app_name & ".app"
-    set app_bundle_q to quoted form of app_bundle
-    set app_dir_q to quoted form of app_dir
-    set user_name_q to quoted form of user_name
+	on run {app_name, cur_pid, app_dir, user_name, restore_owner}
+	    set app_bundle to "/Applications/" & app_name & ".app"
+	    set app_bundle_q to quoted form of app_bundle
+	    set app_dir_q to quoted form of app_dir
+	    set user_name_q to quoted form of user_name
 
-    set check_source to "test -d " & app_dir_q & " || exit 1;"
-    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
-    set copy_files to "rm -rf " & app_bundle_q & " && ditto " & app_dir_q & " " & app_bundle_q & " && chown -R " & user_name_q & ":staff " & app_bundle_q & " && (xattr -r -d com.apple.quarantine " & app_bundle_q & " || true);"
-    set sh to "set -e;" & check_source & kill_others & copy_files
+	    set check_source to "test -d " & app_dir_q & " || exit 1;"
+	    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
+	    set prepare_verified to "verified_dir=$(mktemp -d /tmp/.rustdeskupdate-verified.XXXXXX); verified_app=\"$verified_dir/" & app_name & ".app\"; ditto " & app_dir_q & " \"$verified_app\"; chown -R root:wheel \"$verified_app\"; chmod -R go-w \"$verified_app\";"
+	    set prepare_swap_paths to "temp_bundle=" & app_bundle_q & ".new.$$; old_bundle=" & app_bundle_q & ".old.$$;"
+	    set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
+	    set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
+	    set protect_staged_bundle to "chown -R root:wheel \"$temp_bundle\"; chmod -R go-w \"$temp_bundle\"; (xattr -r -d com.apple.quarantine \"$temp_bundle\" || true);"
+	    set move_current_bundle to "if [ -e " & app_bundle_q & " ]; then mv " & app_bundle_q & " \"$old_bundle\"; fi;"
+	    set install_staged_bundle to "if mv \"$temp_bundle\" " & app_bundle_q & "; then rm -rf \"$old_bundle\"; else if [ -e \"$old_bundle\" ]; then mv \"$old_bundle\" " & app_bundle_q & "; fi; exit 1; fi;"
+	    set restore_installed_owner to "if [ " & quoted form of restore_owner & " = '1' ]; then chown -R " & user_name_q & ":staff " & app_bundle_q & "; fi;"
+	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & move_current_bundle & install_staged_bundle & restore_installed_owner
+	    set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\"; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\"; fi;"
+	    set sh to "set -e; trap " & quoted form of cleanup_verified & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
 
-    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
-end run
-        "#;
-        let active_user = get_active_username();
-        let status = Command::new("osascript")
+	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
+	end run
+	        "#;
+        let output = Command::new("osascript")
             .arg("-e")
             .arg(update_body)
             .arg(app_name.to_string())
             .arg(std::process::id().to_string())
             .arg(app_dir)
-            .arg(active_user)
-            .status();
-        match status {
-            Ok(status) if !status.success() => {
-                log::error!("osascript execution failed with status: {}", status);
+            .arg(get_active_username())
+            .arg(if is_installed_daemon { "0" } else { "1" })
+            .output();
+        match output {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::error!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
+                bail!("run osascript failed: {}", e);
             }
             _ => {}
         }
     }
-    std::process::Command::new("open")
+    let open_status = Command::new("open")
         .arg("-n")
         .arg(&format!("/Applications/{}.app", app_name))
-        .spawn()
-        .ok();
+        .status()
+        .map_err(|e| anyhow!("Failed to relaunch updated app: {}", e))?;
+    if !open_status.success() {
+        bail!("Failed to relaunch updated app: {}", open_status);
+    }
     // leave open a little time
     std::thread::sleep(std::time::Duration::from_millis(300));
     Ok(())
@@ -906,32 +1086,356 @@ pub fn update_from_dmg(dmg_path: &str) -> ResultType<()> {
     Ok(())
 }
 
-pub fn update_to(_file: &str) -> ResultType<()> {
+pub fn update_from_verified_dmg_sidecar(
+    dmg_path: &str,
+    metadata_path: &str,
+    signature_path: &str,
+) -> ResultType<()> {
     let update_temp_dir = get_update_temp_dir_string();
-    update_extracted(&update_temp_dir)?;
+    let metadata_bytes =
+        read_update_sidecar_file(Path::new(metadata_path), UPDATE_METADATA_SIDECAR_MAX_BYTES)?;
+    let signature_bytes = read_update_sidecar_file(
+        Path::new(signature_path),
+        UPDATE_SIGNATURE_SIDECAR_MAX_BYTES,
+    )?;
+    let update_res = update_from_verified_dmg_sidecar_(dmg_path, &metadata_bytes, &signature_bytes);
+    try_remove_temp_update_dir(Some(&update_temp_dir));
+    update_res
+}
+
+fn read_update_sidecar_file(path: &Path, max_bytes: usize) -> ResultType<Vec<u8>> {
+    let max_bytes_u64 = max_bytes as u64;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        bail!("Update sidecar path is not a regular file: {}", path.display());
+    }
+    if path_metadata.len() > max_bytes_u64 {
+        bail!(
+            "Update sidecar file {} is too large: {} bytes, max {} bytes",
+            path.display(),
+            path_metadata.len(),
+            max_bytes
+        );
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
+        .open(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.is_file() {
+        bail!("Update sidecar path is not a regular file: {}", path.display());
+    }
+    if file_metadata.len() > max_bytes_u64 {
+        bail!(
+            "Update sidecar file {} is too large: {} bytes, max {} bytes",
+            path.display(),
+            file_metadata.len(),
+            max_bytes
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(file_metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes_u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        bail!(
+            "Update sidecar file {} grew beyond max {} bytes while reading",
+            path.display(),
+            max_bytes
+        );
+    }
+    Ok(bytes)
+}
+
+fn update_from_verified_dmg_sidecar_(
+    dmg_path: &str,
+    metadata_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> ResultType<()> {
+    let artifact = verify_dmg_sidecar_metadata(dmg_path, metadata_bytes, signature_bytes)?;
+    let (mut dmg_file, temp_dmg_path) =
+        copy_dmg_to_update_temp_file(dmg_path, Some(artifact.size))?;
+    verify_dmg_file_size_and_sha256(
+        &mut dmg_file,
+        artifact.size,
+        &artifact.sha256,
+        &temp_dmg_path.to_string_lossy(),
+    )?;
+    let temp_dmg_path = temp_dmg_path.to_string_lossy();
+    update_from_mounted_dmg_with_options(&temp_dmg_path, true, None)
+}
+
+pub fn update_to_verified_dmg(
+    file: &str,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    let update_temp_dir = get_update_temp_dir_string();
+    let update_res = update_from_verified_dmg(file, expected_sha256, expected_size, before_prompt);
+    try_remove_temp_update_dir(Some(&update_temp_dir));
+    update_res?;
+    quit_gui();
     Ok(())
 }
 
-pub fn extract_update_dmg(file: &str) {
-    let update_temp_dir = get_update_temp_dir_string();
-    let mut evt: HashMap<&str, String> =
-        HashMap::from([("name", "extract-update-dmg".to_string())]);
-    match extract_dmg(file, &update_temp_dir) {
-        Ok(_) => {
-            log::info!("Extracted dmg file to {}", update_temp_dir);
-        }
-        Err(e) => {
-            evt.insert("err", e.to_string());
-            log::error!("Failed to extract dmg file {}: {}", file, e);
+fn update_from_verified_dmg(
+    dmg_path: &str,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    let (mut dmg_file, temp_dmg_path) = copy_dmg_to_update_temp_file(dmg_path, expected_size)?;
+    verify_dmg_file_sha256(&mut dmg_file, expected_sha256, dmg_path)?;
+    update_from_mounted_dmg_with_options(&temp_dmg_path.to_string_lossy(), true, before_prompt)
+}
+
+fn verify_dmg_sidecar_metadata(
+    dmg_path: &str,
+    metadata_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> ResultType<VerifiedUpdateArtifact> {
+    let file_name = dmg_file_name(dmg_path)?;
+    let policy = dmg_sidecar_policy();
+    let query = dmg_sidecar_query(&file_name);
+    hbb_common::update_metadata::verify_update_metadata(
+        metadata_bytes,
+        signature_bytes,
+        &policy,
+        &query,
+    )
+}
+
+fn dmg_sidecar_policy<'a>() -> UpdateMetadataPolicy<'a> {
+    UpdateMetadataPolicy {
+        app: "rustdesk",
+        allowed_package_ids: &["rustdesk"],
+        expected_version: None,
+        expected_release_id: None,
+        expected_artifact_url_prefix: None,
+    }
+}
+
+fn dmg_sidecar_query<'a>(file_name: &'a str) -> UpdateArtifactQuery<'a> {
+    UpdateArtifactQuery {
+        platform: "macos",
+        arch: current_update_dmg_arch(),
+        format: "dmg",
+        file_name: Some(file_name),
+    }
+}
+
+fn current_update_dmg_arch() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        std::env::consts::ARCH
+    }
+}
+
+fn dmg_file_name(dmg_path: &str) -> ResultType<String> {
+    let Some(file_name) = Path::new(dmg_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        bail!("DMG path has no valid file name: {}", dmg_path);
+    };
+    Ok(file_name.to_owned())
+}
+
+fn verify_dmg_file_size_and_sha256(
+    dmg_file: &mut std::fs::File,
+    expected_size: u64,
+    expected_sha256: &str,
+    display_path: &str,
+) -> ResultType<()> {
+    let actual_size = dmg_file.metadata()?.len();
+    if actual_size != expected_size {
+        bail!(
+            "DMG size mismatch for {}: expected {}, got {}",
+            display_path,
+            expected_size,
+            actual_size
+        );
+    }
+    verify_dmg_file_sha256(dmg_file, expected_sha256, display_path)
+}
+
+fn copy_dmg_to_update_temp_file(
+    dmg_path: &str,
+    expected_size: Option<u64>,
+) -> ResultType<(std::fs::File, PathBuf)> {
+    let metadata = std::fs::symlink_metadata(dmg_path)?;
+    if !metadata.file_type().is_file() {
+        bail!("Update DMG path is not a regular file: {}", dmg_path);
+    }
+    let mut source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
+        .open(dmg_path)?;
+    let opened_metadata = source_file.metadata()?;
+    if !opened_metadata.is_file() {
+        bail!("Update DMG path is not a regular file: {}", dmg_path);
+    }
+    if let Some(expected_size) = expected_size {
+        let actual_size = opened_metadata.len();
+        if actual_size != expected_size {
+            bail!(
+                "DMG size mismatch for {}: expected {}, got {}",
+                dmg_path,
+                expected_size,
+                actual_size
+            );
         }
     }
-    let evt = serde_json::ser::to_string(&evt).unwrap_or("".to_owned());
-    #[cfg(feature = "flutter")]
-    crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
+    let (mut dmg_file, file_path) = create_update_temp_dmg_file()?;
+    copy_dmg_with_expected_size(&mut source_file, &mut dmg_file, expected_size, dmg_path)?;
+    dmg_file.flush()?;
+    dmg_file.seek(std::io::SeekFrom::Start(0))?;
+    Ok((dmg_file, file_path))
+}
+
+fn copy_dmg_with_expected_size<R: Read, W: Write>(
+    source: &mut R,
+    target: &mut W,
+    expected_size: Option<u64>,
+    display_path: &str,
+) -> ResultType<()> {
+    let bytes_written = if let Some(expected_size) = expected_size {
+        let mut limited_source = source.take(expected_size.saturating_add(1));
+        std::io::copy(&mut limited_source, target)?
+    } else {
+        std::io::copy(source, target)?
+    };
+    if let Some(expected_size) = expected_size {
+        if bytes_written != expected_size {
+            bail!(
+                "DMG size mismatch for {}: expected {}, got {}",
+                display_path,
+                expected_size,
+                bytes_written
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_dmg_file_sha256(
+    dmg_file: &mut std::fs::File,
+    expected_sha256: &str,
+    display_path: &str,
+) -> ResultType<()> {
+    let expected_sha256 = expected_sha256.trim();
+    if expected_sha256.len() != 64 || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Expected DMG SHA256 is malformed for {}", display_path);
+    }
+
+    dmg_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = sha2::Sha256::default();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = dmg_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buffer[..count]);
+    }
+
+    let actual_sha256 = format!("{:x}", sha2::Digest::finalize(hasher));
+    if actual_sha256 != expected_sha256.to_ascii_lowercase() {
+        bail!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            display_path,
+            expected_sha256,
+            actual_sha256
+        );
+    }
+    Ok(())
+}
+
+struct DmgGuard(&'static str);
+
+impl Drop for DmgGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args(&["detach", self.0, "-force"])
+            .status();
+    }
+}
+
+fn attach_dmg_failure_message(
+    dmg_path: &str,
+    mount_point: &str,
+    status: impl std::fmt::Display,
+) -> String {
+    format!(
+        "Failed to attach DMG image at {dmg_path}: {status}. A stale mount at {mount_point} may remain from a previous update; detach it with `hdiutil detach {mount_point}` or restart and retry."
+    )
+}
+
+fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Vec<String> {
+    let mut args = vec!["attach".to_owned()];
+    if read_only {
+        args.push("-readonly".to_owned());
+    }
+    args.extend([
+        "-nobrowse".to_owned(),
+        "-mountpoint".to_owned(),
+        mount_point.to_owned(),
+        dmg_path.to_owned(),
+    ]);
+    args
+}
+
+fn attach_dmg(dmg_path: &str, mount_point: &'static str, read_only: bool) -> ResultType<DmgGuard> {
+    let args = hdiutil_attach_args(dmg_path, mount_point, read_only);
+    let status = Command::new("hdiutil")
+        .args(args.iter().map(String::as_str))
+        .status()?;
+
+    if !status.success() {
+        bail!(
+            "{}",
+            attach_dmg_failure_message(dmg_path, mount_point, status)
+        );
+    }
+
+    Ok(DmgGuard(mount_point))
+}
+
+fn app_path_in_dmg_mount(mount_point: &str, app_name: &str) -> String {
+    format!("{}/{}.app", mount_point, app_name)
+}
+
+fn update_from_mounted_dmg_with_options(
+    dmg_path: &str,
+    read_only: bool,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    let _guard = attach_dmg(dmg_path, UPDATE_DMG_MOUNT_POINT, read_only)?;
+    update_from_attached_dmg_mount(UPDATE_DMG_MOUNT_POINT, before_prompt)
+}
+
+fn update_from_attached_dmg_mount(
+    mount_point: &str,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    if let Some(before_prompt) = before_prompt {
+        before_prompt();
+    }
+    update_me_from_app_dir(app_path_in_dmg_mount(mount_point, &crate::get_app_name()))
 }
 
 fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_point = "/Volumes/RustDeskUpdate";
     let target_path = Path::new(target_dir);
 
     if target_path.exists() {
@@ -939,26 +1443,10 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     }
     std::fs::create_dir_all(target_path)?;
 
-    let status = Command::new("hdiutil")
-        .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
-        .status()?;
-
-    if !status.success() {
-        bail!("Failed to attach DMG image at {}: {:?}", dmg_path, status);
-    }
-
-    struct DmgGuard(&'static str);
-    impl Drop for DmgGuard {
-        fn drop(&mut self) {
-            let _ = Command::new("hdiutil")
-                .args(&["detach", self.0, "-force"])
-                .status();
-        }
-    }
-    let _guard = DmgGuard(mount_point);
+    let _guard = attach_dmg(dmg_path, UPDATE_DMG_MOUNT_POINT, false)?;
 
     let app_name = format!("{}.app", crate::get_app_name());
-    let src_path = format!("{}/{}", mount_point, app_name);
+    let src_path = format!("{}/{}", UPDATE_DMG_MOUNT_POINT, app_name);
     let dest_path = format!("{}/{}", target_dir, app_name);
 
     let copy_status = Command::new("ditto")
@@ -985,28 +1473,14 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
 }
 
 fn update_extracted(target_dir: &str) -> ResultType<()> {
-    let app_name = crate::get_app_name();
-    let exe_path = format!(
-        "{}/{}.app/Contents/MacOS/{}",
-        target_dir, app_name, app_name
+    let result = update_me_from_app_dir(
+        Path::new(target_dir)
+            .join(format!("{}.app", crate::get_app_name()))
+            .to_string_lossy()
+            .to_string(),
     );
-    let _child = unsafe {
-        if let Err(e) = Command::new(&exe_path)
-            .arg("--update")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .pre_exec(|| {
-                hbb_common::libc::setsid();
-                Ok(())
-            })
-            .spawn()
-        {
-            try_remove_temp_update_dir(Some(target_dir));
-            bail!(e);
-        }
-    };
-    Ok(())
+    try_remove_temp_update_dir(Some(target_dir));
+    result
 }
 
 pub fn get_double_click_time() -> u32 {
@@ -1018,6 +1492,120 @@ pub fn hide_dock() {
     unsafe {
         NSApp().setActivationPolicy_(NSApplicationActivationPolicyAccessory);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_temp_update_dir_removes_symlink_without_touching_target() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-macos-cleanup-symlink-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let target_dir = test_dir.join("target");
+        let link_path = test_dir.join("link");
+        let target_file = target_dir.join("file");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(&target_file, b"target").unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+
+        remove_temp_update_dir(&link_path);
+
+        assert!(!std::fs::symlink_metadata(&link_path).is_ok());
+        assert!(target_file.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_temp_dir_rejects_symlink() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-macos-temp-dir-symlink-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let target_dir = test_dir.join("target");
+        let link_path = test_dir.join("link");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+
+        assert!(ensure_real_update_temp_dir(&link_path).is_err());
+        assert!(ensure_real_update_temp_dir(&target_dir).is_ok());
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_stale_update_temp_dir_name_matches_only_randomized_current_user_dirs() {
+        let euid = unsafe { hbb_common::libc::geteuid() };
+
+        assert!(is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-123-456"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-abc-456"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-123"
+        )));
+        assert!(!is_stale_update_temp_dir_name(".rustdeskupdate-999999-123-456"));
+        assert!(!is_stale_update_temp_dir_name("rustdeskupdate-123-456"));
+    }
+
+    #[test]
+    fn test_copy_dmg_to_update_temp_file_limits_oversized_source() {
+        let mut source: &[u8] = b"rustdesk-extra";
+        let mut target = Vec::new();
+
+        let result = copy_dmg_with_expected_size(&mut source, &mut target, Some(8), "test.dmg");
+
+        assert!(result.is_err());
+        assert_eq!(target.len(), 9);
+    }
+
+    #[test]
+    fn test_sidecar_read_rejects_oversized_file() {
+        let file_path = std::env::temp_dir().join(format!(
+            "rustdesk-macos-sidecar-size-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(
+            &file_path,
+            vec![b'a'; UPDATE_METADATA_SIDECAR_MAX_BYTES + 1],
+        )
+        .unwrap();
+
+        let result = read_update_sidecar_file(&file_path, UPDATE_METADATA_SIDECAR_MAX_BYTES);
+
+        std::fs::remove_file(file_path).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_to_verified_dmg_cleans_temp_dir_on_sha256_failure() {
+        let file_path = std::env::temp_dir().join(format!(
+            "rustdesk-macos-dmg-cleanup-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, b"rustdesk").unwrap();
+
+        let result = update_to_verified_dmg(
+            &file_path.to_string_lossy(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+        );
+
+        std::fs::remove_file(&file_path).unwrap();
+        assert!(result.is_err());
+        assert!(!get_update_temp_dir().exists());
+    }
+
 }
 
 #[inline]

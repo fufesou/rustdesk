@@ -39,7 +39,7 @@ use hbb_common::{
 
 use crate::{
     hbbs_http::{create_http_client_async, get_url_for_tls},
-    ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
+    ui_interface::{get_api_server as ui_get_api_server, get_option, set_option},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -948,6 +948,143 @@ pub fn check_software_update() {
     }
 }
 
+pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
+    let url = url::Url::parse(update_url)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        bail!(
+            "Update URL is not a GitHub HTTPS release URL: {}",
+            update_url
+        );
+    }
+    if url_has_explicit_port(update_url)
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!(
+            "Update URL must not contain credentials or an explicit port: {}",
+            update_url
+        );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!(
+            "Update URL must not contain query or fragment: {}",
+            update_url
+        );
+    }
+
+    let Some(segments) = url.path_segments() else {
+        bail!("Update URL has no path: {}", update_url);
+    };
+    let segments = segments.collect::<Vec<_>>();
+    let release_id = match segments.as_slice() {
+        ["rustdesk", "rustdesk", "releases", "tag", release_id] => *release_id,
+        ["rustdesk", "rustdesk", "releases", "tag", release_id, ""] => *release_id,
+        _ => bail!(
+            "Update URL is not a RustDesk release tag URL: {}",
+            update_url
+        ),
+    };
+    if release_id.is_empty()
+        || release_id == "."
+        || release_id == ".."
+        || release_id.contains([' ', '/', '\\', '?', '#'])
+        || release_id.contains('%')
+    {
+        bail!("Update URL has no release id: {}", update_url);
+    }
+    Ok(release_id.to_owned())
+}
+
+pub(crate) fn url_has_explicit_port(raw_url: &str) -> bool {
+    let Some((_, rest)) = raw_url.split_once("://") else {
+        return false;
+    };
+    let authority = rest
+        .split(|c| matches!(c, '/' | '?' | '#'))
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    host_port.rsplit_once(':').is_some()
+}
+
+pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<String> {
+    let display_version = release_id.strip_prefix('v').unwrap_or(release_id);
+    let segments = display_version.split('.').collect::<Vec<_>>();
+    if segments.len() != 3
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || !segment.chars().all(|c| c.is_ascii_digit()))
+    {
+        bail!("Release id is not a stable display version: {}", release_id);
+    }
+    if get_version_number(display_version) <= 0 {
+        bail!("Release id has invalid display version: {}", release_id);
+    }
+    Ok(display_version.to_owned())
+}
+
+pub(crate) fn release_download_base_url(update_url: &str) -> ResultType<String> {
+    let release_id = release_id_from_update_url(update_url)?;
+    Ok(format!(
+        "https://github.com/rustdesk/rustdesk/releases/download/{release_id}/"
+    ))
+}
+
+pub(crate) fn release_metadata_url(update_url: &str) -> ResultType<String> {
+    Ok(format!(
+        "{}rustdesk-update.json",
+        release_download_base_url(update_url)?
+    ))
+}
+
+pub(crate) fn release_signature_url(update_url: &str) -> ResultType<String> {
+    Ok(format!(
+        "{}rustdesk-update.json.sig",
+        release_download_base_url(update_url)?
+    ))
+}
+
+fn clear_software_update_url() {
+    let mut update_url = SOFTWARE_UPDATE_URL.lock().unwrap();
+    *update_url = String::new();
+}
+
+fn set_software_update_url(update_url: String) {
+    let mut stored_url = SOFTWARE_UPDATE_URL.lock().unwrap();
+    *stored_url = update_url;
+}
+
+fn finish_software_update_check(response_bytes: ResultType<Bytes>) -> ResultType<()> {
+    let result = (|| {
+        let bytes = response_bytes?;
+        let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
+        let response_url = resp.url;
+        let release_id = release_id_from_update_url(&response_url)?;
+        let latest_release_version = display_version_from_release_id(&release_id)?;
+
+        if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
+            #[cfg(feature = "flutter")]
+            {
+                let mut m = HashMap::new();
+                m.insert("name", "check_software_update_finish");
+                m.insert("url", &response_url);
+                if let Ok(data) = serde_json::to_string(&m) {
+                    let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+                }
+            }
+            set_software_update_url(response_url);
+        } else {
+            clear_software_update_url();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        clear_software_update_url();
+    }
+    result
+}
+
 // No need to check `danger_accept_invalid_cert` for now.
 // Because the url is always `https://api.rustdesk.com/version/latest`.
 #[tokio::main(flavor = "current_thread")]
@@ -960,43 +1097,40 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let is_tls_not_cached = tls_type.is_none();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
     let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
+    let latest_release_response: ResultType<_> = match client.post(&url).json(&request).send().await
+    {
+        Ok(resp) => Ok((tls_type, resp)),
         Err(err) => {
             if is_tls_not_cached && err.is_request() {
                 let tls_type = TlsType::NativeTls;
                 let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
+                match client.post(&url).json(&request).send().await {
+                    Ok(resp) => Ok((tls_type, resp)),
+                    Err(err) => Err(err.into()),
+                }
             } else {
-                return Err(err.into());
+                Err(err.into())
             }
         }
     };
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
-
-    if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
-        #[cfg(feature = "flutter")]
-        {
-            let mut m = HashMap::new();
-            m.insert("name", "check_software_update_finish");
-            m.insert("url", &response_url);
-            if let Ok(data) = serde_json::to_string(&m) {
-                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+    let response_bytes = match latest_release_response {
+        Ok((used_tls_type, response)) => {
+            let status = response.status();
+            if !status.is_success() {
+                Err(anyhow!("Software update check failed with HTTP status: {status}"))
+            } else {
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        upsert_tls_cache(tls_url, used_tls_type, false);
+                        Ok(bytes)
+                    }
+                    Err(err) => Err(err.into()),
+                }
             }
         }
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
-    } else {
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
-    }
-    Ok(())
+        Err(err) => Err(err),
+    };
+    finish_software_update_check(response_bytes)
 }
 
 #[inline]
@@ -2178,25 +2312,25 @@ pub fn get_dst_align_rgba() -> usize {
     1
 }
 
-pub fn read_custom_client(config: &str) {
+pub fn read_custom_client(config: &str) -> bool {
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
-        return;
+        return false;
     };
     const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";
     let Some(pk) = get_rs_pk(KEY) else {
         log::error!("Failed to parse public key of custom client");
-        return;
+        return false;
     };
     let Ok(data) = sign::verify(&data, &pk) else {
         log::error!("Failed to dec custom client config");
-        return;
+        return false;
     };
     let Ok(mut data) =
         serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
     else {
         log::error!("Failed to parse custom client config");
-        return;
+        return false;
     };
 
     if let Some(app_name) = data.remove("app-name") {
@@ -2249,6 +2383,7 @@ pub fn read_custom_client(config: &str) {
                 .insert(k, v.to_owned());
         };
     }
+    true
 }
 
 #[inline]
@@ -2645,6 +2780,134 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    static SOFTWARE_UPDATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreSoftwareUpdateUrl(String);
+
+    impl Drop for RestoreSoftwareUpdateUrl {
+        fn drop(&mut self) {
+            *SOFTWARE_UPDATE_URL.lock().unwrap() = self.0.clone();
+        }
+    }
+
+    fn preserve_software_update_url_for_test() -> RestoreSoftwareUpdateUrl {
+        RestoreSoftwareUpdateUrl(SOFTWARE_UPDATE_URL.lock().unwrap().clone())
+    }
+
+    fn set_software_update_url_for_test(update_url: &str) {
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = update_url.to_owned();
+    }
+
+    fn software_update_url_for_test() -> String {
+        SOFTWARE_UPDATE_URL.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn release_id_from_update_url_accepts_tag_url_and_derives_metadata_urls() {
+        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6";
+
+        assert_eq!(release_id_from_update_url(update_url).unwrap(), "v1.4.6");
+        assert_eq!(
+            release_download_base_url(update_url).unwrap(),
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/"
+        );
+        assert_eq!(
+            release_metadata_url(update_url).unwrap(),
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk-update.json"
+        );
+        assert_eq!(
+            release_signature_url(update_url).unwrap(),
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk-update.json.sig"
+        );
+    }
+
+    #[test]
+    fn release_id_from_update_url_rejects_non_rustdesk_github_release_url() {
+        for update_url in [
+            "https://github.com:8443/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com:443/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://user@github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com/other/rustdesk/releases/tag/v1.4.6",
+            "https://github.com/rustdesk/other/releases/tag/v1.4.6",
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+        ] {
+            assert!(release_id_from_update_url(update_url).is_err());
+        }
+    }
+
+    #[test]
+    fn release_id_from_update_url_rejects_query_fragment_and_extra_segments() {
+        for update_url in [
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6?x=1",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6#asset",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/extra",
+        ] {
+            assert!(release_id_from_update_url(update_url).is_err());
+        }
+        assert_eq!(
+            release_id_from_update_url("https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/")
+                .unwrap(),
+            "v1.4.6"
+        );
+    }
+
+    #[test]
+    fn release_id_from_update_url_rejects_encoded_release_ids() {
+        for update_url in [
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1%2F4%2F6",
+            "https://github.com/rustdesk/rustdesk/releases/tag/%2e%2e",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6%20",
+        ] {
+            assert!(release_id_from_update_url(update_url).is_err(), "{update_url}");
+        }
+    }
+
+    #[test]
+    fn display_version_from_release_id_accepts_stable_tags_only() {
+        assert_eq!(display_version_from_release_id("v1.4.6").unwrap(), "1.4.6");
+        assert_eq!(display_version_from_release_id("1.4.6").unwrap(), "1.4.6");
+        assert!(display_version_from_release_id("v1.4.6-1").is_err());
+        assert!(display_version_from_release_id("v1.4.6-rc1").is_err());
+        assert!(display_version_from_release_id("nightly").is_err());
+    }
+
+    #[test]
+    fn finish_software_update_check_uses_display_version_but_keeps_original_tag_url() {
+        let _guard = SOFTWARE_UPDATE_TEST_LOCK.lock().unwrap();
+        let _restore = preserve_software_update_url_for_test();
+        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v999.0.0";
+        set_software_update_url_for_test("stale");
+        let response = Bytes::from(format!(r#"{{"url":"{update_url}"}}"#));
+
+        finish_software_update_check(Ok(response)).unwrap();
+
+        assert_eq!(software_update_url_for_test(), update_url);
+    }
+
+    #[test]
+    fn finish_software_update_check_clears_stale_url_on_discovery_failures() {
+        let _guard = SOFTWARE_UPDATE_TEST_LOCK.lock().unwrap();
+        let _restore = preserve_software_update_url_for_test();
+        let cases: Vec<hbb_common::ResultType<Bytes>> = vec![
+            Err(anyhow!("HTTP failed")),
+            Ok(Bytes::from_static(b"{")),
+            Ok(Bytes::from_static(
+                br#"{"url":"https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6"}"#,
+            )),
+            Ok(Bytes::from_static(
+                br#"{"url":"https://github.com/rustdesk/rustdesk/releases/tag/nightly"}"#,
+            )),
+        ];
+
+        for case in cases {
+            set_software_update_url_for_test("stale");
+
+            assert!(finish_software_update_check(case).is_err());
+            assert_eq!(software_update_url_for_test(), "");
+        }
+    }
 
     #[inline]
     fn get_timestamp_secs() -> u128 {
