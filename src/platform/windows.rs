@@ -1525,6 +1525,7 @@ fn get_after_install(
 ) -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
+    let nested_exe = escape_nested_cmd_ampersands(exe);
 
     // reg delete HKEY_CURRENT_USER\Software\Classes for
     // https://github.com/rustdesk/rustdesk/commit/f4bdfb6936ae4804fc8ab1cf560db192622ad01a
@@ -1560,17 +1561,17 @@ fn get_after_install(
     {start_menu_shortcuts}
     {reg_printer}
     reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f
-    reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f /ve /t REG_SZ  /d \"\\\"{exe}\\\",0\"
+    reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f /ve /t REG_SZ  /d \"\\\"{nested_exe}\\\",0\"
     reg add HKEY_CLASSES_ROOT\\.{ext}\\shell /f
     reg add HKEY_CLASSES_ROOT\\.{ext}\\shell\\open /f
     reg add HKEY_CLASSES_ROOT\\.{ext}\\shell\\open\\command /f
-    reg add HKEY_CLASSES_ROOT\\.{ext}\\shell\\open\\command /f /ve /t REG_SZ /d \"\\\"{exe}\\\" --play \\\"%%1\\\"\"
+    reg add HKEY_CLASSES_ROOT\\.{ext}\\shell\\open\\command /f /ve /t REG_SZ /d \"\\\"{nested_exe}\\\" --play \\\"%%1\\\"\"
     reg add HKEY_CLASSES_ROOT\\{ext} /f
     reg add HKEY_CLASSES_ROOT\\{ext} /f /v \"URL Protocol\" /t REG_SZ /d \"\"
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell /f
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open /f
     reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open\\command /f
-    reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open\\command /f /ve /t REG_SZ /d \"\\\"{exe}\\\" \\\"%%1\\\"\"
+    reg add HKEY_CLASSES_ROOT\\{ext}\\shell\\open\\command /f /ve /t REG_SZ /d \"\\\"{nested_exe}\\\" \\\"%%1\\\"\"
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=out action=allow program=\"{exe}\" enable=yes
     netsh advfirewall firewall add rule name=\"{app_name} Service\" dir=in action=allow program=\"{exe}\" enable=yes
     {create_service}
@@ -1609,16 +1610,8 @@ oLink.Save
 }
 
 fn validate_install_value(value: &str) -> ResultType<()> {
-    if value.contains(['\0', '"', '%', '^', '\r', '\n', '&', '|', '<', '>']) {
+    if value.contains(['\0', '"', '%', '^', '\r', '\n', '|', '<', '>']) {
         bail!("Installer path or name contains characters unsafe for cmd.exe");
-    }
-    Ok(())
-}
-
-fn validate_install_name(value: &str) -> ResultType<()> {
-    validate_install_value(value)?;
-    if value.contains(['(', ')']) {
-        bail!("Application name contains grouping operators unsafe for cmd.exe");
     }
     Ok(())
 }
@@ -1656,7 +1649,6 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     for value in [&path, &exe, &cur_exe] {
         validate_install_value(value)?;
     }
-    validate_install_name(&app_name)?;
     let config_path = Config::file();
     validate_install_value(
         config_path
@@ -1790,7 +1782,7 @@ reg add {subkey} /f /v Publisher /t REG_SZ /d \"{app_name}\"
 reg add {subkey} /f /v VersionMajor /t REG_DWORD /d {version_major}
 reg add {subkey} /f /v VersionMinor /t REG_DWORD /d {version_minor}
 reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {version_build}
-reg add {subkey} /f /v UninstallString /t REG_SZ /d \"\\\"{exe}\\\" --uninstall\"
+reg add {subkey} /f /v UninstallString /t REG_SZ /d \"\\\"{nested_exe}\\\" --uninstall\"
 reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
 {mk_shortcut_commands}
@@ -1805,6 +1797,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {sleep}
     ",
         display_icon = get_custom_icon(&path, &cur_exe).unwrap_or(exe.to_string()),
+        nested_exe = escape_nested_cmd_ampersands(&exe),
         version = crate::VERSION.replace("-", "."),
         build_date = crate::BUILD_DATE,
         after_install = get_after_install(
@@ -3489,7 +3482,6 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
 
 fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
     let app_name = crate::get_app_name();
-    validate_install_name(&app_name)?;
     for value in [path, exe] {
         validate_install_value(value)?;
     }
@@ -3981,10 +3973,19 @@ pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
     Ok(())
 }
 
+// `^` escapes `&` for cmd.exe, including on Windows 7:
+// https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc754250(v=ws.11)
+fn escape_nested_cmd_ampersands(value: &str) -> String {
+    value.replace('&', "^&")
+}
+
 fn get_import_config(exe: &str) -> String {
     if config::is_outgoing_only() {
         return "".to_string();
     }
+    let exe = escape_nested_cmd_ampersands(exe);
+    let config_path = Config::file();
+    let config_path = escape_nested_cmd_ampersands(config_path.to_str().unwrap_or(""));
     format!("
 sc stop {app_name}
 sc delete {app_name}
@@ -3994,7 +3995,6 @@ sc stop {app_name}
 sc delete {app_name}
 ",
     app_name = crate::get_app_name(),
-    config_path=Config::file().to_str().unwrap_or(""),
 )
 }
 
@@ -4008,6 +4008,7 @@ fn get_create_service(exe: &str) -> String {
 if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
 ", app_name = crate::get_app_name())
     } else {
+        let exe = escape_nested_cmd_ampersands(exe);
         format!("
 sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc start {app_name}
@@ -4906,20 +4907,25 @@ mod tests {
     }
 
     #[test]
-    fn install_values_reject_cmd_control_characters() {
+    fn install_values_enforce_command_safety() {
         assert!(validate_install_value(r"C:\safe ! path").is_ok());
         assert!(validate_install_value(r"C:\Program Files (x86)\RustDesk").is_ok());
-        assert!(validate_install_name("RustDesk Custom").is_ok());
-        for character in ['\0', '"', '%', '^', '\r', '\n', '&', '|', '<', '>'] {
+        assert!(validate_install_value(r"C:\Users\R&D\RustDesk.exe").is_ok());
+        for character in ['\0', '"', '%', '^', '\r', '\n', '|', '<', '>'] {
             let value = format!(r"C:\unsafe{character}path");
             assert!(
                 validate_install_value(&value).is_err(),
                 "cmd.exe control character was accepted: {character:?}"
             );
         }
-        for character in ['(', ')'] {
-            assert!(validate_install_name(&format!("RustDesk{character}")).is_err());
-        }
+    }
+
+    #[test]
+    fn nested_cmd_values_escape_ampersands() {
+        assert_eq!(
+            escape_nested_cmd_ampersands(r"C:\Users\R&D\RustDesk.exe"),
+            r"C:\Users\R^&D\RustDesk.exe"
+        );
     }
 
     #[test]
