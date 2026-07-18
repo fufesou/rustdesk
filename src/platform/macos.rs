@@ -312,6 +312,55 @@ fn correct_app_name(s: &str) -> String {
     s
 }
 
+fn write_plist_atomically(path: &str, body: &str) -> ResultType<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = format!("{}.tmp.{}", path, std::process::id());
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(Into::into)
+}
+
+pub fn write_plists() -> ResultType<()> {
+    let daemon_plist_path = format!(
+        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
+        crate::get_app_name()
+    );
+    let agent_plist_path = format!(
+        "/Library/LaunchAgents/com.carriez.{}_server.plist",
+        crate::get_app_name()
+    );
+    let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
+        bail!("daemon.plist not found in embedded resources");
+    };
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+        bail!("Failed to read daemon.plist");
+    };
+    let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
+        bail!("agent.plist not found in embedded resources");
+    };
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+        bail!("Failed to read agent.plist");
+    };
+    write_plist_atomically(&daemon_plist_path, &daemon_plist_body)?;
+    write_plist_atomically(&agent_plist_path, &agent_plist_body)?;
+    log::info!("[write-plists] Wrote daemon and agent plists");
+    Ok(())
+}
+
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     // to-do: do together with win/linux about refactory start/stop service
     if !is_installed_daemon(false) {
@@ -659,6 +708,49 @@ pub fn get_active_userid() -> String {
     get_active_user("-n")
 }
 
+/// Return every UID with a login-window/session entry. Fast user switching
+/// can leave several GUI bootstrap domains alive at once, so updating only
+/// the console user can leave another user's agent on the old bundle.
+fn get_logged_in_uids() -> Vec<String> {
+    let mut uids = std::collections::BTreeSet::new();
+    if let Ok(output) = std::process::Command::new("/usr/bin/who").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some(username) = line.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(output) = std::process::Command::new("/usr/bin/id")
+                .args(["-u", username])
+                .output()
+            else {
+                continue;
+            };
+            let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let gui_domain = format!("gui/{}", uid);
+            if !uid.is_empty()
+                && uid.bytes().all(|byte| byte.is_ascii_digit())
+                && std::process::Command::new("/bin/launchctl")
+                    .args(["print", &gui_domain])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
+                uids.insert(uid);
+            }
+        }
+    }
+    let active_uid = get_active_userid();
+    if !active_uid.is_empty()
+        && active_uid.bytes().all(|byte| byte.is_ascii_digit())
+        && active_uid != "0"
+    {
+        uids.insert(active_uid);
+    }
+    if uids.is_empty() {
+        // The login window has no ordinary gui/0 bootstrap domain.
+        uids.insert("0".to_owned());
+    }
+    uids.into_iter().collect()
+}
+
 pub fn get_active_user_home() -> Option<PathBuf> {
     let username = get_active_username();
     if !username.is_empty() {
@@ -728,8 +820,12 @@ pub fn lock_screen() {
     .ok();
 }
 
+/// Starts the macOS system service IPC listener and the background
+/// silent auto-update thread.
 pub fn start_os_service() {
     log::info!("Username: {}", crate::username());
+    // Silent auto-update — runs as root via LaunchDaemon, no osascript dialog needed
+    crate::updater::start_auto_update_macos();
     if let Err(err) = crate::ipc::start("_service") {
         log::error!("Failed to start ipc_service: {}", err);
     }
@@ -912,6 +1008,536 @@ pub fn update_to(_file: &str) -> ResultType<()> {
     Ok(())
 }
 
+fn backup_update_plist(source: &str, backup: &str) -> ResultType<bool> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!("[root-update] plist is not a regular file: {}", source);
+            }
+            std::fs::copy(source, backup)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn restore_update_plist(target: &str, backup: &str, existed: bool) -> ResultType<()> {
+    if existed {
+        std::fs::copy(backup, target)?;
+    } else {
+        match std::fs::remove_file(target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultType<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        // Frameworks legitimately use internal symlinks (Resources,
+        // Versions/Current), but never allow a link to leave its framework.
+        let Some(framework_root) = framework_root else {
+            bail!("[root-update] symlink outside framework: {}", path.display());
+        };
+        let target = std::fs::read_link(path)?;
+        let target = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new("/")).join(target)
+        };
+        let target = std::fs::canonicalize(target)?;
+        let framework_root = std::fs::canonicalize(framework_root)?;
+        if target.starts_with(&framework_root) {
+            return Ok(());
+        }
+        bail!("[root-update] symlink in update bundle: {}", path.display());
+    }
+    if metadata.file_type().is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let child = entry?.path();
+            let child_framework_root = if child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".framework"))
+            {
+                Some(child.as_path())
+            } else {
+                framework_root
+            };
+            validate_update_tree(&child, child_framework_root)?;
+        }
+    } else if !metadata.file_type().is_file() {
+        bail!("[root-update] unsupported file in update bundle: {}", path.display());
+    }
+    Ok(())
+}
+
+/// Performs a silent update from a DMG file without any osascript dialog.
+/// Must be called from a process running as root (e.g. the service binary).
+pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
+    let app_name = crate::get_app_name();
+    if app_name.is_empty()
+        || !app_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("[root-update] unsafe application name");
+    }
+    let app_bundle = format!("/Applications/{}.app", app_name);
+    let tmp_dir_output = std::process::Command::new("/usr/bin/mktemp")
+        .args(&["-d", "/tmp/.rustdeskupdate-root-XXXXXX"])
+        .output()?;
+    let tmp_dir = String::from_utf8(tmp_dir_output.stdout)
+        .map_err(|e| anyhow!("[root-update] mktemp output error: {}", e))?
+        .trim()
+        .to_string();
+    if tmp_dir.is_empty() {
+        bail!("[root-update] Failed to create temp directory");
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
+    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+
+    log::info!("[root-update] Starting silent root update from {}", dmg_path);
+    // Check sessions before extracting to avoid unnecessary work
+    if !crate::updater::has_no_active_conns_ipc() {
+        bail!("[root-update] Active session detected, deferring update.");
+    }
+    // Extract DMG to temp dir
+    extract_dmg_into_existing_dir(dmg_path, &tmp_dir)?;
+    let src_app = format!("{}/{}.app", tmp_dir, app_name);
+    log::info!("[root-update] DMG extracted to {}", tmp_dir);
+    validate_update_tree(Path::new(&src_app), None)?;
+
+    // Backup current plists before overwriting — needed for restore on reload failure
+    let daemon_plist_bak = format!("{}/daemon_plist.bak", tmp_dir);
+    let agent_plist_bak = format!("{}/agent_plist.bak", tmp_dir);
+    let failed_install = format!("{}/failed_install.app", tmp_dir);
+    // Backups are part of the update transaction.  Do not allow the new
+    // service binary to overwrite either live plist unless both old states
+    // have been captured successfully.  A missing plist is a valid state and
+    // is recorded so rollback can remove a newly-created plist.
+    let daemon_plist_existed = backup_update_plist(&daemon_plist, &daemon_plist_bak)?;
+    let agent_plist_existed = match backup_update_plist(&agent_plist, &agent_plist_bak) {
+        Ok(existed) => existed,
+        Err(err) => {
+            let _ = restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed);
+            return Err(err);
+        }
+    };
+
+    // Ensure the staged release contains the service executable before we
+    // proceed. Plist generation itself is done in this already-root process;
+    // launching a freshly extracted service binary from /tmp is not required.
+    let new_service = format!("{}/Contents/MacOS/service", src_app);
+    if !std::path::Path::new(&new_service).is_file() {
+        restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+        restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+        bail!("[root-update] staged service binary is missing: {}", new_service);
+    }
+    // The new binary writes its own plist definitions after the bundle is
+    // moved into its final root-owned location.  This avoids executing code
+    // directly from /tmp while ensuring the plist matches the new release.
+
+    // Final session check after extraction — minimize race window
+    if !crate::updater::has_no_active_conns_ipc() {
+        // Restore plist backups — new plists were already written
+        restore_update_plist(
+            &daemon_plist,
+            &daemon_plist_bak,
+            daemon_plist_existed,
+        )?;
+        restore_update_plist(
+            &agent_plist,
+            &agent_plist_bak,
+            agent_plist_existed,
+        )?;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!("[root-update] Active session detected after extraction, deferring update.");
+    }
+
+    let logged_in_uids = get_logged_in_uids();
+    // UIDs are validated as decimal digits before embedding in the
+    // root-run shell script, so they cannot alter its command structure.
+    let uid_list = logged_in_uids.join(" ");
+
+    // Write a shell script that runs detached after this function returns.
+    // We cannot directly replace /Applications/RustDesk.app while it is running,
+    // so we spawn a script that waits, kills processes, copies, and restarts.
+    let daemon_label = format!("com.carriez.{}_service", app_name);
+    let agent_label = format!("com.carriez.{}_server", app_name);
+    let script_path = format!("{}/rustdesk_update.sh", tmp_dir);
+    let script = format!(
+        r#"#!/bin/sh
+sleep 3
+rollback_done=0
+bootstrap_agent() {{
+    agent_uid="$1"
+    if [ "$agent_uid" != "0" ]; then
+        launchctl bootstrap gui/"$agent_uid" "{agent_plist}" 2>/dev/null || \
+            launchctl bootstrap user/"$agent_uid" "{agent_plist}" 2>/dev/null || \
+            launchctl load -w "{agent_plist}" 2>/dev/null
+    else
+        # At the login window there is no gui/0 domain.  launchctl load uses
+        # the plist's LoginWindow/Aqua session policy instead.
+        launchctl load -w "{agent_plist}" 2>/dev/null
+    fi
+}}
+bootstrap_agents() {{
+    for agent_uid in {uid_list}; do
+        bootstrap_agent "$agent_uid" || return 1
+    done
+}}
+agent_ready() {{
+    for agent_uid in {uid_list}; do
+        if [ "$agent_uid" != "0" ] && \
+           ! launchctl print gui/"$agent_uid"/{agent_label} >/dev/null 2>&1 && \
+           ! launchctl print user/"$agent_uid"/{agent_label} >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+    return 0
+}}
+write_new_plists() {{
+    /Applications/{app_name}.app/Contents/MacOS/service --write-plists \
+        >"{tmp_dir}/write-plists.log" 2>&1 &
+    write_pid=$!
+    for _ in $(/usr/bin/seq 1 60); do
+        if ! kill -0 "$write_pid" 2>/dev/null; then
+            wait "$write_pid"
+            return $?
+        fi
+        sleep 1
+    done
+    kill -TERM "$write_pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$write_pid" 2>/dev/null || true
+    wait "$write_pid" 2>/dev/null || true
+    return 124
+}}
+rollback_plists() {{
+    [ "$rollback_done" -eq 0 ] || return 0
+    rollback_done=1
+    restore_failed=0
+    if [ "{daemon_plist_existed}" = "1" ]; then
+        cp "{daemon_plist_bak}" "{daemon_plist}" || restore_failed=1
+    else
+        rm -f "{daemon_plist}" || restore_failed=1
+    fi
+    if [ "{agent_plist_existed}" = "1" ]; then
+        cp "{agent_plist_bak}" "{agent_plist}" || restore_failed=1
+    else
+        rm -f "{agent_plist}" || restore_failed=1
+    fi
+    if ! launchctl load -w "{daemon_plist}" 2>/dev/null && \
+       ! launchctl bootstrap system "{daemon_plist}" 2>/dev/null; then
+        restore_failed=1
+    fi
+    bootstrap_agents || restore_failed=1
+    if [ "$restore_failed" -ne 0 ]; then
+        echo "[root-update] CRITICAL: rollback restoration failed" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+}}
+trap rollback_plists EXIT
+gui_uids=""
+for agent_uid in {uid_list}; do
+    for pid in $(pgrep -u "$agent_uid" -x {app_name} || true); do
+        process_args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        if printf '%s\n' "$process_args" | grep -F "/Applications/{app_name}.app/" >/dev/null && \
+           ! printf '%s\n' "$process_args" | grep -E "(^|[[:space:]])(--server|--service|--update)([[:space:]]|$)" >/dev/null; then
+            gui_uids="$gui_uids $agent_uid"
+            break
+        fi
+    done
+done
+if ! launchctl bootout system/{daemon_label} 2>/dev/null && \
+   ! launchctl unload -w {daemon_plist} 2>/dev/null; then
+    touch /var/root/.rustdeskupdate_failed
+    exit 1
+fi
+for agent_uid in {uid_list}; do
+    if [ "$agent_uid" != "0" ]; then
+        launchctl bootout gui/"$agent_uid"/{agent_label} 2>/dev/null || \
+            launchctl bootout user/"$agent_uid"/{agent_label} 2>/dev/null || true
+    else
+        launchctl unload -w "{agent_plist}" 2>/dev/null || true
+    fi
+done
+sleep 1
+# Terminate only processes whose command line points into the RustDesk bundle;
+# avoid broad name/regex-based pkill patterns.
+for agent_uid in {uid_list}; do
+    for pid in $(pgrep -u "$agent_uid" -x {app_name} || true); do
+        process_args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        if printf '%s\n' "$process_args" | grep -F "/Applications/{app_name}.app/" >/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+done
+sleep 2
+staged_bundle="{tmp_dir}/staged.app"
+if [ -e "$staged_bundle" ] || [ -L "$staged_bundle" ]; then
+    echo "[root-update] staged bundle path already exists, aborting" >> {tmp_dir}/rustdesk_root_update.log
+    touch /var/root/.rustdeskupdate_failed
+    exit 1
+fi
+if ! ditto {src_app} "$staged_bundle" 2>/dev/null; then
+    echo "[root-update] ditto failed, aborting update" >> {tmp_dir}/rustdesk_root_update.log
+    touch /var/root/.rustdeskupdate_failed
+    rm -rf "$staged_bundle"
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || \
+        echo "[root-update] WARNING: failed to reload daemon after ditto failure" >> /var/root/.rustdeskupdate_failed
+    bootstrap_agents || true
+    exit 1
+fi
+# Validate staged bundle before atomic swap
+if [ ! -d "$staged_bundle/Contents/MacOS" ] || \
+   [ ! -f "$staged_bundle/Contents/MacOS/{app_name}" ] || \
+   [ ! -f "$staged_bundle/Contents/MacOS/service" ] || \
+   [ ! -f "$staged_bundle/Contents/Info.plist" ]; then
+    echo "[root-update] staged bundle validation failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
+    touch /var/root/.rustdeskupdate_failed
+    rm -rf "$staged_bundle"
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    bootstrap_agents || true
+    exit 1
+fi
+if ! mv {app_bundle} {app_bundle}.bak; then
+    echo "[root-update] backup mv failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
+    touch /var/root/.rustdeskupdate_failed
+    rm -rf "$staged_bundle"
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    bootstrap_agents || true
+    exit 1
+fi
+if ! mv "$staged_bundle" {app_bundle}; then
+    echo "[root-update] replacement mv failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: restore failed, app missing" >> {tmp_dir}/rustdesk_root_update.log
+    fi
+    touch /var/root/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    bootstrap_agents || true
+    exit 1
+fi
+# Install the entire bundle as root-owned.  The LaunchDaemon executes code
+# from this bundle, so no nested framework, helper, or resource may remain
+# user-writable.
+if ! chown -R root:wheel {app_bundle} || ! chmod -R go-w {app_bundle}; then
+    echo "[root-update] chown failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} "{failed_install}" 2>/dev/null || true
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+    touch /var/root/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    bootstrap_agents || true
+    exit 1
+fi
+xattr -r -d com.apple.quarantine {app_bundle} || true
+# Keep root-executed files AND entire ancestor chain root-owned — prevent privilege escalation
+if ! chown root:wheel {app_bundle} || \
+   ! chmod 755 {app_bundle} || \
+   ! chown root:wheel {app_bundle}/Contents || \
+   ! chmod 755 {app_bundle}/Contents || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS || \
+   ! chmod 755 {app_bundle}/Contents/MacOS || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS/service || \
+   ! chmod 755 {app_bundle}/Contents/MacOS/service || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS/{app_name} || \
+   ! chmod 755 {app_bundle}/Contents/MacOS/{app_name}; then
+    echo "[root-update] hardening failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} "{failed_install}" 2>/dev/null || true
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+    touch /var/root/.rustdeskupdate_failed
+    launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    bootstrap_agents || true
+    exit 1
+fi
+# Generate launchd definitions from the new, final-location binary.  The
+# subprocess is bounded and its output is retained for diagnosis; failure
+# causes the existing bundle/plists to be restored by the EXIT trap.
+if ! write_new_plists; then
+    echo "[root-update] CRITICAL: new binary failed to write plists" >> {tmp_dir}/rustdesk_root_update.log
+    cat "{tmp_dir}/write-plists.log" >> {tmp_dir}/rustdesk_root_update.log 2>/dev/null || true
+    touch /var/root/.rustdeskupdate_failed
+    if ! mv {app_bundle} "{failed_install}" 2>/dev/null; then
+        echo "[root-update] CRITICAL: failed to stage failed bundle for restore" >> {tmp_dir}/rustdesk_root_update.log
+    fi
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+    fi
+    exit 1
+fi
+echo "[root-update] Plist definitions written by new binary" >> {tmp_dir}/rustdesk_root_update.log
+# Check daemon registration and readiness BEFORE removing backup.  launchctl
+# load/bootstrap only registers the job; the service can still exit immediately.
+if ! launchctl load -w {daemon_plist} 2>/dev/null && \
+   ! launchctl bootstrap system {daemon_plist} 2>/dev/null; then
+    echo "[root-update] CRITICAL: daemon reload failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    mv {app_bundle} "{failed_install}" 2>/dev/null || true
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+    cp {daemon_plist_bak} {daemon_plist} 2>/dev/null || true
+    cp {agent_plist_bak} {agent_plist} 2>/dev/null || true
+    launchctl load -w {daemon_plist} 2>/dev/null || \
+        launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+    touch /var/root/.rustdeskupdate_failed
+    exit 1
+fi
+daemon_ready=0
+for _ in $(seq 1 30); do
+    daemon_info=$(launchctl print system/{daemon_label} 2>/dev/null || true)
+    daemon_pid=$(printf '%s\n' "$daemon_info" | awk '/^[[:space:]]*pid = / {{print $3; exit}}')
+    if [ -n "$daemon_pid" ] && \
+       printf '%s\n' "$daemon_info" | grep -F "state = running" >/dev/null && \
+       [ -S "/tmp/{app_name}-service/ipc_service" ] && \
+       kill -0 "$daemon_pid" 2>/dev/null; then
+        sleep 2
+        if kill -0 "$daemon_pid" 2>/dev/null; then
+            daemon_ready=1
+            break
+        fi
+    fi
+    sleep 1
+done
+if [ "$daemon_ready" -ne 1 ]; then
+    echo "[root-update] CRITICAL: daemon failed readiness check, restoring" >> {tmp_dir}/rustdesk_root_update.log
+    launchctl bootout system/{daemon_label} 2>/dev/null || \
+        launchctl unload -w "{daemon_plist}" 2>/dev/null || true
+    mv {app_bundle} "{failed_install}" 2>/dev/null || true
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+    touch /var/root/.rustdeskupdate_failed
+    exit 1
+fi
+# Bootstrap agent BEFORE removing backup — needed for rollback on failure.
+# This also uses launchctl load for the login-window/no-console-user case.
+if ! bootstrap_agents || ! agent_ready; then
+        echo "[root-update] CRITICAL: agent bootstrap failed, rolling back" >> {tmp_dir}/rustdesk_root_update.log
+        launchctl bootout system/{daemon_label} 2>/dev/null || true
+        mv {app_bundle} "{failed_install}" 2>/dev/null || true
+        if ! mv {app_bundle}.bak {app_bundle}; then
+            echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+            touch /var/root/.rustdeskupdate_failed
+        fi
+        cp {daemon_plist_bak} {daemon_plist} 2>/dev/null || true
+        cp {agent_plist_bak} {agent_plist} 2>/dev/null || true
+        launchctl load -w {daemon_plist} 2>/dev/null || \
+            launchctl bootstrap system {daemon_plist} 2>/dev/null || true
+        bootstrap_agents || true
+        touch /var/root/.rustdeskupdate_failed
+        exit 1
+fi
+# Recheck daemon liveness after the agent is restored and immediately before
+# deleting the only rollback bundle.
+daemon_info=$(launchctl print system/{daemon_label} 2>/dev/null || true)
+if ! printf '%s\n' "$daemon_info" | grep -F "state = running" >/dev/null || \
+   ! kill -0 "$daemon_pid" 2>/dev/null || \
+   [ ! -S "/tmp/{app_name}-service/ipc_service" ]; then
+    echo "[root-update] CRITICAL: daemon stopped before commit, restoring" >> {tmp_dir}/rustdesk_root_update.log
+    launchctl bootout system/{daemon_label} 2>/dev/null || true
+    mv {app_bundle} "{failed_install}" 2>/dev/null || true
+    if ! mv {app_bundle}.bak {app_bundle}; then
+        echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
+        touch /var/root/.rustdeskupdate_failed
+    fi
+    touch /var/root/.rustdeskupdate_failed
+    exit 1
+fi
+# Only remove backup after BOTH daemon AND agent confirmed running
+rollback_done=1
+rm -rf {app_bundle}.bak
+for gui_uid in $gui_uids; do
+    launchctl asuser "$gui_uid" open -a "{app_bundle}" || true
+done
+echo "[root-update] Done!" >> {tmp_dir}/rustdesk_root_update.log
+rm -rf {tmp_dir}
+"#,
+        app_name = app_name,
+        app_bundle = app_bundle,
+        src_app = src_app,
+        uid_list = uid_list,
+        daemon_plist = daemon_plist,
+        agent_plist = agent_plist,
+        tmp_dir = tmp_dir,
+        daemon_label = daemon_label,
+        agent_label = agent_label,
+        daemon_plist_bak = daemon_plist_bak,
+        agent_plist_bak = agent_plist_bak,
+        failed_install = failed_install,
+        daemon_plist_existed = if daemon_plist_existed { "1" } else { "0" },
+        agent_plist_existed = if agent_plist_existed { "1" } else { "0" },
+    );
+
+   {
+    use std::io::Write;
+    if let Err(err) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script_path)
+        .and_then(|mut f| f.write_all(script.as_bytes()))
+    {
+        restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+        restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+        return Err(err.into());
+    }
+   }
+   match Command::new("/bin/chmod").args(&["+x", &script_path]).status() {
+       Ok(status) if status.success() => {}
+       Ok(status) => {
+           restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+           restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+           bail!("[root-update] failed to make update script executable: {}", status);
+       }
+       Err(err) => {
+           restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+           restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+           return Err(err.into());
+       }
+   }
+   // Recheck immediately before handing control to the detached script; a
+   // session may have started while the script was being prepared.
+   if !crate::updater::has_no_active_conns_ipc() {
+       restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+       restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+       bail!("[root-update] active session started before update launch");
+   }
+   if let Err(err) = Command::new("/bin/bash")
+    .arg(&script_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(0)
+    .spawn()
+   {
+       restore_update_plist(&daemon_plist, &daemon_plist_bak, daemon_plist_existed)?;
+       restore_update_plist(&agent_plist, &agent_plist_bak, agent_plist_existed)?;
+       return Err(err.into());
+   }
+
+    log::info!("[root-update] Update script launched.");
+    Ok(())
+}
+
 pub fn extract_update_dmg(file: &str) {
     let update_temp_dir = get_update_temp_dir_string();
     let mut evt: HashMap<&str, String> =
@@ -931,37 +1557,63 @@ pub fn extract_update_dmg(file: &str) {
 }
 
 fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_point = "/Volumes/RustDeskUpdate";
     let target_path = Path::new(target_dir);
-
     if target_path.exists() {
         std::fs::remove_dir_all(target_path)?;
     }
     std::fs::create_dir_all(target_path)?;
+    extract_dmg_inner(dmg_path, target_dir)
+}
 
-    let status = Command::new("hdiutil")
-        .args(&["attach", "-nobrowse", "-mountpoint", mount_point, dmg_path])
+fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType<()> {
+    let target_path = Path::new(target_dir);
+    if !target_path.exists() {
+        bail!("[root-update] Temp directory does not exist: {:?}", target_path);
+    }
+    extract_dmg_inner(dmg_path, target_dir)
+}
+
+fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
+    let mount_output = Command::new("/usr/bin/mktemp")
+        .args(["-d", "/tmp/.rustdeskmount-XXXXXX"])
+        .output()?;
+    if !mount_output.status.success() {
+        bail!("Failed to create a private DMG mount directory");
+    }
+    let mount_point = String::from_utf8(mount_output.stdout)
+        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
+        .trim()
+        .to_owned();
+    if mount_point.is_empty() {
+        bail!("Failed to create a private DMG mount directory");
+    }
+    let status = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nobrowse", "-mountpoint"])
+        .arg(&mount_point)
+        .arg(dmg_path)
         .status()?;
 
     if !status.success() {
+        let _ = std::fs::remove_dir(&mount_point);
         bail!("Failed to attach DMG image at {}: {:?}", dmg_path, status);
     }
 
-    struct DmgGuard(&'static str);
+    struct DmgGuard(String);
     impl Drop for DmgGuard {
         fn drop(&mut self) {
-            let _ = Command::new("hdiutil")
-                .args(&["detach", self.0, "-force"])
+            let _ = Command::new("/usr/bin/hdiutil")
+                .args(["detach", self.0.as_str(), "-force"])
                 .status();
+            let _ = std::fs::remove_dir(&self.0);
         }
     }
-    let _guard = DmgGuard(mount_point);
+    let _guard = DmgGuard(mount_point.clone());
 
     let app_name = format!("{}.app", crate::get_app_name());
     let src_path = format!("{}/{}", mount_point, app_name);
     let dest_path = format!("{}/{}", target_dir, app_name);
 
-    let copy_status = Command::new("ditto")
+    let copy_status = Command::new("/usr/bin/ditto")
         .args(&[&src_path, &dest_path])
         .status()?;
 
