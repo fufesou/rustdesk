@@ -73,7 +73,7 @@ use winapi::{
         winuser::*,
     },
 };
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::{
     Foundation::{CloseHandle as WinCloseHandle, HANDLE as WinHANDLE},
     Security::{
@@ -134,8 +134,8 @@ const INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE: u32 = 0x5253_0004;
 const BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
 const BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE: u32 = 0x5253_0006;
 const BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
-const BATCH_VBS_DECODE_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
-const BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE: u32 = 0x5253_0009;
+const BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
+const SHORTCUT_ICON_INDEX: i32 = 0;
 const SHA256_HASH_LENGTH: usize = 32;
 const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2048;
 
@@ -1579,34 +1579,67 @@ fn get_after_install(
     ", create_service=get_create_service(&exe))
 }
 
-fn embedded_vbs_commands(commands: String, name: &str) -> String {
-    let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
-    let mut utf16: Vec<u16> = commands.encode_utf16().collect();
-    let encoded = STANDARD.encode(to_le(&mut utf16));
+fn shortcut_bytes(
+    target_path: &str,
+    arguments: Option<&str>,
+    icon_location: Option<&str>,
+) -> ResultType<Vec<u8>> {
+    let _com = initialize_shell_com()?;
+    let link: Shell::IShellLinkW =
+        unsafe { Com::CoCreateInstance(&Shell::ShellLink, None, Com::CLSCTX_INPROC_SERVER) }?;
+    let target_path = wide_string(target_path);
+    unsafe { link.SetPath(PCWSTR(target_path.as_ptr())) }?;
+    if let Some(arguments) = arguments {
+        let arguments = wide_string(arguments);
+        unsafe { link.SetArguments(PCWSTR(arguments.as_ptr())) }?;
+    }
+    if let Some(icon_location) = icon_location {
+        let icon_location = wide_string(icon_location);
+        unsafe { link.SetIconLocation(PCWSTR(icon_location.as_ptr()), SHORTCUT_ICON_INDEX) }?;
+    }
+
+    let stream = unsafe { Shell::SHCreateMemStream(None) }
+        .ok_or_else(|| anyhow!("Failed to create shortcut memory stream"))?;
+    let persist: Com::IPersistStream = link.cast()?;
+    unsafe { persist.Save(&stream, true) }?;
+    let mut stat = Com::STATSTG::default();
+    unsafe { stream.Stat(&mut stat, Com::STATFLAG_NONAME) }?;
+    let size = usize::try_from(stat.cbSize).map_err(|_| anyhow!("Shortcut data is too large"))?;
+    let read_size = u32::try_from(size).map_err(|_| anyhow!("Shortcut data is too large"))?;
+    let mut bytes = vec![0; size];
+    let mut bytes_read = 0;
+    unsafe {
+        stream.Seek(0, Com::STREAM_SEEK_SET, None)?;
+        stream
+            .Read(bytes.as_mut_ptr().cast(), read_size, Some(&mut bytes_read))
+            .ok()?;
+    }
+    if bytes_read != read_size {
+        bail!("Failed to read complete shortcut data");
+    }
+    Ok(bytes)
+}
+
+fn embedded_shortcut_commands(bytes: Vec<u8>, filename: &str, name: &str) -> String {
+    let encoded = STANDARD.encode(bytes);
     let encoded_path = format!("%~f0.{name}.b64");
-    let script_path = format!("%~f0.{name}.vbs");
     format!(
         "> \"{encoded_path}\" echo {encoded}\r\n\
-         certutil -f -decode \"{encoded_path}\" \"{script_path}\" > nul || exit /b {BATCH_VBS_DECODE_FAILURE_EXIT_CODE}\r\n\
-         cscript //B //NoLogo \"{script_path}\" \"%RUSTDESK_OUTPUT_DIR%\" || exit /b {BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE}"
+         certutil -f -decode \"{encoded_path}\" \"%RUSTDESK_OUTPUT_DIR%\\{filename}\" > nul || exit /b {BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE}"
     )
 }
 
-fn embedded_tray_vbs_commands(app_name: &str, exe: &str, shortcut_icon_location: &str) -> String {
-    embedded_vbs_commands(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = WScript.Arguments(0) & \"\\{app_name} Tray.lnk\"
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    oLink.Arguments = \"--tray\"
-    {shortcut_icon_location}
-oLink.Save
-            ",
-        ),
+fn embedded_tray_shortcut_commands(
+    app_name: &str,
+    exe: &str,
+    icon_location: Option<&str>,
+) -> ResultType<String> {
+    let filename = format!("{app_name} Tray.lnk");
+    Ok(embedded_shortcut_commands(
+        shortcut_bytes(exe, Some("--tray"), icon_location)?,
+        &filename,
         "tray_shortcut",
-    )
+    ))
 }
 
 fn validate_install_value(value: &str) -> ResultType<()> {
@@ -1659,36 +1692,19 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         validate_install_value(&icon)?;
     }
     let tmp_path = "%RUSTDESK_OUTPUT_DIR%".to_owned();
-    let shortcut_icon_location = get_shortcut_icon_location(&path, &cur_exe);
-    let mk_shortcut_commands = embedded_vbs_commands(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = WScript.Arguments(0) & \"\\{app_name}.lnk\"
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    {shortcut_icon_location}
-oLink.Save
-            "
-        ),
+    let shortcut_icon_location = get_custom_icon(&path, &cur_exe);
+    let mk_shortcut_commands = embedded_shortcut_commands(
+        shortcut_bytes(&exe, None, shortcut_icon_location.as_deref())?,
+        &format!("{app_name}.lnk"),
         "mk_shortcut",
     );
-    let uninstall_shortcut_commands = embedded_vbs_commands(
-        format!(
-            "
-Set oWS = WScript.CreateObject(\"WScript.Shell\")
-sLinkFile = WScript.Arguments(0) & \"\\Uninstall {app_name}.lnk\"
-Set oLink = oWS.CreateShortcut(sLinkFile)
-    oLink.TargetPath = \"{exe}\"
-    oLink.Arguments = \"--uninstall\"
-    oLink.IconLocation = \"msiexec.exe\"
-oLink.Save
-            "
-        ),
+    let uninstall_shortcut_commands = embedded_shortcut_commands(
+        shortcut_bytes(&exe, Some("--uninstall"), Some("msiexec.exe"))?,
+        &format!("Uninstall {app_name}.lnk"),
         "uninstall_shortcut",
     );
     let tray_shortcut_commands =
-        embedded_tray_vbs_commands(&app_name, &exe, &shortcut_icon_location);
+        embedded_tray_shortcut_commands(&app_name, &exe, shortcut_icon_location.as_deref())?;
     let mut reg_value_desktop_shortcuts = "0".to_owned();
     let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut reg_value_printer = "0".to_owned();
@@ -2205,8 +2221,7 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
         BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE => {
             "failed to create the installer output directory"
         }
-        BATCH_VBS_DECODE_FAILURE_EXIT_CODE => "failed to decode an embedded shortcut script",
-        BATCH_VBS_EXECUTION_FAILURE_EXIT_CODE => "failed to execute an embedded shortcut script",
+        BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE => "failed to decode an embedded shortcut",
         _ => "installer command failed",
     }
 }
@@ -3498,9 +3513,9 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
     if let Some(icon) = get_custom_icon(path, exe) {
         validate_install_value(&icon)?;
     }
-    let shortcut_icon_location = get_shortcut_icon_location(path, exe);
+    let shortcut_icon_location = get_custom_icon(path, exe);
     let tray_shortcut_commands =
-        embedded_tray_vbs_commands(&app_name, exe, &shortcut_icon_location);
+        embedded_tray_shortcut_commands(&app_name, exe, shortcut_icon_location.as_deref())?;
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     Ok(format!(
         "
@@ -4933,18 +4948,40 @@ mod tests {
     }
 
     #[test]
-    fn service_install_does_not_use_mutable_temp_vbs() {
+    fn native_shortcut_supports_unicode_target_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustdesk_shortcut_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let target = directory.join("RustDesk-路径.exe");
+        std::fs::create_dir(&directory).expect("test directory should be created");
+        std::fs::File::create(&target).expect("Unicode test target should be created");
+
+        let bytes = shortcut_bytes(
+            target.to_str().expect("test path should be valid Unicode"),
+            None,
+            None,
+        )
+        .expect("native shortcut should support a Unicode target path");
+        let unicode_name = "RustDesk-路径.exe"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+        assert!(bytes
+            .windows(unicode_name.len())
+            .any(|part| part == unicode_name));
+    }
+
+    #[test]
+    fn service_install_embeds_native_shortcut() {
         let (_, path, _, exe) = get_install_info();
         let commands = get_install_service_commands(&path, &exe)
             .expect("service install commands should be generated");
-        let legacy_script = format!("{}_tray_shortcut.vbs", crate::get_app_name());
         assert!(commands.contains("%~f0.tray_shortcut.b64"));
-        assert!(commands.contains("%~f0.tray_shortcut.vbs"));
         assert!(commands.contains("%RUSTDESK_OUTPUT_DIR%"));
-        assert!(
-            !commands.contains(&legacy_script),
-            "service install must not execute a mutable temporary VBS"
-        );
+        assert!(!commands.contains(".vbs"));
     }
 
     #[test]
@@ -4958,18 +4995,22 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&runner_dir).expect("runner directory should be created");
-        let vbs_commands = embedded_vbs_commands(
-            "If WScript.Arguments.Count <> 1 Then WScript.Quit 1".to_owned(),
+        let shortcut_commands = embedded_shortcut_commands(
+            shortcut_bytes(r"C:\RustDesk.exe", None, None)
+                .expect("native shortcut should be generated"),
+            "test.lnk",
             "test",
         );
-        assert!(vbs_commands.contains("certutil"));
-        assert!(vbs_commands.contains("-decode"));
-        assert!(vbs_commands.contains("cscript"));
-        assert!(!vbs_commands.to_ascii_lowercase().contains("powershell"));
+        assert!(shortcut_commands.contains("certutil"));
+        assert!(shortcut_commands.contains("-decode"));
+        assert!(!shortcut_commands.to_ascii_lowercase().contains("cscript"));
+        assert!(!shortcut_commands
+            .to_ascii_lowercase()
+            .contains("powershell"));
         let script = write_install_script(format!(
             "if \"%PROGRAMDATA%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
              if \"%PUBLIC%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
-             {vbs_commands}\r\n\
+             {shortcut_commands}\r\n\
              > \"{}\" echo verified",
             marker.display()
         ))
