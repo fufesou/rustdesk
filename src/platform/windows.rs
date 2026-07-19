@@ -3516,6 +3516,7 @@ pub fn install_service() -> bool {
     log::info!("Installing service...");
     let _installing = crate::platform::InstallingService::new();
     let (_, path, _, exe) = get_install_info();
+    Config::set_option("stop-service".into(), "".into());
     let cmds = match get_install_service_commands(&path, &exe) {
         Ok(cmds) => cmds,
         Err(err) => {
@@ -3523,7 +3524,6 @@ pub fn install_service() -> bool {
             return true;
         }
     };
-    Config::set_option("stop-service".into(), "".into());
     crate::ipc::EXIT_RECV_CLOSE.store(false, Ordering::Relaxed);
     if let Err(err) = run_cmds(cmds, false, "install") {
         Config::set_option("stop-service".into(), "Y".into());
