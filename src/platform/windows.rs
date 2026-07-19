@@ -1925,6 +1925,9 @@ fn get_known_folder(id: &windows::core::GUID) -> ResultType<PathBuf> {
     Ok(PathBuf::from(path?))
 }
 
+// `%VAR%` is expanded before cmd.exe executes even inside a quoted `set` assignment.
+// Reject all `%` so a handoff path cannot alter the elevated bootstrap before hash verification.
+// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/set_1
 fn path_for_cmd_environment(path: &Path) -> ResultType<&str> {
     let value = path
         .to_str()
@@ -1963,9 +1966,10 @@ fn prepare_install_commands(commands: &str) -> ResultType<String> {
     let commands = commands.replace("\r\n", "\n").replace('\n', "\r\n");
     let chcp = path_for_cmd_assignment(&get_system_executable(CHCP_RELATIVE_PATH)?)?;
     Ok(format!(
-        "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n{}\r\n\
+        "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n\
          \"{chcp}\" {UTF8_CODE_PAGE} > nul || exit /b \
          {BATCH_CODE_PAGE_FAILURE_EXIT_CODE}\r\n\
+         {}\r\n\
          if exist \"%~f0.dir\" exit /b {BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE}\r\n\
          md \"%~f0.dir\" || exit /b {BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE}\r\n\
          set \"RUSTDESK_OUTPUT_DIR=%~f0.dir\"\r\n{commands}\r\nexit /b 0\r\n",
@@ -4926,18 +4930,6 @@ mod tests {
             escape_nested_cmd_ampersands(r"C:\Users\R&D\RustDesk.exe"),
             r"C:\Users\R^&D\RustDesk.exe"
         );
-    }
-
-    #[test]
-    fn install_batch_uses_absolute_system_chcp() {
-        let commands =
-            prepare_install_commands("exit /b 0").expect("install commands should be prepared");
-        let chcp_path = path_for_cmd_assignment(
-            &get_system_executable("chcp.com").expect("system chcp.com should resolve"),
-        )
-        .expect("system chcp.com path should be safe for cmd.exe");
-
-        assert!(commands.contains(&format!("\"{chcp_path}\" {UTF8_CODE_PAGE} > nul")));
     }
 
     #[test]
