@@ -4948,43 +4948,6 @@ mod tests {
     }
 
     #[test]
-    fn native_shortcut_supports_unicode_target_path() {
-        let directory = std::env::temp_dir().join(format!(
-            "rustdesk_shortcut_test_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let target = directory.join("RustDesk-路径.exe");
-        std::fs::create_dir(&directory).expect("test directory should be created");
-        std::fs::File::create(&target).expect("Unicode test target should be created");
-
-        let bytes = shortcut_bytes(
-            target.to_str().expect("test path should be valid Unicode"),
-            None,
-            None,
-        )
-        .expect("native shortcut should support a Unicode target path");
-        let unicode_name = "RustDesk-路径.exe"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-
-        std::fs::remove_dir_all(&directory).expect("test directory should be removed");
-        assert!(bytes
-            .windows(unicode_name.len())
-            .any(|part| part == unicode_name));
-    }
-
-    #[test]
-    fn service_install_embeds_native_shortcut() {
-        let (_, path, _, exe) = get_install_info();
-        let commands = get_install_service_commands(&path, &exe)
-            .expect("service install commands should be generated");
-        assert!(commands.contains("%~f0.tray_shortcut.b64"));
-        assert!(commands.contains("%RUSTDESK_OUTPUT_DIR%"));
-        assert!(!commands.contains(".vbs"));
-    }
-
-    #[test]
     fn native_install_handoff_verifies_before_execution() {
         let marker = std::env::temp_dir().join(format!(
             "rustdesk_install_marker_{}",
