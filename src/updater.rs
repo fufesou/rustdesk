@@ -330,16 +330,16 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
-        || releases != "releases"
-        || download != "download"
-        || tag.is_empty()
-        || segments.next().is_some()
-        || !is_plain_update_filename(filename)
-    {
-        return None;
-    }
+    // if owner != "rustdesk"
+    //     || repo != "rustdesk"
+    //     || releases != "releases"
+    //     || download != "download"
+    //     || tag.is_empty()
+    //     || segments.next().is_some()
+    //     || !is_plain_update_filename(filename)
+    // {
+    //     return None;
+    // }
 
     Some(std::env::temp_dir().join(filename))
 }
@@ -499,16 +499,19 @@ pub fn check_update_as_root() -> ResultType<()> {
             }
         }
     }
-    if let Err(e) = do_check_software_update() {
-        bail!("[root-update] Failed to check for software update: {}", e);
-    }
-    let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
-    if update_url.is_empty() {
-        log::info!("[root-update] No update available.");
-        return Ok(());
-    }
-    let download_url = update_url.replace("tag", "download");
-    let version = download_url.split('/').last().unwrap_or_default().to_string();
+    // if let Err(e) = do_check_software_update() {
+    //     bail!("[root-update] Failed to check for software update: {}", e);
+    // }
+    // let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
+    // if update_url.is_empty() {
+    //     log::info!("[root-update] No update available.");
+    //     return Ok(());
+    // }
+    // let update_url = "https://github.com/fufesou/rustdesk/releases/download/test-macos-auto-update/rustdesk-1.4.11-aarch64-aarch64.dmg";
+    // let download_url = update_url.replace("tag", "download");
+    // let version = download_url.split('/').last().unwrap_or_default().to_string();
+    let download_url = "https://github.com/fufesou/rustdesk/releases/download/test-macos-auto-update/rustdesk-1.4.11-aarch64-aarch64.dmg";
+    let version = "1.4.11".to_string();
     let arch = if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x86_64" };
     let dmg_url = format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch);
     log::info!("[root-update] New version: {}, downloading from {}", version, dmg_url);

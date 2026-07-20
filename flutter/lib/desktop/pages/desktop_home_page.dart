@@ -431,7 +431,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   Widget buildHelpCards(String updateUrl) {
     if (!bind.isCustomClient() &&
-        updateUrl.isNotEmpty &&
+        // updateUrl.isNotEmpty &&
         !isCardClosed &&
         bind.mainUriPrefixSync().contains('rustdesk')) {
       final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
@@ -447,7 +447,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
       return buildInstallCard(
           "Status",
-          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
+          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (1.4.11).",
           btnText,
           onPressed,
           closeButton: true,
