@@ -11,8 +11,10 @@ final _isExtracting = false.obs;
 
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
-  String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  // String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
+  // String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  String downloadUrl = "https://github.com/fufesou/rustdesk/releases/download/test-macos-auto-update/rustdesk-1.4.10-aarch64-aarch64.dmg";
+  String version = "1.4.10";
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
