@@ -120,6 +120,17 @@ const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 
+fn validate_install_app_name(app_name: &str) -> ResultType<()> {
+    if app_name.is_empty()
+        || !app_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        bail!("Application name must match [a-zA-Z0-9-]+");
+    }
+    Ok(())
+}
+
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -1599,13 +1610,13 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
             .to_str()
             .ok_or_else(|| anyhow!("Configuration path is not valid Unicode"))?,
     )?;
-    if let Some(icon) = get_custom_icon(&path, &cur_exe) {
-        validate_install_value(&icon)?;
+    let shortcut_icon_location = get_custom_icon(&path, &cur_exe);
+    if let Some(icon) = shortcut_icon_location.as_deref() {
+        validate_install_value(icon)?;
     }
     // The elevated runner expands this to `%~f0.dir`, beside its protected copy.
     // Do not stage privileged shortcut artifacts in the user-writable `%TEMP%`.
     let tmp_path = "%RUSTDESK_OUTPUT_DIR%".to_owned();
-    let shortcut_icon_location = get_custom_icon(&path, &cur_exe);
     let mk_shortcut_commands = embedded_shortcut_commands(
         shortcut_bytes(&exe, None, shortcut_icon_location.as_deref())?,
         &format!("{app_name}.lnk"),
@@ -1725,7 +1736,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {install_remote_printer}
 {sleep}
     ",
-        display_icon = get_custom_icon(&path, &cur_exe).unwrap_or(exe.to_string()),
+        display_icon = shortcut_icon_location.as_deref().unwrap_or(exe.as_str()),
         nested_exe = escape_nested_cmd_ampersands(&exe),
         version = crate::VERSION.replace("-", "."),
         build_date = crate::BUILD_DATE,
@@ -3144,10 +3155,10 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
             .to_str()
             .ok_or_else(|| anyhow!("Configuration path is not valid Unicode"))?,
     )?;
-    if let Some(icon) = get_custom_icon(path, exe) {
-        validate_install_value(&icon)?;
-    }
     let shortcut_icon_location = get_custom_icon(path, exe);
+    if let Some(icon) = shortcut_icon_location.as_deref() {
+        validate_install_value(icon)?;
+    }
     let tray_shortcut_commands =
         embedded_tray_shortcut_commands(&app_name, exe, shortcut_icon_location.as_deref())?;
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
@@ -3173,6 +3184,7 @@ pub fn install_service() -> bool {
     let cmds = match get_install_service_commands(&path, &exe) {
         Ok(cmds) => cmds,
         Err(err) => {
+            Config::set_option("stop-service".into(), "Y".into());
             log::error!("Failed to prepare service installation: {err}");
             return true;
         }
@@ -4551,6 +4563,17 @@ mod tests {
         assert_eq!(chr, Some('a'));
         let chr = get_char_from_vk(VK_ESCAPE as u32); // VK_ESC
         assert_eq!(chr, None)
+    }
+
+    #[test]
+    fn install_app_names_enforce_ascii_command_safety() {
+        assert!(validate_install_app_name("RustDesk-Admin1").is_ok());
+        for app_name in ["", "RustDesk_Admin", "RustDesk&whoami", "RustDesk应用"] {
+            assert!(
+                validate_install_app_name(app_name).is_err(),
+                "unsafe application name was accepted: {app_name}"
+            );
+        }
     }
 
     #[test]
