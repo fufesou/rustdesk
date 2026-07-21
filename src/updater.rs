@@ -314,16 +314,16 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
-        || releases != "releases"
-        || download != "download"
-        || tag.is_empty()
-        || segments.next().is_some()
-        || !is_plain_update_filename(filename)
-    {
-        return None;
-    }
+    // if owner != "rustdesk"
+    //     || repo != "rustdesk"
+    //     || releases != "releases"
+    //     || download != "download"
+    //     || tag.is_empty()
+    //     || segments.next().is_some()
+    //     || !is_plain_update_filename(filename)
+    // {
+    //     return None;
+    // }
 
     Some(std::env::temp_dir().join(filename))
 }
