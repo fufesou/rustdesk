@@ -22,7 +22,7 @@ void handleUpdate(String releasePageUrl) {
   //   return;
   // }
   // downloadUrl = '$downloadUrl/$downloadFile';
-  String downloadUrl = 'https://github.com/fufesou/rustdesk/releases/download/test-macos-auto-update/rustdesk-1.4.11-aarch64-aarch64.dmg';
+  String downloadUrl = 'https://github.com/fufesou/rustdesk/releases/download/test-macos-auto-update/rustdesk-1.4.11-x86_64.exe';
 
   SimpleWrapper downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
