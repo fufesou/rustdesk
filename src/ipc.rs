@@ -41,6 +41,8 @@ pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
 pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use ipc_auth::{active_uid, authorize_service_scoped_ipc_connection};
+#[cfg(target_os = "macos")]
+use ipc_auth::authorize_user_server_process;
 #[cfg(windows)]
 use ipc_auth::{
     authorize_windows_main_ipc_connection, portable_service_listener_security_attributes,
@@ -382,7 +384,7 @@ pub enum Data {
     #[cfg(windows)]
     SyncWinCpuUsage(Option<f64>),
     FileTransferLog((String, String)),
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
     // CM-side file reading responses (Windows only)
@@ -883,8 +885,14 @@ async fn handle(data: Data, stream: &mut Connection) {
             Some(value) => {
                 let mut updated = true;
                 if name == "id" {
-                    Config::set_key_confirmed(false);
-                    Config::set_id(&value);
+                    // An empty id would wipe the local id and unconfirm the key (cf. #15626).
+                    if value.is_empty() {
+                        log::warn!("Ignoring empty id write over IPC");
+                        updated = false;
+                    } else {
+                        Config::set_key_confirmed(false);
+                        Config::set_id(&value);
+                    }
                 } else if name == "temporary-password" {
                     password::update_temporary_password();
                 } else if name == "permanent-password" {
@@ -992,7 +1000,7 @@ async fn handle(data: Data, stream: &mut Connection) {
         #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Data::Plugin(plugin) => crate::plugin::ipc::handle_plugin(plugin, stream).await,
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(windows)]
         Data::ControlledSessionCount(_) => {
             allow_err!(
                 stream
@@ -1353,7 +1361,14 @@ pub async fn connect_for_uid(
     postfix: &str,
 ) -> ResultType<ConnectionTmpl<ConnClient>> {
     let path = Config::ipc_path_for_uid(uid, postfix);
-    connect_with_path(ms_timeout, &path).await
+    let conn = connect_with_path(ms_timeout, &path).await?;
+    #[cfg(target_os = "macos")]
+    if postfix.is_empty()
+        && !authorize_user_server_process(conn.peer_uid(), conn.peer_pid(), uid)
+    {
+        bail!("Rejected user IPC peer for uid {}", uid);
+    }
+    Ok(conn)
 }
 
 #[cfg(target_os = "linux")]
@@ -1701,19 +1716,24 @@ pub fn clear_trusted_devices() {
 }
 
 pub fn get_id() -> String {
+    // An empty id may come from a process that took over the main IPC with a
+    // config scope that has no id yet (e.g. a user GUI that became the server
+    // while the installed service was restarting). Treat it as no answer,
+    // otherwise the empty id is adopted below and wipes the local one.
     if let Ok(Some(v)) = get_config("id") {
-        // update salt also, so that next time reinstallation not causing first-time auto-login failure
-        if let Ok(Some(v2)) = get_config("salt") {
-            Config::set_salt(&v2);
+        if !v.is_empty() {
+            // update salt also, so that next time reinstallation not causing first-time auto-login failure
+            if let Ok(Some(v2)) = get_config("salt") {
+                Config::set_salt(&v2);
+            }
+            if v != Config::get_id() {
+                Config::set_key_confirmed(false);
+                Config::set_id(&v);
+            }
+            return v;
         }
-        if v != Config::get_id() {
-            Config::set_key_confirmed(false);
-            Config::set_id(&v);
-        }
-        v
-    } else {
-        Config::get_id()
     }
+    Config::get_id()
 }
 
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
