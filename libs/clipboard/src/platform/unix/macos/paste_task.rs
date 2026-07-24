@@ -2,7 +2,7 @@ use crate::{
     platform::unix::{FileDescription, FileType, BLOCK_SIZE},
     send_data, ClipboardFile, CliprdrError, ProgressPercent,
 };
-use hbb_common::{allow_err, log, tokio::time::Instant};
+use hbb_common::{allow_err, fs::join_validated_path, log, tokio::time::Instant};
 use std::{
     cmp::min,
     fs::{File, FileTimes},
@@ -117,7 +117,13 @@ impl PasteTask {
             target_dir,
             files,
         };
-        task_handle.update_next(0).ok();
+        let init_result = task_handle
+            .validate_paths()
+            .and_then(|_| task_handle.update_next(0));
+        if let Err(error) = init_result {
+            log::error!("Failed to initialize paste task: {}", &error);
+            task_handle.on_error(error);
+        }
         if task_handle.is_finished() {
             task_handle.on_finished();
         } else {
@@ -250,6 +256,13 @@ impl PasteTask {
 }
 
 impl PasteTaskHandle {
+    fn validate_paths(&self) -> Result<(), CliprdrError> {
+        for file in &self.files {
+            Self::join_file_path(&self.target_dir, &file.name)?;
+        }
+        Ok(())
+    }
+
     fn update_next(&mut self, size: u64) -> Result<(), CliprdrError> {
         if self.is_finished() {
             return Ok(());
@@ -273,9 +286,11 @@ impl PasteTaskHandle {
                             if let Some(new_file_path) =
                                 Self::get_new_filename(&self.target_dir, file_desc)
                             {
-                                if let Ok(f) = std::fs::File::create(&new_file_path) {
-                                    f.set_len(0).ok();
-                                    Self::set_file_metadata(&f, file_desc);
+                                match File::create_new(&new_file_path) {
+                                    Ok(file) => Self::set_file_metadata(&file, file_desc),
+                                    Err(error) => {
+                                        log::error!("Failed to create empty file: {}", error)
+                                    }
                                 }
                             };
                         } else {
@@ -362,9 +377,7 @@ impl PasteTaskHandle {
             });
         };
 
-        let original_file_path = self
-            .target_dir
-            .join(&file.name)
+        let original_file_path = Self::join_file_path(&self.target_dir, &file.name)?
             .to_string_lossy()
             .to_string();
         let Some(download_file_path) = Self::get_first_filename(
@@ -391,7 +404,7 @@ impl PasteTaskHandle {
                 });
             }
         }
-        match std::fs::File::create(&download_file_path) {
+        match std::fs::File::create_new(&download_file_path) {
             Ok(handle) => {
                 let writer = BufWriter::with_capacity(BLOCK_SIZE as usize * 2, handle);
                 self.progress.download_file_index = self.progress.list_index;
@@ -444,6 +457,15 @@ impl PasteTaskHandle {
         }
         // unreachable
         None
+    }
+
+    fn join_file_path(target_dir: &PathBuf, name: &Path) -> Result<PathBuf, CliprdrError> {
+        let name = name.to_str().ok_or_else(|| CliprdrError::InvalidRequest {
+            description: "clipboard file name is not valid UTF-8".to_string(),
+        })?;
+        join_validated_path(target_dir, name).map_err(|error| CliprdrError::InvalidRequest {
+            description: error.to_string(),
+        })
     }
 
     fn progress_percent(&self) -> ProgressPercent {
@@ -534,10 +556,13 @@ impl PasteTaskHandle {
     }
 
     fn get_new_filename(target_dir: &PathBuf, file_desc: &FileDescription) -> Option<String> {
-        let mut rename_to_path = target_dir
-            .join(&file_desc.name)
-            .to_string_lossy()
-            .to_string();
+        let mut rename_to_path = match Self::join_file_path(target_dir, &file_desc.name) {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(error) => {
+                log::error!("Failed to validate paste destination: {}", error);
+                return None;
+            }
+        };
         if Path::new(&rename_to_path).exists() {
             let Some(new_path) = Self::get_first_filename(rename_to_path.clone(), file_desc.kind)
             else {

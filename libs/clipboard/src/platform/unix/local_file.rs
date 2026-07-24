@@ -386,10 +386,8 @@ mod file_list_test {
 
     #[test]
     fn test_parse_file_descriptors() -> Result<(), CliprdrError> {
-        as_bin_parse_test("")?;
-        as_bin_parse_test("/")?;
         as_bin_parse_test("test")?;
-        as_bin_parse_test("/test")?;
+        as_bin_parse_test("test/nested")?;
         Ok(())
     }
 

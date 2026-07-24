@@ -69,6 +69,60 @@ static BOOL wf_cliprdr_file_group_descriptor_size_valid(SIZE_T size, UINT count)
 	return size >= descriptors_size;
 }
 
+static BOOL wf_cliprdr_file_name_separator(WCHAR value)
+{
+	return value == L'\\' || value == L'/';
+}
+
+static BOOL wf_cliprdr_file_name_component_valid(const WCHAR *component, SIZE_T length)
+{
+	return length > 0 && component[length - 1] != L'.' && component[length - 1] != L' ' &&
+		   !(length == 1 && component[0] == L'.') &&
+		   !(length == 2 && component[0] == L'.' && component[1] == L'.');
+}
+
+static BOOL wf_cliprdr_file_descriptor_name_valid(const WCHAR *name)
+{
+	SIZE_T component_start = 0;
+	SIZE_T i;
+
+	if (!name || wf_cliprdr_file_name_separator(name[0]))
+		return FALSE;
+
+	for (i = 0; i < MAX_PATH; i++)
+	{
+		WCHAR value = name[i];
+		if (value == L':')
+			return FALSE;
+		if (value != L'\0' && !wf_cliprdr_file_name_separator(value))
+			continue;
+		if (!wf_cliprdr_file_name_component_valid(&name[component_start], i - component_start))
+			return FALSE;
+		if (value == L'\0')
+			return TRUE;
+		component_start = i + 1;
+	}
+
+	return FALSE;
+}
+
+static BOOL wf_cliprdr_file_group_descriptor_names_valid(
+	const FILEGROUPDESCRIPTORW *group, UINT count)
+{
+	UINT i;
+
+	if (!group || count == 0)
+		return FALSE;
+
+	for (i = 0; i < count; i++)
+	{
+		if (!wf_cliprdr_file_descriptor_name_valid(group->fgd[i].cFileName))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
 static BOOL wf_cliprdr_bounded_strlen(const char *value, size_t max_len, size_t *len)
 {
 	size_t i;
@@ -907,6 +961,9 @@ static HRESULT STDMETHODCALLTYPE CliprdrDataObject_GetData(IDataObject *This, FO
 
 		stream_count = dsc->cItems;
 		if (!wf_cliprdr_file_group_descriptor_size_valid(hmem_size, stream_count))
+			return wf_cliprdr_fail_locked_file_descriptor_data(
+			    clipboard, pMedium, instance, NULL, 0, E_UNEXPECTED);
+		if (!wf_cliprdr_file_group_descriptor_names_valid(dsc, stream_count))
 			return wf_cliprdr_fail_locked_file_descriptor_data(
 			    clipboard, pMedium, instance, NULL, 0, E_UNEXPECTED);
 

@@ -47,6 +47,24 @@ pub struct FileDescription {
     pub perm: u16,
 }
 
+fn validate_file_name(name: &str) -> Result<(), CliprdrError> {
+    let bytes = name.as_bytes();
+    let has_drive_prefix = matches!(bytes, [letter, b':', ..] if letter.is_ascii_alphabetic());
+    let has_invalid_component = name
+        .split('/')
+        .any(|component| component.is_empty() || component == ".");
+    if has_drive_prefix || has_invalid_component {
+        return Err(CliprdrError::InvalidRequest {
+            description: "clipboard file name is not a normalized relative path".to_string(),
+        });
+    }
+    hbb_common::fs::validate_file_name_no_traversal(name).map_err(|error| {
+        CliprdrError::InvalidRequest {
+            description: error.to_string(),
+        }
+    })
+}
+
 impl FileDescription {
     fn parse_file_descriptor(
         bytes: &mut Bytes,
@@ -136,7 +154,9 @@ impl FileDescription {
         };
 
         let name = wstr.to_utf8().replace('\\', "/");
-        let name = PathBuf::from(name.trim_end_matches('\0'));
+        let name = name.trim_end_matches('\0');
+        validate_file_name(name)?;
+        let name = PathBuf::from(name);
 
         let desc = FileDescription {
             conn_id,
@@ -184,5 +204,66 @@ impl FileDescription {
         }
 
         Ok(files)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PDU_HEADER_SIZE: usize = size_of::<u32>();
+    const DESCRIPTOR_SIZE: usize = 592;
+    const ATTRIBUTES_OFFSET: usize = PDU_HEADER_SIZE + 36;
+    const NAME_OFFSET: usize = PDU_HEADER_SIZE + 72;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    fn parse_name(name: &str, attributes: u32) -> Result<Vec<FileDescription>, CliprdrError> {
+        let mut pdu = vec![0_u8; PDU_HEADER_SIZE + DESCRIPTOR_SIZE];
+        pdu[..PDU_HEADER_SIZE].copy_from_slice(&1_u32.to_le_bytes());
+        pdu[PDU_HEADER_SIZE..PDU_HEADER_SIZE + size_of::<u32>()]
+            .copy_from_slice(&FLAGS_FD_ATTRIBUTES.to_le_bytes());
+        pdu[ATTRIBUTES_OFFSET..ATTRIBUTES_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&attributes.to_le_bytes());
+        for (index, unit) in name.encode_utf16().enumerate() {
+            let offset = NAME_OFFSET + index * size_of::<u16>();
+            pdu[offset..offset + size_of::<u16>()].copy_from_slice(&unit.to_le_bytes());
+        }
+        FileDescription::parse_file_descriptors(pdu, 0)
+    }
+
+    #[test]
+    fn rejects_unsafe_file_names() {
+        let names = [
+            "../payload",
+            "..\\payload",
+            "folder/../../payload",
+            "/tmp/payload",
+            "C:\\payload",
+            "\\\\server\\share\\payload",
+            "folder//payload",
+            "folder/./payload",
+            "folder/",
+            "bad\0name",
+            "",
+        ];
+        for name in names {
+            assert!(matches!(
+                parse_name(name, FILE_ATTRIBUTE_NORMAL),
+                Err(CliprdrError::InvalidRequest { .. })
+            ));
+        }
+        for name in ["", "."] {
+            assert!(matches!(
+                parse_name(name, FILE_ATTRIBUTE_DIRECTORY),
+                Err(CliprdrError::InvalidRequest { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_nested_relative_file_name() {
+        let files = parse_name("folder\\nested\\file.txt", FILE_ATTRIBUTE_NORMAL).unwrap();
+        assert_eq!(files[0].name, PathBuf::from("folder/nested/file.txt"));
     }
 }
