@@ -2810,8 +2810,11 @@ wf_cliprdr_server_format_data_request(CliprdrClientContext *context,
 	{
 		size_t len;
 		size_t i;
+		SIZE_T dropFilesSize;
+		SIZE_T remaining;
 		WCHAR *wFileName;
 		HRESULT result;
+		BOOL fileListValid = FALSE;
 		LPDATAOBJECT dataObj;
 		FORMATETC format_etc;
 		STGMEDIUM stg_medium;
@@ -2851,43 +2854,73 @@ wf_cliprdr_server_format_data_request(CliprdrClientContext *context,
 		}
 
 		clear_file_array(clipboard);
-
-		if (dropFiles->fWide)
+		dropFilesSize = GlobalSize(stg_medium.hGlobal);
+		/* The original strlen/wcslen loops could scan past HGLOBAL if the list terminator
+		 * supplied by the clipboard owner was missing or truncated. */
+		if (dropFilesSize >= sizeof(DROPFILES) && dropFiles->pFiles >= sizeof(DROPFILES) &&
+			(SIZE_T)dropFiles->pFiles < dropFilesSize)
 		{
-			/* dropFiles contains file names */
-			for (wFileName = (WCHAR *)((char *)dropFiles + dropFiles->pFiles);
-				 (len = wcslen(wFileName)) > 0; wFileName += len + 1)
+			remaining = dropFilesSize - dropFiles->pFiles;
+			if (dropFiles->fWide && (dropFiles->pFiles % sizeof(WCHAR)) == 0)
 			{
-				wf_cliprdr_process_filename(clipboard, wFileName, wcslen(wFileName));
-			}
-		}
-		else
-		{
-			char *p;
-			for (p = (char *)((char *)dropFiles + dropFiles->pFiles); (len = strlen(p)) > 0;
-				 p += len + 1, clipboard->nFiles++)
-			{
-				int cchWideChar;
-				cchWideChar = MultiByteToWideChar(CP_ACP, MB_COMPOSITE, p, len, NULL, 0);
-				wFileName = (LPWSTR)calloc(cchWideChar, sizeof(WCHAR));
-				if (wFileName)
+				wFileName = (WCHAR *)((BYTE *)dropFiles + dropFiles->pFiles);
+				while (remaining >= sizeof(WCHAR))
 				{
-					MultiByteToWideChar(CP_ACP, MB_COMPOSITE, p, len, wFileName, cchWideChar);
-					wf_cliprdr_process_filename(clipboard, wFileName, cchWideChar);
-					free(wFileName);
+					if (FAILED(StringCchLengthW(wFileName, remaining / sizeof(WCHAR), &len)))
+						break;
+					if (len == 0)
+					{
+						fileListValid = TRUE;
+						break;
+					}
+					if (!wf_cliprdr_process_filename(clipboard, wFileName, len))
+						break;
+					wFileName += len + 1;
+					remaining -= (len + 1) * sizeof(WCHAR);
 				}
-				else
+			}
+			else if (!dropFiles->fWide)
+			{
+				char *p = (char *)dropFiles + dropFiles->pFiles;
+				while (remaining > 0)
 				{
-					rc = ERROR_INTERNAL_ERROR;
-					GlobalUnlock(stg_medium.hGlobal);
-					ReleaseStgMedium(&stg_medium);
-					goto exit;
+					int cchWideChar;
+					if (FAILED(StringCchLengthA(p, remaining, &len)))
+						break;
+					if (len == 0)
+					{
+						fileListValid = TRUE;
+						break;
+					}
+					cchWideChar = MultiByteToWideChar(CP_ACP, MB_COMPOSITE, p, (int)len, NULL, 0);
+					if (cchWideChar <= 0)
+						break;
+					wFileName = (LPWSTR)calloc((size_t)cchWideChar + 1, sizeof(WCHAR));
+					if (!wFileName)
+						break;
+					if (MultiByteToWideChar(CP_ACP, MB_COMPOSITE, p, (int)len, wFileName,
+										cchWideChar) != cchWideChar ||
+						!wf_cliprdr_process_filename(clipboard, wFileName, (size_t)cchWideChar))
+					{
+						free(wFileName);
+						break;
+					}
+					free(wFileName);
+					p += len + 1;
+					remaining -= len + 1;
 				}
 			}
 		}
 
 		GlobalUnlock(stg_medium.hGlobal);
 		ReleaseStgMedium(&stg_medium);
+		if (!fileListValid)
+		{
+			clear_file_array(clipboard);
+			IDataObject_Release(dataObj);
+			rc = ERROR_INTERNAL_ERROR;
+			goto exit;
+		}
 	resp:
 		// size will not overflow, because size type is size_t (unsigned __int64)
 		size = 4 + clipboard->nFiles * sizeof(FILEDESCRIPTORW);
