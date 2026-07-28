@@ -1132,16 +1132,42 @@ fn move_existing_update_to_backup(final_path: &Path) -> ResultType<Option<PathBu
     Ok(Some(backup_path))
 }
 
+fn restore_or_remove_download_backup(backup_path: &Path, final_path: &Path) -> ResultType<()> {
+    let Err(restore_err) = std::fs::rename(backup_path, final_path) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(backup_path) {
+        Ok(()) => bail!(
+            "Failed to restore update backup {} to {}: {}; removed the unrestored backup",
+            backup_path.display(),
+            final_path.display(),
+            restore_err
+        ),
+        Err(cleanup_err) if cleanup_err.kind() == std::io::ErrorKind::NotFound => bail!(
+            "Failed to restore update backup {} to {}: {}; the backup no longer exists",
+            backup_path.display(),
+            final_path.display(),
+            restore_err
+        ),
+        Err(cleanup_err) => bail!(
+            "Failed to restore update backup {} to {}: {}; failed to remove the unrestored backup: {}",
+            backup_path.display(),
+            final_path.display(),
+            restore_err,
+            cleanup_err
+        ),
+    }
+}
+
 pub(crate) fn install_verified_download(temp_path: &Path, final_path: &Path) -> ResultType<()> {
     let backup_path = move_existing_update_to_backup(final_path)?;
     if let Err(e) = std::fs::rename(temp_path, final_path) {
         if let Some(backup_path) = backup_path.as_ref() {
-            if let Err(restore_err) = std::fs::rename(backup_path, final_path) {
+            if let Err(restore_err) = restore_or_remove_download_backup(backup_path, final_path) {
                 bail!(
-                    "Failed to replace {} with {}, and failed to restore backup {}: replace error {}, restore error {}",
+                    "Failed to replace {} with {}: replace error {}; rollback error: {}",
                     final_path.display(),
                     temp_path.display(),
-                    backup_path.display(),
                     e,
                     restore_err
                 );
@@ -1557,5 +1583,25 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"old-verified-update");
         std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_download_backup_restore_removes_backup() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-backup-restore-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let backup_path = test_dir.join(".rustdesk-update.exe.backup");
+        let final_path = test_dir.join("rustdesk-update.exe");
+        std::fs::create_dir_all(&final_path).unwrap();
+        std::fs::write(&backup_path, b"old-verified-update").unwrap();
+
+        let result = restore_or_remove_download_backup(&backup_path, &final_path);
+        let backup_exists = backup_path.exists();
+        std::fs::remove_dir_all(&test_dir).unwrap();
+
+        assert!(result.is_err());
+        assert!(!backup_exists);
     }
 }

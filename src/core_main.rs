@@ -39,6 +39,20 @@ fn macos_update_exit_code<E: std::fmt::Display>(
     }
 }
 
+#[cfg(any(windows, test))]
+const UPDATE_SUCCESS_EXIT_CODE: i32 = 0;
+#[cfg(any(windows, test))]
+const WINDOWS_UPDATE_FAILURE_EXIT_CODE: i32 = 1;
+
+#[cfg(any(windows, test))]
+fn windows_update_exit_code<T, E>(result: &Result<T, E>) -> i32 {
+    if result.is_ok() {
+        UPDATE_SUCCESS_EXIT_CODE
+    } else {
+        WINDOWS_UPDATE_FAILURE_EXIT_CODE
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn parse_macos_update_args(args: &[String]) -> Result<MacosUpdateArgs, String> {
     if args.first().map(String::as_str) != Some("--update") {
@@ -311,22 +325,21 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             } else if args[0] == "--update" {
                 if config::is_disable_installation() {
-                    return None;
+                    log::error!("Update is disabled by policy");
+                    std::process::exit(WINDOWS_UPDATE_FAILURE_EXIT_CODE);
                 }
 
-                let text = match crate::platform::prepare_custom_client_update() {
-                    Err(e) => {
-                        log::error!("Error preparing custom client update: {}", e);
-                        "Update failed!".to_string()
+                let update_result = match crate::platform::prepare_custom_client_update() {
+                    Err(err) => Err(format!("Error preparing custom client update: {err}")),
+                    Ok(false) => Err("Custom client update preparation failed".to_owned()),
+                    Ok(true) => platform::update_me(false).map_err(|err| err.to_string()),
+                };
+                let text = match &update_result {
+                    Ok(()) => "Updated successfully!".to_owned(),
+                    Err(err) => {
+                        log::error!("Update failed: {err}");
+                        "Update failed!".to_owned()
                     }
-                    Ok(false) => "Update failed!".to_string(),
-                    Ok(true) => match platform::update_me(false) {
-                        Ok(_) => "Updated successfully!".to_string(),
-                        Err(err) => {
-                            log::error!("Failed with error: {err}");
-                            "Update failed!".to_string()
-                        }
-                    },
                 };
                 Toast::new(Toast::POWERSHELL_APP_ID)
                     .title(&config::APP_NAME.read().unwrap())
@@ -335,6 +348,10 @@ pub fn core_main() -> Option<Vec<String>> {
                     .duration(Duration::Short)
                     .show()
                     .ok();
+                let exit_code = windows_update_exit_code(&update_result);
+                if exit_code != UPDATE_SUCCESS_EXIT_CODE {
+                    std::process::exit(exit_code);
+                }
                 return None;
             } else if args[0] == "--after-install" {
                 if let Err(err) = platform::run_after_install() {
@@ -1065,6 +1082,18 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn windows_update_failure_uses_nonzero_exit_code() {
+        let success: Result<(), &str> = Ok(());
+        let failure: Result<(), &str> = Err("failed");
+
+        assert_eq!(windows_update_exit_code(&success), UPDATE_SUCCESS_EXIT_CODE);
+        assert_eq!(
+            windows_update_exit_code(&failure),
+            WINDOWS_UPDATE_FAILURE_EXIT_CODE
+        );
     }
 
     #[test]

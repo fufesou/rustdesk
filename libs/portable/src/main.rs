@@ -21,6 +21,10 @@ const APP_METADATA_CONFIG: &str = "meta.toml";
 const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const APP_PREFIX: &str = "rustdesk";
 const APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+#[cfg(any(windows, test))]
+const UPDATE_SUCCESS_EXIT_CODE: i32 = 0;
+#[cfg(any(windows, test))]
+const UPDATE_FAILURE_EXIT_CODE: i32 = 1;
 #[cfg(windows)]
 const UPDATE_ARG: &str = "--update";
 #[cfg(windows)]
@@ -216,6 +220,15 @@ fn execute_update(reader: &BinaryReader, args: &[String]) -> std::io::Result<()>
     update_dir.cleanup()
 }
 
+#[cfg(any(windows, test))]
+fn update_process_exit_code<T, E>(result: &Result<T, E>) -> i32 {
+    if result.is_ok() {
+        UPDATE_SUCCESS_EXIT_CODE
+    } else {
+        UPDATE_FAILURE_EXIT_CODE
+    }
+}
+
 #[cfg(windows)]
 fn report_update_error(error: &std::io::Error) {
     use std::{ffi::OsStr, iter, os::windows::ffi::OsStrExt, ptr};
@@ -264,8 +277,13 @@ fn main() {
     let reader = BinaryReader::default();
     #[cfg(windows)]
     if args.first().map(String::as_str) == Some(UPDATE_ARG) {
-        if let Err(error) = execute_update(&reader, &args) {
-            report_update_error(&error);
+        let update_result = execute_update(&reader, &args);
+        if let Err(error) = &update_result {
+            report_update_error(error);
+        }
+        let exit_code = update_process_exit_code(&update_result);
+        if exit_code != UPDATE_SUCCESS_EXIT_CODE {
+            std::process::exit(exit_code);
         }
         return;
     }
@@ -282,6 +300,20 @@ fn main() {
             args = vec!["--quick_support".to_owned()];
         }
         execute(exe, args, ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_update_failure_uses_nonzero_exit_code() {
+        let success: std::io::Result<()> = Ok(());
+        let failure: std::io::Result<()> = Err(std::io::Error::other("failed"));
+
+        assert_eq!(update_process_exit_code(&success), UPDATE_SUCCESS_EXIT_CODE);
+        assert_eq!(update_process_exit_code(&failure), UPDATE_FAILURE_EXIT_CODE);
     }
 }
 

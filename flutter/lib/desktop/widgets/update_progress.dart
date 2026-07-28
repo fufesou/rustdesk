@@ -9,8 +9,20 @@ import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 const _eventKeyUpdateMe = 'update-me';
+final _updateLaunchController = UpdateLaunchController();
 
 Future<void> handleUpdate(String releasePageUrl) async {
+  if (!_updateLaunchController.tryStart()) {
+    return;
+  }
+  try {
+    await _handleUpdate(releasePageUrl);
+  } finally {
+    _updateLaunchController.finish();
+  }
+}
+
+Future<void> _handleUpdate(String releasePageUrl) async {
   _showVerifyingUpdate();
   final downloadUrl =
       await bind.mainGetCommon(key: 'verified-download-url-$releasePageUrl');
@@ -27,7 +39,7 @@ Future<void> handleUpdate(String releasePageUrl) async {
   SimpleWrapper<Future<void> Function()> cancelDownload =
       SimpleWrapper(() async {});
   gFFI.dialogManager.dismissAll();
-  gFFI.dialogManager.show((setState, close, context) {
+  await gFFI.dialogManager.show((setState, close, context) {
     cancelDownload.value = () async {
       if (!cancelController.beginCancel(downloadId.value)) {
         return;

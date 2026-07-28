@@ -48,7 +48,7 @@ static PRIVILEGES_SCRIPTS_DIR: Dir =
 static mut LATEST_SEED: i32 = 0;
 static UPDATE_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 const UPDATE_TEMP_DMG_CREATE_ATTEMPTS: usize = 16;
-const UPDATE_DMG_MOUNT_POINT: &str = "/Volumes/RustDeskUpdate";
+const UPDATE_DMG_MOUNT_TEMPLATE: &str = "/tmp/.rustdeskmount-XXXXXX";
 const STALE_UPDATE_TEMP_DIR_SECS: u64 = 24 * 60 * 60;
 const UPDATE_METADATA_SIDECAR_MAX_BYTES: usize = 1024 * 1024;
 const UPDATE_SIGNATURE_SIDECAR_MAX_BYTES: usize = 4 * 1024;
@@ -1135,12 +1135,15 @@ fn update_me_from_app_dir(app_dir: String) -> ResultType<()> {
 	    set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
 	    set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
 	    set protect_staged_bundle to "chown -R root:wheel \"$temp_bundle\"; chmod -R go-w \"$temp_bundle\"; (xattr -r -d com.apple.quarantine \"$temp_bundle\" || true);"
-	    set move_current_bundle to "if [ -e " & app_bundle_q & " ]; then mv " & app_bundle_q & " \"$old_bundle\"; fi;"
-	    set install_staged_bundle to "if mv \"$temp_bundle\" " & app_bundle_q & "; then rm -rf \"$old_bundle\"; else if [ -e \"$old_bundle\" ]; then mv \"$old_bundle\" " & app_bundle_q & "; fi; exit 1; fi;"
+	    set move_current_bundle to "if [ -e " & app_bundle_q & " ]; then mv " & app_bundle_q & " \"$old_bundle\"; bundle_backed_up=1; fi;"
+	    set install_staged_bundle to "mv \"$temp_bundle\" " & app_bundle_q & "; bundle_swapped=1;"
 	    set restore_installed_owner to "if [ " & quoted form of restore_owner & " = '1' ]; then chown -R " & user_name_q & ":staff " & app_bundle_q & "; fi;"
-	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & move_current_bundle & install_staged_bundle & restore_installed_owner
-	    set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\"; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\"; fi;"
-	    set sh to "set -e; trap " & quoted form of cleanup_verified & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
+	    set rollback_bundle to "if [ \"${bundle_backed_up:-0}\" -eq 1 ]; then if [ ! -e \"$old_bundle\" ]; then rollback_status=1; elif ! rm -rf " & app_bundle_q & "; then rollback_status=1; elif ! mv \"$old_bundle\" " & app_bundle_q & "; then rollback_status=1; fi; elif [ \"${bundle_swapped:-0}\" -eq 1 ]; then rm -rf " & app_bundle_q & " || rollback_status=1; fi;"
+	    set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || status=1; fi;"
+	    set rollback_update to "status=$?; trap - EXIT; set +e; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; exit \"$status\";"
+	    set commit_update to "transaction_committed=1; rm -rf \"$old_bundle\";"
+	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & "transaction_started=1;" & move_current_bundle & install_staged_bundle & restore_installed_owner & commit_update
+	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
 
 	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
 	end run
@@ -2246,13 +2249,59 @@ fn verify_dmg_file_sha256(
     Ok(())
 }
 
-struct DmgGuard(&'static str);
+fn create_dmg_mount_point() -> ResultType<String> {
+    let output = Command::new("/usr/bin/mktemp")
+        .args(["-d", UPDATE_DMG_MOUNT_TEMPLATE])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "Failed to create a private DMG mount directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mount_point = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
+        .trim()
+        .to_owned();
+    if mount_point.is_empty() {
+        bail!("Failed to create a private DMG mount directory");
+    }
+    Ok(mount_point)
+}
+
+fn remove_dmg_mount_point(mount_point: &str) {
+    if let Err(e) = std::fs::remove_dir(mount_point) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "Failed to remove DMG mount directory {}: {}",
+                mount_point,
+                e
+            );
+        }
+    }
+}
+
+struct DmgGuard(String);
+
+impl DmgGuard {
+    fn mount_point(&self) -> &str {
+        &self.0
+    }
+}
 
 impl Drop for DmgGuard {
     fn drop(&mut self) {
-        let _ = Command::new("hdiutil")
-            .args(&["detach", self.0, "-force"])
-            .status();
+        match Command::new("hdiutil")
+            .args(["detach", self.0.as_str(), "-force"])
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                log::warn!("Failed to detach DMG mount {}: {}", self.0, status);
+            }
+            Err(e) => log::warn!("Failed to detach DMG mount {}: {}", self.0, e),
+            _ => {}
+        }
+        remove_dmg_mount_point(&self.0);
     }
 }
 
@@ -2261,9 +2310,7 @@ fn attach_dmg_failure_message(
     mount_point: &str,
     status: impl std::fmt::Display,
 ) -> String {
-    format!(
-        "Failed to attach DMG image at {dmg_path}: {status}. A stale mount at {mount_point} may remain from a previous update; detach it with `hdiutil detach {mount_point}` or restart and retry."
-    )
+    format!("Failed to attach DMG image at {dmg_path} to {mount_point}: {status}")
 }
 
 fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Vec<String> {
@@ -2280,17 +2327,24 @@ fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Ve
     args
 }
 
-fn attach_dmg(dmg_path: &str, mount_point: &'static str, read_only: bool) -> ResultType<DmgGuard> {
-    let args = hdiutil_attach_args(dmg_path, mount_point, read_only);
-    let status = Command::new("hdiutil")
+fn attach_dmg(dmg_path: &str, read_only: bool) -> ResultType<DmgGuard> {
+    let mount_point = create_dmg_mount_point()?;
+    let args = hdiutil_attach_args(dmg_path, &mount_point, read_only);
+    let status = match Command::new("hdiutil")
         .args(args.iter().map(String::as_str))
-        .status()?;
+        .status()
+    {
+        Ok(status) => status,
+        Err(e) => {
+            remove_dmg_mount_point(&mount_point);
+            return Err(e.into());
+        }
+    };
 
     if !status.success() {
-        bail!(
-            "{}",
-            attach_dmg_failure_message(dmg_path, mount_point, status)
-        );
+        let message = attach_dmg_failure_message(dmg_path, &mount_point, status);
+        remove_dmg_mount_point(&mount_point);
+        bail!("{}", message);
     }
 
     Ok(DmgGuard(mount_point))
@@ -2305,8 +2359,8 @@ fn update_from_mounted_dmg_with_options(
     read_only: bool,
     before_prompt: Option<fn()>,
 ) -> ResultType<()> {
-    let _guard = attach_dmg(dmg_path, UPDATE_DMG_MOUNT_POINT, read_only)?;
-    update_from_attached_dmg_mount(UPDATE_DMG_MOUNT_POINT, before_prompt)
+    let guard = attach_dmg(dmg_path, read_only)?;
+    update_from_attached_dmg_mount(guard.mount_point(), before_prompt)
 }
 
 fn update_from_attached_dmg_mount(
@@ -2337,19 +2391,7 @@ fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType
 }
 
 fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_output = Command::new("/usr/bin/mktemp")
-        .args(["-d", "/tmp/.rustdeskmount-XXXXXX"])
-        .output()?;
-    if !mount_output.status.success() {
-        bail!("Failed to create a private DMG mount directory");
-    }
-    let mount_point = String::from_utf8(mount_output.stdout)
-        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
-        .trim()
-        .to_owned();
-    if mount_point.is_empty() {
-        bail!("Failed to create a private DMG mount directory");
-    }
+    let mount_point = create_dmg_mount_point()?;
     let status = Command::new("/usr/bin/hdiutil")
         .args(["attach", "-nobrowse", "-mountpoint"])
         .arg(&mount_point)
@@ -2533,6 +2575,48 @@ mod tests {
         assert!(!get_update_temp_dir().exists());
     }
 
+    #[test]
+    fn test_update_dmg_mount_points_are_unique() {
+        let first = create_dmg_mount_point().unwrap();
+        let second = create_dmg_mount_point().unwrap();
+        let are_unique = first != second;
+        for mount_point in [&first, &second] {
+            if mount_point.starts_with("/tmp/.rustdeskmount-") {
+                std::fs::remove_dir(mount_point).unwrap();
+            }
+        }
+
+        assert!(are_unique);
+    }
+
+    #[test]
+    fn test_update_scripts_roll_back_uncommitted_bundle_swap() {
+        let daemon_script = PRIVILEGES_SCRIPTS_DIR
+            .get_file("update.scpt")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        let source = include_str!("macos.rs");
+        let manual_script = source
+            .split_once("let update_body = r#\"")
+            .unwrap()
+            .1
+            .split_once("\"#;")
+            .unwrap()
+            .0;
+
+        for script in [daemon_script, manual_script] {
+            assert!(script.contains("transaction_committed"));
+            assert!(script.contains("rollback_bundle"));
+            assert!(script.contains("bundle_backed_up"));
+            assert!(script.contains(r#"if [ \"${rollback_status:-0}\" -eq 0 ]"#));
+        }
+        assert!(daemon_script.contains(
+            "rollback_bundle & rollback_plists & restore_service & restore_agent"
+        ));
+        assert!(daemon_script.contains("load_service & load_agent & commit_update"));
+        assert!(manual_script.contains("restore_installed_owner & commit_update"));
+    }
 }
 
 #[inline]

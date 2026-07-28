@@ -13,13 +13,14 @@ on run {daemon_file, agent_file, user, cur_pid, source_dir}
 
   set prepare_swap_paths to "temp_bundle=" & quoted form of app_bundle & ".new.$$; old_bundle=" & quoted form of app_bundle & ".old.$$;"
   set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
+  set backup_plists to "daemon_plist_backup=\"$verified_dir/daemon.plist\"; agent_plist_backup=\"$verified_dir/agent.plist\"; daemon_plist_existed=0; agent_plist_existed=0; if [ -e " & daemon_plist & " ]; then cp -p " & daemon_plist & " \"$daemon_plist_backup\"; daemon_plist_existed=1; fi; if [ -e " & quoted form of agent_plist & " ]; then cp -p " & quoted form of agent_plist & " \"$agent_plist_backup\"; agent_plist_existed=1; fi;"
   set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
   set protect_staged_bundle to "chown -R root:wheel \"$temp_bundle\"; chmod -R go-w \"$temp_bundle\"; (xattr -r -d com.apple.quarantine \"$temp_bundle\" || true);"
-  set move_current_bundle to "if [ -e " & quoted form of app_bundle & " ]; then mv " & quoted form of app_bundle & " \"$old_bundle\"; fi;"
-  set install_staged_bundle to "if ! mv \"$temp_bundle\" " & quoted form of app_bundle & "; then if [ -e \"$old_bundle\" ]; then mv \"$old_bundle\" " & quoted form of app_bundle & "; fi; exit 1; fi;"
-  set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & move_current_bundle & install_staged_bundle
-  set remove_old_bundle to "rm -rf \"$old_bundle\";"
-  set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\"; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\"; fi;"
+  set move_current_bundle to "if [ -e " & quoted form of app_bundle & " ]; then mv " & quoted form of app_bundle & " \"$old_bundle\"; bundle_backed_up=1; fi;"
+  set install_staged_bundle to "mv \"$temp_bundle\" " & quoted form of app_bundle & "; bundle_swapped=1;"
+  set rollback_bundle to "if [ \"${bundle_backed_up:-0}\" -eq 1 ]; then if [ ! -e \"$old_bundle\" ]; then rollback_status=1; elif ! rm -rf " & quoted form of app_bundle & "; then rollback_status=1; elif ! mv \"$old_bundle\" " & quoted form of app_bundle & "; then rollback_status=1; fi; elif [ \"${bundle_swapped:-0}\" -eq 1 ]; then rm -rf " & quoted form of app_bundle & " || rollback_status=1; fi;"
+  set rollback_plists to "if [ \"${daemon_plist_existed:-0}\" -eq 1 ]; then cp -p \"$daemon_plist_backup\" " & daemon_plist & " || rollback_status=1; else rm -f " & daemon_plist & " || rollback_status=1; fi; if [ \"${agent_plist_existed:-0}\" -eq 1 ]; then cp -p \"$agent_plist_backup\" " & quoted form of agent_plist & " || rollback_status=1; else rm -f " & quoted form of agent_plist & " || rollback_status=1; fi;"
+  set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || status=1; fi;"
 
   set write_daemon_plist to "echo " & quoted form of daemon_file & " > " & daemon_plist & " && chown root:wheel " & daemon_plist & ";"
   set write_agent_plist to "echo " & quoted form of agent_file & " > " & agent_plist & " && chown root:wheel " & agent_plist & ";"
@@ -28,8 +29,12 @@ on run {daemon_file, agent_file, user, cur_pid, source_dir}
   set bootstrap_agent to "if [ -n \"$uid\" ]; then launchctl bootstrap gui/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl bootstrap user/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl load -w " & quoted form of agent_plist & " || true; else launchctl load -w " & quoted form of agent_plist & " || true; fi;"
   set kickstart_agent to "if [ -n \"$uid\" ]; then launchctl kickstart -k gui/$uid/$agent_label 2>/dev/null || launchctl kickstart -k user/$uid/$agent_label 2>/dev/null || true; fi;"
   set load_agent to agent_label_cmd & bootstrap_agent & kickstart_agent
+  set restore_service to "launchctl load -w " & daemon_plist & " || rollback_status=1;"
+  set restore_agent to "if [ -n \"$uid\" ]; then launchctl bootstrap gui/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl bootstrap user/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl load -w " & quoted form of agent_plist & " || rollback_status=1; else launchctl load -w " & quoted form of agent_plist & " || rollback_status=1; fi;"
+  set rollback_update to "status=$?; trap - EXIT; set +e; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & unload_agent & unload_service & rollback_bundle & rollback_plists & restore_service & restore_agent & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; exit \"$status\";"
+  set commit_update to "transaction_committed=1; rm -rf \"$old_bundle\";"
 
-  set sh to "set -e; trap " & quoted form of cleanup_verified & " EXIT;" & check_source & prepare_verified & resolve_uid & unload_agent & unload_service & kill_others & copy_files & write_daemon_plist & write_agent_plist & load_service & load_agent & remove_old_bundle
+  set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & prepare_verified & resolve_uid & prepare_swap_paths & cleanup_swap_paths & backup_plists & stage_bundle & protect_staged_bundle & "transaction_started=1;" & unload_agent & unload_service & kill_others & move_current_bundle & install_staged_bundle & write_daemon_plist & write_agent_plist & load_service & load_agent & commit_update
 
   do shell script sh with prompt "RustDesk wants to update itself" with administrator privileges
 end run

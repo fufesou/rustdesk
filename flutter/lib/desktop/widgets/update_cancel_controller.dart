@@ -1,3 +1,19 @@
+class UpdateLaunchController {
+  bool _inProgress = false;
+
+  bool tryStart() {
+    if (_inProgress) {
+      return false;
+    }
+    _inProgress = true;
+    return true;
+  }
+
+  void finish() {
+    _inProgress = false;
+  }
+}
+
 class UpdateCancelController {
   bool _pendingCancel = false;
   bool _cancelInFlight = false;

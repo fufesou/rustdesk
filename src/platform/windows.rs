@@ -1465,18 +1465,80 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
     ))
 }
 
-fn copy_update_directory_cmd(src_exe: &str, path: &str) -> ResultType<String> {
+const UPDATE_TRANSACTION_PATH_ATTEMPTS: usize = 16;
+const UPDATE_TRANSACTION_FAILED_EXIT_CODE: u8 = 1;
+const UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE: u8 = 2;
+const UPDATE_TRANSACTION_CLEANUP_FAILED_EXIT_CODE: u8 = 3;
+
+fn update_directory_transaction_root(path: &str) -> ResultType<String> {
+    let install_path = PathBuf::from(path);
+    let parent = install_path
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {path}"))?;
+    for _ in 0..UPDATE_TRANSACTION_PATH_ATTEMPTS {
+        let transaction_root = parent.join(format!(
+            ".rustdesk-update-{}-{:x}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        match std::fs::symlink_metadata(&transaction_root) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(transaction_root.to_string_lossy().to_string());
+            }
+            Ok(_) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    bail!("Failed to allocate a unique update transaction path")
+}
+
+fn copy_update_directory_cmd_with_transaction_root(
+    src_exe: &str,
+    path: &str,
+    transaction_root: &str,
+) -> ResultType<String> {
     let source_dir = PathBuf::from(src_exe)
         .parent()
         .ok_or(anyhow!("Can't get parent directory of {src_exe}"))?
         .to_string_lossy()
         .to_string();
+    let staged_path = PathBuf::from(transaction_root)
+        .join("staged")
+        .to_string_lossy()
+        .to_string();
+    let backup_path = PathBuf::from(transaction_root)
+        .join("backup")
+        .to_string_lossy()
+        .to_string();
+    let rename_staged_exe = rename_staged_exe_cmd(src_exe, &staged_path, transaction_root)?;
     Ok(format!(
         "
+        if exist \"{transaction_root}\" exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+        md \"{staged_path}\" || exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
         taskkill /F /IM \"{broker_exe}\"
-        XCOPY \"{source_dir}\" \"{path}\" /Y /E /H /I /K /R /Z || exit /b
+        XCOPY \"{path}\" \"{staged_path}\" /Y /E /H /I /K /R /Z || (
+            rd /S /Q \"{transaction_root}\"
+            exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+        )
+        XCOPY \"{source_dir}\" \"{staged_path}\" /Y /E /H /I /K /R /Z || (
+            rd /S /Q \"{transaction_root}\"
+            exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+        )
         if exist \"{ORIGIN_PROCESS_EXE}\" (
-            copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{path}\\{broker_exe}\" || exit /b
+            copy /Y \"{ORIGIN_PROCESS_EXE}\" \"{staged_path}\\{broker_exe}\" || (
+                rd /S /Q \"{transaction_root}\"
+                exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+            )
+        )
+        {rename_staged_exe}
+        move /Y \"{path}\" \"{backup_path}\" || (
+            rd /S /Q \"{transaction_root}\"
+            exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+        )
+        move /Y \"{staged_path}\" \"{path}\" || (
+            move /Y \"{backup_path}\" \"{path}\" || exit /b {UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE}
+            rd /S /Q \"{transaction_root}\"
+            exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
         )
         ",
         ORIGIN_PROCESS_EXE = win_topmost_window::ORIGIN_PROCESS_EXE,
@@ -1484,8 +1546,40 @@ fn copy_update_directory_cmd(src_exe: &str, path: &str) -> ResultType<String> {
     ))
 }
 
-#[inline]
-pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
+fn commit_update_directory_cmd(transaction_root: &str) -> String {
+    let backup_path = PathBuf::from(transaction_root)
+        .join("backup")
+        .to_string_lossy()
+        .to_string();
+    format!(
+        "
+        if not exist \"{backup_path}\" exit /b {UPDATE_TRANSACTION_CLEANUP_FAILED_EXIT_CODE}
+        rd /S /Q \"{backup_path}\"
+        if exist \"{backup_path}\" exit /b {UPDATE_TRANSACTION_CLEANUP_FAILED_EXIT_CODE}
+        rd /S /Q \"{transaction_root}\"
+        if exist \"{transaction_root}\" exit /b {UPDATE_TRANSACTION_CLEANUP_FAILED_EXIT_CODE}
+        "
+    )
+}
+
+fn rollback_update_directory_cmd(path: &str, transaction_root: &str) -> String {
+    let backup_path = PathBuf::from(transaction_root)
+        .join("backup")
+        .to_string_lossy()
+        .to_string();
+    format!(
+        "
+        if not exist \"{backup_path}\" exit /b {UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE}
+        rd /S /Q \"{path}\"
+        if exist \"{path}\" exit /b {UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE}
+        move /Y \"{backup_path}\" \"{path}\" || exit /b {UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE}
+        rd /S /Q \"{transaction_root}\"
+        if exist \"{transaction_root}\" exit /b {UPDATE_TRANSACTION_ROLLBACK_FAILED_EXIT_CODE}
+        "
+    )
+}
+
+fn renamed_exe_paths(src_exe: &str, path: &str) -> ResultType<Option<(String, String)>> {
     let src_exe_filename = PathBuf::from(src_exe)
         .file_name()
         .ok_or(anyhow!("Can't get file name of {src_exe}"))?
@@ -1493,23 +1587,55 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         .to_string();
     let app_name = crate::get_app_name().to_lowercase();
     if src_exe_filename.to_lowercase() == format!("{app_name}.exe") {
-        Ok("".to_owned())
-    } else {
-        Ok(format!(
-            "
-        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\" || exit /b
-        ",
-        ))
+        return Ok(None);
     }
+    Ok(Some((
+        format!("{path}\\{src_exe_filename}"),
+        format!("{path}\\{app_name}.exe"),
+    )))
+}
+
+fn rename_staged_exe_cmd(
+    src_exe: &str,
+    staged_path: &str,
+    transaction_root: &str,
+) -> ResultType<String> {
+    let Some((source, destination)) = renamed_exe_paths(src_exe, staged_path)? else {
+        return Ok(String::new());
+    };
+    Ok(format!(
+        "
+        move /Y \"{source}\" \"{destination}\" || (
+            rd /S /Q \"{transaction_root}\"
+            exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+        )
+        "
+    ))
+}
+
+#[inline]
+pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
+    let Some((source, destination)) = renamed_exe_paths(src_exe, path)? else {
+        return Ok(String::new());
+    };
+    Ok(format!(
+        "
+        move /Y \"{source}\" \"{destination}\" || exit /b
+        "
+    ))
 }
 
 #[inline]
 pub fn remove_meta_toml_cmd(is_msi: bool, path: &str) -> String {
+    remove_meta_toml_cmd_with_failure(is_msi, path, "exit /b")
+}
+
+fn remove_meta_toml_cmd_with_failure(is_msi: bool, path: &str, failure_action: &str) -> String {
     if is_msi && crate::is_custom_client() {
         format!(
             "
         if exist \"{path}\\meta.toml\" (
-            del /F /Q \"{path}\\meta.toml\" || exit /b
+            del /F /Q \"{path}\\meta.toml\" || {failure_action}
         )
         ",
         )
@@ -3274,7 +3400,11 @@ pub fn update_me(debug: bool) -> ResultType<()> {
 }
 
 fn start_service_cmd(app_name: &str) -> String {
-    format!("sc start \"{app_name}\" || exit /b")
+    start_service_cmd_with_failure(app_name, "exit /b")
+}
+
+fn start_service_cmd_with_failure(app_name: &str, failure_action: &str) -> String {
+    format!("sc start \"{app_name}\" || {failure_action}")
 }
 
 fn handle_update_command_result(
@@ -3364,20 +3494,20 @@ fn update_me_(debug: bool) -> ResultType<()> {
             "".to_string()
         } else {
             format!(
-                "reg add \"{}\" /f /v DisplayIcon /t REG_SZ /d \"{}\" || exit /b",
+                "reg add \"{}\" /f /v DisplayIcon /t REG_SZ /d \"{}\" || goto rustdesk_update_rollback",
                 subkey, display_icon
             )
         };
         format!(
             "
 {reg_display_icon}
-reg add \"{subkey}\" /f /v DisplayVersion /t REG_SZ /d \"{version}\" || exit /b
-reg add \"{subkey}\" /f /v Version /t REG_SZ /d \"{version}\" || exit /b
-reg add \"{subkey}\" /f /v BuildDate /t REG_SZ /d \"{build_date}\" || exit /b
-reg add \"{subkey}\" /f /v VersionMajor /t REG_DWORD /d {version_major} || exit /b
-reg add \"{subkey}\" /f /v VersionMinor /t REG_DWORD /d {version_minor} || exit /b
-reg add \"{subkey}\" /f /v VersionBuild /t REG_DWORD /d {version_build} || exit /b
-reg add \"{subkey}\" /f /v EstimatedSize /t REG_DWORD /d {size} || exit /b
+reg add \"{subkey}\" /f /v DisplayVersion /t REG_SZ /d \"{version}\" || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v Version /t REG_SZ /d \"{version}\" || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v BuildDate /t REG_SZ /d \"{build_date}\" || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v VersionMajor /t REG_DWORD /d {version_major} || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v VersionMinor /t REG_DWORD /d {version_minor} || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v VersionBuild /t REG_DWORD /d {version_build} || goto rustdesk_update_rollback
+reg add \"{subkey}\" /f /v EstimatedSize /t REG_DWORD /d {size} || goto rustdesk_update_rollback
         "
         )
     }
@@ -3414,6 +3544,11 @@ reg add \"{subkey}\" /f /v EstimatedSize /t REG_DWORD /d {size} || exit /b
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
+        start_service_cmd_with_failure(&app_name, "goto rustdesk_update_rollback")
+    } else {
+        "".to_owned()
+    };
+    let restore_rolled_back_service_cmd = if is_service_running {
         start_service_cmd(&app_name)
     } else {
         "".to_owned()
@@ -3443,24 +3578,39 @@ reg add \"{subkey}\" /f /v EstimatedSize /t REG_DWORD /d {size} || exit /b
     // while I cannot find them by `tasklist` or the methods above.
     // There's should be 4 processes running: service, server, tray and main window.
     // But only 2 processes are shown in the tasklist.
+    let transaction_root = update_directory_transaction_root(&path)?;
+    let copy_exe =
+        copy_update_directory_cmd_with_transaction_root(&src_exe, &path, &transaction_root)?;
+    let commit_update = commit_update_directory_cmd(&transaction_root);
+    let rollback_update = rollback_update_directory_cmd(&path, &transaction_root);
     let cmds = format!(
         "
 chcp 65001
 sc stop \"{app_name}\"
 taskkill /F /IM \"{app_name}.exe\"{filter}
 {copy_exe}
-{rename_exe}
 {reg_cmd}
 {remove_meta_toml}
 {restore_service_cmd}
+{commit_update}
+goto rustdesk_update_done
+:rustdesk_update_rollback
+sc stop \"{app_name}\" >nul 2>&1
+taskkill /F /IM \"{app_name}.exe\"{filter} >nul 2>&1
+{rollback_update}
+{restore_rolled_back_service_cmd}
+exit /b {UPDATE_TRANSACTION_FAILED_EXIT_CODE}
+:rustdesk_update_done
 {uninstall_printer_cmd}
 {install_printer_cmd}
 {sleep}
     ",
         app_name = app_name,
-        copy_exe = copy_update_directory_cmd(&src_exe, &path)?,
-        rename_exe = rename_exe_cmd(&src_exe, &path)?,
-        remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
+        remove_meta_toml = remove_meta_toml_cmd_with_failure(
+            is_msi.unwrap_or(true),
+            &path,
+            "goto rustdesk_update_rollback",
+        ),
         sleep = if debug { "timeout 300" } else { "" },
     );
 
@@ -4834,6 +4984,85 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_directory_transaction_stages_before_replacing_live_install() {
+        let install_path = r"C:\Program Files\RustDesk";
+        let transaction_root = r"C:\Program Files\.rustdesk-update-test";
+        let commands = copy_update_directory_cmd_with_transaction_root(
+            r"C:\verified\rustdesk.exe",
+            install_path,
+            transaction_root,
+        )
+        .unwrap();
+
+        let clone_installed = commands
+            .find(&format!(
+                r#"XCOPY "{install_path}" "{transaction_root}\staged""#
+            ))
+            .unwrap();
+        let overlay_verified = commands
+            .find(&format!(
+                r#"XCOPY "C:\verified" "{transaction_root}\staged""#
+            ))
+            .unwrap();
+        let backup_installed = commands
+            .find(&format!(
+                r#"move /Y "{install_path}" "{transaction_root}\backup""#
+            ))
+            .unwrap();
+        let install_staged = commands
+            .find(&format!(
+                r#"move /Y "{transaction_root}\staged" "{install_path}""#
+            ))
+            .unwrap();
+
+        assert!(clone_installed < overlay_verified);
+        assert!(overlay_verified < backup_installed);
+        assert!(backup_installed < install_staged);
+        assert!(!commands.contains(r#"XCOPY "C:\verified" "C:\Program Files\RustDesk""#));
+    }
+
+    #[test]
+    fn update_directory_transaction_restores_backup_when_swap_fails() {
+        let install_path = r"C:\Program Files\RustDesk";
+        let transaction_root = r"C:\Program Files\.rustdesk-update-test";
+        let commands = copy_update_directory_cmd_with_transaction_root(
+            r"C:\verified\rustdesk.exe",
+            install_path,
+            transaction_root,
+        )
+        .unwrap();
+
+        assert!(commands.contains(&format!(
+            r#"move /Y "{transaction_root}\backup" "{install_path}" || exit /b 2"#
+        )));
+    }
+
+    #[test]
+    fn update_directory_transaction_keeps_backup_until_explicit_commit() {
+        let install_path = r"C:\Program Files\RustDesk";
+        let transaction_root = r"C:\Program Files\.rustdesk-update-test";
+        let commands = copy_update_directory_cmd_with_transaction_root(
+            r"C:\verified\rustdesk.exe",
+            install_path,
+            transaction_root,
+        )
+        .unwrap();
+
+        assert!(!commands.contains(&format!(r#"rd /S /Q "{transaction_root}\backup""#)));
+
+        let commit = commit_update_directory_cmd(transaction_root);
+        assert!(commit.contains(&format!(r#"rd /S /Q "{transaction_root}\backup""#)));
+
+        let rollback = rollback_update_directory_cmd(install_path, transaction_root);
+        assert!(rollback.contains(&format!(
+            r#"if not exist "{transaction_root}\backup" exit /b 2"#
+        )));
+        assert!(rollback.contains(&format!(
+            r#"move /Y "{transaction_root}\backup" "{install_path}" || exit /b 2"#
+        )));
+    }
 
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
