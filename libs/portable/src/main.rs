@@ -19,6 +19,10 @@ const APP_METADATA_CONFIG: &str = "meta.toml";
 const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const APP_PREFIX: &str = "rustdesk";
 const APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+#[cfg(any(windows, test))]
+const UPDATE_SUCCESS_EXIT_CODE: i32 = 0;
+#[cfg(any(windows, test))]
+const UPDATE_FAILURE_EXIT_CODE: i32 = 1;
 #[cfg(windows)]
 const SET_FOREGROUND_WINDOW_ENV_KEY: &str = "SET_FOREGROUND_WINDOW";
 
@@ -174,6 +178,15 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     }
 }
 
+#[cfg(any(windows, test))]
+fn update_process_exit_code<T, E>(result: &Result<T, E>) -> i32 {
+    if result.is_ok() {
+        UPDATE_SUCCESS_EXIT_CODE
+    } else {
+        UPDATE_FAILURE_EXIT_CODE
+    }
+}
+
 fn main() {
     let mut args = Vec::new();
     let mut arg_exe = Default::default();
@@ -207,6 +220,20 @@ fn main() {
             args = vec!["--quick_support".to_owned()];
         }
         execute(exe, args, ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_update_failure_uses_nonzero_exit_code() {
+        let success: std::io::Result<()> = Ok(());
+        let failure: std::io::Result<()> = Err(std::io::Error::other("failed"));
+
+        assert_eq!(update_process_exit_code(&success), UPDATE_SUCCESS_EXIT_CODE);
+        assert_eq!(update_process_exit_code(&failure), UPDATE_FAILURE_EXIT_CODE);
     }
 }
 
