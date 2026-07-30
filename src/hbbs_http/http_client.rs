@@ -11,6 +11,87 @@ use hbb_common::{
     ResultType,
 };
 use reqwest::{blocking::Client as SyncClient, Client as AsyncClient};
+use std::time::Duration;
+
+#[cfg(not(test))]
+const STRICT_HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const STRICT_HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+struct HttpClientProbeOptions {
+    tls_type: TlsType,
+    is_tls_type_cached: bool,
+    danger_accept_invalid_cert: Option<bool>,
+    original_danger_accept_invalid_cert: Option<bool>,
+    timeout: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+enum HttpClientProbeRetry {
+    AcceptInvalidCert(HttpClientProbeOptions),
+    NativeTls(HttpClientProbeOptions),
+}
+
+impl HttpClientProbeRetry {
+    fn options(self) -> HttpClientProbeOptions {
+        match self {
+            Self::AcceptInvalidCert(options) | Self::NativeTls(options) => options,
+        }
+    }
+}
+
+fn next_http_client_probe(options: HttpClientProbeOptions) -> Option<HttpClientProbeRetry> {
+    match (
+        options.tls_type,
+        options.is_tls_type_cached,
+        options.danger_accept_invalid_cert,
+    ) {
+        (TlsType::Rustls, _, None) | (TlsType::NativeTls, _, None) => Some(
+            HttpClientProbeRetry::AcceptInvalidCert(HttpClientProbeOptions {
+                danger_accept_invalid_cert: Some(true),
+                ..options
+            }),
+        ),
+        (TlsType::Rustls, false, Some(_)) => {
+            Some(HttpClientProbeRetry::NativeTls(HttpClientProbeOptions {
+                tls_type: TlsType::NativeTls,
+                danger_accept_invalid_cert: options.original_danger_accept_invalid_cert,
+                ..options
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn log_http_client_probe_retry(tls_url: &str, error: &reqwest::Error, retry: HttpClientProbeRetry) {
+    match retry {
+        HttpClientProbeRetry::AcceptInvalidCert(options) => log::warn!(
+            "Failed to connect to server {} with {:?}: {:?}, trying accept invalid cert",
+            tls_url,
+            options.tls_type,
+            error
+        ),
+        HttpClientProbeRetry::NativeTls(_) => log::warn!(
+            "Failed to connect to server {} with rustls-tls: {:?}, trying native-tls",
+            tls_url,
+            error
+        ),
+    }
+}
+
+fn cache_successful_http_probe(tls_url: &str, options: HttpClientProbeOptions) {
+    log::info!(
+        "Successfully connected to server {} with {:?}",
+        tls_url,
+        options.tls_type
+    );
+    upsert_tls_cache(
+        tls_url,
+        options.tls_type,
+        options.danger_accept_invalid_cert.unwrap_or(false),
+    );
+}
 
 macro_rules! configure_http_client {
     ($builder:expr, $tls_type:expr, $danger_accept_invalid_cert:expr, $Client: ty) => {{
@@ -132,10 +213,13 @@ pub fn create_http_client_with_url(url: &str) -> SyncClient {
     create_http_client_with_url_(
         url,
         tls_url,
-        tls_type,
-        is_tls_type_cached,
-        tls_danger_accept_invalid_cert,
-        tls_danger_accept_invalid_cert,
+        HttpClientProbeOptions {
+            tls_type,
+            is_tls_type_cached,
+            danger_accept_invalid_cert: tls_danger_accept_invalid_cert,
+            original_danger_accept_invalid_cert: tls_danger_accept_invalid_cert,
+            timeout: None,
+        },
     )
 }
 
@@ -158,103 +242,143 @@ pub fn create_http_client_with_url_strict(url: &str) -> ResultType<SyncClient> {
     Ok(create_http_client_with_url_(
         url,
         tls_url,
-        tls_type,
-        can_reuse_cached_probe,
-        Some(false),
-        Some(false),
+        HttpClientProbeOptions {
+            tls_type,
+            is_tls_type_cached: can_reuse_cached_probe,
+            danger_accept_invalid_cert: Some(false),
+            original_danger_accept_invalid_cert: Some(false),
+            timeout: Some(STRICT_HTTP_PROBE_TIMEOUT),
+        },
     ))
 }
 
 fn create_http_client_with_url_(
     url: &str,
     tls_url: &str,
-    tls_type: TlsType,
-    is_tls_type_cached: bool,
-    danger_accept_invalid_cert: Option<bool>,
-    original_danger_accept_invalid_cert: Option<bool>,
+    options: HttpClientProbeOptions,
 ) -> SyncClient {
-    let mut client = create_http_client(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
+    let client = create_http_client(
+        options.tls_type,
+        options.danger_accept_invalid_cert.unwrap_or(false),
+    );
+    if options.is_tls_type_cached && options.original_danger_accept_invalid_cert.is_some() {
         return client;
     }
-    if let Err(e) = client.head(url).send() {
-        if e.is_request() {
-            match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
-                (TlsType::Rustls, _, None) => {
-                    log::warn!(
-                        "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
-                        tls_url,
-                        e
-                    );
-                    client = create_http_client_with_url_(
-                        url,
-                        tls_url,
-                        tls_type,
-                        is_tls_type_cached,
-                        Some(true),
-                        original_danger_accept_invalid_cert,
-                    );
-                }
-                (TlsType::Rustls, false, Some(_)) => {
-                    log::warn!(
-                        "Failed to connect to server {} with rustls-tls: {:?}, trying native-tls",
-                        tls_url,
-                        e
-                    );
-                    client = create_http_client_with_url_(
-                        url,
-                        tls_url,
-                        TlsType::NativeTls,
-                        is_tls_type_cached,
-                        original_danger_accept_invalid_cert,
-                        original_danger_accept_invalid_cert,
-                    );
-                }
-                (TlsType::NativeTls, _, None) => {
-                    log::warn!(
-                        "Failed to connect to server {} with native-tls: {:?}, trying accept invalid cert",
-                        tls_url,
-                        e
-                    );
-                    client = create_http_client_with_url_(
-                        url,
-                        tls_url,
-                        tls_type,
-                        is_tls_type_cached,
-                        Some(true),
-                        original_danger_accept_invalid_cert,
-                    );
-                }
-                _ => {
-                    log::error!(
-                        "Failed to connect to server {} with {:?}, err: {:?}.",
-                        tls_url,
-                        tls_type,
-                        e
-                    );
-                }
-            }
-        } else {
+    let request = client.head(url);
+    let probe_result = if let Some(timeout) = options.timeout {
+        request.timeout(timeout).send()
+    } else {
+        request.send()
+    };
+    match probe_result {
+        Ok(_) => {
+            cache_successful_http_probe(tls_url, options);
+            client
+        }
+        Err(error) if !error.is_request() => {
             log::warn!(
                 "Failed to connect to server {} with {:?}, err: {}.",
                 tls_url,
-                tls_type,
-                e
+                options.tls_type,
+                error
             );
+            client
         }
-    } else {
-        log::info!(
-            "Successfully connected to server {} with {:?}",
-            tls_url,
-            tls_type
-        );
-        upsert_tls_cache(
-            tls_url,
-            tls_type,
-            danger_accept_invalid_cert.unwrap_or(false),
-        );
+        Err(error) => match next_http_client_probe(options) {
+            Some(retry) => {
+                log_http_client_probe_retry(tls_url, &error, retry);
+                create_http_client_with_url_(url, tls_url, retry.options())
+            }
+            None => {
+                log::error!(
+                    "Failed to connect to server {} with {:?}, err: {:?}.",
+                    tls_url,
+                    options.tls_type,
+                    error
+                );
+                client
+            }
+        },
     }
-    client
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+    use std::{net::TcpListener, sync::mpsc, thread, time::Duration};
+
+    const PROBE_COMPLETION_DEADLINE: Duration = Duration::from_millis(500);
+    const SERVER_RELEASE_DEADLINE: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn strict_sync_client_probe_does_not_block_past_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (connection_tx, connection_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _connection = listener.accept().unwrap();
+            connection_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(SERVER_RELEASE_DEADLINE);
+        });
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            create_http_client_with_url_(
+                &url,
+                &url,
+                HttpClientProbeOptions {
+                    tls_type: TlsType::Rustls,
+                    is_tls_type_cached: false,
+                    danger_accept_invalid_cert: Some(false),
+                    original_danger_accept_invalid_cert: Some(false),
+                    timeout: Some(STRICT_HTTP_PROBE_TIMEOUT),
+                },
+            );
+            let _ = finished_tx.send(());
+        });
+
+        connection_rx
+            .recv_timeout(PROBE_COMPLETION_DEADLINE)
+            .unwrap();
+        let completed = finished_rx.recv_timeout(PROBE_COMPLETION_DEADLINE);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        worker.join().unwrap();
+
+        assert!(completed.is_ok(), "strict HTTP probe exceeded its deadline");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn strict_async_client_probe_does_not_block_past_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _connection = listener.accept().unwrap();
+            let _ = release_rx.recv_timeout(SERVER_RELEASE_DEADLINE);
+        });
+
+        let completed = hbb_common::tokio::time::timeout(
+            PROBE_COMPLETION_DEADLINE,
+            create_http_client_async_with_url_(
+                &url,
+                &url,
+                HttpClientProbeOptions {
+                    tls_type: TlsType::Rustls,
+                    is_tls_type_cached: false,
+                    danger_accept_invalid_cert: Some(false),
+                    original_danger_accept_invalid_cert: Some(false),
+                    timeout: Some(STRICT_HTTP_PROBE_TIMEOUT),
+                },
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+
+        assert!(completed.is_ok(), "strict HTTP probe exceeded its deadline");
+    }
 }
 
 pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
@@ -267,10 +391,13 @@ pub async fn create_http_client_async_with_url(url: &str) -> AsyncClient {
     create_http_client_async_with_url_(
         url,
         tls_url,
-        tls_type,
-        is_tls_type_cached,
-        danger_accept_invalid_cert,
-        danger_accept_invalid_cert,
+        HttpClientProbeOptions {
+            tls_type,
+            is_tls_type_cached,
+            danger_accept_invalid_cert,
+            original_danger_accept_invalid_cert: danger_accept_invalid_cert,
+            timeout: None,
+        },
     )
     .await
 }
@@ -294,10 +421,13 @@ pub async fn create_http_client_async_with_url_strict(url: &str) -> ResultType<A
     Ok(create_http_client_async_with_url_(
         url,
         tls_url,
-        tls_type,
-        can_reuse_cached_probe,
-        Some(false),
-        Some(false),
+        HttpClientProbeOptions {
+            tls_type,
+            is_tls_type_cached: can_reuse_cached_probe,
+            danger_accept_invalid_cert: Some(false),
+            original_danger_accept_invalid_cert: Some(false),
+            timeout: Some(STRICT_HTTP_PROBE_TIMEOUT),
+        },
     )
     .await)
 }
@@ -306,86 +436,40 @@ pub async fn create_http_client_async_with_url_strict(url: &str) -> ResultType<A
 async fn create_http_client_async_with_url_(
     url: &str,
     tls_url: &str,
-    tls_type: TlsType,
-    is_tls_type_cached: bool,
-    danger_accept_invalid_cert: Option<bool>,
-    original_danger_accept_invalid_cert: Option<bool>,
+    options: HttpClientProbeOptions,
 ) -> AsyncClient {
-    let mut client =
-        create_http_client_async(tls_type, danger_accept_invalid_cert.unwrap_or(false));
-    if is_tls_type_cached && original_danger_accept_invalid_cert.is_some() {
+    let client = create_http_client_async(
+        options.tls_type,
+        options.danger_accept_invalid_cert.unwrap_or(false),
+    );
+    if options.is_tls_type_cached && options.original_danger_accept_invalid_cert.is_some() {
         return client;
     }
-    if let Err(e) = client.head(url).send().await {
-        match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
-            (TlsType::Rustls, _, None) => {
-                log::warn!(
-                    "Failed to connect to server {} with rustls-tls: {:?}, trying accept invalid cert",
-                    tls_url,
-                    e
-                );
-                client = create_http_client_async_with_url_(
-                    url,
-                    tls_url,
-                    tls_type,
-                    is_tls_type_cached,
-                    Some(true),
-                    original_danger_accept_invalid_cert,
-                )
-                .await;
+    let request = client.head(url);
+    let probe_result = if let Some(timeout) = options.timeout {
+        request.timeout(timeout).send().await
+    } else {
+        request.send().await
+    };
+    match probe_result {
+        Ok(_) => {
+            cache_successful_http_probe(tls_url, options);
+            client
+        }
+        Err(error) => match next_http_client_probe(options) {
+            Some(retry) => {
+                log_http_client_probe_retry(tls_url, &error, retry);
+                create_http_client_async_with_url_(url, tls_url, retry.options()).await
             }
-            (TlsType::Rustls, false, Some(_)) => {
-                log::warn!(
-                    "Failed to connect to server {} with rustls-tls: {:?}, trying native-tls",
-                    tls_url,
-                    e
-                );
-                client = create_http_client_async_with_url_(
-                    url,
-                    tls_url,
-                    TlsType::NativeTls,
-                    is_tls_type_cached,
-                    original_danger_accept_invalid_cert,
-                    original_danger_accept_invalid_cert,
-                )
-                .await;
-            }
-            (TlsType::NativeTls, _, None) => {
-                log::warn!(
-                    "Failed to connect to server {} with native-tls: {:?}, trying accept invalid cert",
-                    tls_url,
-                    e
-                );
-                client = create_http_client_async_with_url_(
-                    url,
-                    tls_url,
-                    tls_type,
-                    is_tls_type_cached,
-                    Some(true),
-                    original_danger_accept_invalid_cert,
-                )
-                .await;
-            }
-            _ => {
+            None => {
                 log::error!(
                     "Failed to connect to server {} with {:?}, err: {:?}.",
                     tls_url,
-                    tls_type,
-                    e
+                    options.tls_type,
+                    error
                 );
+                client
             }
-        }
-    } else {
-        log::info!(
-            "Successfully connected to server {} with {:?}",
-            tls_url,
-            tls_type
-        );
-        upsert_tls_cache(
-            tls_url,
-            tls_type,
-            danger_accept_invalid_cert.unwrap_or(false),
-        );
+        },
     }
-    client
 }
