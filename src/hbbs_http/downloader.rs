@@ -31,6 +31,7 @@ pub struct DownloadData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_size: Option<u64>,
     pub downloaded_size: u64,
+    pub finished: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -288,6 +289,7 @@ pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
             path,
             total_size,
             downloaded_size,
+            finished: downloader.finished,
             error,
         };
         Ok(download_data)
@@ -306,4 +308,37 @@ pub fn cancel(id: &str) {
 
 pub fn remove(id: &str) {
     let _ = DOWNLOADERS.lock().unwrap().remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_size_does_not_imply_download_finished() {
+        let id = format!(
+            "download-finished-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        );
+        let (tx_cancel, _rx_cancel) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: None,
+                total_size: Some(8),
+                downloaded_size: 8,
+                error: None,
+                finished: false,
+                tx_cancel,
+            },
+        );
+
+        let data = get_download_data(&id).unwrap();
+
+        remove(&id);
+        assert_eq!(data.downloaded_size, data.total_size.unwrap());
+        assert!(!data.finished);
+    }
 }
