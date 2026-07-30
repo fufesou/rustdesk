@@ -25,7 +25,11 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        },
     },
     path::*,
     ptr::null_mut,
@@ -59,8 +63,9 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
-            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
+            ES_SYSTEM_REQUIRED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, HANDLE,
+            PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION, PSID,
+            SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
             TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
@@ -1610,6 +1615,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
             .to_str()
             .ok_or_else(|| anyhow!("Configuration path is not valid Unicode"))?,
     )?;
+    validate_install_app_name(&app_name)?;
     let shortcut_icon_location = get_custom_icon(&path, &cur_exe);
     if let Some(icon) = shortcut_icon_location.as_deref() {
         validate_install_value(icon)?;
@@ -3202,8 +3208,7 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     std::process::exit(0);
 }
 
-fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
-    let app_name = crate::get_app_name();
+fn get_install_service_commands(path: &str, exe: &str, app_name: &str) -> ResultType<String> {
     for value in [path, exe] {
         validate_install_value(value)?;
     }
@@ -3217,8 +3222,9 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
     if let Some(icon) = shortcut_icon_location.as_deref() {
         validate_install_value(icon)?;
     }
+    validate_install_app_name(app_name)?;
     let tray_shortcut_commands =
-        embedded_tray_shortcut_commands(&app_name, exe, shortcut_icon_location.as_deref())?;
+        embedded_tray_shortcut_commands(app_name, exe, shortcut_icon_location.as_deref())?;
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     Ok(format!(
         "
@@ -3239,7 +3245,7 @@ pub fn install_service() -> bool {
     let _installing = crate::platform::InstallingService::new();
     let (_, path, _, exe) = get_install_info();
     Config::set_option("stop-service".into(), "".into());
-    let cmds = match get_install_service_commands(&path, &exe) {
+    let cmds = match get_install_service_commands(&path, &exe, &crate::get_app_name()) {
         Ok(cmds) => cmds,
         Err(err) => {
             Config::set_option("stop-service".into(), "Y".into());
@@ -3661,6 +3667,352 @@ pub fn handle_custom_client_staging_dir_before_update(
     }
 
     Ok(())
+}
+
+fn clear_custom_client_staging_after_launch_failure(
+    staging_dir: &Path,
+    launch_result: &ResultType<()>,
+) {
+    if launch_result.is_ok() {
+        return;
+    }
+    if let Err(err) = remove_custom_client_staging_dir(staging_dir) {
+        log::warn!(
+            "Failed to clear custom client staging directory {:?}: {}",
+            staging_dir,
+            err
+        );
+    }
+}
+
+pub fn update_to_verified(
+    file: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> ResultType<()> {
+    let extension = update_file_extension(file).unwrap_or_default();
+    if extension != "exe" && extension != "msi" {
+        bail!("Unsupported update file format: {}", file);
+    }
+
+    let update_file = copy_and_verify_update_file_sha256(file, expected_sha256)?;
+    if let Err(err) = verify_verified_update_file_size(&update_file, expected_size) {
+        update_file.cleanup();
+        return Err(err);
+    }
+    let update_path = match update_file.path_str() {
+        Ok(path) => path.to_owned(),
+        Err(err) => {
+            update_file.cleanup();
+            return Err(err);
+        }
+    };
+    let custom_client_staging_dir = get_custom_client_staging_dir();
+    if crate::is_custom_client() {
+        if let Err(err) = handle_custom_client_staging_dir_before_update(&custom_client_staging_dir)
+        {
+            update_file.cleanup();
+            return Err(err);
+        }
+    } else {
+        // Clean up any residual staging directory from previous custom client
+        allow_err!(remove_custom_client_staging_dir(&custom_client_staging_dir));
+    }
+
+    let result = launch_verified_update(&extension, &update_path);
+    clear_custom_client_staging_after_launch_failure(&custom_client_staging_dir, &result);
+    finish_verified_update_launch(update_file, &extension, result)
+}
+
+fn launch_verified_update(extension: &str, update_path: &str) -> ResultType<()> {
+    match extension {
+        "exe" => {
+            if !run_uac(update_path, "--update")? {
+                bail!(
+                    "Failed to run the update exe with UAC, error: {:?}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        "msi" => {
+            if let Err(e) = update_me_msi(update_path, false) {
+                bail!("Failed to run the update msi: {}", e);
+            }
+        }
+        _ => {
+            bail!("Unsupported update file format: {}", update_path);
+        }
+    }
+    Ok(())
+}
+
+const UPDATE_FILE_COPY_ATTEMPTS: usize = 16;
+const VERIFIED_UPDATE_FILE_PREFIX: &str = "rustdesk-verified-";
+const UNSAFE_VERIFIED_MSI_PATH_CHARS: &[char] = &['"', '|', '<', '>', '%'];
+
+fn schedule_file_removal_on_reboot(path: &Path) -> ResultType<()> {
+    use windows::{
+        core::{HSTRING, PCWSTR},
+        Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT},
+    };
+
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(path),
+            PCWSTR::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    }
+    .map_err(|e| {
+        anyhow!(
+            "Failed to schedule verified update file cleanup for {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    Ok(())
+}
+
+fn schedule_verified_update_file_cleanup_with<F>(path: &Path, schedule: F) -> ResultType<()>
+where
+    F: FnOnce(&Path) -> ResultType<()>,
+{
+    let is_verified_exe = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(VERIFIED_UPDATE_FILE_PREFIX) && name.ends_with(".exe")
+        });
+    if !is_verified_exe {
+        return Ok(());
+    }
+    schedule(path)
+}
+
+pub fn schedule_current_verified_update_file_cleanup() -> ResultType<()> {
+    let current_exe = std::env::current_exe()?;
+    schedule_verified_update_file_cleanup_with(&current_exe, schedule_file_removal_on_reboot)
+}
+
+fn remove_verified_update_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "Failed to remove verified update file {}: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
+pub struct VerifiedUpdateFile {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl VerifiedUpdateFile {
+    pub fn path_str(&self) -> ResultType<&str> {
+        let Some(path) = self.path.to_str() else {
+            bail!("Invalid update file path: {}", self.path.display());
+        };
+        Ok(path)
+    }
+
+    pub fn cleanup(self) {
+        let Self { _file, path } = self;
+        drop(_file);
+        remove_verified_update_file(&path);
+    }
+}
+
+fn verify_verified_update_file_size(
+    update_file: &VerifiedUpdateFile,
+    expected_size: u64,
+) -> ResultType<()> {
+    let actual_size = update_file._file.metadata()?.len();
+    if actual_size != expected_size {
+        bail!(
+            "Update artifact size mismatch for {}: expected {}, got {}",
+            update_file.path.display(),
+            expected_size,
+            actual_size
+        );
+    }
+    Ok(())
+}
+
+// MSI execution waits for installation to finish, so its verified copy can be
+// removed. A successfully launched EXE still needs its copy while it starts.
+pub fn finish_verified_update_launch(
+    update_file: VerifiedUpdateFile,
+    extension: &str,
+    result: ResultType<()>,
+) -> ResultType<()> {
+    if result.is_err() || extension == "msi" {
+        update_file.cleanup();
+    }
+    result
+}
+
+// Reject symlinks, junctions, and other reparse points so verification and
+// execution operate on a regular installer file, not a redirected target.
+fn is_update_file_attributes_trusted(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+// Open reparse points themselves instead of following them, so the
+// attribute check can reject redirected update paths.
+fn update_file_open_flags() -> u32 {
+    FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+fn update_file_extension(file: &str) -> Option<String> {
+    Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn validate_verified_msi_path(path: &Path) -> ResultType<()> {
+    let Some(path_str) = path.to_str() else {
+        bail!("Invalid verified update file path: {}", path.display());
+    };
+    if path_str.contains(UNSAFE_VERIFIED_MSI_PATH_CHARS) {
+        bail!(
+            "Refusing to use unsafe verified update file path: {}",
+            path_str
+        );
+    }
+    Ok(())
+}
+
+fn verified_update_file_path(file: &str) -> ResultType<PathBuf> {
+    let extension = update_file_extension(file).unwrap_or_default();
+    if extension != "exe" && extension != "msi" {
+        bail!("Unsupported update file format: {}", file);
+    }
+    let path = std::env::temp_dir().join(format!(
+        "{}{}-{}.{}",
+        VERIFIED_UPDATE_FILE_PREFIX,
+        std::process::id(),
+        hbb_common::rand::random::<u64>(),
+        extension
+    ));
+    if extension == "msi" {
+        validate_verified_msi_path(&path)?;
+    }
+    Ok(path)
+}
+
+fn open_update_file_for_verification(file: &str) -> ResultType<std::fs::File> {
+    let update_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(update_file_open_flags())
+        .open(file)
+        .map_err(|e| anyhow!("Failed to lock update file {}: {}", file, e))?;
+    let metadata = update_file
+        .metadata()
+        .map_err(|e| anyhow!("Failed to read update file metadata {}: {}", file, e))?;
+    if !metadata.is_file() || !is_update_file_attributes_trusted(metadata.file_attributes()) {
+        bail!("Refusing to verify untrusted update file: {}", file);
+    }
+    Ok(update_file)
+}
+
+fn copy_update_file_for_verification(file: &str) -> ResultType<PathBuf> {
+    let mut source_file = open_update_file_for_verification(file)?;
+    for _ in 0..UPDATE_FILE_COPY_ATTEMPTS {
+        let path = verified_update_file_path(file)?;
+        let mut copy_file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(update_file_open_flags())
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow!(
+                    "Failed to create verified update file {}: {}",
+                    path.display(),
+                    e
+                )
+                .into())
+            }
+        };
+        if let Err(e) = std::io::copy(&mut source_file, &mut copy_file) {
+            drop(copy_file);
+            remove_verified_update_file(&path);
+            return Err(e.into());
+        }
+        if let Err(e) = copy_file.flush() {
+            drop(copy_file);
+            remove_verified_update_file(&path);
+            return Err(e.into());
+        }
+        drop(copy_file);
+        return Ok(path);
+    }
+
+    bail!("Failed to create verified update file for {}", file);
+}
+
+// Verify a unique copy and keep its read handle open without write/delete
+// sharing so its path cannot be replaced before the installer starts.
+pub fn copy_and_verify_update_file_sha256(
+    file: &str,
+    expected_sha256: &str,
+) -> ResultType<VerifiedUpdateFile> {
+    let path = copy_update_file_for_verification(file)?;
+    let Some(update_path) = path.to_str().map(str::to_owned) else {
+        remove_verified_update_file(&path);
+        bail!("Invalid update file path: {}", path.display());
+    };
+
+    let mut read_file = match open_update_file_for_verification(&update_path) {
+        Ok(file) => file,
+        Err(e) => {
+            remove_verified_update_file(&path);
+            return Err(e);
+        }
+    };
+    if let Err(e) = verify_update_file_sha256(&mut read_file, expected_sha256, &update_path) {
+        drop(read_file);
+        remove_verified_update_file(&path);
+        return Err(e);
+    }
+    Ok(VerifiedUpdateFile {
+        _file: read_file,
+        path,
+    })
+}
+
+fn verify_update_file_sha256(
+    update_file: &mut std::fs::File,
+    expected_sha256: &str,
+    file: &str,
+) -> ResultType<()> {
+    use crate::update_hash::{verify_sha256_reader, Sha256VerificationError};
+
+    match verify_sha256_reader(update_file, expected_sha256) {
+        Ok(()) => Ok(()),
+        Err(Sha256VerificationError::InvalidExpected) => {
+            bail!("Expected update file SHA256 is malformed for {}", file)
+        }
+        Err(Sha256VerificationError::Mismatch {
+            expected_sha256,
+            actual_sha256,
+        }) => bail!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            file,
+            expected_sha256,
+            actual_sha256
+        ),
+        Err(Sha256VerificationError::Io(err)) => Err(err.into()),
+    }
 }
 
 // Used for auto update and manual update in the main window.
@@ -4542,6 +4894,220 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mismatched_sha256_removes_verified_copy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-sha256-cleanup-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source_path = test_dir.join("update.exe");
+        std::fs::write(&source_path, b"rustdesk").unwrap();
+
+        let error = match copy_and_verify_update_file_sha256(
+            &source_path.to_string_lossy(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ) {
+            Ok(verified_file) => {
+                verified_file.cleanup();
+                panic!("mismatched SHA-256 was accepted");
+            }
+            Err(error) => error.to_string(),
+        };
+        let verified_path = error
+            .strip_prefix("SHA256 mismatch for ")
+            .and_then(|message| message.split_once(": expected "))
+            .map(|(path, _)| PathBuf::from(path))
+            .expect("mismatch error did not contain verified path");
+
+        assert!(!verified_path.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn update_file_sha256_rejects_mismatched_open_file_handle() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-sha256-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let update_file_path = test_dir.join("update.exe");
+        std::fs::write(&update_file_path, b"rustdesk").unwrap();
+        let update_file_path = update_file_path.to_string_lossy().to_string();
+        let mut update_file = open_update_file_for_verification(&update_file_path).unwrap();
+
+        let result = verify_update_file_sha256(
+            &mut update_file,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            &update_file_path,
+        );
+
+        assert!(result.is_err());
+
+        let result = verify_update_file_sha256(
+            &mut update_file,
+            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
+            &update_file_path,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        drop(update_file);
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn verified_update_file_cleanup_removes_copy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source_path = test_dir.join("update.exe");
+        std::fs::write(&source_path, b"rustdesk").unwrap();
+
+        let verified_file = copy_and_verify_update_file_sha256(
+            &source_path.to_string_lossy(),
+            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
+        )
+        .unwrap();
+        let verified_path = PathBuf::from(verified_file.path_str().unwrap());
+        assert!(verified_path.exists());
+
+        verified_file.cleanup();
+
+        assert!(!verified_path.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn verified_update_file_size_must_match_expected_size() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-size-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source_path = test_dir.join("update.exe");
+        std::fs::write(&source_path, b"rustdesk").unwrap();
+
+        let verified_file = copy_and_verify_update_file_sha256(
+            &source_path.to_string_lossy(),
+            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
+        )
+        .unwrap();
+
+        assert!(verify_verified_update_file_size(&verified_file, 8).is_ok());
+        assert!(verify_verified_update_file_size(&verified_file, 7).is_err());
+
+        verified_file.cleanup();
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn finishing_successful_msi_update_removes_verified_copy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-msi-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source_path = test_dir.join("update.msi");
+        std::fs::write(&source_path, b"rustdesk").unwrap();
+
+        let verified_file = copy_and_verify_update_file_sha256(
+            &source_path.to_string_lossy(),
+            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
+        )
+        .unwrap();
+        let verified_path = PathBuf::from(verified_file.path_str().unwrap());
+        assert!(verified_path.exists());
+
+        assert!(finish_verified_update_launch(verified_file, "msi", Ok(())).is_ok());
+
+        assert!(!verified_path.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_verified_update_launch_clears_staged_custom_client_file() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "rustdesk-update-staging-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let staged_file = staging_dir.join("custom.txt");
+        std::fs::write(&staged_file, b"custom client").unwrap();
+        let successful_launch: ResultType<()> = Ok(());
+        clear_custom_client_staging_after_launch_failure(&staging_dir, &successful_launch);
+        assert!(staged_file.exists());
+        let launch_result = Err(anyhow!("launch failed"));
+
+        clear_custom_client_staging_after_launch_failure(&staging_dir, &launch_result);
+
+        assert!(!staged_file.exists());
+        std::fs::remove_dir_all(&staging_dir).unwrap();
+    }
+
+    #[test]
+    fn schedules_cleanup_for_verified_exe_only() {
+        let verified_exe = Path::new(r"C:\Temp\rustdesk-verified-1-2.exe");
+        let mut scheduled_path = None;
+        schedule_verified_update_file_cleanup_with(verified_exe, |path| {
+            scheduled_path = Some(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scheduled_path.as_deref(), Some(verified_exe));
+
+        for path in [
+            Path::new(r"C:\Temp\rustdesk.exe"),
+            Path::new(r"C:\Temp\rustdesk-verified-1-2.msi"),
+        ] {
+            schedule_verified_update_file_cleanup_with(path, |_| {
+                panic!("unexpected cleanup request")
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_reparse_point_update_file_attributes() {
+        use winapi::um::winnt::FILE_ATTRIBUTE_NORMAL;
+
+        assert!(is_update_file_attributes_trusted(FILE_ATTRIBUTE_NORMAL));
+        assert!(!is_update_file_attributes_trusted(
+            FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(!is_update_file_attributes_trusted(
+            FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
+
+    #[test]
+    fn verified_msi_path_rejects_unsafe_cmd_characters() {
+        for character in ['"', '|', '<', '>', '%'] {
+            let path = PathBuf::from(format!(r"C:\Temp\unsafe{character}\update.msi"));
+            assert!(
+                validate_verified_msi_path(&path).is_err(),
+                "accepted unsafe character {character:?}"
+            );
+        }
+
+        for character in ['&', '^'] {
+            let path = PathBuf::from(format!(r"C:\Temp\safe{character}path\update.msi"));
+            assert!(
+                validate_verified_msi_path(&path).is_ok(),
+                "rejected quoted-safe character {character:?}"
+            );
+        }
+
+        assert!(validate_verified_msi_path(Path::new(r"C:\Temp\safe path\update.msi")).is_ok());
+    }
+
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
     //
@@ -4644,6 +5210,17 @@ mod tests {
                 "unsafe application name was accepted: {app_name}"
             );
         }
+    }
+
+    #[test]
+    fn install_service_commands_reject_unsafe_app_name() {
+        let result = get_install_service_commands(
+            r"C:\Program Files\RustDesk",
+            r"C:\Program Files\RustDesk\RustDesk.exe",
+            "RustDesk&whoami",
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
