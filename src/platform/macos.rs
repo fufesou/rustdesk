@@ -29,10 +29,14 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
-    os::unix::process::CommandExt,
+    io::{Read, Write},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
 // macOS boolean_t is defined as `int` in <mach/boolean.h>
@@ -41,16 +45,100 @@ type BooleanT = hbb_common::libc::c_int;
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
+static UPDATE_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
+const UPDATE_TEMP_DMG_CREATE_ATTEMPTS: usize = 16;
+const UPDATE_DMG_MOUNT_TEMPLATE: &str = "/tmp/.rustdeskmount-XXXXXX";
+const STALE_UPDATE_TEMP_DIR_SECS: u64 = 24 * 60 * 60;
 
 #[inline]
 fn get_update_temp_dir() -> PathBuf {
+    UPDATE_TEMP_DIR.get_or_init(new_update_temp_dir).clone()
+}
+
+fn new_update_temp_dir() -> PathBuf {
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    Path::new("/tmp").join(format!(
+        ".rustdeskupdate-{}-{}-{}",
+        euid,
+        std::process::id(),
+        hbb_common::rand::random::<u64>()
+    ))
+}
+
+fn legacy_update_temp_dir() -> PathBuf {
     let euid = unsafe { hbb_common::libc::geteuid() };
     Path::new("/tmp").join(format!(".rustdeskupdate-{}", euid))
+}
+
+fn stale_update_temp_dir_prefix() -> String {
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    format!(".rustdeskupdate-{}-", euid)
+}
+
+fn is_stale_update_temp_dir_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(&stale_update_temp_dir_prefix()) else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(random), None)
+            if !pid.is_empty()
+                && !random.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && random.bytes().all(|b| b.is_ascii_digit())
+    )
 }
 
 #[inline]
 fn get_update_temp_dir_string() -> String {
     get_update_temp_dir().to_string_lossy().into_owned()
+}
+
+fn ensure_real_update_temp_dir(path: &Path) -> ResultType<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "Update temp path is not a real directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn create_update_temp_dmg_file() -> ResultType<(std::fs::File, PathBuf)> {
+    let update_temp_dir = get_update_temp_dir();
+    std::fs::create_dir_all(&update_temp_dir)?;
+    ensure_real_update_temp_dir(&update_temp_dir)?;
+    std::fs::set_permissions(&update_temp_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let dmg_dir = update_temp_dir.join("dmgdir");
+    std::fs::create_dir_all(&dmg_dir)?;
+    ensure_real_update_temp_dir(&dmg_dir)?;
+    std::fs::set_permissions(&dmg_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    for _ in 0..UPDATE_TEMP_DMG_CREATE_ATTEMPTS {
+        let file_path = dmg_dir.join(format!(
+            "{}-{}-{}.dmg",
+            crate::get_app_name(),
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let file_res = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&file_path);
+        match file_res {
+            Ok(file) => {
+                return Ok((file, file_path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    bail!("Failed to create update DMG file");
 }
 
 /// Global mutex to serialize CoreGraphics cursor operations.
@@ -250,29 +338,34 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     false
 }
 
-fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync: bool) {
+fn update_daemon_agent(
+    agent_plist_file: String,
+    update_source_dir: String,
+    sync: bool,
+) -> ResultType<()> {
     let update_script_file = "update.scpt";
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
-        return;
+        bail!("Failed to find {}", update_script_file);
     };
     let Some(update_script_body) = update_script.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read {}", update_script_file);
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
-        return;
+        bail!("Failed to find daemon.plist");
     };
     let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read daemon.plist");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
-        return;
+        bail!("Failed to find agent.plist");
     };
     let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
-        return;
+        bail!("Failed to read agent.plist");
     };
 
-    let func = move || {
+    let current_pid = std::process::id().to_string();
+    let func = move || -> ResultType<()> {
         let mut binding = std::process::Command::new("osascript");
         let cmd = binding
             .arg("-e")
@@ -280,25 +373,40 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
             .arg(daemon_plist_body)
             .arg(agent_plist_body)
             .arg(&get_active_username())
-            .arg(std::process::id().to_string())
+            .arg(&current_pid)
             .arg(update_source_dir);
-        match cmd.status() {
+        match cmd.output() {
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
+                bail!("run osascript failed: {}", e);
             }
-            Ok(status) if !status.success() => {
-                log::warn!("run osascript failed with status: {}", status);
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "run osascript failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             _ => {
                 let installed = std::path::Path::new(&agent_plist_file).exists();
                 log::info!("Agent file {} installed: {}", &agent_plist_file, installed);
             }
         }
+        Ok(())
     };
     if sync {
-        func();
+        func()
     } else {
-        std::thread::spawn(func);
+        std::thread::spawn(move || {
+            hbb_common::allow_err!(func());
+        });
+        Ok(())
     }
 }
 
@@ -927,21 +1035,64 @@ pub fn quit_gui() {
 
 #[inline]
 pub fn try_remove_temp_update_dir(dir: Option<&str>) {
-    let target_path_buf = dir.map(PathBuf::from).unwrap_or_else(get_update_temp_dir);
-    let target_path = target_path_buf.as_path();
-    if target_path.exists() {
-        std::fs::remove_dir_all(target_path).ok();
+    if let Some(dir) = dir {
+        remove_temp_update_dir(Path::new(dir));
+    } else {
+        remove_temp_update_dir(&legacy_update_temp_dir());
+        remove_stale_update_temp_dirs();
+    }
+}
+
+fn remove_stale_update_temp_dirs() {
+    let current_update_temp_dir = get_update_temp_dir();
+    let legacy_update_temp_dir = legacy_update_temp_dir();
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current_update_temp_dir || path == legacy_update_temp_dir {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_stale_update_temp_dir_name(name) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || !is_old_update_temp_dir(&metadata) {
+            continue;
+        }
+        remove_temp_update_dir(&path);
+    }
+}
+
+fn is_old_update_temp_dir(metadata: &std::fs::Metadata) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_secs() >= STALE_UPDATE_TEMP_DIR_SECS)
+        .unwrap_or(false)
+}
+
+fn remove_temp_update_dir(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(hbb_common::libc::ENOTDIR) => {}
+        Err(e) => {
+            log::warn!("Failed to remove update temp dir {}: {}", path.display(), e);
+        }
     }
 }
 
 pub fn update_me() -> ResultType<()> {
-    let is_installed_daemon = is_installed_daemon(false);
-    let option_stop_service = "stop-service";
-    let is_service_stopped = hbb_common::config::option2bool(
-        option_stop_service,
-        &crate::ui_interface::get_option(option_stop_service),
-    );
-
     let cmd = std::env::current_exe()?;
     // RustDesk.app/Contents/MacOS/RustDesk
     let app_dir = cmd
@@ -952,53 +1103,89 @@ pub fn update_me() -> ResultType<()> {
     let Some(app_dir) = app_dir else {
         bail!("Unknown app directory of current exe file: {:?}", cmd);
     };
+    update_me_from_app_dir(app_dir)
+}
+
+fn update_me_from_app_dir(app_dir: String) -> ResultType<()> {
+    let is_installed_daemon = is_installed_daemon(false);
+    let option_stop_service = "stop-service";
+    let is_service_stopped = hbb_common::config::option2bool(
+        option_stop_service,
+        &crate::ui_interface::get_option(option_stop_service),
+    );
 
     let app_name = crate::get_app_name();
     if is_installed_daemon && !is_service_stopped {
         let agent = format!("{}_server.plist", crate::get_full_name());
         let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
-        update_daemon_agent(agent_plist_file, app_dir, true);
+        update_daemon_agent(agent_plist_file, app_dir, true)?;
     } else {
         // `kill -9` may not work without "administrator privileges"
         let update_body = r#"
-on run {app_name, cur_pid, app_dir, user_name}
-    set app_bundle to "/Applications/" & app_name & ".app"
-    set app_bundle_q to quoted form of app_bundle
-    set app_dir_q to quoted form of app_dir
-    set user_name_q to quoted form of user_name
+	on run {app_name, cur_pid, app_dir, user_name, restore_owner}
+	    set app_bundle to "/Applications/" & app_name & ".app"
+	    set app_bundle_q to quoted form of app_bundle
+	    set app_dir_q to quoted form of app_dir
+	    set user_name_q to quoted form of user_name
 
-    set check_source to "test -d " & app_dir_q & " || exit 1;"
-    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
-    set copy_files to "rm -rf " & app_bundle_q & " && ditto " & app_dir_q & " " & app_bundle_q & " && chown -R " & user_name_q & ":staff " & app_bundle_q & " && (xattr -r -d com.apple.quarantine " & app_bundle_q & " || true);"
-    set sh to "set -e;" & check_source & kill_others & copy_files
+	    set check_source to "test -d " & app_dir_q & " || exit 1;"
+	    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
+	    set prepare_verified to "verified_dir=$(mktemp -d /tmp/.rustdeskupdate-verified.XXXXXX); verified_app=\"$verified_dir/" & app_name & ".app\"; ditto " & app_dir_q & " \"$verified_app\"; chown -R root:wheel \"$verified_app\"; chmod -R go-w \"$verified_app\";"
+	    set prepare_swap_paths to "temp_bundle=" & app_bundle_q & ".new.$$; old_bundle=" & app_bundle_q & ".old.$$;"
+	    set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
+	    set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
+	    set protect_staged_bundle to "chown -R root:wheel \"$temp_bundle\"; chmod -R go-w \"$temp_bundle\"; (xattr -r -d com.apple.quarantine \"$temp_bundle\" || true);"
+	    set move_current_bundle to "if [ -e " & app_bundle_q & " ]; then mv " & app_bundle_q & " \"$old_bundle\"; bundle_backed_up=1; fi;"
+	    set install_staged_bundle to "mv \"$temp_bundle\" " & app_bundle_q & "; bundle_swapped=1;"
+	    set restore_installed_owner to "if [ " & quoted form of restore_owner & " = '1' ]; then chown -R " & user_name_q & ":staff " & app_bundle_q & "; fi;"
+	    set rollback_bundle to "if [ \"${bundle_backed_up:-0}\" -eq 1 ]; then if [ ! -e \"$old_bundle\" ]; then rollback_status=1; elif ! rm -rf " & app_bundle_q & "; then rollback_status=1; elif ! mv \"$old_bundle\" " & app_bundle_q & "; then rollback_status=1; fi; elif [ \"${bundle_swapped:-0}\" -eq 1 ]; then rm -rf " & app_bundle_q & " || rollback_status=1; fi;"
+	    set cleanup_verified to "if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || status=1; fi;"
+	    set rollback_update to "status=$?; trap - EXIT; set +e; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; exit \"$status\";"
+	    set commit_update to "transaction_committed=1; rm -rf \"$old_bundle\";"
+	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & "transaction_started=1;" & move_current_bundle & install_staged_bundle & restore_installed_owner & commit_update
+	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
 
-    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
-end run
-        "#;
-        let active_user = get_active_username();
-        let status = Command::new("osascript")
+	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
+	end run
+	        "#;
+        let output = Command::new("osascript")
             .arg("-e")
             .arg(update_body)
             .arg(app_name.to_string())
             .arg(std::process::id().to_string())
             .arg(app_dir)
-            .arg(active_user)
-            .status();
-        match status {
-            Ok(status) if !status.success() => {
-                log::error!("osascript execution failed with status: {}", status);
+            .arg(get_active_username())
+            .arg(if is_installed_daemon { "0" } else { "1" })
+            .output();
+        match output {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::error!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
+                bail!(
+                    "osascript execution failed with status: {}, stderr: {}",
+                    output.status,
+                    stderr.trim()
+                );
             }
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
+                bail!("run osascript failed: {}", e);
             }
             _ => {}
         }
     }
-    std::process::Command::new("open")
+    let open_status = Command::new("open")
         .arg("-n")
         .arg(&format!("/Applications/{}.app", app_name))
-        .spawn()
-        .ok();
+        .status()
+        .map_err(|e| anyhow!("Failed to relaunch updated app: {}", e))?;
+    if !open_status.success() {
+        bail!("Failed to relaunch updated app: {}", open_status);
+    }
     // leave open a little time
     std::thread::sleep(std::time::Duration::from_millis(300));
     Ok(())
@@ -1007,9 +1194,12 @@ end run
 pub fn update_from_dmg(dmg_path: &str) -> ResultType<()> {
     let update_temp_dir = get_update_temp_dir_string();
     println!("Starting update from DMG: {}", dmg_path);
-    extract_dmg(dmg_path, &update_temp_dir)?;
-    println!("DMG extracted");
-    update_extracted(&update_temp_dir)?;
+    let update_result = (|| {
+        let copied_dmg = copy_dmg_to_update_temp_file(dmg_path)?;
+        update_from_mounted_dmg_with_options(&copied_dmg.to_string_lossy(), true, None)
+    })();
+    try_remove_temp_update_dir(Some(&update_temp_dir));
+    update_result?;
     println!("Update process started");
     Ok(())
 }
@@ -1019,7 +1209,6 @@ pub fn update_to(_file: &str) -> ResultType<()> {
     update_extracted(&update_temp_dir)?;
     Ok(())
 }
-
 fn backup_update_plist(source: &str, backup: &str) -> ResultType<()> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) => {
@@ -1030,7 +1219,10 @@ fn backup_update_plist(source: &str, backup: &str) -> ResultType<()> {
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!("[root-update] required installed plist is missing: {}", source)
+            bail!(
+                "[root-update] required installed plist is missing: {}",
+                source
+            )
         }
         Err(err) => Err(err.into()),
     }
@@ -1042,7 +1234,10 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
         // Frameworks legitimately use internal symlinks (Resources,
         // Versions/Current), but never allow a link to leave its framework.
         let Some(framework_root) = framework_root else {
-            bail!("[root-update] symlink outside framework: {}", path.display());
+            bail!(
+                "[root-update] symlink outside framework: {}",
+                path.display()
+            );
         };
         let target = std::fs::read_link(path)?;
         let target = if target.is_absolute() {
@@ -1072,7 +1267,10 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
             validate_update_tree(&child, child_framework_root)?;
         }
     } else if !metadata.file_type().is_file() {
-        bail!("[root-update] unsupported file in update bundle: {}", path.display());
+        bail!(
+            "[root-update] unsupported file in update bundle: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1103,10 +1301,19 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
-    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+    let agent_plist = format!(
+        "/Library/LaunchAgents/com.carriez.{}_server.plist",
+        app_name
+    );
+    let daemon_plist = format!(
+        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
+        app_name
+    );
 
-    log::info!("[root-update] Starting silent root update from {}", dmg_path);
+    log::info!(
+        "[root-update] Starting silent root update from {}",
+        dmg_path
+    );
     // Check sessions before extracting to avoid unnecessary work
     if !crate::updater::has_no_active_conns_ipc() {
         bail!("[root-update] Active session detected, deferring update.");
@@ -1204,7 +1411,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     // launching a freshly extracted service binary from /tmp is not required.
     let new_service = format!("{}/Contents/MacOS/service", src_app);
     if !std::path::Path::new(&new_service).is_file() {
-        bail!("[root-update] staged service binary is missing: {}", new_service);
+        bail!(
+            "[root-update] staged service binary is missing: {}",
+            new_service
+        );
     }
     // The new binary writes its own plist definitions after the bundle is
     // moved into its final root-owned location.  This avoids executing code
@@ -1792,6 +2002,172 @@ pub fn extract_update_dmg(file: &str) {
     crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
 }
 
+fn copy_dmg_to_update_temp_file(dmg_path: &str) -> ResultType<PathBuf> {
+    let metadata = std::fs::symlink_metadata(dmg_path)?;
+    if !metadata.file_type().is_file() {
+        bail!("Update DMG path is not a regular file: {}", dmg_path);
+    }
+    let mut source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
+        .open(dmg_path)?;
+    let opened_metadata = source_file.metadata()?;
+    if !opened_metadata.is_file() {
+        bail!("Update DMG path is not a regular file: {}", dmg_path);
+    }
+    let (mut dmg_file, file_path) = create_update_temp_dmg_file()?;
+    copy_dmg_with_expected_size(&mut source_file, &mut dmg_file, None)?;
+    dmg_file.flush()?;
+    Ok(file_path)
+}
+
+fn copy_dmg_with_expected_size<R: Read, W: Write>(
+    source: &mut R,
+    target: &mut W,
+    expected_size: Option<u64>,
+) -> ResultType<()> {
+    let bytes_written = if let Some(expected_size) = expected_size {
+        let mut limited_source = source.take(expected_size.saturating_add(1));
+        std::io::copy(&mut limited_source, target)?
+    } else {
+        std::io::copy(source, target)?
+    };
+    if let Some(expected_size) = expected_size {
+        if bytes_written != expected_size {
+            bail!(
+                "DMG size mismatch: expected {}, got {}",
+                expected_size,
+                bytes_written
+            );
+        }
+    }
+    Ok(())
+}
+
+fn create_dmg_mount_point() -> ResultType<String> {
+    let output = Command::new("/usr/bin/mktemp")
+        .args(["-d", UPDATE_DMG_MOUNT_TEMPLATE])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "Failed to create a private DMG mount directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mount_point = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
+        .trim()
+        .to_owned();
+    if mount_point.is_empty() {
+        bail!("Failed to create a private DMG mount directory");
+    }
+    Ok(mount_point)
+}
+
+fn remove_dmg_mount_point(mount_point: &str) {
+    if let Err(e) = std::fs::remove_dir(mount_point) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "Failed to remove DMG mount directory {}: {}",
+                mount_point,
+                e
+            );
+        }
+    }
+}
+
+struct DmgGuard(String);
+
+impl DmgGuard {
+    fn mount_point(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for DmgGuard {
+    fn drop(&mut self) {
+        match Command::new("hdiutil")
+            .args(["detach", self.0.as_str(), "-force"])
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                log::warn!("Failed to detach DMG mount {}: {}", self.0, status);
+            }
+            Err(e) => log::warn!("Failed to detach DMG mount {}: {}", self.0, e),
+            _ => {}
+        }
+        remove_dmg_mount_point(&self.0);
+    }
+}
+
+fn attach_dmg_failure_message(
+    dmg_path: &str,
+    mount_point: &str,
+    status: impl std::fmt::Display,
+) -> String {
+    format!("Failed to attach DMG image at {dmg_path} to {mount_point}: {status}")
+}
+
+fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Vec<String> {
+    let mut args = vec!["attach".to_owned()];
+    if read_only {
+        args.push("-readonly".to_owned());
+    }
+    args.extend([
+        "-nobrowse".to_owned(),
+        "-mountpoint".to_owned(),
+        mount_point.to_owned(),
+        dmg_path.to_owned(),
+    ]);
+    args
+}
+
+fn attach_dmg(dmg_path: &str, read_only: bool) -> ResultType<DmgGuard> {
+    let mount_point = create_dmg_mount_point()?;
+    let args = hdiutil_attach_args(dmg_path, &mount_point, read_only);
+    let status = match Command::new("hdiutil")
+        .args(args.iter().map(String::as_str))
+        .status()
+    {
+        Ok(status) => status,
+        Err(e) => {
+            remove_dmg_mount_point(&mount_point);
+            return Err(e.into());
+        }
+    };
+
+    if !status.success() {
+        let message = attach_dmg_failure_message(dmg_path, &mount_point, status);
+        remove_dmg_mount_point(&mount_point);
+        bail!("{}", message);
+    }
+
+    Ok(DmgGuard(mount_point))
+}
+
+fn app_path_in_dmg_mount(mount_point: &str, app_name: &str) -> String {
+    format!("{}/{}.app", mount_point, app_name)
+}
+
+fn update_from_mounted_dmg_with_options(
+    dmg_path: &str,
+    read_only: bool,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    let guard = attach_dmg(dmg_path, read_only)?;
+    update_from_attached_dmg_mount(guard.mount_point(), before_prompt)
+}
+
+fn update_from_attached_dmg_mount(
+    mount_point: &str,
+    before_prompt: Option<fn()>,
+) -> ResultType<()> {
+    if let Some(before_prompt) = before_prompt {
+        before_prompt();
+    }
+    update_me_from_app_dir(app_path_in_dmg_mount(mount_point, &crate::get_app_name()))
+}
+
 fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let target_path = Path::new(target_dir);
     if target_path.exists() {
@@ -1804,25 +2180,16 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
 fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let target_path = Path::new(target_dir);
     if !target_path.exists() {
-        bail!("[root-update] Temp directory does not exist: {:?}", target_path);
+        bail!(
+            "[root-update] Temp directory does not exist: {:?}",
+            target_path
+        );
     }
     extract_dmg_inner(dmg_path, target_dir)
 }
 
 fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_output = Command::new("/usr/bin/mktemp")
-        .args(["-d", "/tmp/.rustdeskmount-XXXXXX"])
-        .output()?;
-    if !mount_output.status.success() {
-        bail!("Failed to create a private DMG mount directory");
-    }
-    let mount_point = String::from_utf8(mount_output.stdout)
-        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
-        .trim()
-        .to_owned();
-    if mount_point.is_empty() {
-        bail!("Failed to create a private DMG mount directory");
-    }
+    let mount_point = create_dmg_mount_point()?;
     let status = Command::new("/usr/bin/hdiutil")
         .args(["attach", "-nobrowse", "-mountpoint"])
         .arg(&mount_point)
@@ -1873,28 +2240,14 @@ fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
 }
 
 fn update_extracted(target_dir: &str) -> ResultType<()> {
-    let app_name = crate::get_app_name();
-    let exe_path = format!(
-        "{}/{}.app/Contents/MacOS/{}",
-        target_dir, app_name, app_name
+    let result = update_me_from_app_dir(
+        Path::new(target_dir)
+            .join(format!("{}.app", crate::get_app_name()))
+            .to_string_lossy()
+            .to_string(),
     );
-    let _child = unsafe {
-        if let Err(e) = Command::new(&exe_path)
-            .arg("--update")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .pre_exec(|| {
-                hbb_common::libc::setsid();
-                Ok(())
-            })
-            .spawn()
-        {
-            try_remove_temp_update_dir(Some(target_dir));
-            bail!(e);
-        }
-    };
-    Ok(())
+    try_remove_temp_update_dir(Some(target_dir));
+    result
 }
 
 pub fn get_double_click_time() -> u32 {
@@ -1905,6 +2258,125 @@ pub fn get_double_click_time() -> u32 {
 pub fn hide_dock() {
     unsafe {
         NSApp().setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_temp_update_dir_removes_symlink_without_touching_target() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-macos-cleanup-symlink-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let target_dir = test_dir.join("target");
+        let link_path = test_dir.join("link");
+        let target_file = target_dir.join("file");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(&target_file, b"target").unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+
+        remove_temp_update_dir(&link_path);
+
+        assert!(!std::fs::symlink_metadata(&link_path).is_ok());
+        assert!(target_file.exists());
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_temp_dir_rejects_symlink() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-macos-temp-dir-symlink-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        let target_dir = test_dir.join("target");
+        let link_path = test_dir.join("link");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
+
+        assert!(ensure_real_update_temp_dir(&link_path).is_err());
+        assert!(ensure_real_update_temp_dir(&target_dir).is_ok());
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_stale_update_temp_dir_name_matches_only_randomized_current_user_dirs() {
+        let euid = unsafe { hbb_common::libc::geteuid() };
+
+        assert!(is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-123-456"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-abc-456"
+        )));
+        assert!(!is_stale_update_temp_dir_name(&format!(
+            ".rustdeskupdate-{euid}-123"
+        )));
+        assert!(!is_stale_update_temp_dir_name(
+            ".rustdeskupdate-999999-123-456"
+        ));
+        assert!(!is_stale_update_temp_dir_name("rustdeskupdate-123-456"));
+    }
+
+    #[test]
+    fn test_copy_dmg_to_update_temp_file_limits_oversized_source() {
+        let mut source: &[u8] = b"rustdesk-extra";
+        let mut target = Vec::new();
+
+        let result = copy_dmg_with_expected_size(&mut source, &mut target, Some(8));
+
+        assert!(result.is_err());
+        assert_eq!(target.len(), 9);
+    }
+
+    #[test]
+    fn test_update_dmg_mount_points_are_unique() {
+        let first = create_dmg_mount_point().unwrap();
+        let second = create_dmg_mount_point().unwrap();
+        let are_unique = first != second;
+        for mount_point in [&first, &second] {
+            if mount_point.starts_with("/tmp/.rustdeskmount-") {
+                std::fs::remove_dir(mount_point).unwrap();
+            }
+        }
+
+        assert!(are_unique);
+    }
+
+    #[test]
+    fn test_update_scripts_roll_back_uncommitted_bundle_swap() {
+        let daemon_script = PRIVILEGES_SCRIPTS_DIR
+            .get_file("update.scpt")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        let source = include_str!("macos.rs");
+        let manual_script = source
+            .split_once("let update_body = r#\"")
+            .unwrap()
+            .1
+            .split_once("\"#;")
+            .unwrap()
+            .0;
+
+        for script in [daemon_script, manual_script] {
+            assert!(script.contains("transaction_committed"));
+            assert!(script.contains("rollback_bundle"));
+            assert!(script.contains("bundle_backed_up"));
+            assert!(script.contains(r#"if [ \"${rollback_status:-0}\" -eq 0 ]"#));
+        }
+        assert!(daemon_script
+            .contains("rollback_bundle & rollback_plists & restore_service & restore_agent"));
+        assert!(daemon_script.contains("load_service & load_agent & commit_update"));
+        assert!(manual_script.contains("restore_installed_owner & commit_update"));
     }
 }
 
