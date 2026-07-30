@@ -23,4 +23,22 @@ void main() {
     expect(controller.cancelInFlight, isFalse);
     expect(controller.beginCancel('download-id'), isTrue);
   });
+
+  test('finalizing and finished downloads cannot be canceled', () {
+    expect(
+      UpdateCancelController.isFinalizingOrFinished(
+          '{"finalizing":true,"finished":false}'),
+      isTrue,
+    );
+    expect(
+      UpdateCancelController.isFinalizingOrFinished(
+          '{"finalizing":false,"finished":true}'),
+      isTrue,
+    );
+    expect(
+      UpdateCancelController.isFinalizingOrFinished(
+          '{"finalizing":false,"finished":false}'),
+      isFalse,
+    );
+  });
 }

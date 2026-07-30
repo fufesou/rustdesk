@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class UpdateCancelController {
   bool _pendingCancel = false;
   bool _cancelInFlight = false;
@@ -28,5 +30,18 @@ class UpdateCancelController {
 
   void finishCancel() {
     _cancelInFlight = false;
+  }
+
+  static bool isFinalizingOrFinished(String downloadData) {
+    if (downloadData.startsWith('error:')) {
+      return false;
+    }
+    try {
+      final decoded = jsonDecode(downloadData);
+      return decoded is Map &&
+          (decoded['finalizing'] == true || decoded['finished'] == true);
+    } on FormatException {
+      return false;
+    }
   }
 }
