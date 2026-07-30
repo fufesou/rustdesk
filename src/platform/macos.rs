@@ -29,7 +29,8 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
-    os::unix::process::CommandExt,
+    io::Read,
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
@@ -41,6 +42,8 @@ type BooleanT = hbb_common::libc::c_int;
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
+const SHA256_HEX_LENGTH: usize = 64;
+const UPDATE_HASH_BUFFER_SIZE: usize = 8192;
 
 #[inline]
 fn get_update_temp_dir() -> PathBuf {
@@ -1014,6 +1017,60 @@ pub fn update_from_dmg(dmg_path: &str) -> ResultType<()> {
     Ok(())
 }
 
+pub fn update_to_verified_dmg(
+    file: &str,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+) -> ResultType<()> {
+    verify_dmg_file(file, expected_sha256, expected_size)?;
+    update_from_dmg(file)?;
+    quit_gui();
+    Ok(())
+}
+
+fn verify_dmg_file(
+    file: &str,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+) -> ResultType<()> {
+    let expected_sha256 = expected_sha256.trim().to_ascii_lowercase();
+    if expected_sha256.len() != SHA256_HEX_LENGTH
+        || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!("Expected DMG SHA256 is malformed for {}", file);
+    }
+    let path_metadata = std::fs::symlink_metadata(file)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        bail!("Update DMG path is not a regular file: {}", file);
+    }
+    if expected_size.is_some_and(|size| size != path_metadata.len()) {
+        bail!("DMG size mismatch for {}", file);
+    }
+    let mut dmg_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
+        .open(file)?;
+    let opened_metadata = dmg_file.metadata()?;
+    if !opened_metadata.is_file() || expected_size.is_some_and(|size| size != opened_metadata.len())
+    {
+        bail!("DMG changed while opening {}", file);
+    }
+    let mut hasher = sha2::Sha256::default();
+    let mut buffer = [0_u8; UPDATE_HASH_BUFFER_SIZE];
+    loop {
+        let count = dmg_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buffer[..count]);
+    }
+    let actual_sha256 = format!("{:x}", sha2::Digest::finalize(hasher));
+    if actual_sha256 != expected_sha256 {
+        bail!("SHA256 mismatch for {}", file);
+    }
+    Ok(())
+}
+
 pub fn update_to(_file: &str) -> ResultType<()> {
     let update_temp_dir = get_update_temp_dir_string();
     update_extracted(&update_temp_dir)?;
@@ -1905,6 +1962,47 @@ pub fn get_double_click_time() -> u32 {
 pub fn hide_dock() {
     unsafe {
         NSApp().setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+    }
+}
+
+#[cfg(test)]
+mod verified_dmg_tests {
+    use super::*;
+
+    #[test]
+    fn verified_dmg_rejects_sha256_mismatch() {
+        let file_path =
+            std::env::temp_dir().join(format!("rustdesk-verified-dmg-test-{}", std::process::id()));
+        std::fs::write(&file_path, b"rustdesk").unwrap();
+        let result = verify_dmg_file(
+            &file_path.to_string_lossy(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            Some(8),
+        );
+
+        std::fs::remove_file(file_path).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verified_dmg_rejects_symlink() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-verified-dmg-symlink-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let target_path = test_dir.join("target.dmg");
+        let link_path = test_dir.join("update.dmg");
+        std::fs::write(&target_path, b"rustdesk").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+        let result = verify_dmg_file(
+            &link_path.to_string_lossy(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            Some(8),
+        );
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+        assert!(result.is_err());
     }
 }
 
