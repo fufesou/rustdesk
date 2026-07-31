@@ -15,7 +15,8 @@ APP_NAME = "rustdesk"
 SCHEMA_VERSION = 1
 SIGNATURE_ALGORITHM = "ed25519"
 SIGNATURE_CONTEXT = b"RustDesk update metadata v1\n"
-GITHUB_RELEASE_PREFIX = "https://github.com/rustdesk/rustdesk/releases/download"
+GITHUB_REPOSITORY = tuple(os.environ.get("RUSTDESK_UPDATE_GITHUB_REPOSITORY", "rustdesk/rustdesk").split("/"))
+GITHUB_RELEASE_PREFIX = f"https://github.com/{'/'.join(GITHUB_REPOSITORY)}/releases/download"
 def fail(message):
     raise SystemExit(message)
 def read_json(path):
@@ -72,8 +73,10 @@ def parse_artifact_url(url):
     parts = parsed.path.split("/")
     if (
         len(parts) != 7
+        or not re.fullmatch(r"[^/\\ ?#%]+/[^/\\ ?#%]+", "/".join(GITHUB_REPOSITORY))
         or parts[0] != ""
-        or parts[1:5] != ["rustdesk", "rustdesk", "releases", "download"]
+        or tuple(parts[1:3]) != GITHUB_REPOSITORY
+        or parts[3:5] != ["releases", "download"]
         or not parts[5]
         or not parts[6]
     ):

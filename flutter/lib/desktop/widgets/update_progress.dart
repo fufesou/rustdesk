@@ -54,11 +54,7 @@ void _showVerifyingUpdate() {
   gFFI.dialogManager.show(
     (setState, close, context) => CustomAlertDialog(
       title: Text(translate('Preparing for installation ...')),
-      content: const SizedBox(
-        width: 32,
-        height: 32,
-        child: CircularProgressIndicator(strokeWidth: 3),
-      ),
+      content: const LinearProgressIndicator(),
     ),
     tag: 'verifying-update',
   );

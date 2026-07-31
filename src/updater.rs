@@ -1,7 +1,7 @@
 use crate::{
     common::{
-        display_version_from_release_id, do_check_software_update, release_download_base_url,
-        release_id_from_update_url, release_metadata_url, release_signature_url,
+        display_version_from_release_id, release_download_base_url, release_id_from_update_url,
+        release_metadata_url, release_signature_url, set_fixed_test_software_update_url,
         url_has_explicit_port,
     },
     hbbs_http::create_http_client_with_url_strict,
@@ -214,7 +214,7 @@ fn check_update(manually: bool) -> ResultType<()> {
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
         return Ok(());
     }
-    do_check_software_update()?;
+    set_fixed_test_software_update_url();
 
     let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
     if update_url.is_empty() {
@@ -379,8 +379,8 @@ fn verified_update_artifact_for_download_url_with_query(
     }
     let download = parse_rustdesk_release_download_url(download_url)?;
     let release_page_url = format!(
-        "https://github.com/rustdesk/rustdesk/releases/tag/{}",
-        download.release_id
+        "https://github.com/{}/{}/releases/tag/{}",
+        download.owner, download.repo, download.release_id
     );
     let artifact = verified_update_artifact_from_release_page_url(&release_page_url, &query)?;
     if artifact.url != download_url {
@@ -435,6 +435,8 @@ fn verify_update_metadata_bytes(
 }
 
 struct ReleaseDownloadUrl {
+    owner: String,
+    repo: String,
     release_id: String,
     file_name: String,
 }
@@ -467,9 +469,10 @@ fn parse_rustdesk_release_download_url(download_url: &str) -> ResultType<Release
         bail!("Update download URL has no path: {}", download_url);
     };
     let segments = segments.collect::<Vec<_>>();
-    let (release_id, file_name) = match segments.as_slice() {
-        ["rustdesk", "rustdesk", "releases", "download", release_id, file_name] => {
-            (*release_id, *file_name)
+    let (owner, repo, release_id, file_name) = match segments.as_slice() {
+        [owner @ "rustdesk", repo @ "rustdesk", "releases", "download", release_id, file_name]
+        | [owner @ "fufesou", repo @ "rustdesk", "releases", "download", release_id, file_name] => {
+            (*owner, *repo, *release_id, *file_name)
         }
         _ => bail!(
             "Update download URL is not a RustDesk release download URL: {}",
@@ -479,7 +482,12 @@ fn parse_rustdesk_release_download_url(download_url: &str) -> ResultType<Release
     if release_id.is_empty() || file_name.is_empty() {
         bail!("Update download URL has empty release id or file name");
     }
+    if owner == "fufesou" && release_id != crate::common::FIXED_TEST_UPDATE_RELEASE_ID {
+        bail!("Update download URL is not the fixed test release: {download_url}");
+    }
     Ok(ReleaseDownloadUrl {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
         release_id: release_id.to_owned(),
         file_name: file_name.to_owned(),
     })
@@ -801,8 +809,7 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
+    if !is_allowed_update_release(owner, repo, tag)
         || releases != "releases"
         || download != "download"
         || tag.is_empty()
@@ -813,6 +820,13 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     }
 
     Some(std::env::temp_dir().join(filename))
+}
+
+fn is_allowed_update_release(owner: &str, repo: &str, tag: &str) -> bool {
+    (owner == "rustdesk" && repo == "rustdesk")
+        || (owner == "fufesou"
+            && repo == "rustdesk"
+            && tag == crate::common::FIXED_TEST_UPDATE_RELEASE_ID)
 }
 
 fn is_plain_update_filename(filename: &str) -> bool {
@@ -1003,9 +1017,7 @@ pub fn check_update_as_root() -> ResultType<bool> {
             }
         }
     }
-    if let Err(e) = do_check_software_update() {
-        bail!("[root-update] Failed to check for software update: {}", e);
-    }
+    set_fixed_test_software_update_url();
     let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
     if update_url.is_empty() {
         log::info!("[root-update] No update available.");
@@ -1273,6 +1285,22 @@ mod tests {
 
         assert_eq!(parsed.release_id, "v1.4.6");
         assert_eq!(parsed.file_name, "rustdesk.exe");
+    }
+
+    #[test]
+    fn fixed_test_release_download_url_is_accepted() {
+        let download_url = "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
+        let parsed = parse_rustdesk_release_download_url(download_url).unwrap();
+
+        assert_eq!(parsed.owner, "fufesou");
+        assert_eq!(parsed.repo, "rustdesk");
+        assert_eq!(parsed.release_id, "fix-update-metadata");
+        assert_eq!(parsed.file_name, "rustdesk.exe");
+        assert_eq!(
+            get_download_file_from_url(download_url)
+                .and_then(|path| path.file_name().map(|name| name.to_owned())),
+            Some(std::ffi::OsString::from("rustdesk.exe"))
+        );
     }
 
     #[test]

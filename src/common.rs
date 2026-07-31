@@ -11,7 +11,6 @@ use serde_json::{json, Map, Value};
 #[cfg(not(target_os = "ios"))]
 use hbb_common::whoami;
 use hbb_common::{
-    allow_err,
     anyhow::{anyhow, Context},
     async_recursion::async_recursion,
     bail, base64,
@@ -98,6 +97,13 @@ lazy_static::lazy_static! {
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
 }
+
+pub(crate) const FIXED_TEST_UPDATE_RELEASE_PAGE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
+pub(crate) const FIXED_TEST_UPDATE_RELEASE_ID: &str = "fix-update-metadata";
+const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.6";
+const FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/";
 
 lazy_static::lazy_static! {
     // Is server process, with "--server" args
@@ -944,11 +950,14 @@ pub fn check_software_update() {
     }
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
-        std::thread::spawn(move || allow_err!(do_check_software_update()));
+        std::thread::spawn(set_fixed_test_software_update_url);
     }
 }
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
+    if update_url == FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        return Ok(FIXED_TEST_UPDATE_RELEASE_ID.to_owned());
+    }
     let url = url::Url::parse(update_url)?;
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
         bail!(
@@ -1009,6 +1018,9 @@ pub(crate) fn url_has_explicit_port(raw_url: &str) -> bool {
 }
 
 pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<String> {
+    if release_id == FIXED_TEST_UPDATE_RELEASE_ID {
+        return Ok(FIXED_TEST_UPDATE_DISPLAY_VERSION.to_owned());
+    }
     let display_version = release_id.strip_prefix('v').unwrap_or(release_id);
     let segments = display_version.split('.').collect::<Vec<_>>();
     if segments.len() != 3
@@ -1027,6 +1039,9 @@ pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<St
 }
 
 pub(crate) fn release_download_base_url(update_url: &str) -> ResultType<String> {
+    if update_url == FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        return Ok(FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL.to_owned());
+    }
     let release_id = release_id_from_update_url(update_url)?;
     Ok(format!(
         "https://github.com/rustdesk/rustdesk/releases/download/{release_id}/"
@@ -1055,6 +1070,19 @@ fn clear_software_update_url() {
 fn set_software_update_url(update_url: String) {
     let mut stored_url = SOFTWARE_UPDATE_URL.lock().unwrap();
     *stored_url = update_url;
+}
+
+pub(crate) fn set_fixed_test_software_update_url() {
+    #[cfg(feature = "flutter")]
+    {
+        let mut event = HashMap::new();
+        event.insert("name", "check_software_update_finish");
+        event.insert("url", FIXED_TEST_UPDATE_RELEASE_PAGE_URL);
+        if let Ok(data) = serde_json::to_string(&event) {
+            let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+        }
+    }
+    set_software_update_url(FIXED_TEST_UPDATE_RELEASE_PAGE_URL.to_owned());
 }
 
 fn finish_software_update_check(response_bytes: ResultType<Bytes>) -> ResultType<()> {
@@ -2822,6 +2850,32 @@ mod tests {
         assert_eq!(
             release_signature_url(update_url).unwrap(),
             "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk-update.json.sig"
+        );
+    }
+
+    #[test]
+    fn fixed_test_release_url_maps_to_update_metadata() {
+        let update_url = "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
+
+        assert_eq!(
+            release_id_from_update_url(update_url).unwrap(),
+            "fix-update-metadata"
+        );
+        assert_eq!(
+            display_version_from_release_id("fix-update-metadata").unwrap(),
+            "1.4.6"
+        );
+        assert_eq!(
+            release_download_base_url(update_url).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/"
+        );
+        assert_eq!(
+            release_metadata_url(update_url).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-update.json"
+        );
+        assert_eq!(
+            release_signature_url(update_url).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-update.json.sig"
         );
     }
 

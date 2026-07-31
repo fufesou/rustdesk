@@ -747,13 +747,23 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
-    (*SOFTWARE_UPDATE_URL
+    let release_id = (*SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
         .rsplit('/')
         .next()
         .unwrap_or(""))
-    .to_string()
+    .to_string();
+    if release_id != crate::common::FIXED_TEST_UPDATE_RELEASE_ID {
+        return release_id;
+    }
+    match crate::common::display_version_from_release_id(&release_id) {
+        Ok(version) => version,
+        Err(err) => {
+            log::error!("Failed to map update release ID to display version: {err}");
+            release_id
+        }
+    }
 }
 
 #[inline]
