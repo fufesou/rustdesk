@@ -1244,10 +1244,10 @@ mod tests {
 
     fn verified_artifact() -> VerifiedUpdateArtifact {
         VerifiedUpdateArtifact {
-            version: "1.4.6".to_owned(),
-            release_id: "v1.4.6".to_owned(),
+            version: "1.4.7".to_owned(),
+            release_id: "v1.4.7".to_owned(),
             package_id: "rustdesk".to_owned(),
-            url: "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe"
+            url: "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe"
                 .to_owned(),
             file_name: "rustdesk.exe".to_owned(),
             size: 6,
@@ -1279,11 +1279,11 @@ mod tests {
     #[test]
     fn parse_rustdesk_release_download_url_accepts_expected_path() {
         let parsed = parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .unwrap();
 
-        assert_eq!(parsed.release_id, "v1.4.6");
+        assert_eq!(parsed.release_id, "v1.4.7");
         assert_eq!(parsed.file_name, "rustdesk.exe");
     }
 
@@ -1306,31 +1306,31 @@ mod tests {
     #[test]
     fn parse_rustdesk_release_download_url_rejects_untrusted_urls() {
         assert!(parse_rustdesk_release_download_url(
-            "https://example.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://example.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://github.com/other/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com/other/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe?x=1",
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe?x=1",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://user@github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://user@github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://github.com:8443/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com:8443/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .is_err());
         assert!(parse_rustdesk_release_download_url(
-            "https://github.com:443/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com:443/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         )
         .is_err());
     }

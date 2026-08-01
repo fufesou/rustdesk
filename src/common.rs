@@ -101,7 +101,7 @@ lazy_static::lazy_static! {
 pub(crate) const FIXED_TEST_UPDATE_RELEASE_PAGE_URL: &str =
     "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
 pub(crate) const FIXED_TEST_UPDATE_RELEASE_ID: &str = "fix-update-metadata";
-const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.6";
+const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.7";
 const FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/";
 
@@ -2836,20 +2836,20 @@ mod tests {
 
     #[test]
     fn release_id_from_update_url_accepts_tag_url_and_derives_metadata_urls() {
-        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6";
+        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7";
 
-        assert_eq!(release_id_from_update_url(update_url).unwrap(), "v1.4.6");
+        assert_eq!(release_id_from_update_url(update_url).unwrap(), "v1.4.7");
         assert_eq!(
             release_download_base_url(update_url).unwrap(),
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/"
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/"
         );
         assert_eq!(
             release_metadata_url(update_url).unwrap(),
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk-update.json"
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk-update.json"
         );
         assert_eq!(
             release_signature_url(update_url).unwrap(),
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk-update.json.sig"
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk-update.json.sig"
         );
     }
 
@@ -2863,7 +2863,7 @@ mod tests {
         );
         assert_eq!(
             display_version_from_release_id("fix-update-metadata").unwrap(),
-            "1.4.6"
+            "1.4.7"
         );
         assert_eq!(
             release_download_base_url(update_url).unwrap(),
@@ -2882,13 +2882,13 @@ mod tests {
     #[test]
     fn release_id_from_update_url_rejects_non_rustdesk_github_release_url() {
         for update_url in [
-            "https://github.com:8443/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://github.com:443/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://user@github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://github.com/other/rustdesk/releases/tag/v1.4.6",
-            "https://github.com/rustdesk/other/releases/tag/v1.4.6",
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com:8443/rustdesk/rustdesk/releases/tag/v1.4.7",
+            "https://github.com:443/rustdesk/rustdesk/releases/tag/v1.4.7",
+            "https://user@github.com/rustdesk/rustdesk/releases/tag/v1.4.7",
+            "https://example.com/rustdesk/rustdesk/releases/tag/v1.4.7",
+            "https://github.com/other/rustdesk/releases/tag/v1.4.7",
+            "https://github.com/rustdesk/other/releases/tag/v1.4.7",
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.7/rustdesk.exe",
         ] {
             assert!(release_id_from_update_url(update_url).is_err());
         }
@@ -2897,16 +2897,16 @@ mod tests {
     #[test]
     fn release_id_from_update_url_rejects_query_fragment_and_extra_segments() {
         for update_url in [
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6?x=1",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6#asset",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/extra",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7?x=1",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7#asset",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7/extra",
         ] {
             assert!(release_id_from_update_url(update_url).is_err());
         }
         assert_eq!(
-            release_id_from_update_url("https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/")
+            release_id_from_update_url("https://github.com/rustdesk/rustdesk/releases/tag/v1.4.7/")
                 .unwrap(),
-            "v1.4.6"
+            "v1.4.7"
         );
     }
 

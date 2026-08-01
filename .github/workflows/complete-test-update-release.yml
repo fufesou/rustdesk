@@ -13,7 +13,7 @@ env:
   SOURCE_REF: 4a04f715cb13aae7a2bae49d9e2dc99d08b634c2
   TARGET_REPOSITORY: fufesou/rustdesk
   RELEASE_ID: fix-update-metadata
-  VERSION: "1.4.6"
+  VERSION: "1.4.7"
   RUST_VERSION: "1.75"
   FLUTTER_VERSION: "3.44.0"
   LLVM_VERSION: "15.0.6"
