@@ -47,6 +47,8 @@ class JobID {
 typedef GetSessionID = SessionID Function();
 typedef GetDialogManager = OverlayDialogManager? Function();
 
+const _kReadDirTimeout = Duration(seconds: 30);
+
 class FileModel {
   final WeakReference<FFI> parent;
   // late final String sessionId;
@@ -350,6 +352,10 @@ class FileController {
   final history = RxList<String>.empty(growable: true);
   final sortBy = SortBy.name.obs;
   var sortAscending = true;
+  // Only coalesce repeated normal-path openDirectory calls. Refreshes,
+  // command paths, initialization/direct fetches, different paths, and
+  // controller shutdown intentionally keep their existing behavior.
+  final Map<String, Future<bool>> _openingDirectories = {};
   final JobController jobController;
   final WeakReference<FFI> rootState;
 
@@ -468,7 +474,16 @@ class FileController {
     if (!isBack && path == "..") {
       return await _goToParentDirectory(isBack: isBack);
     }
-    return await _openDirectoryPath(path, isBack: isBack);
+    final opening = _openingDirectories[path];
+    if (opening != null) return await opening;
+    late final Future<bool> task;
+    task = _openDirectoryPath(path, isBack: isBack).whenComplete(() {
+      if (identical(_openingDirectories[path], task)) {
+        _openingDirectories.remove(path);
+      }
+    });
+    _openingDirectories[path] = task;
+    return await task;
   }
 
   Future<bool> _openDirectoryPath(String path, {bool isBack = false}) async {
@@ -1400,12 +1415,13 @@ class FileFetcher {
     final c = Completer<FileDirectory>();
     tasks[path] = c;
 
-    Timer(Duration(seconds: 2), () {
+    final timeoutTimer = Timer(_kReadDirTimeout, () {
+      if (!identical(tasks[path], c)) return;
       tasks.remove(path);
       if (c.isCompleted) return;
       c.completeError("Failed to read dir, timeout");
     });
-    return c.future;
+    return c.future.whenComplete(timeoutTimer.cancel);
   }
 
   Future<FileDirectory> registerReadRecursiveTask(int actID) {
