@@ -369,15 +369,15 @@ jobs:
         run: |
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
 
-      - name: Upload signed Windows Flutter EXE
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+      - name: Upload Windows Flutter EXE for test update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-flutter-${{ matrix.job.arch }}-exe
           path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
 
-      - name: Upload signed Windows Flutter MSI
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+      - name: Upload Windows Flutter MSI for test update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-flutter-${{ matrix.job.arch }}-msi
@@ -536,8 +536,8 @@ jobs:
         run: |
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput/
 
-      - name: Upload signed Windows Sciter EXE
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+      - name: Upload Windows Sciter EXE for test update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-sciter-x86-exe
@@ -886,8 +886,8 @@ jobs:
           fi
           test -f "rustdesk-${VERSION}-${ARCH}.dmg"
 
-      - name: Upload signed macOS DMG
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.MACOS_P12_BASE64 != null
+      - name: Upload macOS DMG for test update
+        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-${{ matrix.job.arch }}-dmg

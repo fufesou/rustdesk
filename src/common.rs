@@ -101,7 +101,7 @@ lazy_static::lazy_static! {
 pub(crate) const FIXED_TEST_UPDATE_RELEASE_PAGE_URL: &str =
     "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
 pub(crate) const FIXED_TEST_UPDATE_RELEASE_ID: &str = "fix-update-metadata";
-const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.7";
+const FIXED_TEST_UPDATE_DISPLAY_VERSION: &str = "1.4.6";
 const FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/";
 
@@ -2863,7 +2863,7 @@ mod tests {
         );
         assert_eq!(
             display_version_from_release_id("fix-update-metadata").unwrap(),
-            "1.4.7"
+            "1.4.6"
         );
         assert_eq!(
             release_download_base_url(update_url).unwrap(),
