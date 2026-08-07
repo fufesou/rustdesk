@@ -1960,7 +1960,7 @@ impl Connection {
         if self.is_remote() {
             let mut msg = "".to_string();
             if crate::platform::linux::is_login_screen_wayland() {
-                msg = crate::client::LOGIN_SCREEN_WAYLAND.to_owned()
+                // msg = crate::client::LOGIN_SCREEN_WAYLAND.to_owned()
             } else {
                 let dtype = crate::platform::linux::get_display_server();
                 if dtype != crate::platform::linux::DISPLAY_SERVER_X11

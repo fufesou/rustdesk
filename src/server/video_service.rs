@@ -593,14 +593,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     ) {
         Ok(result) => result,
         Err(err) => {
-            log::error!("Failed to create encoder: {err:?}, fallback to VP9");
+            log::error!("Failed to create encoder: {err:?}, trying VP9 fallback");
             Encoder::set_fallback(&EncoderCfg::VPX(VpxEncoderConfig {
                 width: c.width as _,
                 height: c.height as _,
                 quality,
                 codec: VpxVideoCodecId::VP9,
                 keyframe_interval: None,
-            }));
+            }))?;
             setup_encoder(
                 &c,
                 sp.name(),
@@ -954,7 +954,7 @@ fn setup_encoder(
         last_portable_service_running,
         source,
     );
-    Encoder::set_fallback(&encoder_cfg);
+    Encoder::set_fallback(&encoder_cfg)?;
     let codec_format = Encoder::negotiated_codec();
     let recorder = get_recorder(record_incoming, display_idx, source == VideoSource::Camera);
     let use_i444 = Encoder::use_i444(&encoder_cfg);
