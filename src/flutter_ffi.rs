@@ -2909,6 +2909,9 @@ pub fn main_get_common(key: String) -> String {
 }
 
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    if key.starts_with("verified-download-url-") {
+        return SyncReturn("error:unsupported".to_owned());
+    }
     SyncReturn(main_get_common(key))
 }
 
@@ -2919,6 +2922,17 @@ fn push_update_me_error(error: String) {
         flutter::APP_TYPE_MAIN,
         serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
     );
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn finish_manual_update(
+    update_file: &std::path::Path,
+    result: ResultType<()>,
+) -> ResultType<()> {
+    if result.is_err() {
+        crate::updater::remove_update_file(update_file);
+    }
+    result
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -3040,15 +3054,21 @@ pub fn main_set_common(_key: String, _value: String) {
                 new_version_file_str
             );
             #[cfg(target_os = "windows")]
-            let update_res =
-                crate::platform::update_to_verified(&new_version_file_str, &artifact.sha256);
+            let update_res = crate::platform::update_to_verified(
+                &new_version_file_str,
+                &artifact.sha256,
+                artifact.size,
+            );
             #[cfg(target_os = "macos")]
             let update_res = crate::platform::macos::update_to_verified_dmg(
                 &new_version_file_str,
                 &artifact.sha256,
                 Some(artifact.size),
             );
-            match update_res {
+            match finish_manual_update(
+                std::path::Path::new(&new_version_file_str),
+                update_res,
+            ) {
                 Ok(_) => log::info!("Update process is launched successfully!"),
                 Err(e) => {
                     let error = format!("Failed to update to new version, {}", e);
@@ -3227,5 +3247,50 @@ pub mod server_side {
         _class: JClass,
     ) -> jboolean {
         jboolean::from(crate::server::is_clipboard_service_ok())
+    }
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_common_rejects_verified_download_url() {
+        let result = main_get_common_sync("verified-download-url-".to_owned());
+
+        assert_eq!(result.0, "error:unsupported");
+    }
+
+    #[test]
+    fn successful_manual_update_keeps_downloaded_file() {
+        let update_file = std::env::temp_dir().join(format!(
+            "rustdesk-manual-update-keep-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        std::fs::write(&update_file, b"update").unwrap();
+
+        assert!(finish_manual_update(&update_file, Ok(())).is_ok());
+
+        assert!(update_file.exists());
+        std::fs::remove_file(&update_file).unwrap();
+    }
+
+    #[test]
+    fn failed_manual_update_removes_downloaded_file() {
+        let update_file = std::env::temp_dir().join(format!(
+            "rustdesk-manual-update-cleanup-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        std::fs::write(&update_file, b"update").unwrap();
+
+        let result = finish_manual_update(
+            &update_file,
+            Err(hbb_common::anyhow::anyhow!("update launch failed")),
+        );
+
+        assert!(result.is_err());
+        assert!(!update_file.exists());
     }
 }

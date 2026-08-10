@@ -7,12 +7,34 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'update_submission.dart';
+
 const _eventKeyUpdateMe = 'update-me';
 
+Future<void> _handleUpdateMe(
+    String releasePageUrl, Map<String, dynamic> evt) async {
+  platformFFI.unregisterEventHandler(_eventKeyUpdateMe, _eventKeyUpdateMe);
+  if (evt.containsKey('error')) {
+    _showUpdateError(releasePageUrl, evt['error'] as String);
+  }
+}
+
 Future<void> handleUpdate(String releasePageUrl) async {
-  _showVerifyingUpdate();
-  final downloadUrl =
-      await bind.mainGetCommon(key: 'verified-download-url-$releasePageUrl');
+  final dialogClosed = _showVerifyingUpdate();
+  final String? downloadUrl;
+  try {
+    downloadUrl = await waitForUpdateVerification(
+      bind.mainGetCommon(key: 'verified-download-url-$releasePageUrl'),
+      dialogClosed,
+    );
+  } catch (error) {
+    _showUpdateError(releasePageUrl, error.toString());
+    return;
+  }
+  if (downloadUrl == null) {
+    return;
+  }
+  final verifiedDownloadUrl = downloadUrl;
   if (downloadUrl.startsWith('error:')) {
     _showUpdateError(releasePageUrl, downloadUrl.replaceFirst('error:', ''));
     return;
@@ -24,10 +46,10 @@ Future<void> handleUpdate(String releasePageUrl) async {
   gFFI.dialogManager.show((setState, close, context) {
     return CustomAlertDialog(
         title: Text(translate('Downloading {$appName}')),
-        content:
-            UpdateProgress(releasePageUrl, downloadUrl, downloadId, onCanceled)
-                .marginSymmetric(horizontal: 8)
-                .paddingOnly(top: 12),
+        content: UpdateProgress(
+                releasePageUrl, verifiedDownloadUrl, downloadId, onCanceled)
+            .marginSymmetric(horizontal: 8)
+            .paddingOnly(top: 12),
         actions: [
           dialogButton(translate('Cancel'), onPressed: () async {
             onCanceled.value();
@@ -49,12 +71,28 @@ Future<void> handleUpdate(String releasePageUrl) async {
   });
 }
 
-void _showVerifyingUpdate() {
+Future<T?> waitForUpdateVerification<T extends Object>(
+  Future<T> verification,
+  Future<void> dialogClosed,
+) async {
+  final dialogClosedMarker = Object();
+  final result = await Future.any<Object>([
+    verification.then<Object>((value) => value),
+    dialogClosed.then<Object>((_) => dialogClosedMarker),
+  ]);
+  return identical(result, dialogClosedMarker) ? null : result as T;
+}
+
+Future<void> _showVerifyingUpdate() async {
   gFFI.dialogManager.dismissAll();
-  gFFI.dialogManager.show(
+  await gFFI.dialogManager.show<void>(
     (setState, close, context) => CustomAlertDialog(
       title: Text(translate('Preparing for installation ...')),
       content: const LinearProgressIndicator(),
+      actions: [
+        dialogButton(translate('Close'), onPressed: close, isOutline: true),
+      ],
+      onCancel: close,
     ),
     tag: 'verifying-update',
   );
@@ -85,6 +123,7 @@ class UpdateProgressState extends State<UpdateProgress> {
   Timer? _timer;
   int? _totalSize;
   int _downloadedSize = 0;
+  bool _downloadFinished = false;
   int _getDataFailedCount = 0;
   final String _eventKeyDownloadNewVersion = 'download-new-version';
 
@@ -185,6 +224,8 @@ class UpdateProgressState extends State<UpdateProgress> {
             }
           } else if (key == 'downloaded_size') {
             _downloadedSize = value as int;
+          } else if (key == 'finished') {
+            _downloadFinished = value as bool;
           } else if (key == 'error') {
             if (value != null) {
               err = value.toString();
@@ -203,7 +244,9 @@ class UpdateProgressState extends State<UpdateProgress> {
     if (err != '') {
       _onError(err);
     } else {
-      if (_totalSize != null && _downloadedSize >= _totalSize!) {
+      if (_downloadFinished &&
+          _totalSize != null &&
+          _downloadedSize >= _totalSize!) {
         cancelQueryTimer();
         bind.mainSetCommon(
             key: 'remove-downloader', value: widget.downloadId.value);
@@ -227,17 +270,21 @@ class UpdateProgressState extends State<UpdateProgress> {
       '{$appName}-to-update-tip',
       '',
       gFFI.dialogManager,
-      onSubmit: () {
+      onSubmit: () async {
         debugPrint('Downloaded, update to new version now');
+        final releasePageUrl = widget.releasePageUrl;
         platformFFI.registerEventHandler(_eventKeyUpdateMe, _eventKeyUpdateMe,
-            (evt) async {
-          platformFFI.unregisterEventHandler(
-              _eventKeyUpdateMe, _eventKeyUpdateMe);
-          if (evt.containsKey('error')) {
-            _showUpdateError(widget.releasePageUrl, evt['error'] as String);
-          }
-        }, replace: true);
-        bind.mainSetCommon(key: 'update-me', value: widget.downloadUrl);
+            (evt) => _handleUpdateMe(releasePageUrl, evt),
+            replace: true);
+        await observeUpdateSubmission(
+          submit: () =>
+              bind.mainSetCommon(key: 'update-me', value: widget.downloadUrl),
+          onFailure: (error) {
+            platformFFI.unregisterEventHandler(
+                _eventKeyUpdateMe, _eventKeyUpdateMe);
+            _showUpdateError(releasePageUrl, error.toString());
+          },
+        );
       },
       submitTimeout: 5,
     );

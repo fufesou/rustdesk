@@ -13,7 +13,7 @@ use hbb_common::{
 };
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -104,8 +104,6 @@ const UPDATE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_METADATA_SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
 const UPDATE_FILE_CREATE_ATTEMPTS: usize = 16;
-const UPDATE_HASH_BUFFER_SIZE: usize = 8192;
-const SHA256_HEX_LENGTH: usize = 64;
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
@@ -517,10 +515,9 @@ fn cache_verified_update_artifact(
         arch: query.arch.to_owned(),
         format: query.format.to_owned(),
     };
-    VERIFIED_UPDATE_ARTIFACTS
-        .lock()
-        .unwrap()
-        .insert(artifact.url.clone(), cached);
+    let mut cache = VERIFIED_UPDATE_ARTIFACTS.lock().unwrap();
+    cache.retain(|_, entry| entry.artifact.release_id == artifact.release_id);
+    cache.insert(artifact.url.clone(), cached);
 }
 
 fn get_cached_verified_update_artifact(download_url: &str) -> Option<CachedVerifiedUpdateArtifact> {
@@ -678,6 +675,7 @@ fn verified_update_path(
         Ok(path) => path.to_owned(),
         Err(e) => {
             log::error!("Failed to get verified {} path: {}", kind, e);
+            update_file.cleanup();
             remove_update_file(file_path);
             return None;
         }
@@ -694,12 +692,13 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
     if let Some(p) = file_path.to_str() {
         if let Some(session_id) = crate::platform::get_current_process_session_id() {
             if update_msi {
-                let Some((_update_file, update_path)) =
+                let Some((update_file, update_path)) =
                     verified_update_path(p, expected_sha256, "msi", file_path)
                 else {
                     return;
                 };
-                match crate::platform::update_me_msi(&update_path, true) {
+                let result = crate::platform::update_me_msi(&update_path, true);
+                match crate::platform::finish_verified_update_launch(update_file, "msi", result) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);
                     }
@@ -713,7 +712,7 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                     }
                 }
             } else {
-                let Some((_update_file, update_path)) =
+                let Some((update_file, update_path)) =
                     verified_update_path(p, expected_sha256, "exe", file_path)
                 else {
                     return;
@@ -728,6 +727,7 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                             "Failed to handle custom client staging dir before update: {}",
                             e
                         );
+                        update_file.cleanup();
                         remove_update_file(file_path);
                         return;
                     }
@@ -767,6 +767,7 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                             &dir
                         ));
                     }
+                    update_file.cleanup();
                     remove_update_file(file_path);
                 }
             }
@@ -1108,6 +1109,7 @@ fn create_download_temp_file(final_path: &Path) -> ResultType<(std::fs::File, Pa
             hbb_common::rand::random::<u64>()
         ));
         match std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path)
@@ -1166,44 +1168,38 @@ fn copy_and_verify_update_artifact<R: Read>(
             bytes_written
         );
     }
-    verify_file_sha256(temp_path, expected_sha256)
+    verify_update_file_sha256(file, temp_path, expected_sha256)
 }
 
 fn verify_file_sha256(path: &Path, expected_sha256: &str) -> ResultType<()> {
-    let expected_sha256 = expected_sha256.trim().to_ascii_lowercase();
-    if expected_sha256.len() != SHA256_HEX_LENGTH
-        || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        bail!(
+    let mut file = std::fs::File::open(path)?;
+    verify_update_file_sha256(&mut file, path, expected_sha256)
+}
+
+fn verify_update_file_sha256<R: Read + Seek>(
+    reader: &mut R,
+    path: &Path,
+    expected_sha256: &str,
+) -> ResultType<()> {
+    use crate::update_hash::{verify_sha256_reader, Sha256VerificationError};
+
+    match verify_sha256_reader(reader, expected_sha256) {
+        Ok(()) => Ok(()),
+        Err(Sha256VerificationError::InvalidExpected) => bail!(
             "Expected update file SHA256 is malformed for {}",
             path.display()
-        );
-    }
-
-    let actual_sha256 = sha256_file_hex(path)?;
-    if actual_sha256 != expected_sha256 {
-        bail!(
+        ),
+        Err(Sha256VerificationError::Mismatch {
+            expected_sha256,
+            actual_sha256,
+        }) => bail!(
             "SHA256 mismatch for {}: expected {}, got {}",
             path.display(),
             expected_sha256,
             actual_sha256
-        );
+        ),
+        Err(Sha256VerificationError::Io(err)) => Err(err.into()),
     }
-    Ok(())
-}
-
-fn sha256_file_hex(path: &Path) -> ResultType<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = sha2::Sha256::default();
-    let mut buffer = [0_u8; UPDATE_HASH_BUFFER_SIZE];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        sha2::Digest::update(&mut hasher, &buffer[..count]);
-    }
-    Ok(format!("{:x}", sha2::Digest::finalize(hasher)))
 }
 
 #[cfg(test)]
@@ -1253,6 +1249,18 @@ mod tests {
             size: 6,
             sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4".to_owned(),
         }
+    }
+
+    fn cache_windows_exe(artifact: &VerifiedUpdateArtifact) {
+        cache_verified_update_artifact(
+            artifact,
+            &UpdateArtifactQuery {
+                platform: "windows",
+                arch: "x86_64",
+                format: "exe",
+                file_name: None,
+            },
+        );
     }
 
     #[cfg(all(target_os = "windows", not(feature = "flutter")))]
@@ -1371,6 +1379,37 @@ mod tests {
     }
 
     #[test]
+    fn copy_and_verify_update_artifact_hashes_open_file_handle() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustdesk-updater-open-handle-sha256-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let final_path = test_dir.join("rustdesk-update.exe");
+        let (mut file, _) = create_download_temp_file(&final_path).unwrap();
+        let display_path = test_dir.join("path-must-not-be-opened.download");
+        let mut data: &[u8] = b"rustdesk";
+
+        let result = copy_and_verify_update_artifact(
+            &mut file,
+            &display_path,
+            &mut data,
+            8,
+            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
+        );
+        let position = result
+            .as_ref()
+            .ok()
+            .map(|_| std::io::Seek::stream_position(&mut file).unwrap());
+        drop(file);
+        std::fs::remove_dir_all(&test_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(position, Some(0));
+    }
+
+    #[test]
     fn verify_file_sha256_rejects_mismatched_file() {
         let file_path = std::env::temp_dir().join(format!(
             "rustdesk-updater-sha256-test-{}",
@@ -1388,18 +1427,10 @@ mod tests {
     }
 
     #[test]
-    fn verified_update_artifact_cache_rejects_mismatched_queries() {
+    fn verified_update_artifact_cache_is_release_scoped_and_rejects_mismatches() {
         let artifact = verified_artifact();
         VERIFIED_UPDATE_ARTIFACTS.lock().unwrap().clear();
-        cache_verified_update_artifact(
-            &artifact,
-            &UpdateArtifactQuery {
-                platform: "windows",
-                arch: "x86_64",
-                format: "exe",
-                file_name: None,
-            },
-        );
+        cache_windows_exe(&artifact);
 
         let result = verified_update_artifact_for_download_url_with_query(
             &artifact.url,
@@ -1424,6 +1455,21 @@ mod tests {
         );
 
         assert!(result.is_err());
+
+        let mut same_release_artifact = artifact.clone();
+        same_release_artifact.url = same_release_artifact
+            .url
+            .replace("rustdesk.exe", "other.exe");
+        cache_windows_exe(&same_release_artifact);
+        assert_eq!(VERIFIED_UPDATE_ARTIFACTS.lock().unwrap().len(), 2);
+
+        let mut next_release_artifact = artifact.clone();
+        next_release_artifact.release_id = "v1.4.7".to_owned();
+        next_release_artifact.url = next_release_artifact.url.replace("v1.4.6", "v1.4.7");
+        cache_windows_exe(&next_release_artifact);
+        let cache = VERIFIED_UPDATE_ARTIFACTS.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&next_release_artifact.url));
     }
 
     #[test]

@@ -42,6 +42,8 @@ def sha256_hex(path):
 def validate_release_id(release_id):
     if not release_id:
         fail("release id must not be empty")
+    if not release_id.isascii():
+        fail(f"release id must be ASCII: {release_id}")
     if release_id in {".", ".."}:
         fail(f"invalid release id: {release_id}")
     if any(char in release_id for char in (" ", "/", "\\", "?", "#")):
@@ -49,10 +51,13 @@ def validate_release_id(release_id):
     if unquote(release_id) != release_id:
         fail(f"release id must not require URL decoding: {release_id}")
 def display_version_from_release_id(release_id):
-    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", release_id)
+    match = re.fullmatch(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)", release_id)
     if not match:
         return None
-    if all(int(part) == 0 for part in match.groups()):
+    version_segments = [int(part) for part in match.groups()]
+    if any(segment > 65535 for segment in version_segments):
+        fail(f"release id has out-of-range display version: {release_id}")
+    if all(segment == 0 for segment in version_segments):
         fail(f"release id has invalid display version: {release_id}")
     return ".".join(match.groups())
 def validate_release_version(release_id, version, print_skip=False):
@@ -84,9 +89,7 @@ def parse_artifact_url(url):
     release_id = parts[5]
     file_name = parts[6]
     validate_release_id(release_id)
-    if not file_name:
-        fail(f"artifact URL has no file name: {url}")
-    if file_name in {".", ".."}:
+    if file_name in {".", ".."} or any(char in file_name for char in ("/", "\\")):
         fail(f"invalid artifact URL file name: {url}")
     if unquote(file_name) != file_name:
         fail(f"artifact URL file name must not require URL decoding: {url}")
@@ -130,10 +133,18 @@ def artifact_selector(artifact):
     )
 def validate_fragment(fragment):
     required = ["platform", "arch", "format", "url", "file_name", "size", "sha256"]
+    unknown_fields = set(fragment) - set(required)
+    if unknown_fields:
+        fail(f"unknown fragment fields: {', '.join(sorted(unknown_fields))}")
     for key in required:
         if key not in fragment:
             fail(f"fragment missing field: {key}")
-    if not isinstance(fragment["size"], int) or fragment["size"] < 0:
+        if key in {"platform", "arch", "format", "url", "file_name", "sha256"} and not isinstance(fragment[key], str):
+            fail(f"fragment {key} must be a string")
+    for key in ("platform", "arch", "format"):
+        if not fragment[key].strip():
+            fail(f"fragment {key} must not be empty")
+    if isinstance(fragment["size"], bool) or not isinstance(fragment["size"], int) or fragment["size"] < 0:
         fail("fragment size must be a non-negative integer")
     if not re.fullmatch(r"[0-9a-f]{64}", fragment["sha256"]):
         fail("fragment sha256 must be 64 lowercase hex characters")
@@ -144,10 +155,9 @@ def validate_fragment_url(fragment):
     return release_id
 def command_fragment(args):
     artifact_path = Path(args.artifact)
-    release_id, url_file_name = parse_artifact_url(args.artifact_url)
+    _, url_file_name = parse_artifact_url(args.artifact_url)
     if artifact_path.name != url_file_name:
         fail("artifact URL basename must match artifact file name")
-    validate_release_id(release_id)
     fragment = {
         "platform": args.platform,
         "arch": args.arch,
@@ -159,21 +169,24 @@ def command_fragment(args):
     }
     write_stable_json(args.fragment_out, fragment)
 def command_sign(args):
+    metadata_out = Path(args.metadata_out).resolve()
+    signature_out = Path(args.signature_out).resolve()
+    if metadata_out == signature_out:
+        fail("--metadata-out and --signature-out must be different files")
     validate_release_version(args.release_id, args.version)
     artifacts = [read_json(path) for path in args.fragment]
-    seen_selectors = set()
+    seen_selectors, seen_file_names = set(), set()
     for artifact in artifacts:
         validate_fragment(artifact)
-        fragment_release_id = validate_fragment_url(artifact)
-        if fragment_release_id != args.release_id:
-            fail(
-                f"fragment release id {fragment_release_id} does not match "
-                f"--release-id {args.release_id}"
-            )
+        if (fragment_release_id := validate_fragment_url(artifact)) != args.release_id:
+            fail(f"fragment release id {fragment_release_id} does not match " f"--release-id {args.release_id}")
         selector = artifact_selector(artifact)
         if selector in seen_selectors:
             fail(f"duplicate artifact selector: {selector}")
+        if artifact["file_name"] in seen_file_names:
+            fail("duplicate metadata artifact file_name")
         seen_selectors.add(selector)
+        seen_file_names.add(artifact["file_name"])
     artifacts.sort(key=artifact_selector)
     metadata = {
         "schema_version": SCHEMA_VERSION,
@@ -185,9 +198,8 @@ def command_sign(args):
         "signature_key_id": args.key_id,
         "artifacts": artifacts,
     }
-    metadata_bytes = write_stable_json(args.metadata_out, metadata)
-    seed = load_seed_from_env(args.private_key_seed_env)
-    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(load_seed_from_env(args.private_key_seed_env))
+    metadata_bytes = write_stable_json(metadata_out, metadata)
     signature = private_key.sign(SIGNATURE_CONTEXT + metadata_bytes)
     signature_json = {
         "schema_version": SCHEMA_VERSION,
@@ -195,7 +207,7 @@ def command_sign(args):
         "key_id": args.key_id,
         "signature": base64.b64encode(signature).decode("ascii"),
     }
-    write_stable_json(args.signature_out, signature_json)
+    write_stable_json(signature_out, signature_json)
 def validate_metadata_and_signature(metadata, signature, args):
     if signature.get("schema_version") != SCHEMA_VERSION:
         fail("unsupported signature schema version")
@@ -216,27 +228,30 @@ def validate_metadata_and_signature(metadata, signature, args):
     if metadata.get("signature_key_id") != signature.get("key_id"):
         fail("metadata signature key id mismatch")
 def command_verify(args):
-    metadata_path = Path(args.metadata)
-    signature_path = Path(args.signature)
-    metadata_bytes = metadata_path.read_bytes()
+    metadata_bytes = Path(args.metadata).read_bytes()
     metadata = json.loads(metadata_bytes.decode("utf-8"))
-    signature_json = read_json(signature_path)
+    signature_json = read_json(args.signature)
     validate_metadata_and_signature(metadata, signature_json, args)
-    signature = decode_signature(signature_json["signature"])
     public_key = load_public_key(args.trusted_public_key_base64)
     try:
-        public_key.verify(signature, SIGNATURE_CONTEXT + metadata_bytes)
+        public_key.verify(decode_signature(signature_json["signature"]), SIGNATURE_CONTEXT + metadata_bytes)
     except InvalidSignature:
         fail("invalid metadata signature")
-    artifacts = metadata.get("artifacts")
-    if not isinstance(artifacts, list) or not artifacts:
+    if not isinstance(artifacts := metadata.get("artifacts"), list) or not artifacts:
         fail("metadata must contain artifacts")
     local_artifacts = {Path(path).name: Path(path) for path in args.artifact}
-    metadata_names = {artifact.get("file_name") for artifact in artifacts}
+    if len(local_artifacts) != len(args.artifact):
+        fail("duplicate local artifact basename")
+    metadata_names, seen_selectors = {artifact.get("file_name") for artifact in artifacts}, set()
+    if len(metadata_names) != len(artifacts):
+        fail("duplicate metadata artifact file_name")
     if metadata_names != set(local_artifacts):
         fail("local artifact set does not match metadata artifact set")
     for artifact in artifacts:
         validate_fragment(artifact)
+        if (selector := artifact_selector(artifact)) in seen_selectors:
+            fail(f"duplicate artifact selector: {selector}")
+        seen_selectors.add(selector)
         validate_fragment_url(artifact)
         file_name = artifact["file_name"]
         expected_url = expected_artifact_url(args.release_id, file_name)

@@ -375,6 +375,7 @@ jobs:
         with:
           name: windows-flutter-${{ matrix.job.arch }}-exe
           path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+          if-no-files-found: error
 
       - name: Upload signed Windows Flutter MSI
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
@@ -382,6 +383,7 @@ jobs:
         with:
           name: windows-flutter-${{ matrix.job.arch }}-msi
           path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+          if-no-files-found: error
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -542,6 +544,7 @@ jobs:
         with:
           name: windows-sciter-x86-exe
           path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
+          if-no-files-found: error
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -892,6 +895,7 @@ jobs:
         with:
           name: macos-${{ matrix.job.arch }}-dmg
           path: ./rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg
+          if-no-files-found: error
 
       - name: Publish DMG package
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
@@ -905,10 +909,24 @@ jobs:
   publish-signed-update-metadata:
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata }}
+    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'rustdesk/rustdesk' }}
+    concurrency:
+      group: signed-update-${{ inputs.upload-tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - name: Validate update signing configuration
+        shell: bash
+        env:
+          RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+        run: |
+          test "$SIGN_BASE_URL" != "-2" || { echo "::error::SIGN_BASE_URL is not configured"; exit 1; }
+          test -n "$MACOS_P12_BASE64" || { echo "::error::MACOS_P12_BASE64 is not configured"; exit 1; }
+          test -n "$RUSTDESK_UPDATE_ED25519_SEED" || { echo "::error::RUSTDESK_UPDATE_ED25519_SEED is not configured"; exit 1; }
+          test -n "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" || { echo "::error::RUSTDESK_UPDATE_ED25519_PUBLIC_KEY is not configured"; exit 1; }
+
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -929,10 +947,18 @@ jobs:
         run: 'python -m pip install --only-binary=:all: --require-hashes -r res/update_metadata_requirements.txt'
 
       - name: Test update metadata verifier
-        run: cargo test -p hbb_common --lib update_metadata --no-default-features
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p hbb_common --lib update_metadata --no-default-features 2>&1 | tee cargo-update-metadata-tests.log
+          grep -Eq '^running [1-9][0-9]* tests?$' cargo-update-metadata-tests.log
 
       - name: Test update metadata script
-        run: python -m unittest discover -s res -p "test_generate_update_metadata.py"
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s res -p "test_generate_update_metadata*.py" 2>&1 | tee python-update-metadata-tests.log
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' python-update-metadata-tests.log
 
       - name: Download Windows Flutter EXE
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1067,10 +1093,36 @@ jobs:
               raise SystemExit("embedded update public key does not match RUSTDESK_UPDATE_ED25519_PUBLIC_KEY")
           PY
 
-      - name: Publish signed update release
+      - name: Remove published update metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ env.TAG_NAME }}
+        run: |
+          set -euo pipefail
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          release_count="$(jq -r --arg tag "$TAG_NAME" '[.[][] | select(.tag_name == $tag)] | length' <<<"$releases")"
+          if [ "$release_count" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$release_count" -ne 1 ]; then
+            echo "::error::Expected one release for tag $TAG_NAME, found $release_count"
+            exit 1
+          fi
+          release_id="$(jq -r --arg tag "$TAG_NAME" '.[][] | select(.tag_name == $tag) | .id' <<<"$releases")"
+          assets="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100")"
+          for asset_name in rustdesk-update.json rustdesk-update.json.sig; do
+            asset_ids="$(jq -r --arg name "$asset_name" '.[][] | select(.name == $name) | .id' <<<"$assets")"
+            for asset_id in $asset_ids; do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done
+          done
+
+      - name: Upload signed update artifacts
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
+          fail_on_unmatched_files: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
             ./artifacts/windows-x86_64/rustdesk-${{ env.VERSION }}-x86_64.exe
@@ -1080,8 +1132,22 @@ jobs:
             ./artifacts/windows-x86/rustdesk-${{ env.VERSION }}-x86-sciter.exe
             ./artifacts/macos-aarch64/rustdesk-${{ env.VERSION }}-aarch64.dmg
             ./artifacts/macos-x86_64/rustdesk-${{ env.VERSION }}-x86_64.dmg
-            ./rustdesk-update.json
-            ./rustdesk-update.json.sig
+
+      - name: Upload signed update metadata signature
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          fail_on_unmatched_files: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: ./rustdesk-update.json.sig
+
+      - name: Publish signed update metadata
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          fail_on_unmatched_files: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: ./rustdesk-update.json
 
   publish_unsigned:
     needs:
