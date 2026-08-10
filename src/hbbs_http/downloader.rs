@@ -47,12 +47,21 @@ struct Downloader {
     tx_cancel: UnboundedSender<()>,
 }
 
+pub struct DownloadOptions {
+    pub auto_delete_after: Option<Duration>,
+    pub expected_size: u64,
+}
+
 // The caller should check if the file is downloaded successfully and remove the job from the map.
 pub fn download_file(
     url: String,
     path: Option<PathBuf>,
-    auto_del_dur: Option<Duration>,
+    options: DownloadOptions,
 ) -> ResultType<String> {
+    let DownloadOptions {
+        auto_delete_after,
+        expected_size,
+    } = options;
     let id = url.clone();
     // First pass: if a non-error downloader exists for this URL, reuse it.
     // If an errored downloader exists, remove it so this call can retry.
@@ -87,7 +96,7 @@ pub fn download_file(
     let downloader = Downloader {
         data: Vec::new(),
         path: path.clone(),
-        total_size: None,
+        total_size: Some(expected_size),
         downloaded_size: 0,
         error: None,
         tx_cancel: tx,
@@ -116,7 +125,7 @@ pub fn download_file(
 
     let id2 = id.clone();
     std::thread::spawn(
-        move || match do_download(&id2, url, path, auto_del_dur, rx) {
+        move || match do_download(&id2, url, path, auto_delete_after, rx) {
             Ok(is_all_downloaded) => {
                 let mut downloaded_size = 0;
                 let mut total_size = 0;
@@ -171,43 +180,13 @@ async fn do_download(
     let client = create_http_client_async_with_url_strict(&url).await?;
 
     let mut is_all_downloaded = false;
-    tokio::select! {
-        _ = rx_cancel.recv() => {
-            return Ok(is_all_downloaded);
-        }
-        head_resp = client.head(&url).send() => {
-            match head_resp {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        let total_size = resp
-                            .headers()
-                            .get(reqwest::header::CONTENT_LENGTH)
-                            .and_then(|ct_len| ct_len.to_str().ok())
-                            .and_then(|ct_len| ct_len.parse::<u64>().ok());
-                        let Some(total_size) = total_size else {
-                            bail!("Failed to get content length");
-                        };
-                        DOWNLOADERS.lock().unwrap().get_mut(id).map(|downloader| {
-                            downloader.total_size = Some(total_size);
-                        });
-                    } else {
-                        bail!("Failed to get content length: {}", resp.status());
-                    }
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-
     let mut response;
     tokio::select! {
         _ = rx_cancel.recv() => {
             return Ok(is_all_downloaded);
         }
         resp = client.get(url).send() => {
-            response = resp?;
+            response = resp?.error_for_status()?;
         }
     }
 
@@ -224,6 +203,7 @@ async fn do_download(
             chunk = response.chunk() => {
                 match chunk {
                     Ok(Some(chunk)) => {
+                        validate_download_chunk_size(id, chunk.len() as u64)?;
                         match dest {
                             Some(ref mut f) => {
                                 f.write_all(&chunk).await?;
@@ -257,6 +237,10 @@ async fn do_download(
         f.flush().await?;
     }
 
+    if is_all_downloaded {
+        validate_download_size(id)?;
+    }
+
     if let Some(ref mut downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {
         downloader.finished = true;
     }
@@ -270,6 +254,45 @@ async fn do_download(
         }
     }
     Ok(is_all_downloaded)
+}
+
+fn validate_download_size(id: &str) -> ResultType<()> {
+    let downloaders = DOWNLOADERS.lock().unwrap();
+    let Some(downloader) = downloaders.get(id) else {
+        bail!("Downloader not found");
+    };
+    let Some(total_size) = downloader.total_size else {
+        bail!("Failed to get expected download size");
+    };
+    if downloader.downloaded_size != total_size {
+        bail!(
+            "Download size mismatch: expected {}, got {}",
+            total_size,
+            downloader.downloaded_size
+        );
+    }
+    Ok(())
+}
+
+fn validate_download_chunk_size(id: &str, chunk_size: u64) -> ResultType<()> {
+    let downloaders = DOWNLOADERS.lock().unwrap();
+    let Some(downloader) = downloaders.get(id) else {
+        bail!("Downloader not found");
+    };
+    let Some(total_size) = downloader.total_size else {
+        bail!("Failed to get expected download size");
+    };
+    let Some(downloaded_size) = downloader.downloaded_size.checked_add(chunk_size) else {
+        bail!("Download size overflow");
+    };
+    if downloaded_size > total_size {
+        bail!(
+            "Download size exceeds expected size: expected {}, got {}",
+            total_size,
+            downloaded_size
+        );
+    }
+    Ok(())
 }
 
 pub fn get_download_data(id: &str) -> ResultType<DownloadData> {

@@ -3002,10 +3002,14 @@ pub fn main_set_common(_key: String, _value: String) {
                     Ok(artifact) => {
                         if let Some(download_file) = get_download_file_from_url(&artifact.url) {
                             crate::updater::remove_update_file(&download_file);
+                            let options = crate::hbbs_http::downloader::DownloadOptions {
+                                auto_delete_after: Some(Duration::from_secs(3)),
+                                expected_size: artifact.size,
+                            };
                             match crate::hbbs_http::downloader::download_file(
                                 artifact.url,
                                 Some(download_file),
-                                Some(Duration::from_secs(3)),
+                                options,
                             ) {
                                 Ok(id) => HashMap::from([("name", event_key), ("id", id)]),
                                 Err(e) => {
