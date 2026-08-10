@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "Noklusējuma skārienpaliktņa ātrums"),
         ("Numeric one-time password", "Vienreiz lietojama ciparu parole"),
         ("Enable IPv6 P2P connection", "Iespējot IPv6 P2P savienojumu"),
-        ("Enable WebRTC P2P connection", "Iespējot WebRTC P2P savienojumu"),
         ("Enable UDP hole punching", "Iespējot UDP caurumu veidošanu"),
         ("View camera", "Skatīt kameru"),
         ("Enable camera", "Iespējot kameru"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Bloķēt audeklu"),
         ("Sync clipboard between sessions", "Sinhronizēt starpliktuvi starp sesijām"),
         ("sync-clipboard-between-sessions-tip", "Vienā attālajā sesijā nokopētais teksts vai attēli tiek nosūtīti arī uz pārējo pievienoto sesiju starpliktuvi."),
+        ("Enable WebRTC P2P connection", "Iespējot WebRTC P2P savienojumu"),
     ].iter().cloned().collect();
 }

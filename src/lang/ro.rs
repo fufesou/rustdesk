@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "Viteza implicită a touchpad-ului"),
         ("Numeric one-time password", "Parolă unică numerică"),
         ("Enable IPv6 P2P connection", "Activează conexiunea P2P prin IPv6"),
-        ("Enable WebRTC P2P connection", "Activează conexiunea P2P prin WebRTC"),
         ("Enable UDP hole punching", "Activează traversarea UDP (hole punching)"),
         ("View camera", "Vezi camera"),
         ("Enable camera", "Activează camera"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Blochează ecranul"),
         ("Sync clipboard between sessions", "Sincronizează clipboardul între sesiuni"),
         ("sync-clipboard-between-sessions-tip", "Textul sau imaginile copiate într-o sesiune la distanță sunt trimise și în clipboardul celorlalte sesiuni conectate."),
+        ("Enable WebRTC P2P connection", "Activează conexiunea P2P prin WebRTC"),
     ].iter().cloned().collect();
 }

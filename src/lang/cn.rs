@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "默认触控板速度"),
         ("Numeric one-time password", "一次性密码为数字"),
         ("Enable IPv6 P2P connection", "启用 IPv6 P2P 连接"),
-        ("Enable WebRTC P2P connection", "启用 WebRTC P2P 连接"),
         ("Enable UDP hole punching", "启用 UDP 打洞"),
         ("View camera", "查看摄像头"),
         ("Enable camera", "允许查看摄像头"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "锁定画布"),
         ("Sync clipboard between sessions", "在会话间同步剪贴板"),
         ("sync-clipboard-between-sessions-tip", "在一个远程会话中复制的文本或图片也会发送到其他已连接会话的剪贴板。"),
+        ("Enable WebRTC P2P connection", "启用 WebRTC P2P 连接"),
     ].iter().cloned().collect();
 }

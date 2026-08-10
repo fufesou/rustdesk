@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "Privzeta hitrost sledilne ploščice"),
         ("Numeric one-time password", "Numerično enkratno geslo"),
         ("Enable IPv6 P2P connection", "Omogoči povezavo IPv6 P2P"),
-        ("Enable WebRTC P2P connection", "Omogoči povezavo WebRTC P2P"),
         ("Enable UDP hole punching", "Omogoči preboj lukenj UDP"),
         ("View camera", "Pogled kamere"),
         ("Enable camera", "Omogoči kamero"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Zakleni platno"),
         ("Sync clipboard between sessions", "Sinhroniziraj odložišče med sejami"),
         ("sync-clipboard-between-sessions-tip", "Besedilo ali slike, kopirane v eni oddaljeni seji, se pošljejo tudi v odložišče vaših drugih povezanih sej."),
+        ("Enable WebRTC P2P connection", "Omogoči povezavo WebRTC P2P"),
     ].iter().cloned().collect();
 }

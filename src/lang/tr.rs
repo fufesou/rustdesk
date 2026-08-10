@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "Varsayılan izleme paneli hızı"),
         ("Numeric one-time password", "Sayısal tek seferlik parola"),
         ("Enable IPv6 P2P connection", "IPv6 P2P bağlantısını etkinleştir"),
-        ("Enable WebRTC P2P connection", "WebRTC P2P bağlantısını etkinleştir"),
         ("Enable UDP hole punching", "UDP delik açmayı etkinleştir"),
         ("View camera", "Kamerayı görüntüle"),
         ("Enable camera", "Kamerayı etkinleştir"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Tuvali kilitle"),
         ("Sync clipboard between sessions", "Oturumlar arasında panoyu senkronize et"),
         ("sync-clipboard-between-sessions-tip", "Bir uzak oturumda kopyalanan metin veya görseller, bağlı diğer oturumlarınızın panosuna da gönderilir."),
+        ("Enable WebRTC P2P connection", "WebRTC P2P bağlantısını etkinleştir"),
     ].iter().cloned().collect();
 }

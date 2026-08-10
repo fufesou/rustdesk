@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "기본 트랙패드 속도"),
         ("Numeric one-time password", "숫자 일회용 비밀번호"),
         ("Enable IPv6 P2P connection", "IPv6 P2P 연결 사용"),
-        ("Enable WebRTC P2P connection", "WebRTC P2P 연결 사용"),
         ("Enable UDP hole punching", "UDP 홀 펀칭 사용"),
         ("View camera", "카메라 보기"),
         ("Enable camera", "카메라 허용"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "캔버스 잠금"),
         ("Sync clipboard between sessions", "세션 간 클립보드 동기화"),
         ("sync-clipboard-between-sessions-tip", "하나의 원격 세션에서 복사한 텍스트나 이미지는 연결된 다른 세션의 클립보드에도 전송됩니다."),
+        ("Enable WebRTC P2P connection", "WebRTC P2P 연결 사용"),
     ].iter().cloned().collect();
 }

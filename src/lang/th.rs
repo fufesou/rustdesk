@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "ความเร็วแทร็กแพดเริ่มต้น"),
         ("Numeric one-time password", "รหัสผ่านครั้งเดียวแบบตัวเลข"),
         ("Enable IPv6 P2P connection", "เปิดใช้งานการเชื่อมต่อ P2P แบบ IPv6"),
-        ("Enable WebRTC P2P connection", "เปิดใช้งานการเชื่อมต่อ P2P แบบ WebRTC"),
         ("Enable UDP hole punching", "เปิดใช้งาน UDP hole punching"),
         ("View camera", "ดูกล้อง"),
         ("Enable camera", "เปิดใช้งานกล้อง"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "ล็อคแคนวาส"),
         ("Sync clipboard between sessions", "ซิงค์คลิปบอร์ดระหว่างเซสชัน"),
         ("sync-clipboard-between-sessions-tip", "ข้อความหรือรูปภาพที่คัดลอกในเซสชันระยะไกลหนึ่งจะถูกส่งไปยังคลิปบอร์ดของเซสชันอื่นที่เชื่อมต่ออยู่ด้วย"),
+        ("Enable WebRTC P2P connection", "เปิดใช้งานการเชื่อมต่อ P2P แบบ WebRTC"),
     ].iter().cloned().collect();
 }

@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", ""),
         ("Numeric one-time password", ""),
         ("Enable IPv6 P2P connection", ""),
-        ("Enable WebRTC P2P connection", ""),
         ("Enable UDP hole punching", ""),
         ("View camera", ""),
         ("Enable camera", ""),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", ""),
         ("Sync clipboard between sessions", ""),
         ("sync-clipboard-between-sessions-tip", ""),
+        ("Enable WebRTC P2P connection", ""),
     ].iter().cloned().collect();
 }

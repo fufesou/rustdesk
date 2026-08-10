@@ -676,7 +676,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Default trackpad speed", "Velocitat per defecte del trackpad"),
         ("Numeric one-time password", "Contrasenya numèrica d'un sol ús"),
         ("Enable IPv6 P2P connection", "Habilita la connexió IPv6 P2P"),
-        ("Enable WebRTC P2P connection", "Habilita la connexió WebRTC P2P"),
         ("Enable UDP hole punching", "Activa la perforació UDP"),
         ("View camera", "Mostra la càmera"),
         ("Enable camera", "Habilita la càmera"),
@@ -764,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Bloca el llenç"),
         ("Sync clipboard between sessions", "Sincronitza el porta-retalls entre sessions"),
         ("sync-clipboard-between-sessions-tip", "El text o les imatges copiats en una sessió remota també s'envien al porta-retalls de les altres sessions connectades."),
+        ("Enable WebRTC P2P connection", "Habilita la connexió WebRTC P2P"),
     ].iter().cloned().collect();
 }
