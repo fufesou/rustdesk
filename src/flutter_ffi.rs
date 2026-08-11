@@ -3001,10 +3001,10 @@ pub fn main_set_common(_key: String, _value: String) {
                 match crate::updater::verified_update_artifact_for_download_url(&download_url) {
                     Ok(artifact) => {
                         if let Some(download_file) = get_download_file_from_url(&artifact.url) {
-                            crate::updater::remove_update_file(&download_file);
                             let options = crate::hbbs_http::downloader::DownloadOptions {
                                 auto_delete_after: Some(Duration::from_secs(3)),
                                 expected_size: artifact.size,
+                                artifact_sha256: artifact.sha256,
                             };
                             match crate::hbbs_http::downloader::download_file(
                                 artifact.url,

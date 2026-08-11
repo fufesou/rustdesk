@@ -41,15 +41,25 @@ struct Downloader {
     path: Option<PathBuf>,
     // Some file may be empty, so we use Option<u64> to indicate if the size is known
     total_size: Option<u64>,
+    artifact_sha256: String,
     downloaded_size: u64,
     error: Option<String>,
     finished: bool,
     tx_cancel: UnboundedSender<()>,
 }
 
+impl Downloader {
+    fn matches_request(&self, path: &Option<PathBuf>, options: &DownloadOptions) -> bool {
+        self.path.as_ref() == path.as_ref()
+            && self.total_size == Some(options.expected_size)
+            && self.artifact_sha256 == options.artifact_sha256
+    }
+}
+
 pub struct DownloadOptions {
     pub auto_delete_after: Option<Duration>,
     pub expected_size: u64,
+    pub artifact_sha256: String,
 }
 
 // The caller should check if the file is downloaded successfully and remove the job from the map.
@@ -58,69 +68,54 @@ pub fn download_file(
     path: Option<PathBuf>,
     options: DownloadOptions,
 ) -> ResultType<String> {
-    let DownloadOptions {
-        auto_delete_after,
-        expected_size,
-    } = options;
     let id = url.clone();
-    // First pass: if a non-error downloader exists for this URL, reuse it.
-    // If an errored downloader exists, remove it so this call can retry.
-    let mut stale_path = None;
-    {
-        let mut downloaders = DOWNLOADERS.lock().unwrap();
-        if let Some(downloader) = downloaders.get(&id) {
-            if downloader.error.is_none() {
-                return Ok(id);
-            }
-            stale_path = downloader.path.clone();
-            downloaders.remove(&id);
-        }
-    }
-    if let Some(p) = stale_path {
-        if p.exists() {
-            if let Err(e) = std::fs::remove_file(&p) {
-                log::warn!("Failed to remove stale download file {}: {}", p.display(), e);
-            }
-        }
-    }
-
-    if let Some(path) = path.as_ref() {
-        if path.exists() {
-            bail!("File {} already exists", path.display());
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
     let (tx, rx) = unbounded_channel();
-    let downloader = Downloader {
-        data: Vec::new(),
-        path: path.clone(),
-        total_size: Some(expected_size),
-        downloaded_size: 0,
-        error: None,
-        tx_cancel: tx,
-        finished: false,
-    };
-    // Second pass (atomic with insert) to avoid race with another concurrent caller.
-    let mut stale_path_after_check = None;
+    let auto_delete_after = options.auto_delete_after;
     {
         let mut downloaders = DOWNLOADERS.lock().unwrap();
         if let Some(existing) = downloaders.get(&id) {
             if existing.error.is_none() {
-                return Ok(id);
-            }
-            stale_path_after_check = existing.path.clone();
-            downloaders.remove(&id);
-        }
-        downloaders.insert(id.clone(), downloader);
-    }
-    if let Some(p) = stale_path_after_check {
-        if p.exists() {
-            if let Err(e) = std::fs::remove_file(&p) {
-                log::warn!("Failed to remove stale download file {}: {}", p.display(), e);
+                if existing.matches_request(&path, &options) {
+                    return Ok(id);
+                }
+                bail!("Existing download job does not match requested artifact");
             }
         }
+
+        let stale_path = downloaders
+            .remove(&id)
+            .and_then(|downloader| downloader.path);
+        if stale_path.as_ref() != path.as_ref() {
+            if let Some(p) = stale_path {
+                if p.exists() {
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        log::warn!(
+                            "Failed to remove stale download file {}: {}",
+                            p.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(path) = path.as_ref() {
+            prepare_download_path(path)?;
+        }
+
+        downloaders.insert(
+            id.clone(),
+            Downloader {
+                data: Vec::new(),
+                path: path.clone(),
+                total_size: Some(options.expected_size),
+                artifact_sha256: options.artifact_sha256,
+                downloaded_size: 0,
+                error: None,
+                tx_cancel: tx,
+                finished: false,
+            },
+        );
     }
 
     let id2 = id.clone();
@@ -167,6 +162,18 @@ pub fn download_file(
     );
 
     Ok(id)
+}
+
+fn prepare_download_path(path: &PathBuf) -> ResultType<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -344,6 +351,78 @@ pub fn remove(id: &str) {
 mod tests {
     use super::*;
 
+    fn insert_reusable_download(id: &str, path: PathBuf, options: &DownloadOptions) {
+        let (tx_cancel, _rx_cancel) = unbounded_channel();
+        DOWNLOADERS.lock().unwrap().insert(
+            id.to_owned(),
+            Downloader {
+                data: Vec::new(),
+                path: Some(path),
+                total_size: Some(options.expected_size),
+                artifact_sha256: options.artifact_sha256.clone(),
+                downloaded_size: 0,
+                error: None,
+                finished: false,
+                tx_cancel,
+            },
+        );
+    }
+
+    fn test_options(expected_size: u64, artifact_sha256: &str) -> DownloadOptions {
+        DownloadOptions {
+            auto_delete_after: None,
+            expected_size,
+            artifact_sha256: artifact_sha256.to_owned(),
+        }
+    }
+
+    #[test]
+    fn reuse_requires_matching_artifact_identity_and_path() {
+        const EXPECTED_SIZE: u64 = 8;
+        const EXPECTED_SHA256: &str =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        const OTHER_SHA256: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        let id = format!(
+            "download-identity-test-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        );
+        let path = PathBuf::from("download-identity-test.bin");
+        insert_reusable_download(
+            &id,
+            path.clone(),
+            &test_options(EXPECTED_SIZE, EXPECTED_SHA256),
+        );
+
+        let mismatched_size = download_file(
+            id.clone(),
+            Some(path.clone()),
+            test_options(EXPECTED_SIZE + 1, EXPECTED_SHA256),
+        );
+        let mismatched_path = download_file(
+            id.clone(),
+            Some(PathBuf::from("other-download-identity-test.bin")),
+            test_options(EXPECTED_SIZE, EXPECTED_SHA256),
+        );
+        let mismatched_sha256 = download_file(
+            id.clone(),
+            Some(path.clone()),
+            test_options(EXPECTED_SIZE, OTHER_SHA256),
+        );
+        let matching = download_file(
+            id.clone(),
+            Some(path),
+            test_options(EXPECTED_SIZE, EXPECTED_SHA256),
+        );
+        remove(&id);
+
+        assert!(mismatched_size.is_err());
+        assert!(mismatched_path.is_err());
+        assert!(mismatched_sha256.is_err());
+        assert_eq!(matching.unwrap(), id);
+    }
+
     #[test]
     fn completed_size_does_not_imply_download_finished() {
         let id = format!(
@@ -358,6 +437,7 @@ mod tests {
                 data: Vec::new(),
                 path: None,
                 total_size: Some(8),
+                artifact_sha256: String::new(),
                 downloaded_size: 8,
                 error: None,
                 finished: false,
