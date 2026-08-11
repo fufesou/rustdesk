@@ -241,9 +241,7 @@ async fn do_download(
         validate_download_size(id)?;
     }
 
-    if let Some(ref mut downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {
-        downloader.finished = true;
-    }
+    mark_download_finished(id, is_all_downloaded);
     if is_all_downloaded {
         let id_del = id.to_string();
         if let Some(dur) = auto_del_dur {
@@ -254,6 +252,15 @@ async fn do_download(
         }
     }
     Ok(is_all_downloaded)
+}
+
+fn mark_download_finished(id: &str, is_all_downloaded: bool) {
+    if !is_all_downloaded {
+        return;
+    }
+    if let Some(downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {
+        downloader.finished = true;
+    }
 }
 
 fn validate_download_size(id: &str) -> ResultType<()> {
@@ -357,10 +364,11 @@ mod tests {
                 tx_cancel,
             },
         );
+        mark_download_finished(&id, false);
 
-        let data = get_download_data(&id).unwrap();
-
+        let data = get_download_data(&id);
         remove(&id);
+        let data = data.unwrap();
         assert_eq!(data.downloaded_size, data.total_size.unwrap());
         assert!(!data.finished);
     }

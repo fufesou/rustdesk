@@ -3254,7 +3254,7 @@ pub mod server_side {
     }
 }
 
-#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3265,6 +3265,7 @@ mod tests {
         assert_eq!(result.0, "error:unsupported");
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn successful_manual_update_keeps_downloaded_file() {
         let update_file = std::env::temp_dir().join(format!(
@@ -3280,6 +3281,7 @@ mod tests {
         std::fs::remove_file(&update_file).unwrap();
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn failed_manual_update_removes_downloaded_file() {
         let update_file = std::env::temp_dir().join(format!(
