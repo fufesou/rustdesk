@@ -2086,7 +2086,7 @@ impl DmgGuard {
 
 impl Drop for DmgGuard {
     fn drop(&mut self) {
-        match Command::new("hdiutil")
+        match Command::new("/usr/bin/hdiutil")
             .args(["detach", self.0.as_str(), "-force"])
             .status()
         {
@@ -2103,9 +2103,13 @@ impl Drop for DmgGuard {
 fn attach_dmg_failure_message(
     dmg_path: &str,
     mount_point: &str,
-    status: impl std::fmt::Display,
+    output: &std::process::Output,
 ) -> String {
-    format!("Failed to attach DMG image at {dmg_path} to {mount_point}: {status}")
+    format!(
+        "Failed to attach DMG image at {dmg_path} to {mount_point}: {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Vec<String> {
@@ -2125,19 +2129,19 @@ fn hdiutil_attach_args(dmg_path: &str, mount_point: &str, read_only: bool) -> Ve
 fn attach_dmg(dmg_path: &str, read_only: bool) -> ResultType<DmgGuard> {
     let mount_point = create_dmg_mount_point()?;
     let args = hdiutil_attach_args(dmg_path, &mount_point, read_only);
-    let status = match Command::new("hdiutil")
+    let output = match Command::new("/usr/bin/hdiutil")
         .args(args.iter().map(String::as_str))
-        .status()
+        .output()
     {
-        Ok(status) => status,
+        Ok(output) => output,
         Err(e) => {
             remove_dmg_mount_point(&mount_point);
             return Err(e.into());
         }
     };
 
-    if !status.success() {
-        let message = attach_dmg_failure_message(dmg_path, &mount_point, status);
+    if !output.status.success() {
+        let message = attach_dmg_failure_message(dmg_path, &mount_point, &output);
         remove_dmg_mount_point(&mount_point);
         bail!("{}", message);
     }
@@ -2189,28 +2193,8 @@ fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType
 }
 
 fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_point = create_dmg_mount_point()?;
-    let status = Command::new("/usr/bin/hdiutil")
-        .args(["attach", "-nobrowse", "-mountpoint"])
-        .arg(&mount_point)
-        .arg(dmg_path)
-        .status()?;
-
-    if !status.success() {
-        let _ = std::fs::remove_dir(&mount_point);
-        bail!("Failed to attach DMG image at {}: {:?}", dmg_path, status);
-    }
-
-    struct DmgGuard(String);
-    impl Drop for DmgGuard {
-        fn drop(&mut self) {
-            let _ = Command::new("/usr/bin/hdiutil")
-                .args(["detach", self.0.as_str(), "-force"])
-                .status();
-            let _ = std::fs::remove_dir(&self.0);
-        }
-    }
-    let _guard = DmgGuard(mount_point.clone());
+    let guard = attach_dmg(dmg_path, true)?;
+    let mount_point = guard.mount_point();
 
     let app_name = format!("{}.app", crate::get_app_name());
     let src_path = format!("{}/{}", mount_point, app_name);
@@ -2349,6 +2333,21 @@ mod tests {
         }
 
         assert!(are_unique);
+    }
+
+    #[test]
+    fn test_attach_failure_reports_hdiutil_stderr() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"image is not recognized\n".to_vec(),
+        };
+
+        let message = attach_dmg_failure_message("update.dmg", "/tmp/mount", &output);
+
+        assert!(message.contains("image is not recognized"));
     }
 
     #[test]
