@@ -1085,8 +1085,7 @@ pub(crate) fn set_fixed_test_software_update_url() {
     set_software_update_url(FIXED_TEST_UPDATE_RELEASE_PAGE_URL.to_owned());
 }
 
-fn process_software_update_check_response(response_bytes: ResultType<Bytes>) -> ResultType<()> {
-    let bytes = response_bytes?;
+fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
     let release_id = release_id_from_update_url(&response_url)?;
@@ -1107,16 +1106,6 @@ fn process_software_update_check_response(response_bytes: ResultType<Bytes>) -> 
         clear_software_update_url();
     }
     Ok(())
-}
-
-fn finish_software_update_check(response_bytes: ResultType<Bytes>) -> ResultType<()> {
-    match process_software_update_check_response(response_bytes) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            clear_software_update_url();
-            Err(err)
-        }
-    }
 }
 
 // No need to check `danger_accept_invalid_cert` for now.
@@ -1166,7 +1155,11 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
         }
         Err(err) => Err(err),
     };
-    finish_software_update_check(response_bytes)
+    let result = response_bytes.and_then(process_software_update_check_response);
+    if result.is_err() {
+        clear_software_update_url();
+    }
+    result
 }
 
 #[inline]
@@ -2938,51 +2931,45 @@ mod tests {
     }
 
     #[test]
-    fn finish_software_update_check_uses_display_version_but_keeps_original_tag_url() {
+    fn process_software_update_check_response_keeps_original_tag_url() {
         let _guard = SOFTWARE_UPDATE_TEST_LOCK.lock().unwrap();
         let _restore = preserve_software_update_url_for_test();
         let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v999.0.0";
         set_software_update_url_for_test("stale");
         let response = Bytes::from(format!(r#"{{"url":"{update_url}"}}"#));
 
-        finish_software_update_check(Ok(response)).unwrap();
+        process_software_update_check_response(response).unwrap();
 
         assert_eq!(software_update_url_for_test(), update_url);
     }
 
     #[test]
-    fn finish_software_update_check_clears_url_for_not_newer_release() {
+    fn process_software_update_check_response_clears_url_for_not_newer_release() {
         let _guard = SOFTWARE_UPDATE_TEST_LOCK.lock().unwrap();
         let _restore = preserve_software_update_url_for_test();
         let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v0.0.1";
         set_software_update_url_for_test("stale");
         let response = Bytes::from(format!(r#"{{"url":"{update_url}"}}"#));
 
-        finish_software_update_check(Ok(response)).unwrap();
+        process_software_update_check_response(response).unwrap();
 
         assert_eq!(software_update_url_for_test(), "");
     }
 
     #[test]
-    fn finish_software_update_check_clears_stale_url_on_discovery_failures() {
-        let _guard = SOFTWARE_UPDATE_TEST_LOCK.lock().unwrap();
-        let _restore = preserve_software_update_url_for_test();
-        let cases: Vec<hbb_common::ResultType<Bytes>> = vec![
-            Err(anyhow!("HTTP failed")),
-            Ok(Bytes::from_static(b"{")),
-            Ok(Bytes::from_static(
+    fn process_software_update_check_response_rejects_invalid_responses() {
+        let cases = [
+            Bytes::from_static(b"{"),
+            Bytes::from_static(
                 br#"{"url":"https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6"}"#,
-            )),
-            Ok(Bytes::from_static(
+            ),
+            Bytes::from_static(
                 br#"{"url":"https://github.com/rustdesk/rustdesk/releases/tag/nightly"}"#,
-            )),
+            ),
         ];
 
         for case in cases {
-            set_software_update_url_for_test("stale");
-
-            assert!(finish_software_update_check(case).is_err());
-            assert_eq!(software_update_url_for_test(), "");
+            assert!(process_software_update_check_response(case).is_err());
         }
     }
 

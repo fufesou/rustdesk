@@ -16,7 +16,6 @@ use flutter_rust_bridge::{StreamSink, SyncReturn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::allow_err;
 use hbb_common::{
-    bail,
     config::{self, LocalConfig, PeerConfig, PeerInfoSerde},
     fs, lazy_static, log,
     rendezvous_proto::ConnType,
@@ -24,12 +23,11 @@ use hbb_common::{
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 pub type SessionID = uuid::Uuid;
@@ -2925,28 +2923,6 @@ fn push_update_me_error(error: String) {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn finish_manual_update(
-    update_file: &std::path::Path,
-    result: ResultType<()>,
-) -> ResultType<()> {
-    if result.is_err() {
-        crate::updater::remove_update_file(update_file);
-    }
-    result
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn resolve_update_install_path(download_file: Option<PathBuf>) -> ResultType<String> {
-    let Some(download_file) = download_file else {
-        bail!("Failed to resolve downloaded update file path");
-    };
-    let Some(download_file_str) = download_file.to_str() else {
-        bail!("Invalid UTF-8 path for downloaded update file");
-    };
-    Ok(download_file_str.to_owned())
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn verified_update_artifact_for_release_page_url(
     release_page_url: &str,
 ) -> ResultType<hbb_common::update_metadata::VerifiedUpdateArtifact> {
@@ -3002,7 +2978,6 @@ pub fn main_set_common(_key: String, _value: String) {
                     Ok(artifact) => {
                         if let Some(download_file) = get_download_file_from_url(&artifact.url) {
                             let options = crate::hbbs_http::downloader::DownloadOptions {
-                                auto_delete_after: Some(Duration::from_secs(3)),
                                 expected_size: artifact.size,
                                 artifact_sha256: artifact.sha256,
                             };
@@ -3043,36 +3018,38 @@ pub fn main_set_common(_key: String, _value: String) {
                     return;
                 }
             };
-            let new_version_file_str =
-                match resolve_update_install_path(get_download_file_from_url(&artifact.url)) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        let error = e.to_string();
-                        log::error!("{}", error);
-                        push_update_me_error(error);
-                        return;
-                    }
-                };
+            let Some(new_version_file) = get_download_file_from_url(&artifact.url) else {
+                let error = "Failed to resolve downloaded update file path".to_owned();
+                log::error!("{}", error);
+                push_update_me_error(error);
+                return;
+            };
+            let Some(new_version_file_str) = new_version_file.to_str() else {
+                let error = "Invalid UTF-8 path for downloaded update file".to_owned();
+                log::error!("{}", error);
+                push_update_me_error(error);
+                return;
+            };
             log::debug!(
                 "New version file is downloaded, update begin, {:?}",
                 new_version_file_str
             );
             #[cfg(target_os = "windows")]
             let update_res = crate::platform::update_to_verified(
-                &new_version_file_str,
+                new_version_file_str,
                 &artifact.sha256,
                 artifact.size,
             );
             #[cfg(target_os = "macos")]
             let update_res = crate::platform::macos::update_to_verified_dmg(
-                &new_version_file_str,
+                new_version_file_str,
                 &artifact.sha256,
                 Some(artifact.size),
             );
-            match finish_manual_update(
-                std::path::Path::new(&new_version_file_str),
-                update_res,
-            ) {
+            if update_res.is_err() {
+                crate::updater::remove_update_file(&new_version_file);
+            }
+            match update_res {
                 Ok(_) => log::info!("Update process is launched successfully!"),
                 Err(e) => {
                     let error = format!("Failed to update to new version, {}", e);
@@ -3115,8 +3092,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }
@@ -3263,40 +3239,5 @@ mod tests {
         let result = main_get_common_sync("verified-download-url-".to_owned());
 
         assert_eq!(result.0, "error:unsupported");
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    #[test]
-    fn successful_manual_update_keeps_downloaded_file() {
-        let update_file = std::env::temp_dir().join(format!(
-            "rustdesk-manual-update-keep-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        std::fs::write(&update_file, b"update").unwrap();
-
-        assert!(finish_manual_update(&update_file, Ok(())).is_ok());
-
-        assert!(update_file.exists());
-        std::fs::remove_file(&update_file).unwrap();
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    #[test]
-    fn failed_manual_update_removes_downloaded_file() {
-        let update_file = std::env::temp_dir().join(format!(
-            "rustdesk-manual-update-cleanup-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        std::fs::write(&update_file, b"update").unwrap();
-
-        let result = finish_manual_update(
-            &update_file,
-            Err(hbb_common::anyhow::anyhow!("update launch failed")),
-        );
-
-        assert!(result.is_err());
-        assert!(!update_file.exists());
     }
 }

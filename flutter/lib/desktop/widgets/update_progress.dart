@@ -7,8 +7,6 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import 'update_submission.dart';
-
 const _eventKeyUpdateMe = 'update-me';
 
 Future<void> _handleUpdateMe(
@@ -177,19 +175,20 @@ class UpdateProgressState extends State<UpdateProgress> {
     final msgBoxTitle = 'Error';
     final msgBoxText = 'download-new-version-failed-tip';
     final dialogManager = gFFI.dialogManager;
+    final releasePageUrl = widget.releasePageUrl;
 
     close() {
       dialogManager.dismissAll();
     }
 
     jumplink() {
-      launchUrl(Uri.parse(widget.releasePageUrl));
+      launchUrl(Uri.parse(releasePageUrl));
       dialogManager.dismissAll();
     }
 
     retry() {
       dialogManager.dismissAll();
-      handleUpdate(widget.releasePageUrl);
+      handleUpdate(releasePageUrl);
     }
 
     final List<Widget> buttons = [
@@ -263,6 +262,8 @@ class UpdateProgressState extends State<UpdateProgress> {
   }
 
   void updateMsgBox() {
+    final releasePageUrl = widget.releasePageUrl;
+    final downloadUrl = widget.downloadUrl;
     msgBox(
       gFFI.sessionId,
       'custom-nocancel',
@@ -272,19 +273,16 @@ class UpdateProgressState extends State<UpdateProgress> {
       gFFI.dialogManager,
       onSubmit: () async {
         debugPrint('Downloaded, update to new version now');
-        final releasePageUrl = widget.releasePageUrl;
         platformFFI.registerEventHandler(_eventKeyUpdateMe, _eventKeyUpdateMe,
             (evt) => _handleUpdateMe(releasePageUrl, evt),
             replace: true);
-        await observeUpdateSubmission(
-          submit: () =>
-              bind.mainSetCommon(key: 'update-me', value: widget.downloadUrl),
-          onFailure: (error) {
-            platformFFI.unregisterEventHandler(
-                _eventKeyUpdateMe, _eventKeyUpdateMe);
-            _showUpdateError(releasePageUrl, error.toString());
-          },
-        );
+        try {
+          await bind.mainSetCommon(key: 'update-me', value: downloadUrl);
+        } catch (error) {
+          platformFFI.unregisterEventHandler(
+              _eventKeyUpdateMe, _eventKeyUpdateMe);
+          _showUpdateError(releasePageUrl, error.toString());
+        }
       },
       submitTimeout: 5,
     );

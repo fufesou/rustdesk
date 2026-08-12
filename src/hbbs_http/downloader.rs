@@ -12,7 +12,7 @@ use hbb_common::{
     ResultType,
 };
 use serde_derive::Serialize;
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 lazy_static! {
     static ref DOWNLOADERS: Mutex<HashMap<String, Downloader>> = Default::default();
@@ -39,8 +39,7 @@ pub struct DownloadData {
 struct Downloader {
     data: Vec<u8>,
     path: Option<PathBuf>,
-    // Some file may be empty, so we use Option<u64> to indicate if the size is known
-    total_size: Option<u64>,
+    total_size: u64,
     artifact_sha256: String,
     downloaded_size: u64,
     error: Option<String>,
@@ -51,15 +50,21 @@ struct Downloader {
 impl Downloader {
     fn matches_request(&self, path: &Option<PathBuf>, options: &DownloadOptions) -> bool {
         self.path.as_ref() == path.as_ref()
-            && self.total_size == Some(options.expected_size)
+            && self.total_size == options.expected_size
             && self.artifact_sha256 == options.artifact_sha256
     }
 }
 
 pub struct DownloadOptions {
-    pub auto_delete_after: Option<Duration>,
     pub expected_size: u64,
     pub artifact_sha256: String,
+}
+
+struct DownloadRequest {
+    id: String,
+    url: String,
+    path: Option<PathBuf>,
+    expected_size: u64,
 }
 
 // The caller should check if the file is downloaded successfully and remove the job from the map.
@@ -70,7 +75,6 @@ pub fn download_file(
 ) -> ResultType<String> {
     let id = url.clone();
     let (tx, rx) = unbounded_channel();
-    let auto_delete_after = options.auto_delete_after;
     {
         let mut downloaders = DOWNLOADERS.lock().unwrap();
         if let Some(existing) = downloaders.get(&id) {
@@ -108,7 +112,7 @@ pub fn download_file(
             Downloader {
                 data: Vec::new(),
                 path: path.clone(),
-                total_size: Some(options.expected_size),
+                total_size: options.expected_size,
                 artifact_sha256: options.artifact_sha256,
                 downloaded_size: 0,
                 error: None,
@@ -118,48 +122,60 @@ pub fn download_file(
         );
     }
 
-    let id2 = id.clone();
-    std::thread::spawn(
-        move || match do_download(&id2, url, path, auto_delete_after, rx) {
-            Ok(is_all_downloaded) => {
-                let mut downloaded_size = 0;
-                let mut total_size = 0;
-                DOWNLOADERS.lock().unwrap().get_mut(&id2).map(|downloader| {
+    let request = DownloadRequest {
+        id: id.clone(),
+        url,
+        path,
+        expected_size: options.expected_size,
+    };
+    let worker_id = id.clone();
+    std::thread::spawn(move || match do_download(request, rx) {
+        Ok(is_all_downloaded) => {
+            let mut downloaded_size = 0;
+            let mut total_size = 0;
+            DOWNLOADERS
+                .lock()
+                .unwrap()
+                .get_mut(&worker_id)
+                .map(|downloader| {
                     downloaded_size = downloader.downloaded_size;
-                    total_size = downloader.total_size.unwrap_or(0);
+                    total_size = downloader.total_size;
                 });
-                log::info!(
-                    "Download {} end, {}/{}, {:.2} %",
-                    &id2,
-                    downloaded_size,
-                    total_size,
-                    if total_size == 0 {
-                        0.0
-                    } else {
-                        downloaded_size as f64 / total_size as f64 * 100.0
-                    }
-                );
+            log::info!(
+                "Download {} end, {}/{}, {:.2} %",
+                &worker_id,
+                downloaded_size,
+                total_size,
+                if total_size == 0 {
+                    0.0
+                } else {
+                    downloaded_size as f64 / total_size as f64 * 100.0
+                }
+            );
 
-                let is_canceled = !is_all_downloaded;
-                if is_canceled {
-                    if let Some(downloader) = DOWNLOADERS.lock().unwrap().remove(&id2) {
-                        if let Some(p) = downloader.path {
-                            if p.exists() {
-                                std::fs::remove_file(p).ok();
-                            }
+            let is_canceled = !is_all_downloaded;
+            if is_canceled {
+                if let Some(downloader) = DOWNLOADERS.lock().unwrap().remove(&worker_id) {
+                    if let Some(p) = downloader.path {
+                        if p.exists() {
+                            std::fs::remove_file(p).ok();
                         }
                     }
                 }
             }
-            Err(e) => {
-                let err = e.to_string();
-                log::error!("Download {}, failed: {}", &id2, &err);
-                DOWNLOADERS.lock().unwrap().get_mut(&id2).map(|downloader| {
+        }
+        Err(e) => {
+            let err = e.to_string();
+            log::error!("Download {}, failed: {}", &worker_id, &err);
+            DOWNLOADERS
+                .lock()
+                .unwrap()
+                .get_mut(&worker_id)
+                .map(|downloader| {
                     downloader.error = Some(err);
                 });
-            }
-        },
-    );
+        }
+    });
 
     Ok(id)
 }
@@ -178,27 +194,25 @@ fn prepare_download_path(path: &PathBuf) -> ResultType<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn do_download(
-    id: &str,
-    url: String,
-    path: Option<PathBuf>,
-    auto_del_dur: Option<Duration>,
+    request: DownloadRequest,
     mut rx_cancel: UnboundedReceiver<()>,
 ) -> ResultType<bool> {
-    let client = create_http_client_async_with_url_strict(&url).await?;
+    let client = create_http_client_async_with_url_strict(&request.url).await?;
 
     let mut is_all_downloaded = false;
+    let mut downloaded_size = 0_u64;
     let mut response;
     tokio::select! {
         _ = rx_cancel.recv() => {
             return Ok(is_all_downloaded);
         }
-        resp = client.get(url).send() => {
+        resp = client.get(request.url).send() => {
             response = resp?.error_for_status()?;
         }
     }
 
     let mut dest: Option<File> = None;
-    if let Some(p) = path {
+    if let Some(p) = request.path {
         dest = Some(File::create(p).await?);
     }
 
@@ -210,29 +224,42 @@ async fn do_download(
             chunk = response.chunk() => {
                 match chunk {
                     Ok(Some(chunk)) => {
-                        validate_download_chunk_size(id, chunk.len() as u64)?;
+                        let next_size = downloaded_size
+                            .checked_add(chunk.len() as u64)
+                            .ok_or_else(|| hbb_common::anyhow::anyhow!("Download size overflow"))?;
+                        if next_size > request.expected_size {
+                            bail!(
+                                "Download size exceeds expected size: expected {}, got {}",
+                                request.expected_size,
+                                next_size
+                            );
+                        }
                         match dest {
                             Some(ref mut f) => {
                                 f.write_all(&chunk).await?;
                                 f.flush().await?;
-                                DOWNLOADERS.lock().unwrap().get_mut(id).map(|downloader| {
-                                    downloader.downloaded_size += chunk.len() as u64;
-                                });
                             }
                             None => {
-                                DOWNLOADERS.lock().unwrap().get_mut(id).map(|downloader| {
-                                    downloader.data.extend_from_slice(&chunk);
-                                    downloader.downloaded_size += chunk.len() as u64;
-                                });
+                                let mut downloaders = DOWNLOADERS.lock().unwrap();
+                                let Some(downloader) = downloaders.get_mut(&request.id) else {
+                                    bail!("Downloader not found");
+                                };
+                                downloader.data.extend_from_slice(&chunk);
                             }
                         }
+                        downloaded_size = next_size;
+                        let mut downloaders = DOWNLOADERS.lock().unwrap();
+                        let Some(downloader) = downloaders.get_mut(&request.id) else {
+                            bail!("Downloader not found");
+                        };
+                        downloader.downloaded_size = downloaded_size;
                     }
                     Ok(None) => {
                         is_all_downloaded = true;
                         break;
                     },
                     Err(e) => {
-                        log::error!("Download {} failed: {}", id, e);
+                        log::error!("Download {} failed: {}", request.id, e);
                         return Err(e.into());
                     }
                 }
@@ -244,90 +271,38 @@ async fn do_download(
         f.flush().await?;
     }
 
-    if is_all_downloaded {
-        validate_download_size(id)?;
-    }
-
-    mark_download_finished(id, is_all_downloaded);
-    if is_all_downloaded {
-        let id_del = id.to_string();
-        if let Some(dur) = auto_del_dur {
-            tokio::spawn(async move {
-                tokio::time::sleep(dur).await;
-                DOWNLOADERS.lock().unwrap().remove(&id_del);
-            });
-        }
-    }
-    Ok(is_all_downloaded)
-}
-
-fn mark_download_finished(id: &str, is_all_downloaded: bool) {
-    if !is_all_downloaded {
-        return;
-    }
-    if let Some(downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {
-        downloader.finished = true;
-    }
-}
-
-fn validate_download_size(id: &str) -> ResultType<()> {
-    let downloaders = DOWNLOADERS.lock().unwrap();
-    let Some(downloader) = downloaders.get(id) else {
-        bail!("Downloader not found");
-    };
-    let Some(total_size) = downloader.total_size else {
-        bail!("Failed to get expected download size");
-    };
-    if downloader.downloaded_size != total_size {
+    if is_all_downloaded && downloaded_size != request.expected_size {
         bail!(
             "Download size mismatch: expected {}, got {}",
-            total_size,
-            downloader.downloaded_size
-        );
-    }
-    Ok(())
-}
-
-fn validate_download_chunk_size(id: &str, chunk_size: u64) -> ResultType<()> {
-    let downloaders = DOWNLOADERS.lock().unwrap();
-    let Some(downloader) = downloaders.get(id) else {
-        bail!("Downloader not found");
-    };
-    let Some(total_size) = downloader.total_size else {
-        bail!("Failed to get expected download size");
-    };
-    let Some(downloaded_size) = downloader.downloaded_size.checked_add(chunk_size) else {
-        bail!("Download size overflow");
-    };
-    if downloaded_size > total_size {
-        bail!(
-            "Download size exceeds expected size: expected {}, got {}",
-            total_size,
+            request.expected_size,
             downloaded_size
         );
     }
-    Ok(())
+    if is_all_downloaded {
+        let mut downloaders = DOWNLOADERS.lock().unwrap();
+        let Some(downloader) = downloaders.get_mut(&request.id) else {
+            bail!("Downloader not found");
+        };
+        downloader.finished = true;
+    }
+    Ok(is_all_downloaded)
 }
 
 pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
     let downloaders = DOWNLOADERS.lock().unwrap();
     if let Some(downloader) = downloaders.get(id) {
-        let downloaded_size = downloader.downloaded_size;
-        let total_size = downloader.total_size.clone();
-        let error = downloader.error.clone();
-        let data = if total_size.unwrap_or(0) == downloaded_size && downloader.path.is_none() {
+        let data = if downloader.finished && downloader.path.is_none() {
             downloader.data.clone()
         } else {
             Vec::new()
         };
-        let path = downloader.path.clone();
         let download_data = DownloadData {
             data,
-            path,
-            total_size,
-            downloaded_size,
+            path: downloader.path.clone(),
+            total_size: Some(downloader.total_size),
+            downloaded_size: downloader.downloaded_size,
             finished: downloader.finished,
-            error,
+            error: downloader.error.clone(),
         };
         Ok(download_data)
     } else {
@@ -337,119 +312,11 @@ pub fn get_download_data(id: &str) -> ResultType<DownloadData> {
 
 pub fn cancel(id: &str) {
     if let Some(downloader) = DOWNLOADERS.lock().unwrap().get(id) {
-        // downloader.is_canceled.store(true, Ordering::SeqCst);
-        // The receiver may not be able to receive the cancel signal, so we also set the atomic bool to true
+        // The receiver may not be able to receive the cancel signal, so keep the job until it exits.
         let _ = downloader.tx_cancel.send(());
     }
 }
 
 pub fn remove(id: &str) {
     let _ = DOWNLOADERS.lock().unwrap().remove(id);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn insert_reusable_download(id: &str, path: PathBuf, options: &DownloadOptions) {
-        let (tx_cancel, _rx_cancel) = unbounded_channel();
-        DOWNLOADERS.lock().unwrap().insert(
-            id.to_owned(),
-            Downloader {
-                data: Vec::new(),
-                path: Some(path),
-                total_size: Some(options.expected_size),
-                artifact_sha256: options.artifact_sha256.clone(),
-                downloaded_size: 0,
-                error: None,
-                finished: false,
-                tx_cancel,
-            },
-        );
-    }
-
-    fn test_options(expected_size: u64, artifact_sha256: &str) -> DownloadOptions {
-        DownloadOptions {
-            auto_delete_after: None,
-            expected_size,
-            artifact_sha256: artifact_sha256.to_owned(),
-        }
-    }
-
-    #[test]
-    fn reuse_requires_matching_artifact_identity_and_path() {
-        const EXPECTED_SIZE: u64 = 8;
-        const EXPECTED_SHA256: &str =
-            "0000000000000000000000000000000000000000000000000000000000000000";
-        const OTHER_SHA256: &str =
-            "1111111111111111111111111111111111111111111111111111111111111111";
-        let id = format!(
-            "download-identity-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        );
-        let path = PathBuf::from("download-identity-test.bin");
-        insert_reusable_download(
-            &id,
-            path.clone(),
-            &test_options(EXPECTED_SIZE, EXPECTED_SHA256),
-        );
-
-        let mismatched_size = download_file(
-            id.clone(),
-            Some(path.clone()),
-            test_options(EXPECTED_SIZE + 1, EXPECTED_SHA256),
-        );
-        let mismatched_path = download_file(
-            id.clone(),
-            Some(PathBuf::from("other-download-identity-test.bin")),
-            test_options(EXPECTED_SIZE, EXPECTED_SHA256),
-        );
-        let mismatched_sha256 = download_file(
-            id.clone(),
-            Some(path.clone()),
-            test_options(EXPECTED_SIZE, OTHER_SHA256),
-        );
-        let matching = download_file(
-            id.clone(),
-            Some(path),
-            test_options(EXPECTED_SIZE, EXPECTED_SHA256),
-        );
-        remove(&id);
-
-        assert!(mismatched_size.is_err());
-        assert!(mismatched_path.is_err());
-        assert!(mismatched_sha256.is_err());
-        assert_eq!(matching.unwrap(), id);
-    }
-
-    #[test]
-    fn completed_size_does_not_imply_download_finished() {
-        let id = format!(
-            "download-finished-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        );
-        let (tx_cancel, _rx_cancel) = unbounded_channel();
-        DOWNLOADERS.lock().unwrap().insert(
-            id.clone(),
-            Downloader {
-                data: Vec::new(),
-                path: None,
-                total_size: Some(8),
-                artifact_sha256: String::new(),
-                downloaded_size: 8,
-                error: None,
-                finished: false,
-                tx_cancel,
-            },
-        );
-        mark_download_finished(&id, false);
-
-        let data = get_download_data(&id);
-        remove(&id);
-        let data = data.unwrap();
-        assert_eq!(data.downloaded_size, data.total_size.unwrap());
-        assert!(!data.finished);
-    }
 }

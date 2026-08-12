@@ -6,310 +6,263 @@ import hashlib
 import json
 import os
 import re
-import sys
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
 APP_NAME = "rustdesk"
 SCHEMA_VERSION = 1
 SIGNATURE_ALGORITHM = "ed25519"
 SIGNATURE_CONTEXT = b"RustDesk update metadata v1\n"
-GITHUB_REPOSITORY = tuple(os.environ.get("RUSTDESK_UPDATE_GITHUB_REPOSITORY", "rustdesk/rustdesk").split("/"))
-GITHUB_RELEASE_PREFIX = f"https://github.com/{'/'.join(GITHUB_REPOSITORY)}/releases/download"
+KEY_ID = "2026-ed25519-main"
+SEED_ENV = "RUSTDESK_UPDATE_ED25519_SEED"
+PUBLIC_KEY_ENV = "RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"
+GITHUB_REPOSITORY_ENV = "RUSTDESK_UPDATE_GITHUB_REPOSITORY"
+DEFAULT_GITHUB_REPOSITORY = "rustdesk/rustdesk"
+GITHUB_REPOSITORY = os.environ.get(GITHUB_REPOSITORY_ENV, DEFAULT_GITHUB_REPOSITORY)
+RFC3339_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
 def fail(message):
     raise SystemExit(message)
-def read_json(path):
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-def write_stable_json(path, value):
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    output_path.write_bytes(raw)
-    return raw
+
+
+def github_release_prefix():
+    parts = GITHUB_REPOSITORY.split("/")
+    if (
+        len(parts) != 2
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+    ):
+        fail(f"invalid GitHub repository in {GITHUB_REPOSITORY_ENV}")
+    return f"https://github.com/{GITHUB_REPOSITORY}/releases/download"
+
+
+def stable_json(value):
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def write_bytes(path, data):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
+
+
 def sha256_hex(path):
     hasher = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
-def validate_release_id(release_id):
-    if not release_id:
-        fail("release id must not be empty")
-    if not release_id.isascii():
-        fail(f"release id must be ASCII: {release_id}")
-    if release_id in {".", ".."}:
+
+
+def decode_env(name, expected_size):
+    encoded = os.environ.get(name)
+    if not encoded:
+        fail(f"missing environment variable: {name}")
+    try:
+        value = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        fail(f"invalid base64 in {name}: {error}")
+    if len(value) != expected_size:
+        fail(f"{name} must decode to {expected_size} bytes")
+    return value
+
+
+def validate_release(release_id, version):
+    if (
+        not release_id
+        or not release_id.isascii()
+        or release_id in {".", ".."}
+        or any(char in release_id for char in (" ", "/", "\\", "?", "#"))
+        or unquote(release_id) != release_id
+    ):
         fail(f"invalid release id: {release_id}")
-    if any(char in release_id for char in (" ", "/", "\\", "?", "#")):
-        fail(f"invalid release id: {release_id}")
-    if unquote(release_id) != release_id:
-        fail(f"release id must not require URL decoding: {release_id}")
-def display_version_from_release_id(release_id):
     match = re.fullmatch(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)", release_id)
     if not match:
-        return None
-    version_segments = [int(part) for part in match.groups()]
-    if any(segment > 65535 for segment in version_segments):
-        fail(f"release id has out-of-range display version: {release_id}")
-    if all(segment == 0 for segment in version_segments):
-        fail(f"release id has invalid display version: {release_id}")
-    return ".".join(match.groups())
-def validate_release_version(release_id, version, print_skip=False):
-    validate_release_id(release_id)
-    display_version = display_version_from_release_id(release_id)
-    if display_version is None:
-        if print_skip:
-            print(f"release id is not a stable version tag, skip display version check: {release_id}")
         return
+    segments = [int(part) for part in match.groups()]
+    if any(part > 65535 for part in segments) or not any(segments):
+        fail(f"invalid release version: {release_id}")
+    display_version = ".".join(match.groups())
     if display_version != version:
         fail(f"release id {release_id} maps to {display_version}, not {version}")
-def parse_artifact_url(url):
-    parsed = urlsplit(url)
-    if parsed.scheme != "https" or parsed.netloc != "github.com":
-        fail(f"artifact URL must use GitHub HTTPS: {url}")
-    if parsed.query or parsed.fragment:
-        fail(f"artifact URL must not contain query or fragment: {url}")
-    parts = parsed.path.split("/")
-    if (
-        len(parts) != 7
-        or not re.fullmatch(r"[^/\\ ?#%]+/[^/\\ ?#%]+", "/".join(GITHUB_REPOSITORY))
-        or parts[0] != ""
-        or tuple(parts[1:3]) != GITHUB_REPOSITORY
-        or parts[3:5] != ["releases", "download"]
-        or not parts[5]
-        or not parts[6]
-    ):
-        fail(f"artifact URL must be a RustDesk release asset URL: {url}")
-    release_id = parts[5]
-    file_name = parts[6]
-    validate_release_id(release_id)
-    if file_name in {".", ".."} or any(char in file_name for char in ("/", "\\")):
-        fail(f"invalid artifact URL file name: {url}")
-    if unquote(file_name) != file_name:
-        fail(f"artifact URL file name must not require URL decoding: {url}")
-    return release_id, file_name
-def expected_artifact_url(release_id, file_name):
-    return f"{GITHUB_RELEASE_PREFIX}/{release_id}/{file_name}"
-def load_seed_from_env(env_name):
-    encoded = os.environ.get(env_name)
-    if not encoded:
-        fail(f"missing private key seed environment variable: {env_name}")
+
+
+def validate_published_at(value):
+    if not RFC3339_TIMESTAMP.fullmatch(value):
+        fail("published_at must be an RFC 3339 timestamp")
+    normalized = value[:-1] + "+00:00" if value[-1] in "Zz" else value
     try:
-        seed = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as error:
-        fail(f"invalid private key seed base64 in {env_name}: {error}")
-    if len(seed) != 32:
-        fail(f"private key seed in {env_name} must decode to 32 bytes")
-    return seed
-def load_public_key(encoded):
-    try:
-        key_bytes = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as error:
-        fail(f"invalid trusted public key base64: {error}")
-    if len(key_bytes) != 32:
-        fail("trusted public key must decode to 32 bytes")
-    return ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
-def decode_signature(encoded):
-    try:
-        signature = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as error:
-        fail(f"invalid metadata signature base64: {error}")
-    if len(signature) != 64:
-        fail("metadata signature must decode to 64 bytes")
-    if base64.b64encode(signature).decode("ascii") != encoded:
-        fail("metadata signature must use standard base64 with padding")
-    return signature
-def artifact_selector(artifact):
-    return (
-        artifact.get("platform"),
-        artifact.get("arch"),
-        artifact.get("format"),
-    )
-def validate_fragment(fragment):
-    required = ["platform", "arch", "format", "url", "file_name", "size", "sha256"]
-    unknown_fields = set(fragment) - set(required)
-    if unknown_fields:
-        fail(f"unknown fragment fields: {', '.join(sorted(unknown_fields))}")
-    for key in required:
-        if key not in fragment:
-            fail(f"fragment missing field: {key}")
-        if key in {"platform", "arch", "format", "url", "file_name", "sha256"} and not isinstance(fragment[key], str):
-            fail(f"fragment {key} must be a string")
-    for key in ("platform", "arch", "format"):
-        if not fragment[key].strip():
-            fail(f"fragment {key} must not be empty")
-    if isinstance(fragment["size"], bool) or not isinstance(fragment["size"], int) or fragment["size"] < 0:
-        fail("fragment size must be a non-negative integer")
-    if not re.fullmatch(r"[0-9a-f]{64}", fragment["sha256"]):
-        fail("fragment sha256 must be 64 lowercase hex characters")
-def validate_fragment_url(fragment):
-    release_id, file_name = parse_artifact_url(fragment["url"])
-    if fragment["file_name"] != file_name:
-        fail("fragment URL basename does not match file_name")
-    return release_id
-def command_fragment(args):
-    artifact_path = Path(args.artifact)
-    _, url_file_name = parse_artifact_url(args.artifact_url)
-    if artifact_path.name != url_file_name:
-        fail("artifact URL basename must match artifact file name")
-    fragment = {
-        "platform": args.platform,
-        "arch": args.arch,
-        "format": args.format,
-        "url": args.artifact_url,
-        "file_name": artifact_path.name,
-        "size": artifact_path.stat().st_size,
-        "sha256": sha256_hex(artifact_path),
+        datetime.fromisoformat(normalized)
+    except ValueError:
+        fail("published_at must be an RFC 3339 timestamp")
+
+
+def artifact_metadata(spec, release_id):
+    platform, arch, file_format, raw_path = spec
+    if not all(value.strip() for value in (platform, arch, file_format)):
+        fail("artifact selector fields must not be empty")
+    path = Path(raw_path)
+    file_name = path.name
+    if not file_name or file_name in {".", ".."} or "\\" in file_name:
+        fail(f"invalid artifact file name: {file_name}")
+    return {
+        "platform": platform,
+        "arch": arch,
+        "format": file_format,
+        "url": f"{github_release_prefix()}/{release_id}/{file_name}",
+        "file_name": file_name,
+        "size": path.stat().st_size,
+        "sha256": sha256_hex(path),
     }
-    write_stable_json(args.fragment_out, fragment)
+
+
 def command_sign(args):
     metadata_out = Path(args.metadata_out).resolve()
     signature_out = Path(args.signature_out).resolve()
     if metadata_out == signature_out:
-        fail("--metadata-out and --signature-out must be different files")
-    validate_release_version(args.release_id, args.version)
-    artifacts = [read_json(path) for path in args.fragment]
-    seen_selectors, seen_file_names = set(), set()
-    for artifact in artifacts:
-        validate_fragment(artifact)
-        if (fragment_release_id := validate_fragment_url(artifact)) != args.release_id:
-            fail(f"fragment release id {fragment_release_id} does not match " f"--release-id {args.release_id}")
-        selector = artifact_selector(artifact)
-        if selector in seen_selectors:
-            fail(f"duplicate artifact selector: {selector}")
-        if artifact["file_name"] in seen_file_names:
-            fail("duplicate metadata artifact file_name")
-        seen_selectors.add(selector)
-        seen_file_names.add(artifact["file_name"])
-    artifacts.sort(key=artifact_selector)
+        fail("metadata and signature outputs must be different files")
+    validate_release(args.release_id, args.version)
+    validate_published_at(args.published_at)
+    artifacts = [artifact_metadata(spec, args.release_id) for spec in args.artifact]
+    selectors = [(item["platform"], item["arch"], item["format"]) for item in artifacts]
+    names = [item["file_name"] for item in artifacts]
+    if len(set(selectors)) != len(selectors):
+        fail("duplicate artifact selector")
+    if len(set(names)) != len(names):
+        fail("duplicate artifact file name")
+    artifacts.sort(key=lambda item: (item["platform"], item["arch"], item["format"]))
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "app": APP_NAME,
-        "package_id": args.package_id,
+        "package_id": APP_NAME,
         "version": args.version,
         "release_id": args.release_id,
         "published_at": args.published_at,
-        "signature_key_id": args.key_id,
+        "signature_key_id": KEY_ID,
         "artifacts": artifacts,
     }
-    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(load_seed_from_env(args.private_key_seed_env))
-    metadata_bytes = write_stable_json(metadata_out, metadata)
-    signature = private_key.sign(SIGNATURE_CONTEXT + metadata_bytes)
-    signature_json = {
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(decode_env(SEED_ENV, 32))
+    metadata_bytes = stable_json(metadata)
+    signature = {
         "schema_version": SCHEMA_VERSION,
         "algorithm": SIGNATURE_ALGORITHM,
-        "key_id": args.key_id,
-        "signature": base64.b64encode(signature).decode("ascii"),
+        "key_id": KEY_ID,
+        "signature": base64.b64encode(
+            private_key.sign(SIGNATURE_CONTEXT + metadata_bytes)
+        ).decode("ascii"),
     }
-    write_stable_json(signature_out, signature_json)
-def validate_metadata_and_signature(metadata, signature, args):
-    if signature.get("schema_version") != SCHEMA_VERSION:
-        fail("unsupported signature schema version")
-    if signature.get("algorithm") != SIGNATURE_ALGORITHM:
-        fail("unsupported signature algorithm")
-    if signature.get("key_id") != args.trusted_public_key_id:
-        fail("signature key id mismatch")
-    if metadata.get("schema_version") != SCHEMA_VERSION:
-        fail("unsupported metadata schema version")
-    if metadata.get("app") != APP_NAME:
-        fail("metadata app mismatch")
-    if metadata.get("package_id") != args.package_id:
-        fail("metadata package id mismatch")
-    if metadata.get("version") != args.version:
-        fail("metadata version mismatch")
-    if metadata.get("release_id") != args.release_id:
-        fail("metadata release id mismatch")
-    if metadata.get("signature_key_id") != signature.get("key_id"):
-        fail("metadata signature key id mismatch")
+    write_bytes(metadata_out, metadata_bytes)
+    write_bytes(signature_out, stable_json(signature))
+
+
 def command_verify(args):
     metadata_bytes = Path(args.metadata).read_bytes()
-    metadata = json.loads(metadata_bytes.decode("utf-8"))
-    signature_json = read_json(args.signature)
-    validate_metadata_and_signature(metadata, signature_json, args)
-    public_key = load_public_key(args.trusted_public_key_base64)
+    metadata = json.loads(metadata_bytes)
+    signature = json.loads(Path(args.signature).read_bytes())
+    if (
+        signature.get("schema_version") != SCHEMA_VERSION
+        or signature.get("algorithm") != SIGNATURE_ALGORITHM
+        or signature.get("key_id") != KEY_ID
+    ):
+        fail("invalid signature metadata")
+    public_key = ed25519.Ed25519PublicKey.from_public_bytes(decode_env(PUBLIC_KEY_ENV, 32))
     try:
-        public_key.verify(decode_signature(signature_json["signature"]), SIGNATURE_CONTEXT + metadata_bytes)
-    except InvalidSignature:
+        public_key.verify(
+            base64.b64decode(signature["signature"], validate=True),
+            SIGNATURE_CONTEXT + metadata_bytes,
+        )
+    except (InvalidSignature, ValueError, binascii.Error):
         fail("invalid metadata signature")
-    if not isinstance(artifacts := metadata.get("artifacts"), list) or not artifacts:
+    expected_fields = {
+        "schema_version": SCHEMA_VERSION,
+        "app": APP_NAME,
+        "package_id": APP_NAME,
+        "version": args.version,
+        "release_id": args.release_id,
+        "signature_key_id": KEY_ID,
+    }
+    if any(metadata.get(key) != value for key, value in expected_fields.items()):
+        fail("metadata does not match the release")
+    validate_release(args.release_id, args.version)
+    validate_published_at(metadata.get("published_at", ""))
+    local_paths = [Path(path) for path in args.artifact]
+    local_artifacts = {path.name: path for path in local_paths}
+    if len(local_artifacts) != len(local_paths):
+        fail("duplicate local artifact file name")
+    artifacts = metadata.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
         fail("metadata must contain artifacts")
-    local_artifacts = {Path(path).name: Path(path) for path in args.artifact}
-    if len(local_artifacts) != len(args.artifact):
-        fail("duplicate local artifact basename")
-    metadata_names, seen_selectors = {artifact.get("file_name") for artifact in artifacts}, set()
-    if len(metadata_names) != len(artifacts):
-        fail("duplicate metadata artifact file_name")
-    if metadata_names != set(local_artifacts):
-        fail("local artifact set does not match metadata artifact set")
+    names = [artifact.get("file_name") for artifact in artifacts]
+    selectors = [
+        (artifact.get("platform"), artifact.get("arch"), artifact.get("format"))
+        for artifact in artifacts
+    ]
+    if len(set(names)) != len(names) or set(names) != set(local_artifacts):
+        fail("artifact file set mismatch")
+    if len(set(selectors)) != len(selectors):
+        fail("duplicate artifact selector")
     for artifact in artifacts:
-        validate_fragment(artifact)
-        if (selector := artifact_selector(artifact)) in seen_selectors:
-            fail(f"duplicate artifact selector: {selector}")
-        seen_selectors.add(selector)
-        validate_fragment_url(artifact)
         file_name = artifact["file_name"]
-        expected_url = expected_artifact_url(args.release_id, file_name)
-        if artifact["url"] != expected_url:
+        if artifact["url"] != f"{github_release_prefix()}/{args.release_id}/{file_name}":
             fail(f"artifact URL mismatch for {file_name}")
-        local_path = local_artifacts[file_name]
-        if local_path.stat().st_size != artifact["size"]:
+        path = local_artifacts[file_name]
+        if path.stat().st_size != artifact["size"]:
             fail(f"artifact size mismatch for {file_name}")
-        if sha256_hex(local_path) != artifact["sha256"]:
+        if sha256_hex(path) != artifact["sha256"]:
             fail(f"artifact sha256 mismatch for {file_name}")
-def command_check_version(args):
-    validate_release_version(args.release_id, args.version, print_skip=True)
+
+
+def command_check_key(args):
+    source = Path(args.rust_source).read_text(encoding="utf-8")
+    match = re.search(
+        rf'TrustedUpdateKey\s*\{{[^{{}}]*key_id:\s*"{KEY_ID}"[^{{}}]*public_key:\s*\[([^\]]+)\]',
+        source,
+        re.S,
+    )
+    if not match:
+        fail("failed to find embedded update public key")
+    embedded_key = bytes(int(part) for part in match.group(1).split(",") if part.strip())
+    if embedded_key != decode_env(PUBLIC_KEY_ENV, 32):
+        fail(f"embedded update public key does not match {PUBLIC_KEY_ENV}")
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description="Generate and verify RustDesk update metadata")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    fragment = subparsers.add_parser("fragment", help="Generate one artifact metadata fragment")
-    fragment.add_argument("--artifact", required=True)
-    fragment.add_argument("--artifact-url", required=True)
-    fragment.add_argument("--platform", required=True)
-    fragment.add_argument("--arch", required=True)
-    fragment.add_argument("--format", required=True)
-    fragment.add_argument("--fragment-out", required=True)
-    fragment.set_defaults(func=command_fragment)
-    sign = subparsers.add_parser("sign", help="Sign release metadata")
-    sign.add_argument("--fragment", action="append", required=True)
-    sign.add_argument("--package-id", required=True)
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    sign = commands.add_parser("sign")
+    sign.add_argument("--artifact", action="append", nargs=4, required=True)
     sign.add_argument("--version", required=True)
     sign.add_argument("--release-id", required=True)
     sign.add_argument("--published-at", required=True)
-    sign.add_argument("--key-id", required=True)
-    sign.add_argument("--private-key-seed-env", required=True)
     sign.add_argument("--metadata-out", required=True)
     sign.add_argument("--signature-out", required=True)
     sign.set_defaults(func=command_sign)
-    verify = subparsers.add_parser("verify", help="Verify release metadata and artifacts")
+    verify = commands.add_parser("verify")
     verify.add_argument("--metadata", required=True)
     verify.add_argument("--signature", required=True)
-    verify.add_argument("--artifact", action="append", default=[])
-    verify.add_argument("--package-id", required=True)
+    verify.add_argument("--artifact", action="append", required=True)
     verify.add_argument("--version", required=True)
     verify.add_argument("--release-id", required=True)
-    verify.add_argument("--trusted-public-key-base64", required=True)
-    verify.add_argument("--trusted-public-key-id", required=True)
     verify.set_defaults(func=command_verify)
-    check_version = subparsers.add_parser("check-version", help="Validate tag/version consistency")
-    check_version.add_argument("--version", required=True)
-    check_version.add_argument("--release-id", required=True)
-    check_version.set_defaults(func=command_check_version)
+    check_key = commands.add_parser("check-key")
+    check_key.add_argument(
+        "--rust-source", default="libs/hbb_common/src/update_metadata.rs"
+    )
+    check_key.set_defaults(func=command_check_key)
     return parser
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+
+
+def main():
+    args = build_parser().parse_args()
     args.func(args)
+
+
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as error:
-        print(str(error), file=sys.stderr)
-        raise SystemExit(1)
+    main()

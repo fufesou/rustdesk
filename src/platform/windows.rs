@@ -3810,25 +3810,23 @@ fn schedule_file_removal_on_reboot(path: &Path) -> ResultType<()> {
     Ok(())
 }
 
-fn schedule_verified_update_file_cleanup_with<F>(path: &Path, schedule: F) -> ResultType<()>
-where
-    F: FnOnce(&Path) -> ResultType<()>,
-{
+fn should_schedule_verified_update_cleanup(path: &Path, temp_dir: &Path) -> bool {
     let is_verified_exe = path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name.starts_with(VERIFIED_UPDATE_FILE_PREFIX) && name.ends_with(".exe")
         });
-    if !is_verified_exe {
-        return Ok(());
-    }
-    schedule(path)
+    let is_in_temp_dir = path.parent().is_some_and(|parent| parent == temp_dir);
+    is_verified_exe && is_in_temp_dir
 }
 
 pub fn schedule_current_verified_update_file_cleanup() -> ResultType<()> {
     let current_exe = std::env::current_exe()?;
-    schedule_verified_update_file_cleanup_with(&current_exe, schedule_file_removal_on_reboot)
+    if should_schedule_verified_update_cleanup(&current_exe, &std::env::temp_dir()) {
+        schedule_file_removal_on_reboot(&current_exe)?;
+    }
+    Ok(())
 }
 
 fn remove_verified_update_file(path: &Path) {
@@ -5116,24 +5114,19 @@ mod tests {
     }
 
     #[test]
-    fn schedules_cleanup_for_verified_exe_only() {
-        let verified_exe = Path::new(r"C:\Temp\rustdesk-verified-1-2.exe");
-        let mut scheduled_path = None;
-        schedule_verified_update_file_cleanup_with(verified_exe, |path| {
-            scheduled_path = Some(path.to_owned());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(scheduled_path.as_deref(), Some(verified_exe));
+    fn schedules_cleanup_for_verified_exe_in_temp_dir_only() {
+        let temp_dir = Path::new(r"C:\Temp");
 
+        assert!(should_schedule_verified_update_cleanup(
+            Path::new(r"C:\Temp\rustdesk-verified-1-2.exe"),
+            temp_dir,
+        ));
         for path in [
+            Path::new(r"C:\Other\rustdesk-verified-1-2.exe"),
             Path::new(r"C:\Temp\rustdesk.exe"),
             Path::new(r"C:\Temp\rustdesk-verified-1-2.msi"),
         ] {
-            schedule_verified_update_file_cleanup_with(path, |_| {
-                panic!("unexpected cleanup request")
-            })
-            .unwrap();
+            assert!(!should_schedule_verified_update_cleanup(path, temp_dir));
         }
     }
 

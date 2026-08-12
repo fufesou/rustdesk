@@ -256,22 +256,13 @@ jobs:
             echo "Update metadata signing configuration is missing" >&2
             exit 1
           fi
-          python - <<'PY'
-          import base64, os, re
-          from pathlib import Path
-          source = Path("libs/hbb_common/src/update_metadata.rs").read_text(encoding="utf-8")
-          match = re.search(r'key_id:\s*"2026-ed25519-main".*?public_key:\s*\[([^\]]+)\]', source, re.S)
-          if match is None:
-              raise SystemExit("Embedded update public key is missing")
-          embedded = bytes(int(value.strip()) for value in match.group(1).replace("\n", " ").split(",") if value.strip())
-          configured = base64.b64decode(os.environ["RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"], validate=True)
-          if embedded != configured:
-              raise SystemExit("Embedded and configured update public keys differ")
-          PY
-          mkdir fragments
+          python res/generate_update_metadata.py check-key
+          sign_args=()
+          artifact_args=()
           while read -r platform arch format file; do
             test -f "artifacts/$file"
-            python res/generate_update_metadata.py fragment --artifact "artifacts/$file" --artifact-url "https://github.com/${TARGET_REPOSITORY}/releases/download/${RELEASE_ID}/${file}" --platform "$platform" --arch "$arch" --format "$format" --fragment-out "fragments/${platform}-${arch}-${format}.json"
+            sign_args+=(--artifact "$platform" "$arch" "$format" "artifacts/$file")
+            artifact_args+=(--artifact "artifacts/$file")
           done <<EOF
           windows x86_64 exe rustdesk-${VERSION}-x86_64.exe
           windows x86_64 msi rustdesk-${VERSION}-x86_64.msi
@@ -281,13 +272,9 @@ jobs:
           macos aarch64 dmg rustdesk-${VERSION}-aarch64.dmg
           macos x86_64 dmg rustdesk-${VERSION}-x86_64.dmg
           EOF
-          fragment_args=()
-          artifact_args=()
-          for path in fragments/*.json; do fragment_args+=(--fragment "$path"); done
-          for path in artifacts/*; do artifact_args+=(--artifact "$path"); done
           published_at=$(gh release view "$RELEASE_ID" --repo "$TARGET_REPOSITORY" --json publishedAt --jq .publishedAt)
-          python res/generate_update_metadata.py sign "${fragment_args[@]}" --package-id rustdesk --version "$VERSION" --release-id "$RELEASE_ID" --published-at "$published_at" --key-id 2026-ed25519-main --private-key-seed-env RUSTDESK_UPDATE_ED25519_SEED --metadata-out rustdesk-update.json --signature-out rustdesk-update.json.sig
-          python res/generate_update_metadata.py verify --metadata rustdesk-update.json --signature rustdesk-update.json.sig "${artifact_args[@]}" --package-id rustdesk --version "$VERSION" --release-id "$RELEASE_ID" --trusted-public-key-base64 "$RUSTDESK_UPDATE_ED25519_PUBLIC_KEY" --trusted-public-key-id 2026-ed25519-main
+          python res/generate_update_metadata.py sign "${sign_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID" --published-at "$published_at" --metadata-out rustdesk-update.json --signature-out rustdesk-update.json.sig
+          python res/generate_update_metadata.py verify --metadata rustdesk-update.json --signature rustdesk-update.json.sig "${artifact_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID"
       - name: Publish ARM64 packages before metadata
         env:
           GH_TOKEN: ${{ github.token }}

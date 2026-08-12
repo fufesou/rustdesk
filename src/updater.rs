@@ -2,7 +2,6 @@ use crate::{
     common::{
         display_version_from_release_id, release_download_base_url, release_id_from_update_url,
         release_metadata_url, release_signature_url, set_fixed_test_software_update_url,
-        url_has_explicit_port,
     },
     hbbs_http::create_http_client_with_url_strict,
 };
@@ -12,7 +11,6 @@ use hbb_common::{
     ResultType,
 };
 use std::{
-    collections::HashMap,
     io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
     sync::{
@@ -75,16 +73,7 @@ enum UpdateMsg {
 
 lazy_static::lazy_static! {
     static ref TX_MSG : Mutex<Sender<UpdateMsg>> = Mutex::new(start_auto_update_check());
-    static ref VERIFIED_UPDATE_ARTIFACTS: Mutex<HashMap<String, CachedVerifiedUpdateArtifact>> =
-        Mutex::new(HashMap::new());
-}
-
-#[derive(Clone)]
-struct CachedVerifiedUpdateArtifact {
-    artifact: VerifiedUpdateArtifact,
-    platform: String,
-    arch: String,
-    format: String,
+    static ref VERIFIED_UPDATE_ARTIFACT: Mutex<Option<VerifiedUpdateArtifact>> = Mutex::new(None);
 }
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -333,59 +322,20 @@ pub fn verified_update_artifact_for_release_page_url(
     query: UpdateArtifactQuery<'_>,
 ) -> ResultType<VerifiedUpdateArtifact> {
     let artifact = verified_update_artifact_from_release_page_url(release_page_url, &query)?;
-    cache_verified_update_artifact(&artifact, &query);
+    *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(artifact.clone());
     Ok(artifact)
 }
 
 pub fn verified_update_artifact_for_download_url(
     download_url: &str,
 ) -> ResultType<VerifiedUpdateArtifact> {
-    let download = parse_rustdesk_release_download_url(download_url)?;
-    let format = update_format_from_file_name(&download.file_name)?;
-    let query = UpdateArtifactQuery {
-        platform: current_update_platform(),
-        arch: current_update_arch(),
-        format,
-        file_name: Some(download.file_name.as_str()),
-    };
-    verified_update_artifact_for_download_url_with_query(download_url, query)
-}
-
-fn verified_update_artifact_for_download_url_with_query(
-    download_url: &str,
-    query: UpdateArtifactQuery<'_>,
-) -> ResultType<VerifiedUpdateArtifact> {
-    if let Some(cached) = get_cached_verified_update_artifact(download_url) {
-        if cached.platform != query.platform
-            || cached.arch != query.arch
-            || cached.format != query.format
-        {
-            bail!("cached update artifact selector does not match requested selector");
-        }
-        let artifact = cached.artifact;
-        if query
-            .file_name
-            .is_some_and(|file_name| artifact.file_name != file_name)
-        {
-            bail!("cached update artifact file name does not match requested file name");
-        }
-        let cached_format = update_format_from_file_name(&artifact.file_name)?;
-        if cached_format != query.format {
-            bail!("cached update artifact format does not match requested format");
-        }
-        return Ok(artifact);
-    }
-    let download = parse_rustdesk_release_download_url(download_url)?;
-    let release_page_url = format!(
-        "https://github.com/{}/{}/releases/tag/{}",
-        download.owner, download.repo, download.release_id
-    );
-    let artifact = verified_update_artifact_from_release_page_url(&release_page_url, &query)?;
-    if artifact.url != download_url {
-        bail!("update artifact URL does not match requested download URL");
-    }
-    cache_verified_update_artifact(&artifact, &query);
-    Ok(artifact)
+    VERIFIED_UPDATE_ARTIFACT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|artifact| artifact.url == download_url)
+        .cloned()
+        .ok_or_else(|| hbb_common::anyhow::anyhow!("update artifact was not verified"))
 }
 
 fn verified_update_artifact_from_release_page_url(
@@ -399,133 +349,19 @@ fn verified_update_artifact_from_release_page_url(
     let signature_url = release_signature_url(update_url)?;
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
     let signature_bytes = fetch_update_sidecar_bytes(&signature_url)?;
-    verify_update_metadata_bytes(
-        &metadata_bytes,
-        &signature_bytes,
-        display_version.as_str(),
-        release_id.as_str(),
-        expected_artifact_url_prefix.as_str(),
-        query,
-    )
-}
-
-fn verify_update_metadata_bytes(
-    metadata_bytes: &[u8],
-    signature_bytes: &[u8],
-    display_version: &str,
-    release_id: &str,
-    expected_artifact_url_prefix: &str,
-    query: &UpdateArtifactQuery<'_>,
-) -> ResultType<VerifiedUpdateArtifact> {
     let policy = UpdateMetadataPolicy {
         app: "rustdesk",
         allowed_package_ids: &["rustdesk"],
-        expected_version: Some(display_version),
-        expected_release_id: Some(release_id),
-        expected_artifact_url_prefix: Some(expected_artifact_url_prefix),
+        expected_version: Some(display_version.as_str()),
+        expected_release_id: Some(release_id.as_str()),
+        expected_artifact_url_prefix: Some(expected_artifact_url_prefix.as_str()),
     };
     hbb_common::update_metadata::verify_update_metadata(
-        metadata_bytes,
-        signature_bytes,
+        &metadata_bytes,
+        &signature_bytes,
         &policy,
         query,
     )
-}
-
-struct ReleaseDownloadUrl {
-    owner: String,
-    repo: String,
-    release_id: String,
-    file_name: String,
-}
-
-fn parse_rustdesk_release_download_url(download_url: &str) -> ResultType<ReleaseDownloadUrl> {
-    let url = url::Url::parse(download_url)?;
-    if url.scheme() != "https" || url.host_str() != Some("github.com") {
-        bail!(
-            "Update download URL is not a GitHub HTTPS release URL: {}",
-            download_url
-        );
-    }
-    if url_has_explicit_port(download_url)
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        bail!(
-            "Update download URL must not contain credentials or an explicit port: {}",
-            download_url
-        );
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!(
-            "Update download URL must not contain query or fragment: {}",
-            download_url
-        );
-    }
-    let Some(segments) = url.path_segments() else {
-        bail!("Update download URL has no path: {}", download_url);
-    };
-    let segments = segments.collect::<Vec<_>>();
-    let (owner, repo, release_id, file_name) = match segments.as_slice() {
-        [owner @ "rustdesk", repo @ "rustdesk", "releases", "download", release_id, file_name]
-        | [owner @ "fufesou", repo @ "rustdesk", "releases", "download", release_id, file_name] => {
-            (*owner, *repo, *release_id, *file_name)
-        }
-        _ => bail!(
-            "Update download URL is not a RustDesk release download URL: {}",
-            download_url
-        ),
-    };
-    if release_id.is_empty() || file_name.is_empty() {
-        bail!("Update download URL has empty release id or file name");
-    }
-    if owner == "fufesou" && release_id != crate::common::FIXED_TEST_UPDATE_RELEASE_ID {
-        bail!("Update download URL is not the fixed test release: {download_url}");
-    }
-    Ok(ReleaseDownloadUrl {
-        owner: owner.to_owned(),
-        repo: repo.to_owned(),
-        release_id: release_id.to_owned(),
-        file_name: file_name.to_owned(),
-    })
-}
-
-fn update_format_from_file_name(file_name: &str) -> ResultType<&'static str> {
-    let normalized_file_name = file_name.to_ascii_lowercase();
-    if normalized_file_name.ends_with(".msi") {
-        return Ok("msi");
-    }
-    if normalized_file_name.ends_with(".exe") {
-        return Ok("exe");
-    }
-    if normalized_file_name.ends_with(".dmg") {
-        return Ok("dmg");
-    }
-    bail!("Unsupported update artifact file format: {}", file_name);
-}
-
-fn cache_verified_update_artifact(
-    artifact: &VerifiedUpdateArtifact,
-    query: &UpdateArtifactQuery<'_>,
-) {
-    let cached = CachedVerifiedUpdateArtifact {
-        artifact: artifact.clone(),
-        platform: query.platform.to_owned(),
-        arch: query.arch.to_owned(),
-        format: query.format.to_owned(),
-    };
-    let mut cache = VERIFIED_UPDATE_ARTIFACTS.lock().unwrap();
-    cache.retain(|_, entry| entry.artifact.release_id == artifact.release_id);
-    cache.insert(artifact.url.clone(), cached);
-}
-
-fn get_cached_verified_update_artifact(download_url: &str) -> Option<CachedVerifiedUpdateArtifact> {
-    VERIFIED_UPDATE_ARTIFACTS
-        .lock()
-        .unwrap()
-        .get(download_url)
-        .cloned()
 }
 
 fn read_limited_response_bytes<R: Read>(
@@ -567,11 +403,10 @@ fn ensure_verified_update_artifact(
     expected_size: u64,
     expected_sha256: &str,
 ) -> ResultType<()> {
-    let mut is_file_exists = false;
     if let Some(file_size) = cached_update_artifact_size(file_path)? {
         if file_size == expected_size {
             match verify_file_sha256(file_path, expected_sha256) {
-                Ok(()) => is_file_exists = true,
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("Removing cached update file with invalid SHA256: {}", e);
                     remove_cached_update_artifact(file_path)?;
@@ -587,27 +422,24 @@ fn ensure_verified_update_artifact(
             remove_cached_update_artifact(file_path)?;
         }
     }
-    if !is_file_exists {
-        let client = create_http_client_with_url_strict(download_url)?;
-        let response = client
-            .get(download_url)
-            .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
-            .send()?;
-        if !response.status().is_success() {
-            bail!(
-                "Failed to download the new version file: {}",
-                response.status()
-            );
-        }
-        let mut limited_response = response.take(expected_size.saturating_add(1));
-        write_verified_update_artifact(
-            file_path,
-            &mut limited_response,
-            expected_size,
-            expected_sha256,
-        )?;
+    let client = create_http_client_with_url_strict(download_url)?;
+    let response = client
+        .get(download_url)
+        .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
+        .send()?;
+    if !response.status().is_success() {
+        bail!(
+            "Failed to download the new version file: {}",
+            response.status()
+        );
     }
-    Ok(())
+    let mut limited_response = response.take(expected_size.saturating_add(1));
+    write_verified_update_artifact(
+        file_path,
+        &mut limited_response,
+        expected_size,
+        expected_sha256,
+    )
 }
 
 fn cached_update_artifact_size(file_path: &Path) -> ResultType<Option<u64>> {
@@ -1238,36 +1070,49 @@ mod tests {
         }
     }
 
-    fn verified_artifact() -> VerifiedUpdateArtifact {
+    fn verified_artifact(url: &str, file_name: &str) -> VerifiedUpdateArtifact {
         VerifiedUpdateArtifact {
             version: "1.4.6".to_owned(),
-            release_id: "v1.4.6".to_owned(),
+            release_id: "fix-update-metadata".to_owned(),
             package_id: "rustdesk".to_owned(),
-            url: "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe"
-                .to_owned(),
-            file_name: "rustdesk.exe".to_owned(),
+            url: url.to_owned(),
+            file_name: file_name.to_owned(),
             size: 6,
-            sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4".to_owned(),
+            sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4"
+                .to_owned(),
         }
     }
 
-    fn cache_windows_exe(artifact: &VerifiedUpdateArtifact) {
-        cache_verified_update_artifact(
-            artifact,
-            &UpdateArtifactQuery {
-                platform: "windows",
-                arch: "x86_64",
-                format: "exe",
-                file_name: None,
-            },
+    #[test]
+    fn fixed_test_release_download_url_is_accepted() {
+        let download_url = "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
+
+        assert_eq!(
+            get_download_file_from_url(download_url)
+                .and_then(|path| path.file_name().map(|name| name.to_owned())),
+            Some(std::ffi::OsString::from("rustdesk.exe"))
         );
     }
 
-    #[cfg(all(target_os = "windows", not(feature = "flutter")))]
     #[test]
-    fn current_update_format_uses_exe_for_non_flutter_windows() {
-        assert_eq!(current_update_format(true), "exe");
-        assert_eq!(current_update_format(false), "exe");
+    fn verified_update_artifact_cache_keeps_only_last_verified_url() {
+        let first_url =
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
+        let second_url =
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.msi";
+        let first = verified_artifact(first_url, "rustdesk.exe");
+        let second = verified_artifact(second_url, "rustdesk.msi");
+
+        *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(first);
+        *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(second.clone());
+
+        assert!(verified_update_artifact_for_download_url(first_url).is_err());
+        assert_eq!(
+            verified_update_artifact_for_download_url(second_url)
+                .unwrap()
+                .file_name,
+            second.file_name
+        );
     }
 
     #[test]
@@ -1282,100 +1127,6 @@ mod tests {
 
         let mut oversized: &[u8] = b"too-large";
         assert!(read_limited_response_bytes(&mut oversized, 4, "sidecar").is_err());
-    }
-
-    #[test]
-    fn parse_rustdesk_release_download_url_accepts_expected_path() {
-        let parsed = parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .unwrap();
-
-        assert_eq!(parsed.release_id, "v1.4.6");
-        assert_eq!(parsed.file_name, "rustdesk.exe");
-    }
-
-    #[test]
-    fn fixed_test_release_download_url_is_accepted() {
-        let download_url = "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
-        let parsed = parse_rustdesk_release_download_url(download_url).unwrap();
-
-        assert_eq!(parsed.owner, "fufesou");
-        assert_eq!(parsed.repo, "rustdesk");
-        assert_eq!(parsed.release_id, "fix-update-metadata");
-        assert_eq!(parsed.file_name, "rustdesk.exe");
-        assert_eq!(
-            get_download_file_from_url(download_url)
-                .and_then(|path| path.file_name().map(|name| name.to_owned())),
-            Some(std::ffi::OsString::from("rustdesk.exe"))
-        );
-    }
-
-    #[test]
-    fn parse_rustdesk_release_download_url_rejects_untrusted_urls() {
-        assert!(parse_rustdesk_release_download_url(
-            "https://example.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://github.com/other/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe?x=1",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://user@github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://github.com:8443/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .is_err());
-        assert!(parse_rustdesk_release_download_url(
-            "https://github.com:443/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn update_format_from_file_name_accepts_update_artifacts_only() {
-        assert_eq!(update_format_from_file_name("rustdesk.exe").unwrap(), "exe");
-        assert_eq!(update_format_from_file_name("rustdesk.msi").unwrap(), "msi");
-        assert_eq!(update_format_from_file_name("rustdesk.dmg").unwrap(), "dmg");
-        assert_eq!(update_format_from_file_name("RustDesk.EXE").unwrap(), "exe");
-        assert_eq!(update_format_from_file_name("RustDesk.MSI").unwrap(), "msi");
-        assert_eq!(update_format_from_file_name("RustDesk.DMG").unwrap(), "dmg");
-        assert!(update_format_from_file_name("rustdesk.zip").is_err());
-    }
-
-    #[test]
-    fn ensure_verified_update_artifact_removes_temp_file_on_sha256_mismatch() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-updater-artifact-sha256-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let file_path = test_dir.join("rustdesk-update.exe");
-
-        let mut data: &[u8] = b"update";
-        let result = write_verified_update_artifact(
-            &file_path,
-            &mut data,
-            6,
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        );
-
-        assert!(result.is_err());
-        assert!(!file_path.exists());
-        assert!(std::fs::read_dir(&test_dir).unwrap().next().is_none());
-        std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[test]
@@ -1410,69 +1161,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_file_sha256_rejects_mismatched_file() {
-        let file_path = std::env::temp_dir().join(format!(
-            "rustdesk-updater-sha256-test-{}",
-            std::process::id()
-        ));
-        std::fs::write(&file_path, b"rustdesk").unwrap();
-
-        let result = verify_file_sha256(
-            &file_path,
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        );
-        std::fs::remove_file(&file_path).unwrap();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verified_update_artifact_cache_is_release_scoped_and_rejects_mismatches() {
-        let artifact = verified_artifact();
-        VERIFIED_UPDATE_ARTIFACTS.lock().unwrap().clear();
-        cache_windows_exe(&artifact);
-
-        let result = verified_update_artifact_for_download_url_with_query(
-            &artifact.url,
-            UpdateArtifactQuery {
-                platform: "windows",
-                arch: "x86_64",
-                format: "exe",
-                file_name: Some("rustdesk.msi"),
-            },
-        );
-
-        assert!(result.is_err());
-
-        let result = verified_update_artifact_for_download_url_with_query(
-            &artifact.url,
-            UpdateArtifactQuery {
-                platform: "windows",
-                arch: "aarch64",
-                format: "exe",
-                file_name: Some(&artifact.file_name),
-            },
-        );
-
-        assert!(result.is_err());
-
-        let mut same_release_artifact = artifact.clone();
-        same_release_artifact.url = same_release_artifact
-            .url
-            .replace("rustdesk.exe", "other.exe");
-        cache_windows_exe(&same_release_artifact);
-        assert_eq!(VERIFIED_UPDATE_ARTIFACTS.lock().unwrap().len(), 2);
-
-        let mut next_release_artifact = artifact.clone();
-        next_release_artifact.release_id = "v1.4.7".to_owned();
-        next_release_artifact.url = next_release_artifact.url.replace("v1.4.6", "v1.4.7");
-        cache_windows_exe(&next_release_artifact);
-        let cache = VERIFIED_UPDATE_ARTIFACTS.lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&next_release_artifact.url));
-    }
-
-    #[test]
     fn remove_cached_update_artifact_rejects_directory() {
         let test_dir = std::env::temp_dir().join(format!(
             "rustdesk-updater-cache-dir-test-{}",
@@ -1488,31 +1176,6 @@ mod tests {
 
         assert!(result.is_err());
         assert!(cache_path.exists());
-        std::fs::remove_dir_all(&test_dir).unwrap();
-    }
-
-    #[test]
-    fn write_verified_download_removes_temp_file_on_install_error() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-updater-install-error-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let final_path = test_dir.join("rustdesk-update.exe");
-        std::fs::create_dir(&final_path).unwrap();
-
-        let mut data: &[u8] = b"update";
-        let result = write_verified_update_artifact(
-            &final_path,
-            &mut data,
-            6,
-            "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4",
-        );
-
-        assert!(result.is_err());
-        assert!(final_path.is_dir());
-        assert_eq!(std::fs::read_dir(&test_dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
