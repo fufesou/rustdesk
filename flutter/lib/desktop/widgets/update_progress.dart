@@ -192,9 +192,9 @@ class UpdateProgressState extends State<UpdateProgress> {
     }
 
     final List<Widget> buttons = [
-      dialogButton('Download', onPressed: jumplink),
-      dialogButton('Retry', onPressed: retry),
-      dialogButton('Close', onPressed: close),
+      dialogButton(translate('Download'), onPressed: jumplink),
+      dialogButton(translate('Retry'), onPressed: retry),
+      dialogButton(translate('Close'), onPressed: close),
     ];
     dialogManager.dismissAll();
     dialogManager.show(

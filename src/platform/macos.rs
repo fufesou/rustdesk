@@ -48,6 +48,7 @@ static mut LATEST_SEED: i32 = 0;
 static UPDATE_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 const UPDATE_TEMP_DMG_CREATE_ATTEMPTS: usize = 16;
 const UPDATE_DMG_MOUNT_TEMPLATE: &str = "/tmp/.rustdeskmount-XXXXXX";
+const UPDATE_CLEANUP_FAILED_AFTER_COMMIT: &str = "UPDATE_CLEANUP_FAILED_AFTER_COMMIT";
 const STALE_UPDATE_TEMP_DIR_SECS: u64 = 24 * 60 * 60;
 
 #[inline]
@@ -345,6 +346,12 @@ enum UpdateSource {
     },
 }
 
+fn log_update_cleanup_warning(output: &std::process::Output) {
+    if String::from_utf8_lossy(&output.stdout).contains(UPDATE_CLEANUP_FAILED_AFTER_COMMIT) {
+        log::warn!("Update committed, but temporary update cleanup failed");
+    }
+}
+
 impl UpdateSource {
     fn into_script_args(self) -> (String, String) {
         match self {
@@ -399,7 +406,8 @@ fn update_daemon_agent(
                     stderr.trim()
                 );
             }
-            _ => {
+            Ok(output) => {
+                log_update_cleanup_warning(&output);
                 let installed = std::path::Path::new(&agent_plist_file).exists();
                 log::info!("Agent file {} installed: {}", &agent_plist_file, installed);
             }
@@ -1156,8 +1164,8 @@ fn update_me_from_source(update_source: UpdateSource) -> ResultType<()> {
 	    set install_staged_bundle to "mv \"$temp_bundle\" " & app_bundle_q & "; bundle_swapped=1;"
 	    set restore_installed_owner to "if [ " & quoted form of restore_owner & " = '1' ]; then chown -R " & user_name_q & ":staff " & app_bundle_q & "; fi;"
 	    set rollback_bundle to "if [ \"${bundle_backed_up:-0}\" -eq 1 ]; then if [ ! -e \"$old_bundle\" ]; then rollback_status=1; elif ! rm -rf " & app_bundle_q & "; then rollback_status=1; elif ! mv \"$old_bundle\" " & app_bundle_q & "; then rollback_status=1; fi; elif [ \"${bundle_swapped:-0}\" -eq 1 ]; then rm -rf " & app_bundle_q & " || rollback_status=1; fi;"
-	    set cleanup_verified to "if [ \"${dmg_attached:-0}\" -eq 1 ]; then /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null 2>&1 || status=1; fi; if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || status=1; fi;"
-	    set rollback_update to "status=$?; trap - EXIT; set +e; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; exit \"$status\";"
+	    set cleanup_verified to "if [ \"${dmg_attached:-0}\" -eq 1 ]; then /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null 2>&1 || cleanup_status=1; fi; if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || cleanup_status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || cleanup_status=1; fi;"
+	    set rollback_update to "status=$?; trap - EXIT; set +e; cleanup_status=0; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; if [ \"$cleanup_status\" -ne 0 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then status=1; elif [ \"$cleanup_status\" -ne 0 ]; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi; exit \"$status\";"
 	    set commit_update to "transaction_committed=1; rm -rf \"$old_bundle\";"
 	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & "transaction_started=1;" & move_current_bundle & install_staged_bundle & restore_installed_owner & commit_update
 	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
@@ -1193,16 +1201,21 @@ fn update_me_from_source(update_source: UpdateSource) -> ResultType<()> {
                 log::error!("run osascript failed: {}", e);
                 bail!("run osascript failed: {}", e);
             }
-            _ => {}
+            Ok(output) => log_update_cleanup_warning(&output),
         }
     }
-    let open_status = Command::new("open")
+    match Command::new("open")
         .arg("-n")
         .arg(&format!("/Applications/{}.app", app_name))
         .status()
-        .map_err(|e| anyhow!("Failed to relaunch updated app: {}", e))?;
-    if !open_status.success() {
-        bail!("Failed to relaunch updated app: {}", open_status);
+    {
+        Ok(status) if !status.success() => {
+            log::warn!("Failed to relaunch updated app: {}", status);
+        }
+        Err(err) => {
+            log::warn!("Failed to relaunch updated app: {}", err);
+        }
+        _ => {}
     }
     // leave open a little time
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2871,6 +2884,28 @@ mod verified_dmg_tests {
     }
 
     #[test]
+    fn committed_update_cleanup_failure_is_non_fatal() {
+        for script in privileged_update_scripts() {
+            let cleanup = script
+                .lines()
+                .find(|line| line.contains("set cleanup_verified"))
+                .unwrap();
+            let rollback = script
+                .lines()
+                .find(|line| line.contains("set rollback_update"))
+                .unwrap();
+
+            assert!(cleanup.contains("cleanup_status=1"));
+            assert!(!cleanup.contains("|| status=1"));
+            assert!(rollback.contains("cleanup_status=0"));
+            assert!(rollback.contains("UPDATE_CLEANUP_FAILED_AFTER_COMMIT"));
+            assert!(
+                rollback.contains(r#"[ \"${transaction_committed:-0}\" -ne 1 ]; then status=1"#)
+            );
+        }
+    }
+
+    #[test]
     fn verified_dmg_is_hashed_after_privileged_copy() {
         for script in privileged_update_scripts() {
             let copy = script.find("/bin/cp").unwrap();
@@ -2890,5 +2925,57 @@ mod verified_dmg_tests {
             .unwrap();
 
         assert!(!bootstrap_agent.contains("|| true"));
+    }
+
+    #[test]
+    fn daemon_update_quotes_daemon_plist_path() {
+        let [daemon_script, _] = privileged_update_scripts();
+
+        assert!(daemon_script.contains("set daemon_plist_q to quoted form of daemon_plist"));
+        assert!(!daemon_script.contains("& daemon_plist &"));
+    }
+
+    #[test]
+    fn daemon_update_bounds_plist_generation() {
+        let [daemon_script, _] = privileged_update_scripts();
+        let write_new_plists = daemon_script
+            .lines()
+            .find(|line| line.contains("set write_new_plists"))
+            .unwrap();
+
+        assert!(daemon_script.contains("set write_plist_attempts to \"60\""));
+        assert!(write_new_plists.contains("kill -TERM"));
+        assert!(write_new_plists.contains("kill -KILL"));
+        assert!(write_new_plists.contains("return 124"));
+    }
+
+    #[test]
+    fn daemon_update_quotes_launchd_targets() {
+        let [daemon_script, _] = privileged_update_scripts();
+        let check_service = daemon_script
+            .lines()
+            .find(|line| line.contains("set check_service"))
+            .unwrap();
+        let check_agent = daemon_script
+            .lines()
+            .find(|line| line.contains("set check_agent"))
+            .unwrap();
+        let kickstart_agent = daemon_script
+            .lines()
+            .find(|line| line.contains("set kickstart_agent"))
+            .unwrap();
+
+        assert!(daemon_script
+            .contains("set daemon_target_q to quoted form of (\"system/\" & daemon_label)"));
+        assert!(check_service.contains("launchctl print \" & daemon_target_q & \""));
+        for target in [
+            r#"\"gui/$uid/$agent_label\""#,
+            r#"\"user/$uid/$agent_label\""#,
+            r#"\"system/$agent_label\""#,
+        ] {
+            assert!(check_agent.contains(target));
+        }
+        assert!(kickstart_agent.contains(r#"\"gui/$uid/$agent_label\""#));
+        assert!(kickstart_agent.contains(r#"\"user/$uid/$agent_label\""#));
     }
 }
