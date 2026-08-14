@@ -35,8 +35,8 @@ fn app_dir_name(exe: &str) -> String {
         .unwrap_or_else(|| APP_PREFIX.to_owned())
 }
 
-fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
-    let Ok(app_metadata) = std::str::from_utf8(APP_METADATA) else {
+fn is_timestamp_matches_with_metadata(dir: &Path, ts: &mut u64, app_metadata: &[u8]) -> bool {
+    let Ok(app_metadata) = std::str::from_utf8(app_metadata) else {
         return true;
     };
     for line in app_metadata.lines() {
@@ -61,6 +61,13 @@ fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
         }
     }
     false
+}
+
+fn prepare_extraction(dir: &Path, clear: bool, app_metadata: &[u8]) -> (bool, u64) {
+    // A forced rebuild must still persist the embedded timestamp for the next launch.
+    let mut ts = 0;
+    let timestamp_matches = is_timestamp_matches_with_metadata(dir, &mut ts, app_metadata);
+    (clear || !timestamp_matches, ts)
 }
 
 fn write_meta(dir: &Path, ts: u64, package_paths: &[String]) {
@@ -176,8 +183,8 @@ fn setup(
         }
     };
 
-    let mut ts = 0;
-    if clear || !is_timestamp_matches(&dir, &mut ts) {
+    let (needs_clear, ts) = prepare_extraction(&dir, clear, APP_METADATA);
+    if needs_clear {
         #[cfg(windows)]
         if _args.is_empty() {
             *_ui = true;
@@ -351,6 +358,14 @@ mod win {
 #[cfg(test)]
 mod meta_tests {
     use super::*;
+
+    #[test]
+    fn clear_rebuild_retains_embedded_timestamp() {
+        let (needs_clear, timestamp) =
+            prepare_extraction(Path::new("portable-test"), true, b"timestamp = 123\n");
+        assert!(needs_clear);
+        assert_eq!(timestamp, 123);
+    }
 
     #[test]
     fn resolve_within_rejects_paths_that_escape() {
