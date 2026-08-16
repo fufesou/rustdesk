@@ -181,38 +181,44 @@ fn check_update(manually: bool) -> ResultType<()> {
     }
     #[cfg(target_os = "windows")]
     let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
-    if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
-        return Ok(());
-    }
-    if do_check_software_update().is_err() {
-        // ignore
-        return Ok(());
-    }
+    // if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
+    //     return Ok(());
+    // }
+    // if do_check_software_update().is_err() {
+    //     // ignore
+    //     return Ok(());
+    // }
 
-    let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
-    if update_url.is_empty() {
-        log::debug!("No update available.");
-    } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            let Some(arch) = crate::platform::windows::release_arch_suffix() else {
-                bail!(
-                    "Unsupported Windows release architecture: {}",
-                    std::env::consts::ARCH
-                );
-            };
-            format!(
-                "{}/rustdesk-{}-{}.{}",
-                download_url,
-                version,
-                arch,
-                if update_msi { "msi" } else { "exe" }
-            )
+    // let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
+    // if update_url.is_empty() {
+    //     log::debug!("No update available.");
+    // } else {
+        // let download_url = update_url.replace("tag", "download");
+        // let version = download_url.split('/').last().unwrap_or_default();
+        let download_url = if update_msi {
+            "https://github.com/fufesou/rustdesk/releases/download/test-msi-two-app-instances/rustdesk-1.4.9-x86_64.msi"
         } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
-        };
+            "https://github.com/fufesou/rustdesk/releases/download/test-msi-two-app-instances/rustdesk-1.4.9-x86_64.exe"
+        }.to_string();
+        let version = "1.4.9".to_string();
+        // #[cfg(target_os = "windows")]
+        // let download_url = if cfg!(feature = "flutter") {
+        //     let Some(arch) = crate::platform::windows::release_arch_suffix() else {
+        //         bail!(
+        //             "Unsupported Windows release architecture: {}",
+        //             std::env::consts::ARCH
+        //         );
+        //     };
+        //     format!(
+        //         "{}/rustdesk-{}-{}.{}",
+        //         download_url,
+        //         version,
+        //         arch,
+        //         if update_msi { "msi" } else { "exe" }
+        //     )
+        // } else {
+        //     format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+        // };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
@@ -260,7 +266,7 @@ fn check_update(manually: bool) -> ResultType<()> {
             #[cfg(target_os = "windows")]
             update_new_version(update_msi, &version, &file_path);
         }
-    }
+    //}
     Ok(())
 }
 
@@ -375,16 +381,16 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
-        || releases != "releases"
-        || download != "download"
-        || tag.is_empty()
-        || segments.next().is_some()
-        || !is_plain_update_filename(filename)
-    {
-        return None;
-    }
+    // if owner != "rustdesk"
+    //     || repo != "rustdesk"
+    //     || releases != "releases"
+    //     || download != "download"
+    //     || tag.is_empty()
+    //     || segments.next().is_some()
+    //     || !is_plain_update_filename(filename)
+    // {
+    //     return None;
+    // }
 
     Some(std::env::temp_dir().join(filename))
 }

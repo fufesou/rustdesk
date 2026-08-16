@@ -11,8 +11,10 @@ final _isExtracting = false.obs;
 
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
-  String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  // String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
+  // String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  String downloadUrl = 'https://github.com/fufesou/rustdesk/releases/download/test-msi-two-app-instances/rustdesk-1.4.9-x86_64.exe';
+  String version = '1.4.9';
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
@@ -21,7 +23,7 @@ void handleUpdate(String releasePageUrl) {
         releasePageUrl, gFFI.dialogManager);
     return;
   }
-  downloadUrl = '$downloadUrl/$downloadFile';
+  // downloadUrl = '$downloadUrl/$downloadFile';
 
   SimpleWrapper downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
@@ -131,6 +133,7 @@ class UpdateProgressState extends State<UpdateProgress> {
   // `isExtractDmg` is true when handling extract-update-dmg event.
   // It's a rare case that the dmg file is corrupted and cannot be extracted.
   void _onError(String error, {bool isExtractDmg = false}) {
+    debugPrint('=================== downloadUrl: $widget.downloadUrl');
     cancelQueryTimer();
 
     debugPrint(

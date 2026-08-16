@@ -430,6 +430,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
+    updateUrl = 'https://github.com/fufesou/rustdesk/releases/download/test-msi-two-app-instances/rustdesk-1.4.9-x86_64.exe';
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&
