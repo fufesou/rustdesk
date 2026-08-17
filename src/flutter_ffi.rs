@@ -2677,29 +2677,47 @@ pub fn main_get_common(key: String) -> String {
                 }
             }
         } else if key.starts_with("download-file-") {
-            let _version = key.replace("download-file-", "");
+            let _release_id = key.replace("download-file-", "");
+            let _version = crate::common::display_version_from_release_id(&_release_id);
             #[cfg(target_os = "windows")]
-            return match (
-                crate::platform::windows::is_msi_installed(),
-                crate::common::is_custom_client(),
-            ) {
-                (Ok(true), false) => match crate::platform::windows::release_arch_suffix() {
-                    Some(arch) => format!("rustdesk-{_version}-{arch}.msi"),
-                    None => "error:unsupported".to_owned(),
-                },
-                (Ok(true), true) | (Ok(false), _) => {
-                    match crate::platform::windows::release_arch_suffix() {
-                        Some(arch) => format!("rustdesk-{_version}-{arch}.exe"),
-                        None => "error:unsupported".to_owned(),
+            {
+                let update_msi = match (
+                    crate::platform::windows::is_msi_installed(),
+                    crate::common::is_custom_client(),
+                ) {
+                    (Ok(is_msi_installed), is_custom_client) => {
+                        is_msi_installed && !is_custom_client
                     }
+                    (Err(e), _) => {
+                        log::error!("Failed to check if is msi: {}", e);
+                        return "error:update-failed-check-msi-tip".to_owned();
+                    }
+                };
+                let Some(arch) = crate::platform::windows::release_arch_suffix() else {
+                    return "error:unsupported".to_owned();
+                };
+                if _release_id == crate::common::FIXED_TEST_UPDATE_RELEASE_TAG {
+                    return match crate::updater::fixed_test_windows_asset_name(
+                        arch, update_msi, true,
+                    ) {
+                        Ok(asset_name) => asset_name,
+                        Err(e) => format!("error:{e}"),
+                    };
                 }
-                (Err(e), _) => {
-                    log::error!("Failed to check if is msi: {}", e);
-                    format!("error:update-failed-check-msi-tip")
-                }
-            };
+                return format!(
+                    "rustdesk-{_version}-{arch}.{}",
+                    if update_msi { "msi" } else { "exe" }
+                );
+            }
             #[cfg(target_os = "macos")]
             {
+                if _release_id == crate::common::FIXED_TEST_UPDATE_RELEASE_TAG {
+                    return match crate::updater::fixed_test_macos_asset_name(std::env::consts::ARCH)
+                    {
+                        Ok(asset_name) => asset_name,
+                        Err(e) => format!("error:{e}"),
+                    };
+                }
                 return if cfg!(target_arch = "x86_64") {
                     format!("rustdesk-{_version}-x86_64.dmg")
                 } else if cfg!(target_arch = "aarch64") {

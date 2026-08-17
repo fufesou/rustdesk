@@ -747,13 +747,9 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
-    (*SOFTWARE_UPDATE_URL
-        .lock()
-        .unwrap()
-        .rsplit('/')
-        .next()
-        .unwrap_or(""))
-    .to_string()
+    let update_url = SOFTWARE_UPDATE_URL.lock().unwrap();
+    let release_id = update_url.rsplit('/').next().unwrap_or("");
+    crate::common::display_version_from_release_id(release_id).to_owned()
 }
 
 #[inline]

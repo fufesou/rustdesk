@@ -99,6 +99,21 @@ lazy_static::lazy_static! {
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
 }
 
+pub(crate) const FIXED_TEST_UPDATE_RELEASE_PAGE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata";
+pub(crate) const FIXED_TEST_UPDATE_RELEASE_TAG: &str = "fix-update-metadata";
+pub(crate) const FIXED_TEST_UPDATE_VERSION: &str = "1.4.6";
+pub(crate) const FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata";
+
+pub(crate) fn display_version_from_release_id(release_id: &str) -> &str {
+    if release_id == FIXED_TEST_UPDATE_RELEASE_TAG {
+        FIXED_TEST_UPDATE_VERSION
+    } else {
+        release_id
+    }
+}
+
 lazy_static::lazy_static! {
     // Is server process, with "--server" args
     static ref IS_SERVER: bool = std::env::args().nth(1) == Some("--server".to_owned());
@@ -950,53 +965,25 @@ pub fn check_software_update() {
     }
 }
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
-#[tokio::main(flavor = "current_thread")]
-pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(&url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_not_cached = tls_type.is_none();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
-        Err(err) => {
-            if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
-            } else {
-                return Err(err.into());
-            }
-        }
-    };
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
+fn fixed_test_update_release_url(current_version: &str) -> Option<&'static str> {
+    (get_version_number(FIXED_TEST_UPDATE_VERSION) > get_version_number(current_version))
+        .then_some(FIXED_TEST_UPDATE_RELEASE_PAGE_URL)
+}
 
-    if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
+pub fn do_check_software_update() -> hbb_common::ResultType<()> {
+    if let Some(response_url) = fixed_test_update_release_url(crate::VERSION) {
         #[cfg(feature = "flutter")]
         {
             let mut m = HashMap::new();
             m.insert("name", "check_software_update_finish");
-            m.insert("url", &response_url);
+            m.insert("url", response_url);
             if let Ok(data) = serde_json::to_string(&m) {
                 let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
             }
         }
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url.to_owned();
     } else {
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = String::new();
     }
     Ok(())
 }
@@ -2699,6 +2686,25 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn fixed_test_update_release_is_newer_than_1_4_3_only() {
+        assert_eq!(
+            fixed_test_update_release_url("1.4.3"),
+            Some(FIXED_TEST_UPDATE_RELEASE_PAGE_URL)
+        );
+        assert_eq!(fixed_test_update_release_url("1.4.6"), None);
+        assert_eq!(fixed_test_update_release_url("1.4.7"), None);
+    }
+
+    #[test]
+    fn fixed_test_release_id_maps_to_asset_version() {
+        assert_eq!(
+            display_version_from_release_id(FIXED_TEST_UPDATE_RELEASE_TAG),
+            FIXED_TEST_UPDATE_VERSION
+        );
+        assert_eq!(display_version_from_release_id("1.4.7"), "1.4.7");
+    }
 
     #[inline]
     fn get_timestamp_secs() -> u128 {

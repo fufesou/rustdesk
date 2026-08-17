@@ -79,6 +79,84 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
 /// Retry interval when an update check fails or a session is active (30 minutes).
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
 
+fn fixed_test_release_asset_url(update_url: &str, asset_name: &str) -> ResultType<String> {
+    if update_url != crate::common::FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        bail!("Unexpected fixed test update URL: {}", update_url);
+    }
+    Ok(format!(
+        "{}/{}",
+        crate::common::FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL,
+        asset_name
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn fixed_test_windows_asset_name(
+    arch: &str,
+    update_msi: bool,
+    is_flutter: bool,
+) -> ResultType<String> {
+    if !is_flutter {
+        return Ok(format!(
+            "rustdesk-{}-x86-sciter.exe",
+            crate::common::FIXED_TEST_UPDATE_VERSION
+        ));
+    }
+    if arch != "x86_64" {
+        bail!("Fixed test release has no Windows {} asset", arch);
+    }
+    let extension = if update_msi { "msi" } else { "exe" };
+    Ok(format!(
+        "rustdesk-{}-{}.{}",
+        crate::common::FIXED_TEST_UPDATE_VERSION,
+        arch,
+        extension
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn fixed_test_macos_asset_name(arch: &str) -> ResultType<String> {
+    if !matches!(arch, "aarch64" | "x86_64") {
+        bail!("Fixed test release has no macOS {} asset", arch);
+    }
+    Ok(format!(
+        "rustdesk-{}-{}.dmg",
+        crate::common::FIXED_TEST_UPDATE_VERSION,
+        arch
+    ))
+}
+
+fn fixed_test_desktop_download_url(update_url: &str, update_msi: bool) -> ResultType<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let asset_name = fixed_test_windows_asset_name(
+            std::env::consts::ARCH,
+            update_msi,
+            cfg!(feature = "flutter"),
+        )?;
+        return fixed_test_release_asset_url(update_url, &asset_name);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = update_msi;
+        let asset_name = fixed_test_macos_asset_name(std::env::consts::ARCH)?;
+        return fixed_test_release_asset_url(update_url, &asset_name);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (update_url, update_msi);
+        bail!(
+            "Fixed test update assets are unsupported on {}",
+            std::env::consts::OS
+        );
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn should_update_with_msi(is_msi_installed: bool, is_custom_client: bool) -> bool {
+    is_msi_installed && !is_custom_client
+}
+
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
 }
@@ -180,7 +258,12 @@ fn check_update(manually: bool) -> ResultType<()> {
         return Ok(());
     }
     #[cfg(target_os = "windows")]
-    let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
+    let update_msi = should_update_with_msi(
+        crate::platform::is_msi_installed()?,
+        crate::is_custom_client(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let update_msi = false;
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
         return Ok(());
     }
@@ -193,26 +276,8 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            let Some(arch) = crate::platform::windows::release_arch_suffix() else {
-                bail!(
-                    "Unsupported Windows release architecture: {}",
-                    std::env::consts::ARCH
-                );
-            };
-            format!(
-                "{}/rustdesk-{}-{}.{}",
-                download_url,
-                version,
-                arch,
-                if update_msi { "msi" } else { "exe" }
-            )
-        } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
-        };
+        let version = crate::common::FIXED_TEST_UPDATE_VERSION;
+        let download_url = fixed_test_desktop_download_url(&update_url, update_msi)?;
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
@@ -258,7 +323,7 @@ fn check_update(manually: bool) -> ResultType<()> {
         // before the download, but not empty after the download.
         if has_no_active_conns() {
             #[cfg(target_os = "windows")]
-            update_new_version(update_msi, &version, &file_path);
+            update_new_version(update_msi, version, &file_path);
         }
     }
     Ok(())
@@ -375,8 +440,10 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
+    let is_trusted_repository = repo == "rustdesk"
+        && (owner == "rustdesk"
+            || (owner == "fufesou" && tag == crate::common::FIXED_TEST_UPDATE_RELEASE_TAG));
+    if !is_trusted_repository
         || releases != "releases"
         || download != "download"
         || tag.is_empty()
@@ -585,11 +652,14 @@ pub fn check_update_as_root() -> ResultType<bool> {
         log::info!("[root-update] No update available.");
         return Ok(false);
     }
-    let download_url = update_url.replace("tag", "download");
-    let version = download_url.split('/').last().unwrap_or_default().to_string();
-    let arch = if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x86_64" };
-    let dmg_url = format!("{}/rustdesk-{}-{}.dmg", download_url, version, arch);
-    log::info!("[root-update] New version: {}, downloading from {}", version, dmg_url);
+    let version = crate::common::FIXED_TEST_UPDATE_VERSION;
+    let asset_name = fixed_test_macos_asset_name(std::env::consts::ARCH)?;
+    let dmg_url = fixed_test_release_asset_url(&update_url, &asset_name)?;
+    log::info!(
+        "[root-update] New version: {}, downloading from {}",
+        version,
+        dmg_url
+    );
     // Validate URL against GitHub release allowlist before downloading as root
     let Some(file_path_validated) = get_update_download_file_from_url(&dmg_url) else {
         bail!("[root-update] URL failed allowlist check: {}", dmg_url);
@@ -646,7 +716,7 @@ pub fn check_update_as_root() -> ResultType<bool> {
         bail!("[root-update] Active session started during download, deferring update.");
     }
     // Install silently as root
-    let result = crate::platform::update_from_dmg_as_root(&tmp_path, &version);
+    let result = crate::platform::update_from_dmg_as_root(&tmp_path, version);
     // Clean up download directory
     if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
         log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
@@ -656,7 +726,55 @@ pub fn check_update_as_root() -> ResultType<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_download_file_from_url;
+    use super::{
+        fixed_test_macos_asset_name, fixed_test_release_asset_url, fixed_test_windows_asset_name,
+        get_download_file_from_url, should_update_with_msi,
+    };
+
+    #[test]
+    fn fixed_test_release_builds_1_4_6_asset_urls() {
+        let release_url = crate::common::FIXED_TEST_UPDATE_RELEASE_PAGE_URL;
+        let exe_name = fixed_test_windows_asset_name("x86_64", false, true).unwrap();
+        let msi_name = fixed_test_windows_asset_name("x86_64", true, true).unwrap();
+        let sciter_name = fixed_test_windows_asset_name("x86", false, false).unwrap();
+        let arm_dmg_name = fixed_test_macos_asset_name("aarch64").unwrap();
+        let intel_dmg_name = fixed_test_macos_asset_name("x86_64").unwrap();
+
+        assert_eq!(
+            fixed_test_release_asset_url(release_url, &exe_name).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86_64.exe"
+        );
+        assert_eq!(
+            fixed_test_release_asset_url(release_url, &msi_name).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86_64.msi"
+        );
+        assert_eq!(
+            fixed_test_release_asset_url(release_url, &sciter_name).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86-sciter.exe"
+        );
+        assert_eq!(
+            fixed_test_release_asset_url(release_url, &arm_dmg_name).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-aarch64.dmg"
+        );
+        assert_eq!(
+            fixed_test_release_asset_url(release_url, &intel_dmg_name).unwrap(),
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86_64.dmg"
+        );
+    }
+
+    #[test]
+    fn fixed_test_release_rejects_missing_platform_assets() {
+        assert!(fixed_test_windows_asset_name("aarch64", false, true).is_err());
+        assert!(fixed_test_windows_asset_name("aarch64", true, true).is_err());
+        assert!(fixed_test_macos_asset_name("x86").is_err());
+    }
+
+    #[test]
+    fn windows_msi_selection_keeps_custom_clients_on_exe() {
+        assert!(!should_update_with_msi(false, false));
+        assert!(should_update_with_msi(true, false));
+        assert!(!should_update_with_msi(true, true));
+    }
 
     #[test]
     fn update_download_file_accepts_expected_github_asset_urls() {
@@ -668,6 +786,16 @@ mod tests {
         assert_eq!(
             file.file_name().and_then(|name| name.to_str()),
             Some("rustdesk-1.4.0-x86_64.dmg")
+        );
+
+        let test_release_file = get_download_file_from_url(
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86_64.exe",
+        )
+        .expect("valid fixed test release asset URL");
+
+        assert_eq!(
+            test_release_file.file_name().and_then(|name| name.to_str()),
+            Some("rustdesk-1.4.6-x86_64.exe")
         );
     }
 
@@ -684,6 +812,7 @@ mod tests {
             "https://github.com:443/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
             "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe?download=1",
             "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe#download",
+            "https://github.com/fufesou/rustdesk/releases/download/other-tag/rustdesk-1.4.6-x86_64.exe",
             "not a url",
         ] {
             assert!(get_download_file_from_url(url).is_none(), "{url}");
