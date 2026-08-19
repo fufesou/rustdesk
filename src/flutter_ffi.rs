@@ -2925,7 +2925,7 @@ fn push_update_me_error(error: String) {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn verified_update_artifact_for_release_page_url(
     release_page_url: &str,
-) -> ResultType<hbb_common::update_metadata::VerifiedUpdateArtifact> {
+) -> ResultType<crate::update_metadata::VerifiedUpdateArtifact> {
     #[cfg(target_os = "windows")]
     let update_msi = crate::platform::windows::is_msi_installed()? && !crate::is_custom_client();
     #[cfg(target_os = "macos")]

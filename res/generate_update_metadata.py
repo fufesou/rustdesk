@@ -26,6 +26,7 @@ GITHUB_REPOSITORY = os.environ.get(GITHUB_REPOSITORY_ENV, DEFAULT_GITHUB_REPOSIT
 RFC3339_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})"
 )
+ARTIFACT_FILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def fail(message):
@@ -104,14 +105,22 @@ def validate_published_at(value):
         fail("published_at must be an RFC 3339 timestamp")
 
 
+def validate_artifact_file_name(file_name):
+    if (
+        not isinstance(file_name, str)
+        or file_name in {".", ".."}
+        or not ARTIFACT_FILE_NAME_PATTERN.fullmatch(file_name)
+    ):
+        fail(f"invalid artifact file name: {file_name}")
+
+
 def artifact_metadata(spec, release_id):
     platform, arch, file_format, raw_path = spec
     if not all(value.strip() for value in (platform, arch, file_format)):
         fail("artifact selector fields must not be empty")
     path = Path(raw_path)
     file_name = path.name
-    if not file_name or file_name in {".", ".."} or "\\" in file_name:
-        fail(f"invalid artifact file name: {file_name}")
+    validate_artifact_file_name(file_name)
     return {
         "platform": platform,
         "arch": arch,
@@ -199,11 +208,28 @@ def command_verify(args):
     artifacts = metadata.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         fail("metadata must contain artifacts")
-    names = [artifact.get("file_name") for artifact in artifacts]
-    selectors = [
-        (artifact.get("platform"), artifact.get("arch"), artifact.get("format"))
+    selector_fields = ("platform", "arch", "format")
+    required_artifact_fields = selector_fields + (
+        "file_name",
+        "url",
+        "size",
+        "sha256",
+    )
+    if any(
+        not isinstance(artifact, dict)
+        or any(field not in artifact for field in required_artifact_fields)
         for artifact in artifacts
-    ]
+    ):
+        fail("artifact metadata is missing required fields")
+    names = [artifact.get("file_name") for artifact in artifacts]
+    for file_name in names:
+        validate_artifact_file_name(file_name)
+    selectors = [tuple(artifact[field] for field in selector_fields) for artifact in artifacts]
+    if any(
+        not all(isinstance(value, str) and value.strip() for value in selector)
+        for selector in selectors
+    ):
+        fail("artifact selector fields must be non-empty strings")
     if len(set(names)) != len(names) or set(names) != set(local_artifacts):
         fail("artifact file set mismatch")
     if len(set(selectors)) != len(selectors):
@@ -228,7 +254,12 @@ def command_check_key(args):
     )
     if not match:
         fail("failed to find embedded update public key")
-    embedded_key = bytes(int(part) for part in match.group(1).split(",") if part.strip())
+    try:
+        embedded_key = bytes(
+            int(part) for part in match.group(1).split(",") if part.strip()
+        )
+    except ValueError as error:
+        fail(f"invalid embedded update public key: {error}")
     if embedded_key != decode_env(PUBLIC_KEY_ENV, 32):
         fail(f"embedded update public key does not match {PUBLIC_KEY_ENV}")
 
@@ -253,7 +284,7 @@ def build_parser():
     verify.set_defaults(func=command_verify)
     check_key = commands.add_parser("check-key")
     check_key.add_argument(
-        "--rust-source", default="libs/hbb_common/src/update_metadata.rs"
+        "--rust-source", default="src/update_metadata.rs"
     )
     check_key.set_defaults(func=command_check_key)
     return parser

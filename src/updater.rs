@@ -4,12 +4,9 @@ use crate::{
         release_metadata_url, release_signature_url, set_fixed_test_software_update_url,
     },
     hbbs_http::create_http_client_with_url_strict,
+    update_metadata::{UpdateArtifactQuery, UpdateMetadataRequirements, VerifiedUpdateArtifact},
 };
-use hbb_common::{
-    bail, config, log,
-    update_metadata::{UpdateArtifactQuery, UpdateMetadataPolicy, VerifiedUpdateArtifact},
-    ResultType,
-};
+use hbb_common::{bail, config, log, ResultType};
 use std::{
     io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
@@ -89,7 +86,6 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
 
 /// Retry interval when an update check fails or a session is active (30 minutes).
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
-const UPDATE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_METADATA_SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
 const UPDATE_FILE_CREATE_ATTEMPTS: usize = 16;
@@ -221,7 +217,6 @@ fn check_update(manually: bool) -> ResultType<()> {
             platform: current_update_platform(),
             arch: current_update_arch(),
             format: update_format,
-            file_name: None,
         };
         let artifact = verified_update_artifact_from_release_page_url(&update_url, &query)?;
         let download_url = artifact.url.as_str();
@@ -313,7 +308,6 @@ pub fn current_update_artifact_query(update_msi: bool) -> UpdateArtifactQuery<'s
         platform: current_update_platform(),
         arch: current_update_arch(),
         format: current_update_format(update_msi),
-        file_name: None,
     }
 }
 
@@ -349,19 +343,13 @@ fn verified_update_artifact_from_release_page_url(
     let signature_url = release_signature_url(update_url)?;
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
     let signature_bytes = fetch_update_sidecar_bytes(&signature_url)?;
-    let policy = UpdateMetadataPolicy {
-        app: "rustdesk",
-        allowed_package_ids: &["rustdesk"],
-        expected_version: Some(display_version.as_str()),
-        expected_release_id: Some(release_id.as_str()),
-        expected_artifact_url_prefix: Some(expected_artifact_url_prefix.as_str()),
+    let requirements = UpdateMetadataRequirements {
+        expected_version: display_version.as_str(),
+        expected_release_id: release_id.as_str(),
+        expected_artifact_url_prefix: expected_artifact_url_prefix.as_str(),
+        artifact: *query,
     };
-    hbb_common::update_metadata::verify_update_metadata(
-        &metadata_bytes,
-        &signature_bytes,
-        &policy,
-        query,
-    )
+    crate::update_metadata::verify_update_metadata(&metadata_bytes, &signature_bytes, requirements)
 }
 
 fn read_limited_response_bytes<R: Read>(
@@ -423,10 +411,7 @@ fn ensure_verified_update_artifact(
         }
     }
     let client = create_http_client_with_url_strict(download_url)?;
-    let response = client
-        .get(download_url)
-        .timeout(UPDATE_HTTP_REQUEST_TIMEOUT)
-        .send()?;
+    let response = client.get(download_url).send()?;
     if !response.status().is_success() {
         bail!(
             "Failed to download the new version file: {}",
@@ -451,6 +436,11 @@ fn cached_update_artifact_size(file_path: &Path) -> ResultType<Option<u64>> {
     if metadata.file_type().is_file() {
         return Ok(Some(metadata.len()));
     }
+    if metadata.file_type().is_symlink() {
+        log::warn!("Removing cached update symlink: {}", file_path.display());
+        remove_cached_update_artifact(file_path)?;
+        return Ok(None);
+    }
     bail!(
         "Refusing to use update cache path that is not a regular file: {}",
         file_path.display()
@@ -464,7 +454,19 @@ fn remove_cached_update_artifact(file_path: &Path) -> ResultType<()> {
         Err(e) => return Err(e.into()),
     };
     let file_type = metadata.file_type();
-    if file_type.is_file() || file_type.is_symlink() {
+    if file_type.is_file() {
+        std::fs::remove_file(file_path)?;
+    } else if file_type.is_symlink() {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if file_type.is_symlink_dir() {
+                std::fs::remove_dir(file_path)?;
+            } else {
+                std::fs::remove_file(file_path)?;
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
         std::fs::remove_file(file_path)?;
     } else {
         bail!(
@@ -691,39 +693,47 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
 /// an unknown session state.
 #[cfg(target_os = "macos")]
 pub fn has_no_active_conns_ipc() -> bool {
-    let rt = match hbb_common::tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return false,
+    let result = match hbb_common::tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(query_no_active_conns_ipc()),
+        Err(err) => Err(hbb_common::anyhow::anyhow!(
+            "failed to create IPC runtime: {err}"
+        )),
     };
-    rt.block_on(async {
-        // Use the same GUI-domain-filtered UID set as the update script.
-        // Shell-only SSH/TTY users are excluded, while an empty GUI set maps
-        // to UID 0 so the LoginWindow server is queried rather than assumed idle.
-        let uids = crate::platform::get_logged_in_uids();
-        // Check each user's server — fail closed if any has active connections
-        for uid in uids {
-            if let Ok(mut conn) = crate::ipc::connect_for_uid(1000, uid, "").await {
-                if conn.send(&crate::ipc::Data::HasNoActiveConns(None)).await.is_ok() {
-                    match conn.next_timeout(1000).await {
-                        Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(true)))) => {
-                            // Explicit no active connections — safe to continue
-                        }
-                        Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(false)))) => {
-                            return false; // Explicit active connections
-                        }
-                        _ => {
-                            return false; // Timeout/error/unexpected — fail closed
-                        }
-                    }
-                } else {
-                    return false; // Send failed — fail closed
-                }
-            } else {
-                return false; // Connection failed — fail closed
-            }
+    match result {
+        Ok(no_active_conns) => no_active_conns,
+        Err(err) => {
+            log::warn!(
+                "[root-update] Unable to determine active connection state; deferring update: {}",
+                err
+            );
+            false
         }
-        true // All users explicitly confirmed no active connections
-    })
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn query_no_active_conns_ipc() -> ResultType<bool> {
+    const IPC_TIMEOUT_MS: u64 = 1_000;
+    // An empty GUI user set maps to UID 0 so LoginWindow must also confirm it is idle.
+    let uids = crate::platform::get_logged_in_uids();
+    for uid in uids {
+        let mut conn = crate::ipc::connect_for_uid(IPC_TIMEOUT_MS, uid, "")
+            .await
+            .map_err(|err| {
+                hbb_common::anyhow::anyhow!("IPC connection failed for uid {uid}: {err}")
+            })?;
+        conn.send(&crate::ipc::Data::HasNoActiveConns(None))
+            .await
+            .map_err(|err| hbb_common::anyhow::anyhow!("IPC send failed for uid {uid}: {err}"))?;
+        match conn.next_timeout(IPC_TIMEOUT_MS).await {
+            Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(true)))) => {}
+            Ok(Some(crate::ipc::Data::HasNoActiveConns(Some(false)))) => return Ok(false),
+            Ok(Some(_)) => bail!("unexpected active-connection IPC response for uid {uid}"),
+            Ok(None) => bail!("active-connection IPC closed for uid {uid}"),
+            Err(err) => bail!("active-connection IPC failed for uid {uid}: {err}"),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -1073,13 +1083,10 @@ mod tests {
     fn verified_artifact(url: &str, file_name: &str) -> VerifiedUpdateArtifact {
         VerifiedUpdateArtifact {
             version: "1.4.6".to_owned(),
-            release_id: "fix-update-metadata".to_owned(),
-            package_id: "rustdesk".to_owned(),
             url: url.to_owned(),
             file_name: file_name.to_owned(),
             size: 6,
-            sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4"
-                .to_owned(),
+            sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4".to_owned(),
         }
     }
 

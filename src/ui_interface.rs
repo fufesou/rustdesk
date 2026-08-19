@@ -747,13 +747,14 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
-    let release_id = (*SOFTWARE_UPDATE_URL
+    let release_id = SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
+        .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .unwrap_or(""))
-    .to_string();
+        .unwrap_or("")
+        .to_owned();
     if release_id != crate::common::FIXED_TEST_UPDATE_RELEASE_ID {
         return release_id;
     }
