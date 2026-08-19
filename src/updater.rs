@@ -1,15 +1,18 @@
-use crate::{
-    common::{
-        display_version_from_release_id, release_download_base_url, release_id_from_update_url,
-        release_metadata_url, release_signature_url, set_fixed_test_software_update_url,
-    },
-    hbbs_http::create_http_client_with_url_strict,
-    update_metadata::{UpdateArtifactQuery, UpdateMetadataRequirements, VerifiedUpdateArtifact},
+mod artifact;
+mod download;
+
+use crate::common::set_fixed_test_software_update_url;
+use artifact::verified_update_artifact_from_release_page_url;
+pub(crate) use artifact::{current_update_arch, current_update_format, current_update_platform};
+pub use artifact::{
+    current_update_artifact_query, get_update_download_file_from_url,
+    verified_update_artifact_for_download_url, verified_update_artifact_for_release_page_url,
 };
+use download::ensure_verified_update_artifact;
+pub(crate) use download::remove_update_file;
 use hbb_common::{bail, config, log, ResultType};
 use std::{
-    io::{Read, Seek, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{channel, Receiver, Sender},
@@ -70,7 +73,6 @@ enum UpdateMsg {
 
 lazy_static::lazy_static! {
     static ref TX_MSG : Mutex<Sender<UpdateMsg>> = Mutex::new(start_auto_update_check());
-    static ref VERIFIED_UPDATE_ARTIFACT: Mutex<Option<VerifiedUpdateArtifact>> = Mutex::new(None);
 }
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -86,9 +88,6 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(60 * 10);
 
 /// Retry interval when an update check fails or a session is active (30 minutes).
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 30);
-const UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const UPDATE_METADATA_SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
-const UPDATE_FILE_CREATE_ATTEMPTS: usize = 16;
 
 pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
@@ -213,7 +212,7 @@ fn check_update(manually: bool) -> ResultType<()> {
             log::debug!("Background auto-install is not supported on macOS.");
             return Ok(());
         }
-        let query = UpdateArtifactQuery {
+        let query = crate::update_metadata::UpdateArtifactQuery {
             platform: current_update_platform(),
             arch: current_update_arch(),
             format: update_format,
@@ -248,245 +247,6 @@ fn check_update(manually: bool) -> ResultType<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn current_update_platform() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "windows"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "macos"
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::env::consts::OS
-    }
-}
-
-pub(crate) fn current_update_arch() -> &'static str {
-    #[cfg(all(target_os = "windows", not(feature = "flutter")))]
-    {
-        "x86"
-    }
-    #[cfg(not(all(target_os = "windows", not(feature = "flutter"))))]
-    {
-        std::env::consts::ARCH
-    }
-}
-
-pub(crate) fn current_update_format(update_msi: bool) -> &'static str {
-    #[cfg(any(
-        not(target_os = "windows"),
-        all(target_os = "windows", not(feature = "flutter"))
-    ))]
-    let _ = update_msi;
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
-    {
-        if update_msi {
-            return "msi";
-        }
-        "exe"
-    }
-    #[cfg(all(target_os = "windows", not(feature = "flutter")))]
-    {
-        "exe"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "dmg"
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        "unknown"
-    }
-}
-
-pub fn current_update_artifact_query(update_msi: bool) -> UpdateArtifactQuery<'static> {
-    UpdateArtifactQuery {
-        platform: current_update_platform(),
-        arch: current_update_arch(),
-        format: current_update_format(update_msi),
-    }
-}
-
-pub fn verified_update_artifact_for_release_page_url(
-    release_page_url: &str,
-    query: UpdateArtifactQuery<'_>,
-) -> ResultType<VerifiedUpdateArtifact> {
-    let artifact = verified_update_artifact_from_release_page_url(release_page_url, &query)?;
-    *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(artifact.clone());
-    Ok(artifact)
-}
-
-pub fn verified_update_artifact_for_download_url(
-    download_url: &str,
-) -> ResultType<VerifiedUpdateArtifact> {
-    VERIFIED_UPDATE_ARTIFACT
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|artifact| artifact.url == download_url)
-        .cloned()
-        .ok_or_else(|| hbb_common::anyhow::anyhow!("update artifact was not verified"))
-}
-
-fn verified_update_artifact_from_release_page_url(
-    update_url: &str,
-    query: &UpdateArtifactQuery<'_>,
-) -> ResultType<VerifiedUpdateArtifact> {
-    let release_id = release_id_from_update_url(update_url)?;
-    let display_version = display_version_from_release_id(&release_id)?;
-    let expected_artifact_url_prefix = release_download_base_url(update_url)?;
-    let metadata_url = release_metadata_url(update_url)?;
-    let signature_url = release_signature_url(update_url)?;
-    let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
-    let signature_bytes = fetch_update_sidecar_bytes(&signature_url)?;
-    let requirements = UpdateMetadataRequirements {
-        expected_version: display_version.as_str(),
-        expected_release_id: release_id.as_str(),
-        expected_artifact_url_prefix: expected_artifact_url_prefix.as_str(),
-        artifact: *query,
-    };
-    crate::update_metadata::verify_update_metadata(&metadata_bytes, &signature_bytes, requirements)
-}
-
-fn read_limited_response_bytes<R: Read>(
-    reader: &mut R,
-    limit: u64,
-    what: &str,
-) -> ResultType<Vec<u8>> {
-    let mut limited_reader = reader.take(limit.saturating_add(1));
-    let mut bytes = Vec::new();
-    limited_reader.read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        bail!("{what} exceeds maximum allowed size of {limit} bytes");
-    }
-    Ok(bytes)
-}
-
-fn fetch_update_sidecar_bytes(url: &str) -> ResultType<Vec<u8>> {
-    let client = create_http_client_with_url_strict(url)?;
-    let mut response = client
-        .get(url)
-        .timeout(UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT)
-        .send()?;
-    if !response.status().is_success() {
-        bail!(
-            "Failed to download update metadata sidecar: {}",
-            response.status()
-        );
-    }
-    read_limited_response_bytes(
-        &mut response,
-        UPDATE_METADATA_SIDECAR_MAX_BYTES,
-        "Update metadata sidecar",
-    )
-}
-
-fn ensure_verified_update_artifact(
-    download_url: &str,
-    file_path: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> ResultType<()> {
-    if let Some(file_size) = cached_update_artifact_size(file_path)? {
-        if file_size == expected_size {
-            match verify_file_sha256(file_path, expected_sha256) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("Removing cached update file with invalid SHA256: {}", e);
-                    remove_cached_update_artifact(file_path)?;
-                }
-            }
-        } else {
-            log::warn!(
-                "Removing cached update file with size mismatch for {}: expected {}, got {}",
-                file_path.display(),
-                expected_size,
-                file_size
-            );
-            remove_cached_update_artifact(file_path)?;
-        }
-    }
-    let client = create_http_client_with_url_strict(download_url)?;
-    let response = client.get(download_url).send()?;
-    if !response.status().is_success() {
-        bail!(
-            "Failed to download the new version file: {}",
-            response.status()
-        );
-    }
-    let mut limited_response = response.take(expected_size.saturating_add(1));
-    write_verified_update_artifact(
-        file_path,
-        &mut limited_response,
-        expected_size,
-        expected_sha256,
-    )
-}
-
-fn cached_update_artifact_size(file_path: &Path) -> ResultType<Option<u64>> {
-    let metadata = match std::fs::symlink_metadata(file_path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if metadata.file_type().is_file() {
-        return Ok(Some(metadata.len()));
-    }
-    if metadata.file_type().is_symlink() {
-        log::warn!("Removing cached update symlink: {}", file_path.display());
-        remove_cached_update_artifact(file_path)?;
-        return Ok(None);
-    }
-    bail!(
-        "Refusing to use update cache path that is not a regular file: {}",
-        file_path.display()
-    )
-}
-
-fn remove_cached_update_artifact(file_path: &Path) -> ResultType<()> {
-    let metadata = match std::fs::symlink_metadata(file_path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_file() {
-        std::fs::remove_file(file_path)?;
-    } else if file_type.is_symlink() {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::fs::FileTypeExt;
-            if file_type.is_symlink_dir() {
-                std::fs::remove_dir(file_path)?;
-            } else {
-                std::fs::remove_file(file_path)?;
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        std::fs::remove_file(file_path)?;
-    } else {
-        bail!(
-            "Refusing to remove update cache path that is not a file: {}",
-            file_path.display()
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_update_file(file_path: &Path) {
-    match std::fs::remove_file(file_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!(
-            "Failed to remove update file {}: {}",
-            file_path.display(),
-            e
-        ),
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -621,65 +381,6 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
     }
 }
 
-pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
-    let parsed = url::Url::parse(url).ok()?;
-    // Check the raw prefix before Url normalizes default ports.
-    if !url.starts_with("https://github.com/")
-        || parsed.scheme() != "https"
-        || parsed.host_str() != Some("github.com")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return None;
-    }
-
-    let mut segments = parsed.path_segments()?;
-    let owner = segments.next()?;
-    let repo = segments.next()?;
-    let releases = segments.next()?;
-    let download = segments.next()?;
-    let tag = segments.next()?;
-    let filename = segments.next()?;
-
-    if !is_allowed_update_release(owner, repo, tag)
-        || releases != "releases"
-        || download != "download"
-        || tag.is_empty()
-        || segments.next().is_some()
-        || !is_plain_update_filename(filename)
-    {
-        return None;
-    }
-
-    Some(std::env::temp_dir().join(filename))
-}
-
-fn is_allowed_update_release(owner: &str, repo: &str, tag: &str) -> bool {
-    (owner == "rustdesk" && repo == "rustdesk")
-        || (owner == "fufesou"
-            && repo == "rustdesk"
-            && tag == crate::common::FIXED_TEST_UPDATE_RELEASE_ID)
-}
-
-fn is_plain_update_filename(filename: &str) -> bool {
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains(':')
-    {
-        return false;
-    }
-
-    let mut components = Path::new(filename).components();
-    matches!(
-        components.next(),
-        Some(Component::Normal(name)) if name.to_str() == Some(filename)
-    ) && components.next().is_none()
-}
-
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     get_update_download_file_from_url(url)
 }
@@ -750,11 +451,7 @@ fn wait_for_failed_update_retry() {
     let remaining = std::fs::metadata(marker)
         .and_then(|metadata| metadata.modified())
         .ok()
-        .and_then(|modified| {
-            std::time::SystemTime::now()
-                .duration_since(modified)
-                .ok()
-        })
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
         .map(|elapsed| RETRY_INTERVAL.saturating_sub(elapsed))
         .unwrap_or(RETRY_INTERVAL);
     if !remaining.is_zero() {
@@ -919,7 +616,11 @@ pub fn check_update_as_root() -> ResultType<bool> {
     // Recheck active sessions before installing — download can take minutes
     if !has_no_active_conns_ipc() {
         if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
-            log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
+            log::warn!(
+                "[root-update] Failed to remove temp dir {}: {}",
+                private_tmp,
+                e
+            );
         }
         bail!("[root-update] Active session started during download, deferring update.");
     }
@@ -927,294 +628,11 @@ pub fn check_update_as_root() -> ResultType<bool> {
     let result = crate::platform::update_from_dmg_as_root(&tmp_path, &artifact.version);
     // Clean up download directory
     if let Err(e) = std::fs::remove_dir_all(&private_tmp) {
-        log::warn!("[root-update] Failed to remove temp dir {}: {}", private_tmp, e);
+        log::warn!(
+            "[root-update] Failed to remove temp dir {}: {}",
+            private_tmp,
+            e
+        );
     }
     result.map(|_| true)
-}
-
-fn create_download_temp_file(final_path: &Path) -> ResultType<(std::fs::File, PathBuf)> {
-    let Some(download_dir) = final_path.parent() else {
-        bail!(
-            "Update file has no parent directory: {}",
-            final_path.display()
-        );
-    };
-    let Some(file_name) = final_path.file_name() else {
-        bail!("Update file has no file name: {}", final_path.display());
-    };
-    let file_name = file_name.to_string_lossy();
-    for _ in 0..UPDATE_FILE_CREATE_ATTEMPTS {
-        let temp_path = download_dir.join(format!(
-            ".{}.{}.{}.download",
-            file_name,
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((file, temp_path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    bail!("Failed to create temporary update file");
-}
-
-fn write_verified_update_artifact<R: Read>(
-    final_path: &Path,
-    reader: &mut R,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> ResultType<()> {
-    let (mut file, temp_path) = create_download_temp_file(final_path)?;
-    if let Err(e) = copy_and_verify_update_artifact(
-        &mut file,
-        &temp_path,
-        reader,
-        expected_size,
-        expected_sha256,
-    ) {
-        remove_update_file(&temp_path);
-        return Err(e);
-    }
-    drop(file);
-    if let Err(e) = remove_cached_update_artifact(final_path) {
-        remove_update_file(&temp_path);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&temp_path, final_path) {
-        remove_update_file(&temp_path);
-        return Err(e.into());
-    }
-    Ok(())
-}
-
-fn copy_and_verify_update_artifact<R: Read>(
-    file: &mut std::fs::File,
-    temp_path: &Path,
-    reader: &mut R,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> ResultType<()> {
-    let bytes_written = std::io::copy(reader, file)?;
-    file.flush()?;
-    if bytes_written != expected_size {
-        bail!(
-            "Update artifact size mismatch for {}: expected {}, got {}",
-            temp_path.display(),
-            expected_size,
-            bytes_written
-        );
-    }
-    verify_update_file_sha256(file, temp_path, expected_sha256)
-}
-
-fn verify_file_sha256(path: &Path, expected_sha256: &str) -> ResultType<()> {
-    let mut file = std::fs::File::open(path)?;
-    verify_update_file_sha256(&mut file, path, expected_sha256)
-}
-
-fn verify_update_file_sha256<R: Read + Seek>(
-    reader: &mut R,
-    path: &Path,
-    expected_sha256: &str,
-) -> ResultType<()> {
-    use crate::update_hash::{verify_sha256_reader, Sha256VerificationError};
-
-    match verify_sha256_reader(reader, expected_sha256) {
-        Ok(()) => Ok(()),
-        Err(Sha256VerificationError::InvalidExpected) => bail!(
-            "Expected update file SHA256 is malformed for {}",
-            path.display()
-        ),
-        Err(Sha256VerificationError::Mismatch {
-            expected_sha256,
-            actual_sha256,
-        }) => bail!(
-            "SHA256 mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected_sha256,
-            actual_sha256
-        ),
-        Err(Sha256VerificationError::Io(err)) => Err(err.into()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn update_download_file_accepts_expected_github_asset_urls() {
-        let file = get_download_file_from_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/1.4.0/rustdesk-1.4.0-x86_64.dmg",
-        )
-        .expect("valid GitHub release asset URL");
-
-        assert_eq!(
-            file.file_name().and_then(|name| name.to_str()),
-            Some("rustdesk-1.4.0-x86_64.dmg")
-        );
-    }
-
-    #[test]
-    fn update_download_file_rejects_untrusted_or_malformed_urls() {
-        for url in [
-            "http://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://example.com/rustdesk.exe",
-            "https://github.com/other/project/releases/download/1/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/nested/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/C:rustdesk.exe",
-            "https://user@github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://github.com:443/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe?download=1",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe#download",
-            "not a url",
-        ] {
-            assert!(get_download_file_from_url(url).is_none(), "{url}");
-        }
-    }
-
-    fn verified_artifact(url: &str, file_name: &str) -> VerifiedUpdateArtifact {
-        VerifiedUpdateArtifact {
-            version: "1.4.6".to_owned(),
-            url: url.to_owned(),
-            file_name: file_name.to_owned(),
-            size: 6,
-            sha256: "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4".to_owned(),
-        }
-    }
-
-    #[test]
-    fn fixed_test_release_download_url_is_accepted() {
-        let download_url = "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
-
-        assert_eq!(
-            get_download_file_from_url(download_url)
-                .and_then(|path| path.file_name().map(|name| name.to_owned())),
-            Some(std::ffi::OsString::from("rustdesk.exe"))
-        );
-    }
-
-    #[test]
-    fn verified_update_artifact_cache_keeps_only_last_verified_url() {
-        let first_url =
-            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.exe";
-        let second_url =
-            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk.msi";
-        let first = verified_artifact(first_url, "rustdesk.exe");
-        let second = verified_artifact(second_url, "rustdesk.msi");
-
-        *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(first);
-        *VERIFIED_UPDATE_ARTIFACT.lock().unwrap() = Some(second.clone());
-
-        assert!(verified_update_artifact_for_download_url(first_url).is_err());
-        assert_eq!(
-            verified_update_artifact_for_download_url(second_url)
-                .unwrap()
-                .file_name,
-            second.file_name
-        );
-    }
-
-    #[test]
-    fn limited_sidecar_reader_rejects_oversized_payloads() {
-        let mut payload: &[u8] = b"rustdesk";
-        assert_eq!(
-            read_limited_response_bytes(&mut payload, 8, "sidecar")
-                .unwrap()
-                .len(),
-            8
-        );
-
-        let mut oversized: &[u8] = b"too-large";
-        assert!(read_limited_response_bytes(&mut oversized, 4, "sidecar").is_err());
-    }
-
-    #[test]
-    fn copy_and_verify_update_artifact_hashes_open_file_handle() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-updater-open-handle-sha256-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let final_path = test_dir.join("rustdesk-update.exe");
-        let (mut file, _) = create_download_temp_file(&final_path).unwrap();
-        let display_path = test_dir.join("path-must-not-be-opened.download");
-        let mut data: &[u8] = b"rustdesk";
-
-        let result = copy_and_verify_update_artifact(
-            &mut file,
-            &display_path,
-            &mut data,
-            8,
-            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
-        );
-        let position = result
-            .as_ref()
-            .ok()
-            .map(|_| std::io::Seek::stream_position(&mut file).unwrap());
-        drop(file);
-        std::fs::remove_dir_all(&test_dir).unwrap();
-
-        assert!(result.is_ok(), "{:?}", result.err());
-        assert_eq!(position, Some(0));
-    }
-
-    #[test]
-    fn remove_cached_update_artifact_rejects_directory() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-updater-cache-dir-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let cache_path = test_dir.join("rustdesk-update.exe");
-        std::fs::create_dir(&cache_path).unwrap();
-        std::fs::write(cache_path.join("stale"), b"stale").unwrap();
-
-        let result = remove_cached_update_artifact(&cache_path);
-
-        assert!(result.is_err());
-        assert!(cache_path.exists());
-        std::fs::remove_dir_all(&test_dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn verified_download_replaces_symlink_without_touching_target() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-updater-symlink-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let final_path = test_dir.join("rustdesk-update.exe");
-        let victim_path = test_dir.join("victim");
-        std::fs::write(&victim_path, b"victim").unwrap();
-        std::os::unix::fs::symlink(&victim_path, &final_path).unwrap();
-        let mut data: &[u8] = b"update";
-
-        write_verified_update_artifact(
-            &final_path,
-            &mut data,
-            6,
-            "2937013f2181810606b2a799b05bda2849f3e369a20982a4138f0e0a55984ce4",
-        )
-        .unwrap();
-
-        assert_eq!(std::fs::read(&victim_path).unwrap(), b"victim");
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"update");
-        assert!(!std::fs::symlink_metadata(&final_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        std::fs::remove_dir_all(&test_dir).unwrap();
-    }
 }

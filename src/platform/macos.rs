@@ -2,6 +2,13 @@
 // https://github.com/servo/core-foundation-rs
 // https://github.com/rust-windowing/winit
 
+mod update_temp;
+mod verified_dmg;
+
+#[cfg(test)]
+#[path = "macos/verified_dmg_tests.rs"]
+mod verified_dmg_tests;
+
 use super::{CursorData, ResultType};
 use cocoa::{
     appkit::{NSApp, NSApplication, NSApplicationActivationPolicy::*},
@@ -29,14 +36,16 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
-    io::{self, Write},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
+};
+pub use update_temp::try_remove_temp_update_dir;
+use update_temp::{copy_dmg_to_update_temp_file, get_update_temp_dir_string};
+use verified_dmg::{
+    attach_dmg, copy_and_verify_dmg_file, extract_dmg_inner, verified_dmg_path, verify_stored_dmg,
+    VerifiedDmg,
 };
 
 // macOS boolean_t is defined as `int` in <mach/boolean.h>
@@ -45,11 +54,7 @@ type BooleanT = hbb_common::libc::c_int;
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
-static UPDATE_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
-const UPDATE_TEMP_DMG_CREATE_ATTEMPTS: usize = 16;
-const UPDATE_DMG_MOUNT_TEMPLATE: &str = "/tmp/.rustdeskmount-XXXXXX";
 const UPDATE_CLEANUP_FAILED_AFTER_COMMIT: &str = "UPDATE_CLEANUP_FAILED_AFTER_COMMIT";
-const STALE_UPDATE_TEMP_DIR_SECS: u64 = 24 * 60 * 60;
 // `kill -9` may not work without administrator privileges.
 const PRIVILEGED_UPDATE_BODY: &str = r#"
 	on run {app_name, cur_pid, source_path, user_name, restore_owner, expected_sha256}
@@ -80,96 +85,6 @@ const PRIVILEGED_UPDATE_BODY: &str = r#"
 	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
 	end run
 	        "#;
-
-#[inline]
-fn get_update_temp_dir() -> PathBuf {
-    UPDATE_TEMP_DIR.get_or_init(new_update_temp_dir).clone()
-}
-
-fn new_update_temp_dir() -> PathBuf {
-    let euid = unsafe { hbb_common::libc::geteuid() };
-    Path::new("/tmp").join(format!(
-        ".rustdeskupdate-{}-{}-{}",
-        euid,
-        std::process::id(),
-        hbb_common::rand::random::<u64>()
-    ))
-}
-
-fn legacy_update_temp_dir() -> PathBuf {
-    let euid = unsafe { hbb_common::libc::geteuid() };
-    Path::new("/tmp").join(format!(".rustdeskupdate-{}", euid))
-}
-
-fn stale_update_temp_dir_prefix() -> String {
-    let euid = unsafe { hbb_common::libc::geteuid() };
-    format!(".rustdeskupdate-{}-", euid)
-}
-
-fn is_stale_update_temp_dir_name(name: &str) -> bool {
-    let Some(suffix) = name.strip_prefix(&stale_update_temp_dir_prefix()) else {
-        return false;
-    };
-    let mut parts = suffix.split('-');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(pid), Some(random), None)
-            if !pid.is_empty()
-                && !random.is_empty()
-                && pid.bytes().all(|byte| byte.is_ascii_digit())
-                && random.bytes().all(|byte| byte.is_ascii_digit())
-    )
-}
-
-#[inline]
-fn get_update_temp_dir_string() -> String {
-    get_update_temp_dir().to_string_lossy().into_owned()
-}
-
-fn ensure_real_update_temp_dir(path: &Path) -> ResultType<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "Update temp path is not a real directory: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn create_update_temp_dmg_file() -> ResultType<(std::fs::File, PathBuf)> {
-    let update_temp_dir = get_update_temp_dir();
-    std::fs::create_dir_all(&update_temp_dir)?;
-    ensure_real_update_temp_dir(&update_temp_dir)?;
-    std::fs::set_permissions(&update_temp_dir, std::fs::Permissions::from_mode(0o700))?;
-
-    let dmg_dir = update_temp_dir.join("dmgdir");
-    std::fs::create_dir_all(&dmg_dir)?;
-    ensure_real_update_temp_dir(&dmg_dir)?;
-    std::fs::set_permissions(&dmg_dir, std::fs::Permissions::from_mode(0o700))?;
-
-    for _ in 0..UPDATE_TEMP_DMG_CREATE_ATTEMPTS {
-        let file_path = dmg_dir.join(format!(
-            "{}-{}-{}.dmg",
-            crate::get_app_name(),
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&file_path);
-        match file {
-            Ok(file) => return Ok((file, file_path)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    bail!("Failed to create update DMG file")
-}
 
 /// Global mutex to serialize CoreGraphics cursor operations.
 /// This prevents race conditions between cursor visibility (hide depth tracking)
@@ -1077,72 +992,6 @@ pub fn quit_gui() {
     };
 }
 
-#[inline]
-pub fn try_remove_temp_update_dir(dir: Option<&str>) {
-    if let Some(dir) = dir {
-        remove_temp_update_dir(Path::new(dir));
-    } else {
-        remove_temp_update_dir(&legacy_update_temp_dir());
-        remove_stale_update_temp_dirs();
-    }
-}
-
-fn remove_stale_update_temp_dirs() {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let current_update_temp_dir = get_update_temp_dir();
-    let legacy_update_temp_dir = legacy_update_temp_dir();
-    let euid = unsafe { hbb_common::libc::geteuid() };
-    let Ok(entries) = std::fs::read_dir("/tmp") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == current_update_temp_dir || path == legacy_update_temp_dir {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !is_stale_update_temp_dir_name(name) {
-            continue;
-        }
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_dir() || metadata.uid() != euid || !is_old_update_temp_dir(&metadata) {
-            continue;
-        }
-        remove_temp_update_dir(&path);
-    }
-}
-
-fn is_old_update_temp_dir(metadata: &std::fs::Metadata) -> bool {
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|age| age.as_secs() >= STALE_UPDATE_TEMP_DIR_SECS)
-        .unwrap_or(false)
-}
-
-fn remove_temp_update_dir(path: &Path) {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => {}
-        Err(err)
-            if err.kind() == io::ErrorKind::NotFound
-                || err.raw_os_error() == Some(hbb_common::libc::ENOTDIR) => {}
-        Err(err) => {
-            log::warn!(
-                "Failed to remove update temp dir {}: {}",
-                path.display(),
-                err
-            );
-        }
-    }
-}
-
 pub fn update_me() -> ResultType<()> {
     let cmd = std::env::current_exe()?;
     // RustDesk.app/Contents/MacOS/RustDesk
@@ -1261,92 +1110,6 @@ fn update_from_verified_dmg(verified_dmg: &VerifiedDmg) -> ResultType<()> {
     update_me_from_source(verified_dmg_update_source(verified_dmg)?)?;
     println!("Update process started");
     Ok(())
-}
-
-fn open_dmg_file(file: &str, expected_size: Option<u64>) -> ResultType<std::fs::File> {
-    let path_metadata = std::fs::symlink_metadata(file)?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-        bail!("Update DMG path is not a regular file: {}", file);
-    }
-    if expected_size.is_some_and(|size| size != path_metadata.len()) {
-        bail!("DMG size mismatch for {}", file);
-    }
-    let dmg_file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
-        .open(file)?;
-    let opened_metadata = dmg_file.metadata()?;
-    if !opened_metadata.is_file() || expected_size.is_some_and(|size| size != opened_metadata.len())
-    {
-        bail!("DMG changed while opening {}", file);
-    }
-    Ok(dmg_file)
-}
-
-fn verify_dmg_contents(
-    dmg_file: &mut std::fs::File,
-    expected_sha256: &str,
-    file: &str,
-) -> ResultType<()> {
-    use crate::update_hash::{verify_sha256_reader, Sha256VerificationError};
-
-    match verify_sha256_reader(dmg_file, expected_sha256) {
-        Ok(()) => Ok(()),
-        Err(Sha256VerificationError::InvalidExpected) => {
-            bail!("Expected DMG SHA256 is malformed for {}", file)
-        }
-        Err(Sha256VerificationError::Mismatch { .. }) => {
-            bail!("SHA256 mismatch for {}", file)
-        }
-        Err(Sha256VerificationError::Io(err)) => Err(err.into()),
-    }
-}
-
-#[derive(Debug)]
-struct VerifiedDmg {
-    file: std::fs::File,
-    path: PathBuf,
-    expected_sha256: String,
-}
-
-impl Drop for VerifiedDmg {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                log::warn!(
-                    "Failed to remove verified DMG copy {}: {}",
-                    self.path.display(),
-                    err
-                );
-            }
-        }
-    }
-}
-
-// Retain the named copy until the privileged installer has verified its root-owned copy.
-fn copy_and_verify_dmg_file(
-    file: &str,
-    expected_sha256: &str,
-    expected_size: Option<u64>,
-) -> ResultType<VerifiedDmg> {
-    let mut source_file = open_dmg_file(file, expected_size)?;
-    let mut verified_dmg = create_verified_dmg_file(expected_sha256)?;
-    let copied_size = io::copy(&mut source_file, &mut verified_dmg.file)?;
-    if expected_size.is_some_and(|size| size != copied_size) {
-        bail!("DMG size mismatch for {}", file);
-    }
-    verified_dmg.file.flush()?;
-    verify_dmg_contents(&mut verified_dmg.file, expected_sha256, file)?;
-    Ok(verified_dmg)
-}
-
-fn create_verified_dmg_file(expected_sha256: &str) -> ResultType<VerifiedDmg> {
-    let (file, path) = create_update_temp_dmg_file()?;
-    Ok(VerifiedDmg {
-        file,
-        path,
-        expected_sha256: expected_sha256.trim().to_ascii_lowercase(),
-    })
 }
 
 pub fn update_to(_file: &str) -> ResultType<()> {
@@ -2128,24 +1891,6 @@ pub fn extract_update_dmg(file: &str) {
     crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
 }
 
-fn copy_dmg_to_update_temp_file(dmg_path: &str) -> ResultType<PathBuf> {
-    let metadata = std::fs::symlink_metadata(dmg_path)?;
-    if !metadata.file_type().is_file() {
-        bail!("Update DMG path is not a regular file: {}", dmg_path);
-    }
-    let mut source_file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_NONBLOCK)
-        .open(dmg_path)?;
-    if !source_file.metadata()?.is_file() {
-        bail!("Update DMG path is not a regular file: {}", dmg_path);
-    }
-    let (mut dmg_file, file_path) = create_update_temp_dmg_file()?;
-    io::copy(&mut source_file, &mut dmg_file)?;
-    dmg_file.flush()?;
-    Ok(file_path)
-}
-
 fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let target_path = Path::new(target_dir);
     if target_path.exists() {
@@ -2153,17 +1898,6 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     }
     std::fs::create_dir_all(target_path)?;
     extract_dmg_inner(dmg_path, target_dir)
-}
-
-#[cfg(test)]
-fn extract_verified_dmg(verified_dmg: &VerifiedDmg, target_dir: &str) -> ResultType<()> {
-    let target_path = Path::new(target_dir);
-    if target_path.exists() {
-        std::fs::remove_dir_all(target_path)?;
-    }
-    std::fs::create_dir_all(target_path)?;
-    verify_stored_dmg(verified_dmg)?;
-    extract_dmg_inner(verified_dmg_path(verified_dmg)?, target_dir)
 }
 
 fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType<()> {
@@ -2174,160 +1908,12 @@ fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType
     extract_dmg_inner(dmg_path, target_dir)
 }
 
-fn create_dmg_mount_point() -> ResultType<String> {
-    let output = Command::new("/usr/bin/mktemp")
-        .args(["-d", UPDATE_DMG_MOUNT_TEMPLATE])
-        .output()?;
-    if !output.status.success() {
-        bail!(
-            "Failed to create a private DMG mount directory: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let mount_point = String::from_utf8(output.stdout)
-        .map_err(|e| anyhow!("Invalid DMG mount directory: {}", e))?
-        .trim()
-        .to_owned();
-    if mount_point.is_empty() {
-        bail!("Failed to create a private DMG mount directory");
-    }
-    Ok(mount_point)
-}
-
-fn remove_dmg_mount_point(mount_point: &str) {
-    if let Err(err) = std::fs::remove_dir(mount_point) {
-        if err.kind() != io::ErrorKind::NotFound {
-            log::warn!(
-                "Failed to remove DMG mount directory {}: {}",
-                mount_point,
-                err
-            );
-        }
-    }
-}
-
-struct DmgGuard(String);
-
-impl DmgGuard {
-    fn mount_point(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for DmgGuard {
-    fn drop(&mut self) {
-        match Command::new("/usr/bin/hdiutil")
-            .args(["detach", self.0.as_str(), "-force"])
-            .status()
-        {
-            Ok(status) if !status.success() => {
-                log::warn!("Failed to detach DMG mount {}: {}", self.0, status);
-            }
-            Err(err) => log::warn!("Failed to detach DMG mount {}: {}", self.0, err),
-            _ => {}
-        }
-        remove_dmg_mount_point(&self.0);
-    }
-}
-
-fn attach_dmg(dmg_path: &str) -> ResultType<DmgGuard> {
-    let mount_point = create_dmg_mount_point()?;
-    // Update images are input only, so never mount them writable.
-    let output = match Command::new("/usr/bin/hdiutil")
-        .args([
-            "attach",
-            "-readonly",
-            "-nobrowse",
-            "-mountpoint",
-            mount_point.as_str(),
-            dmg_path,
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            remove_dmg_mount_point(&mount_point);
-            return Err(err.into());
-        }
-    };
-    if !output.status.success() {
-        remove_dmg_mount_point(&mount_point);
-        bail!(
-            "Failed to attach DMG image at {dmg_path} to {mount_point}: {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(DmgGuard(mount_point))
-}
-
-fn verified_dmg_path(verified_dmg: &VerifiedDmg) -> ResultType<&str> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let path_metadata = std::fs::symlink_metadata(&verified_dmg.path)?;
-    let file_metadata = verified_dmg.file.metadata()?;
-    if !path_metadata.is_file()
-        || path_metadata.dev() != file_metadata.dev()
-        || path_metadata.ino() != file_metadata.ino()
-    {
-        bail!("Verified DMG path changed: {}", verified_dmg.path.display());
-    }
-    verified_dmg
-        .path
-        .to_str()
-        .ok_or_else(|| anyhow!("Invalid verified DMG path: {}", verified_dmg.path.display()))
-}
-
-fn verify_stored_dmg(verified_dmg: &VerifiedDmg) -> ResultType<()> {
-    let mut file = verified_dmg.file.try_clone()?;
-    verify_dmg_contents(
-        &mut file,
-        &verified_dmg.expected_sha256,
-        &verified_dmg.path.to_string_lossy(),
-    )
-}
-
 fn verified_dmg_update_source(verified_dmg: &VerifiedDmg) -> ResultType<UpdateSource> {
     verify_stored_dmg(verified_dmg)?;
     Ok(UpdateSource::VerifiedDmg {
         path: verified_dmg_path(verified_dmg)?.to_owned(),
         expected_sha256: verified_dmg.expected_sha256.clone(),
     })
-}
-
-fn extract_dmg_inner(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let guard = attach_dmg(dmg_path)?;
-    extract_attached_dmg(guard, target_dir)
-}
-
-fn extract_attached_dmg(guard: DmgGuard, target_dir: &str) -> ResultType<()> {
-    let mount_point = guard.mount_point();
-
-    let app_name = format!("{}.app", crate::get_app_name());
-    let src_path = format!("{}/{}", mount_point, app_name);
-    let dest_path = format!("{}/{}", target_dir, app_name);
-
-    let copy_status = Command::new("/usr/bin/ditto")
-        .args(&[&src_path, &dest_path])
-        .status()?;
-
-    if !copy_status.success() {
-        bail!(
-            "Failed to copy application from {} to {}: {:?}",
-            src_path,
-            dest_path,
-            copy_status
-        );
-    }
-
-    if !Path::new(&dest_path).exists() {
-        bail!(
-            "Copy operation failed - destination not found at {}",
-            dest_path
-        );
-    }
-
-    Ok(())
 }
 
 fn update_extracted(target_dir: &str) -> ResultType<()> {
@@ -2562,10 +2148,8 @@ fn get_bundle_id() -> Option<String> {
 }
 
 #[cfg(test)]
-mod verified_dmg_tests {
+mod update_tests {
     use super::*;
-
-    const TEST_DMG_MARKER: &[u8] = b"verified DMG";
 
     fn privileged_update_scripts() -> [&'static str; 2] {
         let daemon_script = PRIVILEGES_SCRIPTS_DIR
@@ -2574,248 +2158,6 @@ mod verified_dmg_tests {
             .contents_utf8()
             .unwrap();
         [daemon_script, PRIVILEGED_UPDATE_BODY]
-    }
-
-    fn create_test_dmg(test_dir: &Path) -> PathBuf {
-        let source_dir = test_dir.join("source");
-        let app_dir = source_dir
-            .join(format!("{}.app", crate::get_app_name()))
-            .join("Contents");
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("marker"), TEST_DMG_MARKER).unwrap();
-        let dmg_path = test_dir.join("update.dmg");
-        let output = Command::new("/usr/bin/hdiutil")
-            .args(["create", "-quiet", "-format", "UDZO", "-srcfolder"])
-            .arg(&source_dir)
-            .arg(&dmg_path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        dmg_path
-    }
-
-    #[test]
-    fn temp_dir_cleanup_does_not_follow_symlink() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-macos-cleanup-symlink-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        let target_dir = test_dir.join("target");
-        let link_path = test_dir.join("link");
-        let target_file = target_dir.join("file");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(&target_file, b"target").unwrap();
-        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
-
-        remove_temp_update_dir(&link_path);
-
-        assert!(std::fs::symlink_metadata(&link_path).is_err());
-        assert!(target_file.exists());
-        std::fs::remove_dir_all(test_dir).unwrap();
-    }
-
-    #[test]
-    fn update_temp_dir_rejects_symlink() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-macos-temp-dir-symlink-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        let target_dir = test_dir.join("target");
-        let link_path = test_dir.join("link");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::os::unix::fs::symlink(&target_dir, &link_path).unwrap();
-
-        assert!(ensure_real_update_temp_dir(&link_path).is_err());
-        assert!(ensure_real_update_temp_dir(&target_dir).is_ok());
-
-        std::fs::remove_dir_all(test_dir).unwrap();
-    }
-
-    #[test]
-    fn stale_update_temp_dir_name_requires_owned_randomized_dir() {
-        let euid = unsafe { hbb_common::libc::geteuid() };
-
-        assert!(is_stale_update_temp_dir_name(&format!(
-            ".rustdeskupdate-{euid}-123-456"
-        )));
-        for name in [
-            format!(".rustdeskupdate-{euid}"),
-            format!(".rustdeskupdate-{euid}-abc-456"),
-            format!(".rustdeskupdate-{euid}-123"),
-            ".rustdeskupdate-999999-123-456".to_owned(),
-            "rustdeskupdate-123-456".to_owned(),
-        ] {
-            assert!(!is_stale_update_temp_dir_name(&name), "{name}");
-        }
-    }
-
-    #[test]
-    fn update_dmg_mount_points_are_unique() {
-        let first = create_dmg_mount_point().unwrap();
-        let second = create_dmg_mount_point().unwrap();
-        let are_unique = first != second;
-        for mount_point in [&first, &second] {
-            if mount_point.starts_with("/tmp/.rustdeskmount-") {
-                std::fs::remove_dir(mount_point).unwrap();
-            }
-        }
-
-        assert!(are_unique);
-    }
-
-    #[test]
-    fn verified_dmg_extracts_from_named_copy() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-verified-dmg-extract-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let dmg_path = create_test_dmg(&test_dir);
-        let mut dmg_file = std::fs::File::open(&dmg_path).unwrap();
-        let sha256 = crate::update_hash::sha256_reader_hex(&mut dmg_file).unwrap();
-        let size = dmg_file.metadata().unwrap().len();
-        let verified_dmg =
-            copy_and_verify_dmg_file(&dmg_path.to_string_lossy(), &sha256, Some(size)).unwrap();
-        let target_dir = test_dir.join("target");
-
-        let result = extract_verified_dmg(&verified_dmg, &target_dir.to_string_lossy());
-        let marker = std::fs::read(
-            target_dir
-                .join(format!("{}.app", crate::get_app_name()))
-                .join("Contents/marker"),
-        );
-        std::fs::remove_dir_all(test_dir).unwrap();
-
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(marker.unwrap(), TEST_DMG_MARKER);
-    }
-
-    #[test]
-    fn verified_dmg_rejects_replaced_path() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-verified-dmg-replacement-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        let dmg_path = create_test_dmg(&test_dir.join("trusted"));
-        let mut dmg_file = std::fs::File::open(&dmg_path).unwrap();
-        let sha256 = crate::update_hash::sha256_reader_hex(&mut dmg_file).unwrap();
-        let size = dmg_file.metadata().unwrap().len();
-        let verified_dmg =
-            copy_and_verify_dmg_file(&dmg_path.to_string_lossy(), &sha256, Some(size)).unwrap();
-        let replacement_dmg = create_test_dmg(&test_dir.join("replacement"));
-        std::fs::remove_file(&verified_dmg.path).unwrap();
-        std::fs::rename(replacement_dmg, &verified_dmg.path).unwrap();
-
-        let result = verified_dmg_update_source(&verified_dmg);
-        drop(verified_dmg);
-        std::fs::remove_dir_all(test_dir).unwrap();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verified_dmg_rejects_in_place_mutation() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-verified-dmg-mutation-test-{}-{}",
-            std::process::id(),
-            hbb_common::rand::random::<u64>()
-        ));
-        let dmg_path = create_test_dmg(&test_dir);
-        let mut dmg_file = std::fs::File::open(&dmg_path).unwrap();
-        let sha256 = crate::update_hash::sha256_reader_hex(&mut dmg_file).unwrap();
-        let size = dmg_file.metadata().unwrap().len();
-        let verified_dmg =
-            copy_and_verify_dmg_file(&dmg_path.to_string_lossy(), &sha256, Some(size)).unwrap();
-        std::fs::write(&verified_dmg.path, b"tampered").unwrap();
-
-        let result = verified_dmg_update_source(&verified_dmg);
-        drop(verified_dmg);
-        std::fs::remove_dir_all(test_dir).unwrap();
-
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("SHA256 mismatch"));
-    }
-
-    #[test]
-    fn verified_dmg_rejects_sha256_mismatch() {
-        let file_path =
-            std::env::temp_dir().join(format!("rustdesk-verified-dmg-test-{}", std::process::id()));
-        std::fs::write(&file_path, b"rustdesk").unwrap();
-        let result = copy_and_verify_dmg_file(
-            &file_path.to_string_lossy(),
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            Some(8),
-        );
-
-        std::fs::remove_file(file_path).unwrap();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verified_dmg_rejects_symlink() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-verified-dmg-symlink-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let target_path = test_dir.join("target.dmg");
-        let link_path = test_dir.join("update.dmg");
-        std::fs::write(&target_path, b"rustdesk").unwrap();
-        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
-        let result = copy_and_verify_dmg_file(
-            &link_path.to_string_lossy(),
-            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
-            Some(8),
-        );
-
-        std::fs::remove_dir_all(test_dir).unwrap();
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not a regular file"));
-    }
-
-    #[test]
-    fn verified_dmg_handle_survives_path_replacement() {
-        use std::io::{Read as _, Seek as _};
-
-        let test_dir = std::env::temp_dir().join(format!(
-            "rustdesk-verified-dmg-handle-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let file_path = test_dir.join("update.dmg");
-        let original_path = test_dir.join("original.dmg");
-        std::fs::write(&file_path, b"rustdesk").unwrap();
-
-        let mut verified_dmg = copy_and_verify_dmg_file(
-            &file_path.to_string_lossy(),
-            "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed",
-            Some(8),
-        )
-        .unwrap();
-        std::fs::rename(&file_path, &original_path).unwrap();
-        std::fs::write(&file_path, b"tampered").unwrap();
-
-        verified_dmg.file.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let mut contents = Vec::new();
-        verified_dmg.file.read_to_end(&mut contents).unwrap();
-
-        std::fs::remove_dir_all(test_dir).unwrap();
-        assert_eq!(contents, b"rustdesk");
     }
 
     #[test]
