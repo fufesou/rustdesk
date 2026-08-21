@@ -53,6 +53,73 @@ use crate::{client::Data, client::Interface};
 
 const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum IoLoopStage {
+    #[default]
+    NotStarted,
+    Preparing,
+    Connecting,
+    ConfirmingSecurity,
+    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+    WaitingClipboardLock,
+    Selecting,
+    HandlingPeerMessage,
+    HandlingUiCommand,
+    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+    HandlingClipboard,
+    HandlingFileJob,
+    Exiting,
+    Disconnecting,
+    SyncingJobs,
+    Finished,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IoLoopState {
+    round: u32,
+    stage: IoLoopStage,
+}
+
+#[derive(Default)]
+pub struct SessionLifecycleDiagnostics {
+    id: Mutex<Option<Uuid>>,
+    state: Mutex<IoLoopState>,
+}
+
+impl SessionLifecycleDiagnostics {
+    fn is_newer_round(round: u32, current_round: u32) -> bool {
+        match (current_round, round) {
+            (u32::MAX, 0) => true,
+            (0, u32::MAX) => false,
+            _ => round > current_round,
+        }
+    }
+
+    pub(crate) fn start_round(&self, round: u32) {
+        let mut state = self.state.lock().unwrap();
+        if state.round != round && !Self::is_newer_round(round, state.round) {
+            return;
+        }
+        *state = IoLoopState {
+            round,
+            stage: IoLoopStage::Preparing,
+        };
+    }
+
+    pub(crate) fn set_stage(&self, round: u32, stage: IoLoopStage) {
+        let mut state = self.state.lock().unwrap();
+        if state.round == round {
+            state.stage = stage;
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (Uuid, u32, IoLoopStage) {
+        let id = *self.id.lock().unwrap().get_or_insert_with(Uuid::new_v4);
+        let state = *self.state.lock().unwrap();
+        (id, state.round, state.stage)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
     pub password: String,
@@ -72,6 +139,7 @@ pub struct Session<T: InvokeUiSession> {
     pub reconnect_count: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
+    pub lifecycle_diagnostics: Arc<SessionLifecycleDiagnostics>,
 }
 
 #[derive(Clone)]
@@ -1275,18 +1343,39 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
-    pub fn reconnect(&self, force_relay: bool) {
-        // 1. If current session is connecting, do not reconnect.
-        // 2. If the connection is established, send `Data::Close`.
-        // 3. If the connection is disconnected, do nothing.
-        let mut connection_round_state_lock = self.connection_round_state.lock().unwrap();
-        if self.thread.lock().unwrap().is_some() {
-            match connection_round_state_lock.state {
-                ConnectionState::Connecting => return,
-                ConnectionState::Connected => self.send(Data::Close),
-                ConnectionState::Disconnected => {}
-            }
+    fn send_data(&self, data: Data) -> &'static str {
+        let sender_lock = self.sender.read().unwrap();
+        let Some(sender) = sender_lock.as_ref() else {
+            return "sender-missing";
+        };
+        if sender.send(data).is_ok() {
+            "queued"
+        } else {
+            "receiver-closed"
         }
+    }
+
+    pub fn reconnect(&self, force_relay: bool) {
+        // Close a tracked established loop, but do not overlap tracked connection attempts.
+        let mut connection_round_state_lock = self.connection_round_state.lock().unwrap();
+        let previous_round = connection_round_state_lock.round;
+        let (session_id, lifecycle_round, previous_stage) = self.lifecycle_diagnostics.snapshot();
+        let has_thread = self.thread.lock().unwrap().is_some();
+        let close_delivery = if has_thread {
+            match connection_round_state_lock.state {
+                ConnectionState::Connecting => {
+                    drop(connection_round_state_lock);
+                    log::info!(
+                        "================== reconnect skipped: session={session_id}, round={previous_round}, lifecycle_round={lifecycle_round}, stage={previous_stage:?}"
+                    );
+                    return;
+                }
+                ConnectionState::Connected => self.send_data(Data::Close),
+                ConnectionState::Disconnected => "not-sent-disconnected",
+            }
+        } else {
+            "not-sent-no-tracked-thread"
+        };
         let round = connection_round_state_lock.new_round();
         drop(connection_round_state_lock);
 
@@ -1304,6 +1393,10 @@ impl<T: InvokeUiSession> Session<T> {
         *lock = Some(std::thread::spawn(move || {
             io_loop(cloned, round);
         }));
+        drop(lock);
+        log::info!(
+            "================== reconnect dispatched: session={session_id}, previous_round={previous_round}, lifecycle_round={lifecycle_round}, previous_stage={previous_stage:?}, close_delivery={close_delivery}, round={round}"
+        );
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -1761,8 +1854,17 @@ impl<T: InvokeUiSession> Interface for Session<T> {
     }
 
     fn send(&self, data: Data) {
-        if let Some(sender) = self.sender.read().unwrap().as_ref() {
-            sender.send(data).ok();
+        let is_close = matches!(&data, Data::Close);
+        let delivery = self.send_data(data);
+        if is_close {
+            let (session_id, round, stage) = self.lifecycle_diagnostics.snapshot();
+            log::info!(
+                "================== Data::Close delivery: session={}, round={}, stage={:?}, delivery={}",
+                session_id,
+                round,
+                stage,
+                delivery
+            );
         }
     }
 
@@ -1935,11 +2037,26 @@ impl<T: InvokeUiSession> Session<T> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
+    let lifecycle_diagnostics = handler.lifecycle_diagnostics.clone();
+    lifecycle_diagnostics.start_round(round);
+    let (session_id, _, _) = lifecycle_diagnostics.snapshot();
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let (sender, receiver) = mpsc::unbounded_channel::<Data>();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
-    *handler.sender.write().unwrap() = Some(sender.clone());
+    let replaced_sender = handler
+        .sender
+        .write()
+        .unwrap()
+        .replace(sender.clone())
+        .is_some();
+    log::info!(
+        "================== io_loop wrapper started: session={}, round={}, thread={:?}, replaced_previous_sender={}",
+        session_id,
+        round,
+        std::thread::current().id(),
+        replaced_sender
+    );
     let token = LocalConfig::get_option("access_token");
     let key = crate::get_key(false).await;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2026,11 +2143,36 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
             )
             .await;
         }
+        log::info!(
+            "================== io_loop wrapper finished: session={}, round={}, thread={:?}",
+            session_id,
+            round,
+            std::thread::current().id()
+        );
+        lifecycle_diagnostics.set_stage(round, IoLoopStage::Finished);
         return;
     }
+    log::info!(
+        "================== Remote::io_loop starting: session={}, round={}",
+        session_id,
+        round
+    );
     let mut remote = Remote::new(handler, receiver, sender);
     remote.io_loop(&key, &token, round).await;
+    lifecycle_diagnostics.set_stage(round, IoLoopStage::SyncingJobs);
+    log::info!(
+        "================== Remote::io_loop returned: session={}, round={}",
+        session_id,
+        round
+    );
     let _ = remote.sync_jobs_status_to_local().await;
+    log::info!(
+        "================== io_loop wrapper finished: session={}, round={}, thread={:?}",
+        session_id,
+        round,
+        std::thread::current().id()
+    );
+    lifecycle_diagnostics.set_stage(round, IoLoopStage::Finished);
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

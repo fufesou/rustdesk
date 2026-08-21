@@ -8,7 +8,7 @@ use crate::{
         QualityStatus, MILLI1, SEC30,
     },
     common::get_default_sound_input,
-    ui_session_interface::{InvokeUiSession, Session},
+    ui_session_interface::{InvokeUiSession, IoLoopStage, Session},
 };
 
 // Empirical no-data window before exposing the restart reconnect state to the UI.
@@ -136,6 +136,8 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
+        let lifecycle_diagnostics = self.handler.lifecycle_diagnostics.clone();
+        let (session_id, _, _) = lifecycle_diagnostics.snapshot();
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -169,6 +171,7 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        lifecycle_diagnostics.set_stage(round, IoLoopStage::Connecting);
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -179,6 +182,7 @@ impl<T: InvokeUiSession> Remote<T> {
         .await
         {
             Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
+                lifecycle_diagnostics.set_stage(round, IoLoopStage::Preparing);
                 self.handler
                     .connection_round_state
                     .lock()
@@ -187,10 +191,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 let is_secured = peer.is_secured();
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
-                if !is_secured
-                    && !crate::common::is_direct_ip_access(&self.handler.get_id())
-                    && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
-                {
+                if !is_secured && !crate::common::is_direct_ip_access(&self.handler.get_id()) && {
+                    lifecycle_diagnostics.set_stage(round, IoLoopStage::ConfirmingSecurity);
+                    let rejected =
+                        !client::confirm_insecure_connection(&self.handler, &mut self.receiver)
+                            .await;
+                    lifecycle_diagnostics.set_stage(round, IoLoopStage::Preparing);
+                    rejected
+                } {
+                    lifecycle_diagnostics.set_stage(round, IoLoopStage::Exiting);
                     self.send_close_reason(&mut peer, "").await;
                     if kcp.is_some() {
                         tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
@@ -219,16 +228,47 @@ impl<T: InvokeUiSession> Remote<T> {
                             clipboard::get_rx_cliprdr_client(&self.handler.get_id());
                         log::debug!("get cliprdr client for conn_id {}", self.client_conn_id);
                         let client_conn_id = self.client_conn_id;
+                        let client_round = round;
+                        let client_session_id = session_id;
                         rx_clip_client_holder.1 = Some(crate::SimpleCallOnReturn {
                             b: true,
                             f: Box::new(move || {
+                                log::info!(
+                                    "================== clipboard channel cleanup started: session={}, round={}, conn_id={}",
+                                    client_session_id,
+                                    client_round,
+                                    client_conn_id
+                                );
                                 clipboard::remove_channel_by_conn_id(client_conn_id);
+                                log::info!(
+                                    "================== clipboard channel cleanup finished: session={}, round={}, conn_id={}",
+                                    client_session_id,
+                                    client_round,
+                                    client_conn_id
+                                );
                             }),
                         });
+                        lifecycle_diagnostics.set_stage(round, IoLoopStage::WaitingClipboardLock);
+                        log::info!(
+                            "================== clipboard receiver lock waiting: session={}, round={}, conn_id={}",
+                            session_id,
+                            round,
+                            self.client_conn_id
+                        );
                     };
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 let mut rx_clip_client = rx_clip_client_holder.0.lock().await;
+                #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+                if self.handler.is_default() {
+                    lifecycle_diagnostics.set_stage(round, IoLoopStage::Preparing);
+                    log::info!(
+                        "================== clipboard receiver lock acquired: session={}, round={}, conn_id={}",
+                        session_id,
+                        round,
+                        self.client_conn_id
+                    );
+                }
 
                 let mut status_timer =
                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
@@ -237,6 +277,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let _keep_it = client::hc_connection(feedback, rendezvous_server, token).await;
                 let mut last_recv_time = Instant::now();
 
+                lifecycle_diagnostics.set_stage(round, IoLoopStage::Selecting);
                 loop {
                     tokio::select! {
                         res = peer.next() => {
@@ -253,7 +294,13 @@ impl<T: InvokeUiSession> Remote<T> {
                                             self.handler.update_received(true);
                                         }
                                         self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
-                                        if !self.handle_msg_from_peer(bytes, &mut peer).await {
+                                        lifecycle_diagnostics
+                                            .set_stage(round, IoLoopStage::HandlingPeerMessage);
+                                        let continue_running =
+                                            self.handle_msg_from_peer(bytes, &mut peer).await;
+                                        lifecycle_diagnostics
+                                            .set_stage(round, IoLoopStage::Selecting);
+                                        if !continue_running {
                                             break
                                         }
                                     }
@@ -271,14 +318,46 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                         d = self.receiver.recv() => {
                             if let Some(d) = d {
-                                if !self.handle_msg_from_ui(d, &mut peer).await {
+                                lifecycle_diagnostics
+                                    .set_stage(round, IoLoopStage::HandlingUiCommand);
+                                let is_close = matches!(&d, Data::Close);
+                                if is_close {
+                                    log::info!(
+                                        "================== Data::Close received: session={}, round={}",
+                                        session_id,
+                                        round
+                                    );
+                                }
+                                let continue_running = self.handle_msg_from_ui(d, &mut peer).await;
+                                lifecycle_diagnostics.set_stage(
+                                    round,
+                                    if continue_running {
+                                        IoLoopStage::Selecting
+                                    } else {
+                                        IoLoopStage::Exiting
+                                    },
+                                );
+                                if is_close {
+                                    log::info!(
+                                        "================== Data::Close handled: session={}, round={}, continue={}",
+                                        session_id,
+                                        round,
+                                        continue_running
+                                    );
+                                }
+                                if !continue_running {
                                     break;
                                 }
                             }
                         }
                         _msg = rx_clip_client.recv() => {
                             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+                            lifecycle_diagnostics
+                                .set_stage(round, IoLoopStage::HandlingClipboard);
+                            #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                             self.handle_local_clipboard_msg(&mut peer, _msg).await;
+                            #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+                            lifecycle_diagnostics.set_stage(round, IoLoopStage::Selecting);
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
@@ -286,11 +365,16 @@ impl<T: InvokeUiSession> Remote<T> {
                                 break;
                             }
                             if !self.read_jobs.is_empty() {
-                                if let Err(err) = fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await {
+                                lifecycle_diagnostics
+                                    .set_stage(round, IoLoopStage::HandlingFileJob);
+                                let result =
+                                    fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await;
+                                if let Err(err) = result {
                                     self.handler.msgbox("error", "Connection Error", &err.to_string(), "");
                                     break;
                                 }
                                 self.update_jobs_status();
+                                lifecycle_diagnostics.set_stage(round, IoLoopStage::Selecting);
                             } else {
                                 self.timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
                             }
@@ -341,7 +425,13 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                 }
+                lifecycle_diagnostics.set_stage(round, IoLoopStage::Exiting);
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
+                log::info!(
+                    "================== Exit io_loop: session={}, round={}",
+                    session_id,
+                    round
+                );
                 // Stop client audio server.
                 if let Some(s) = self.stop_voice_call_sender.take() {
                     s.send(()).ok();
@@ -362,25 +452,43 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     fn handle_disconnected(&self, round: u32) {
+        self.handler
+            .lifecycle_diagnostics
+            .set_stage(round, IoLoopStage::Disconnecting);
+        let (session_id, _, _) = self.handler.lifecycle_diagnostics.snapshot();
         // set_disconnected_ok is used to check if new connection round is started.
-        let _set_disconnected_ok = self
+        let set_disconnected_ok = self
             .handler
             .connection_round_state
             .lock()
             .unwrap()
             .set_disconnected(round);
+        log::info!(
+            "================== disconnected state updated: session={}, round={}, accepted={}",
+            session_id,
+            round,
+            set_disconnected_ok
+        );
 
         #[cfg(not(target_os = "ios"))]
-        if self.handler.is_default() && _set_disconnected_ok {
+        if self.handler.is_default() && set_disconnected_ok {
             Client::try_stop_clipboard();
         }
 
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
-        if self.handler.is_default() && _set_disconnected_ok {
+        if self.handler.is_default() && set_disconnected_ok {
             // Linux client cleanup runs synchronously in try_stop_clipboard() before FUSE is
             // unmounted. Keep this async path for other file-clipboard platforms.
             crate::clipboard::try_empty_clipboard_files(ClipboardSide::Client, self.client_conn_id);
         }
+        log::info!(
+            "================== handle_disconnected finished: session={}, round={}",
+            session_id,
+            round
+        );
+        self.handler
+            .lifecycle_diagnostics
+            .set_stage(round, IoLoopStage::Finished);
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
