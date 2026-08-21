@@ -2080,14 +2080,13 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget otherRow(String label, String key) {
-    final value = bind.mainGetUserDefaultOption(key: key) == 'Y';
-    final isOptFixed = isOptionFixed(key);
+    final value = getOtherDefaultSettingOption(key) == 'Y';
+    final isOptFixed = isOtherDefaultSettingReadOnly(key);
     onChanged(bool b) async {
-      await bind.mainSetUserDefaultOption(
-          key: key,
-          value: b
-              ? 'Y'
-              : (key == kOptionEnableFileCopyPaste ? 'N' : defaultOptionNo));
+      await setOtherDefaultSettingOption(
+        key,
+        b ? 'Y' : (key == kOptionEnableFileCopyPaste ? 'N' : defaultOptionNo),
+      );
       setState(() {});
     }
 
@@ -2099,7 +2098,7 @@ class _DisplayState extends State<_Display> {
                     onChanged: isOptFixed ? null : (_) => onChanged(!value))
                 .marginOnly(right: 5),
             Expanded(
-              child: Text(translate(label)),
+              child: Text(otherDefaultSettingLabel(label, key)),
             )
           ],
         ).marginOnly(left: _kCheckBoxLeftMargin),

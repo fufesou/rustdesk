@@ -11,6 +11,7 @@ import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/terminal_copy_shortcut.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
+import 'package:flutter_hbb/models/terminal_mouse_handler.dart';
 import 'package:flutter_hbb/mobile/terminal_keyboard_utils.dart';
 import 'package:flutter_hbb/web/dummy.dart'
     if (dart.library.html) 'package:flutter_hbb/web/terminal_font.dart';
@@ -18,6 +19,46 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:xterm/xterm.dart';
 import '../../desktop/pages/terminal_connection_manager.dart';
 import '../../consts.dart';
+
+const _terminalBackgroundOpacity = 0.7;
+
+Widget _buildTerminalViewForPlatform({
+  required bool webDesktop,
+  required Terminal terminal,
+  required TerminalController controller,
+  required TerminalStyle textStyle,
+  required EdgeInsets padding,
+  required bool deleteDetection,
+  required Map<ShortcutActivator, Intent>? shortcuts,
+  required FocusOnKeyEventCallback onKeyEvent,
+  required void Function(TapDownDetails, CellOffset) onSecondaryTapDown,
+}) {
+  if (webDesktop) {
+    return TerminalMouseInteraction(
+      terminal,
+      controller: controller,
+      autofocus: true,
+      textStyle: textStyle,
+      shortcuts: shortcuts,
+      onKeyEvent: onKeyEvent,
+      backgroundOpacity: _terminalBackgroundOpacity,
+      padding: padding,
+      onSecondaryTapDown: onSecondaryTapDown,
+    );
+  }
+  return TerminalView(
+    terminal,
+    controller: controller,
+    autofocus: true,
+    textStyle: textStyle,
+    deleteDetection: deleteDetection,
+    shortcuts: shortcuts,
+    onKeyEvent: onKeyEvent,
+    backgroundOpacity: _terminalBackgroundOpacity,
+    padding: padding,
+    onSecondaryTapDown: onSecondaryTapDown,
+  );
+}
 
 class TerminalPage extends StatefulWidget {
   const TerminalPage({
@@ -41,6 +82,19 @@ class TerminalPage extends StatefulWidget {
 
 class _TerminalPageState extends State<TerminalPage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
+  bool get _canConfigureTerminalClipboardPermission =>
+      canConfigureTerminalClipboardPermission(
+        settingsDisabled: bind.isDisableSettings(),
+        optionFixed: isOptionFixed(kOptionAllowTerminalClipboardWrite),
+      );
+  bool get _canHandleTerminalClipboardWriteRequest =>
+      canHandleTerminalClipboardWriteRequest(
+        localOption: bind.mainGetLocalOption(
+          key: kOptionAllowTerminalClipboardWrite,
+        ),
+        canConfigurePermission: _canConfigureTerminalClipboardPermission,
+      );
+
   late FFI _ffi;
   late TerminalModel _terminalModel;
   double? _cellHeight;
@@ -57,6 +111,9 @@ class _TerminalPageState extends State<TerminalPage>
   // For iOS edge swipe gesture
   double _swipeStartX = 0;
   double _swipeCurrentX = 0;
+  ScaffoldFeatureController<MaterialBanner, MaterialBannerClosedReason>?
+      _terminalClipboardNoticeController;
+  final _terminalClipboardNotice = TerminalClipboardNoticeCoordinator<int>();
 
   // For web only.
   // 'monospace' does not work on web, use Google Fonts, `??` is only for null safety.
@@ -89,6 +146,12 @@ class _TerminalPageState extends State<TerminalPage>
 
     // Create terminal model with specific terminal ID
     _terminalModel = TerminalModel(_ffi, widget.terminalId);
+    if (_canHandleTerminalClipboardWriteRequest) {
+      _terminalModel.onClipboardWriteBlocked =
+          _handleTerminalClipboardWriteBlocked;
+      _terminalModel.onClipboardWriteSucceeded =
+          _handleTerminalClipboardWriteSucceeded;
+    }
     debugPrint(
         '[TerminalPage] Terminal model created for terminal ${widget.terminalId}');
 
@@ -106,9 +169,7 @@ class _TerminalPageState extends State<TerminalPage>
       }
     };
 
-    // Web desktop users have full hardware keyboard access, so the on-screen
-    // terminal extra keys bar is unnecessary and disabled.
-    _showTerminalExtraKeys = !isWebDesktop &&
+    _showTerminalExtraKeys =
         mainGetLocalBoolOptionSync(kOptionEnableShowTerminalExtraKeys);
     _terminalModel.isCtrlLocked = () => _ctrlLocked;
     _terminalModel.clearCtrlLock = () {
@@ -134,12 +195,124 @@ class _TerminalPageState extends State<TerminalPage>
     _ffi.ffiModel.updateEventListener(_ffi.sessionId, widget.id);
   }
 
+  Future<void> _handleTerminalClipboardWriteBlocked(
+      String clipboardText) async {
+    final option = bind.mainGetLocalOption(
+      key: kOptionAllowTerminalClipboardWrite,
+    );
+    try {
+      final shouldShow = await _terminalClipboardNotice.recordBlocked(
+        source: widget.terminalId,
+        text: clipboardText,
+        option: option,
+        canHandle: _canHandleTerminalClipboardWriteRequest,
+        canWrite: (_) => _canWriteTerminalClipboard,
+        persistDenial: () => bind.mainSetLocalOption(
+          key: kOptionAllowTerminalClipboardWrite,
+          value: kTerminalClipboardWriteDenied,
+        ),
+      );
+      if (mounted && shouldShow) {
+        _showTerminalClipboardNotice();
+      }
+    } catch (error) {
+      debugPrint(
+          '[TerminalPage] Failed to save terminal clipboard permission: $error');
+    }
+  }
+
+  void _showTerminalClipboardNotice() {
+    final request = _terminalClipboardNotice
+        .startShowing((_) => _canWriteTerminalClipboard);
+    if (request == null) return;
+    final controller = ScaffoldMessenger.of(context).showMaterialBanner(
+      MaterialBanner(
+        leading: const Icon(Icons.content_copy_outlined),
+        content: Text(translate(kTerminalClipboardNoticeMessageKey)),
+        actions: [
+          TextButton(
+            onPressed: _closeTerminalClipboardNotice,
+            child: Text(translate('Dismiss')),
+          ),
+          TextButton(
+            onPressed: () {
+              final latest = _terminalClipboardNotice.current;
+              if (latest == null) return;
+              unawaited(_completeTerminalClipboardWrite(latest));
+            },
+            child: Text(translate(request.actionKey)),
+          ),
+        ],
+      ),
+    );
+    _terminalClipboardNoticeController = controller;
+    unawaited(controller.closed.then<void>((_) {
+      if (identical(_terminalClipboardNoticeController, controller)) {
+        _terminalClipboardNoticeController = null;
+        final hasNext = _terminalClipboardNotice.noticeClosed();
+        if (!mounted) {
+          _terminalClipboardNotice.clear();
+        } else if (hasNext) {
+          _showTerminalClipboardNotice();
+        }
+      }
+    }));
+  }
+
+  bool get _canWriteTerminalClipboard =>
+      _canHandleTerminalClipboardWriteRequest &&
+      !_ffi.closed &&
+      _ffi.ffiModel.permissions['clipboard'] != false;
+
+  void _handleTerminalClipboardWriteSucceeded(String _) {
+    _closeTerminalClipboardNotice();
+  }
+
+  Future<void> _completeTerminalClipboardWrite(
+    TerminalClipboardNoticeRequest<int> request,
+  ) async {
+    try {
+      final completed = await completeTerminalClipboardWrite(
+        clipboardText: request.text,
+        canWrite: () => _canWriteTerminalClipboard,
+        writeClipboard: writeTerminalClipboard,
+        persistAllowed: request.persistAllowed
+            ? () => bind.mainSetLocalOption(
+                  key: kOptionAllowTerminalClipboardWrite,
+                  value: kTerminalClipboardWriteAllowed,
+                )
+            : null,
+      );
+      if (!completed) return;
+    } catch (error) {
+      debugPrint(
+          '[TerminalPage] Failed to complete terminal clipboard write: $error');
+      return;
+    }
+    _closeTerminalClipboardNotice(expected: request);
+  }
+
+  void _closeTerminalClipboardNotice({
+    TerminalClipboardNoticeRequest<int>? expected,
+  }) {
+    if (!_terminalClipboardNotice.beginClose(expected: expected)) return;
+    final controller = _terminalClipboardNoticeController;
+    if (controller == null) {
+      debugPrint('[TerminalPage] Clipboard notice controller is missing');
+      _terminalClipboardNotice.noticeClosed();
+      return;
+    }
+    controller.close();
+  }
+
   @override
   void dispose() {
     // Unregister terminal model from FFI
     _ffi.unregisterTerminalModel(widget.terminalId);
     _terminalModel.dispose();
     _keyboardDebounce?.cancel();
+    _terminalClipboardNotice.clear();
+    _terminalClipboardNoticeController?.close();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
     TerminalConnectionManager.releaseConnection(widget.id);
@@ -234,12 +407,11 @@ class _TerminalPageState extends State<TerminalPage>
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   final heightPx = constraints.maxHeight;
-                  return TerminalView(
-                    _terminalModel.terminal,
+                  return _buildTerminalViewForPlatform(
+                    webDesktop: isWebDesktop,
+                    terminal: _terminalModel.terminal,
                     controller: _terminalModel.terminalController,
-                    autofocus: true,
                     textStyle: _getTerminalStyle(),
-                    backgroundOpacity: 0.7,
                     // The following comment is from xterm.dart source code:
                     // Workaround to detect delete key for platforms and IMEs that do not
                     // emit a hardware delete event. Preferred on mobile platforms. [false] by

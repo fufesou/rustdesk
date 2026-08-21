@@ -276,5 +276,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("whitelist_cidr_tip", "CIDR notation is supported, e.g. 192.168.1.0/24"),
         ("Your ip is blocked by the peer", "Your IP is blocked by the peer"),
         ("sync-clipboard-between-sessions-tip", "Text or images copied in one remote session are also sent to the clipboard of your other connected sessions."),
+        ("terminal-clipboard-write-tip", "A terminal application tried to copy text to your local clipboard. This setting applies to all terminal connections. Manual copy and paste are unaffected."),
     ].iter().cloned().collect();
 }

@@ -763,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Bloquear lienzo"),
         ("Sync clipboard between sessions", "Sincronizar portapapeles entre sesiones"),
         ("sync-clipboard-between-sessions-tip", "El texto o las imágenes copiados en una sesión remota también se envían al portapapeles de tus otras sesiones conectadas."),
+        ("terminal-clipboard-write-tip", ""),
     ].iter().cloned().collect();
 }

@@ -763,5 +763,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "キャンバスをロック"),
         ("Sync clipboard between sessions", "セッション間でクリップボードを同期"),
         ("sync-clipboard-between-sessions-tip", "1つのリモートセッションでコピーしたテキストや画像は、接続中の他のセッションのクリップボードにも送信されます。"),
+        ("terminal-clipboard-write-tip", ""),
     ].iter().cloned().collect();
 }

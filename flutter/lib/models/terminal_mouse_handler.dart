@@ -1,23 +1,38 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'package:xterm/xterm.dart';
 
+import 'platform_model.dart';
+import 'rustdesk_terminal.dart';
 import 'terminal_copy_shortcut.dart';
 import 'terminal_mouse_drag_reporter.dart';
+
+const _prepareTerminalClipboardCommand = 'prepare_terminal_clipboard';
+const _finishTerminalClipboardCommand = 'finish_terminal_clipboard';
+const _cancelTerminalClipboardCommand = 'cancel_terminal_clipboard';
 
 /// xterm 4.0.0 encodes wheel buttons as 68..71; the extra bit reads as a Shift
 /// modifier, so strict full-screen apps ignore the report and never scroll.
 /// Upstream fix: TerminalStudio/xterm.dart#238.
 class WheelButtonFixMouseHandler implements TerminalMouseHandler {
-  const WheelButtonFixMouseHandler({this.positionProvider});
+  const WheelButtonFixMouseHandler({
+    this.positionProvider,
+    this.suppressLeftButton,
+  });
 
   final CellOffset? Function()? positionProvider;
+  final bool Function(TerminalMouseButtonState)? suppressLeftButton;
 
   @override
   String? call(TerminalMouseEvent event) {
     if (!event.button.isWheel) {
+      if (event.button == TerminalMouseButton.left &&
+          suppressLeftButton?.call(event.buttonState) == true) {
+        return null;
+      }
       return defaultMouseHandler(event);
     }
     // Same gate as UpDownMouseHandler: only the scroll modes report a wheel,
@@ -47,6 +62,10 @@ class TerminalMouseInteraction extends StatefulWidget {
     super.key,
     required this.controller,
     this.focusNode,
+    this.autofocus = false,
+    this.textStyle = const TerminalStyle(),
+    this.shortcuts,
+    this.onKeyEvent,
     this.backgroundOpacity = 1,
     this.padding,
     this.onSecondaryTapDown,
@@ -55,6 +74,10 @@ class TerminalMouseInteraction extends StatefulWidget {
   final Terminal terminal;
   final TerminalController controller;
   final FocusNode? focusNode;
+  final bool autofocus;
+  final TerminalStyle textStyle;
+  final Map<ShortcutActivator, Intent>? shortcuts;
+  final FocusOnKeyEventCallback? onKeyEvent;
   final double backgroundOpacity;
   final EdgeInsets? padding;
   final void Function(TapDownDetails, CellOffset)? onSecondaryTapDown;
@@ -83,6 +106,9 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
   Timer? _selectionScrollTimer;
   var _selectionHasScrolled = false;
   var _scrollDirection = _noScroll;
+  // xterm can finish its tap callbacks after the raw drag was reported.
+  var _suppressXtermLeftButton = false;
+  var _terminalClipboardGesturePrepared = false;
   TerminalViewState? get _terminalView => _terminalViewKey.currentState;
 
   @override
@@ -90,6 +116,7 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
     super.initState();
     _mouseHandler = WheelButtonFixMouseHandler(
       positionProvider: _cellAtPointer,
+      suppressLeftButton: kIsWeb ? _consumeXtermLeftButtonSuppression : null,
     );
     _installMouseHandler(widget.terminal);
   }
@@ -104,6 +131,7 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
     if (controllerChanged && !terminalChanged) {
       _mouseDrag.updateController(widget.controller);
     } else {
+      _discardPendingTerminalClipboardWrites();
       _mouseDrag.cancel();
     }
     _clearSelectionDrag();
@@ -138,7 +166,10 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
 
   void _handlePointerDown(PointerDownEvent event) {
     _updatePointerPosition(event);
+    _suppressXtermLeftButton = false;
     if (_mouseDrag.handleDown(event, widget.terminal, _terminalView)) {
+      _prepareTerminalClipboardWrite();
+      if (kIsWeb) _suppressXtermLeftButton = true;
       _clearSelectionDrag();
       return;
     }
@@ -160,9 +191,25 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
     _selectionPointer = localPosition;
   }
 
+  bool _consumeXtermLeftButtonSuppression(TerminalMouseButtonState state) {
+    final suppress = _suppressXtermLeftButton;
+    if (state == TerminalMouseButtonState.up) {
+      _suppressXtermLeftButton = false;
+    }
+    return suppress;
+  }
+
   void _handlePointerMove(PointerMoveEvent event) {
     _updatePointerPosition(event);
-    if (_mouseDrag.handleMove(event, widget.terminal, _terminalView)) return;
+    if (_mouseDrag.handleMove(
+      event,
+      widget.terminal,
+      _terminalView,
+      beforeRelease: _finishTerminalClipboardWrite,
+      onCancel: _cancelTerminalClipboardWrite,
+    )) {
+      return;
+    }
     if (event.pointer != _selectionPointerId) return;
     if (event.kind != PointerDeviceKind.mouse ||
         (event.buttons & kPrimaryMouseButton) != kPrimaryMouseButton) {
@@ -241,10 +288,69 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
 
   void _handlePointerEnd(PointerEvent event) {
     _updatePointerPosition(event);
-    if (!_mouseDrag.handleEnd(event, widget.terminal, _terminalView) &&
-        event.pointer != _selectionPointerId) return;
+    final handledByMouseDrag = _mouseDrag.handleEnd(
+      event,
+      widget.terminal,
+      _terminalView,
+      beforeRelease: event is PointerUpEvent
+          ? _finishTerminalClipboardWrite
+          : (_) => _cancelTerminalClipboardWrite(),
+      onCancel: _cancelTerminalClipboardWrite,
+    );
+    if (!handledByMouseDrag && event.pointer != _selectionPointerId) {
+      return;
+    }
     if (_selectionHasScrolled) _scrollSelection(scroll: false);
     _clearSelectionDrag();
+  }
+
+  void _prepareTerminalClipboardWrite() {
+    if (!kIsWeb) return;
+    _cancelTerminalClipboardWrite();
+    final terminal = widget.terminal;
+    if (terminal is! RustDeskTerminal || !terminal.isClipboardWriteAllowed) {
+      return;
+    }
+    try {
+      ffiSetByName(_prepareTerminalClipboardCommand);
+      _terminalClipboardGesturePrepared = true;
+    } catch (error) {
+      debugPrint('[Terminal] Failed to prepare Web clipboard write: $error');
+    }
+  }
+
+  void _finishTerminalClipboardWrite(bool responseExpected) {
+    if (!_terminalClipboardGesturePrepared) return;
+    _terminalClipboardGesturePrepared = false;
+    if (!kIsWeb) return;
+    try {
+      ffiSetByName(
+        _finishTerminalClipboardCommand,
+        responseExpected ? 'true' : 'false',
+      );
+    } catch (error) {
+      debugPrint('[Terminal] Failed to finish Web clipboard write: $error');
+    }
+  }
+
+  void _cancelTerminalClipboardWrite() {
+    if (!_terminalClipboardGesturePrepared) return;
+    _terminalClipboardGesturePrepared = false;
+    _sendTerminalClipboardCancel();
+  }
+
+  void _discardPendingTerminalClipboardWrites() {
+    _cancelTerminalClipboardWrite();
+    _sendTerminalClipboardCancel();
+  }
+
+  void _sendTerminalClipboardCancel() {
+    if (!kIsWeb) return;
+    try {
+      ffiSetByName(_cancelTerminalClipboardCommand);
+    } catch (error) {
+      debugPrint('[Terminal] Failed to cancel Web clipboard write: $error');
+    }
   }
 
   void _clearSelectionDrag() {
@@ -265,6 +371,7 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
 
   @override
   void dispose() {
+    _discardPendingTerminalClipboardWrites();
     _mouseDrag.cancel();
     _clearSelectionDrag();
     _restoreMouseHandler(widget.terminal);
@@ -290,10 +397,13 @@ class _TerminalMouseInteractionState extends State<TerminalMouseInteraction> {
         controller: widget.controller,
         scrollController: _scrollController,
         focusNode: widget.focusNode,
+        autofocus: widget.autofocus,
+        textStyle: widget.textStyle,
         backgroundOpacity: widget.backgroundOpacity,
         padding: widget.padding,
-        shortcuts: platformTerminalShortcuts(),
-        onKeyEvent: terminalCopyHandler(widget.terminal, widget.controller),
+        shortcuts: widget.shortcuts ?? platformTerminalShortcuts(),
+        onKeyEvent: widget.onKeyEvent ??
+            terminalCopyHandler(widget.terminal, widget.controller),
         onSecondaryTapDown: widget.onSecondaryTapDown,
       ),
     );

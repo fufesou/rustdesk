@@ -62,6 +62,7 @@ class TerminalMouseDragReporter {
   var _ownsControllerSuspension = false;
   var _releasePending = false;
   var _reporting = false;
+  var _dragged = false;
 
   bool handleDown(
     PointerDownEvent event,
@@ -85,6 +86,7 @@ class TerminalMouseDragReporter {
     _ownsControllerSuspension = true;
     _releasePending = true;
     _reporting = true;
+    _dragged = false;
     controller.setSuspendPointerInput(true);
     _clearSelection(controller);
     final position = _cellAt(event, terminalView);
@@ -98,26 +100,36 @@ class TerminalMouseDragReporter {
   bool handleMove(
     PointerMoveEvent event,
     Terminal terminal,
-    TerminalViewState? terminalView,
-  ) {
+    TerminalViewState? terminalView, {
+    void Function(bool dragged)? beforeRelease,
+    void Function()? onCancel,
+  }) {
     if (event.pointer != _pointerId) return false;
     if (terminalView == null) {
+      onCancel?.call();
       cancel();
       return true;
     }
     final reportsDrag = _reportsDrag(terminal.mouseMode);
     if (!_isPrimaryMouse(event)) {
       if (_releasePending && reportsDrag) {
-        _reportRelease(
+        _finishRelease(
+          event,
           terminal,
-          _reporting ? _cellAt(event, terminalView) : _lastReportedPosition,
+          terminalView,
+          beforeRelease: beforeRelease,
         );
+      } else {
+        onCancel?.call();
       }
       cancel();
       return true;
     }
     if (!_reporting || !reportsDrag) {
-      if (!reportsDrag) _releasePending = false;
+      if (!reportsDrag && _releasePending) {
+        _releasePending = false;
+        onCancel?.call();
+      }
       _reporting = false;
       // Keep ownership until the matching end event to suppress local selection.
       final controller = _controller;
@@ -126,7 +138,7 @@ class TerminalMouseDragReporter {
     }
 
     final position = _cellAt(event, terminalView);
-    _lastReportedPosition = position;
+    _recordPosition(position);
     terminal.textInput(
       _report(terminal.mouseReportMode, position, motion: true),
     );
@@ -138,16 +150,22 @@ class TerminalMouseDragReporter {
   bool handleEnd(
     PointerEvent event,
     Terminal terminal,
-    TerminalViewState? terminalView,
-  ) {
+    TerminalViewState? terminalView, {
+    void Function(bool dragged)? beforeRelease,
+    void Function()? onCancel,
+  }) {
     if (event.pointer != _pointerId) return false;
     if (terminalView != null &&
         _releasePending &&
         _reportsDrag(terminal.mouseMode)) {
-      _reportRelease(
+      _finishRelease(
+        event,
         terminal,
-        _reporting ? _cellAt(event, terminalView) : _lastReportedPosition,
+        terminalView,
+        beforeRelease: beforeRelease,
       );
+    } else {
+      onCancel?.call();
     }
     _clearSelection(_controller);
     final controller = _controller;
@@ -172,6 +190,7 @@ class TerminalMouseDragReporter {
     _ownsControllerSuspension = false;
     _releasePending = false;
     _reporting = false;
+    _dragged = false;
   }
 
   void updateController(TerminalController controller) {
@@ -201,6 +220,24 @@ class TerminalMouseDragReporter {
         release: true,
       ),
     );
+  }
+
+  void _finishRelease(
+    PointerEvent event,
+    Terminal terminal,
+    TerminalViewState terminalView, {
+    void Function(bool dragged)? beforeRelease,
+  }) {
+    final position =
+        _reporting ? _cellAt(event, terminalView) : _lastReportedPosition;
+    if (_reporting) _recordPosition(position);
+    beforeRelease?.call(_dragged);
+    _reportRelease(terminal, position);
+  }
+
+  void _recordPosition(CellOffset position) {
+    _dragged = _dragged || position != _lastReportedPosition;
+    _lastReportedPosition = position;
   }
 
   CellOffset _cellAt(PointerEvent event, TerminalViewState terminalView) {

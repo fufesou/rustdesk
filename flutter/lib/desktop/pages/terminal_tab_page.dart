@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -10,6 +11,8 @@ import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/models/model.dart';
+import 'package:flutter_hbb/models/terminal_copy_shortcut.dart';
+import 'package:flutter_hbb/models/terminal_model.dart';
 import 'package:get/get.dart';
 
 import '../../models/platform_model.dart';
@@ -18,6 +21,12 @@ import 'terminal_connection_manager.dart';
 import '../widgets/material_mod_popup_menu.dart' as mod_menu;
 import '../widgets/popup_menu.dart';
 import 'package:bot_toast/bot_toast.dart';
+
+typedef _TerminalClipboardSource = ({
+  String peerId,
+  int terminalId,
+  String tabKey,
+});
 
 class TerminalTabPage extends StatefulWidget {
   final Map<String, dynamic> params;
@@ -30,6 +39,18 @@ class TerminalTabPage extends StatefulWidget {
 
 class _TerminalTabPageState extends State<TerminalTabPage> {
   DesktopTabController get tabController => Get.find<DesktopTabController>();
+  bool get _canConfigureTerminalClipboardPermission =>
+      canConfigureTerminalClipboardPermission(
+        settingsDisabled: bind.isDisableSettings(),
+        optionFixed: isOptionFixed(kOptionAllowTerminalClipboardWrite),
+      );
+  bool get _canHandleTerminalClipboardWriteRequest =>
+      canHandleTerminalClipboardWriteRequest(
+        localOption: bind.mainGetLocalOption(
+          key: kOptionAllowTerminalClipboardWrite,
+        ),
+        canConfigurePermission: _canConfigureTerminalClipboardPermission,
+      );
 
   static const IconData selectedIcon = Icons.terminal;
   static const IconData unselectedIcon = Icons.terminal_outlined;
@@ -38,6 +59,9 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
   final Set<String> _closingTabs = {};
   // When true, all session cleanup should persist (window-level close in progress)
   bool _windowClosing = false;
+  CancelFunc? _terminalClipboardNoticeCancel;
+  final _terminalClipboardNotice =
+      TerminalClipboardNoticeCoordinator<_TerminalClipboardSource>();
 
   _TerminalTabPageState(Map<String, dynamic> params) {
     Get.put(DesktopTabController(tabType: DesktopTabType.terminal));
@@ -45,7 +69,10 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
       WindowController.fromWindowId(windowId())
           .setTitle(getWindowNameWithId(id));
     };
-    tabController.onRemoved = (_, id) => onRemoveId(id);
+    tabController.onRemoved = (_, id) {
+      _closeTerminalClipboardNoticeForTab(id);
+      onRemoveId(id);
+    };
     tabController.onCloseWindow = _closeWindowFromConnection;
     final terminalId = params['terminalId'] ?? _nextTerminalId++;
     tabController.add(_createTerminalTab(
@@ -70,6 +97,11 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
     final alias = bind.mainGetPeerOptionSync(id: peerId, key: 'alias');
     final tabLabel =
         alias.isNotEmpty ? '$alias #$terminalId' : '$peerId #$terminalId';
+    final clipboardSource = (
+      peerId: peerId,
+      terminalId: terminalId,
+      tabKey: tabKey,
+    );
     return TabInfo(
       key: tabKey,
       label: tabLabel,
@@ -86,8 +118,153 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
         tabController: tabController,
         forceRelay: forceRelay,
         connToken: connToken,
+        onClipboardWriteBlocked: _canHandleTerminalClipboardWriteRequest
+            ? (text) => unawaited(
+                  _handleTerminalClipboardWriteBlocked(
+                    clipboardSource,
+                    text,
+                  ),
+                )
+            : null,
+        onClipboardWriteSucceeded: (_) {
+          _handleTerminalClipboardWriteSucceeded(clipboardSource);
+        },
       ),
     );
+  }
+
+  Future<void> _handleTerminalClipboardWriteBlocked(
+    _TerminalClipboardSource source,
+    String clipboardText,
+  ) async {
+    final option = bind.mainGetLocalOption(
+      key: kOptionAllowTerminalClipboardWrite,
+    );
+    try {
+      final shouldShow = await _terminalClipboardNotice.recordBlocked(
+        source: source,
+        text: clipboardText,
+        option: option,
+        canHandle: _canHandleTerminalClipboardWriteRequest,
+        canWrite: _canWriteTerminalClipboard,
+        persistDenial: () => bind.mainSetLocalOption(
+          key: kOptionAllowTerminalClipboardWrite,
+          value: kTerminalClipboardWriteDenied,
+        ),
+      );
+      if (mounted && shouldShow) {
+        _showTerminalClipboardNotice();
+      }
+    } catch (error) {
+      debugPrint(
+          '[TerminalTabPage] Failed to save terminal clipboard permission: $error');
+    }
+  }
+
+  void _showTerminalClipboardNotice() {
+    final request =
+        _terminalClipboardNotice.startShowing(_canWriteTerminalClipboard);
+    if (request == null) return;
+    _terminalClipboardNoticeCancel = BotToast.showCustomNotification(
+      duration: null,
+      enableSlideOff: false,
+      onlyOne: true,
+      onClose: _handleTerminalClipboardNoticeClosed,
+      toastBuilder: (_) => MaterialBanner(
+        leading: const Icon(Icons.content_copy_outlined),
+        content: Text(translate(kTerminalClipboardNoticeMessageKey)),
+        actions: [
+          TextButton(
+            onPressed: _closeTerminalClipboardNotice,
+            child: Text(translate('Dismiss')),
+          ),
+          TextButton(
+            onPressed: () {
+              final latest = _terminalClipboardNotice.current;
+              if (latest == null) return;
+              unawaited(_completeTerminalClipboardWrite(latest));
+            },
+            child: Text(translate(request.actionKey)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _handleTerminalClipboardNoticeClosed() {
+    _terminalClipboardNoticeCancel = null;
+    final hasNext = _terminalClipboardNotice.noticeClosed();
+    if (!mounted) {
+      _terminalClipboardNotice.clear();
+      return;
+    }
+    if (hasNext) _showTerminalClipboardNotice();
+  }
+
+  bool _canWriteTerminalClipboard(
+    _TerminalClipboardSource source,
+  ) {
+    if (!_canHandleTerminalClipboardWriteRequest) return false;
+    final ffi = TerminalConnectionManager.getExistingConnection(source.peerId);
+    return ffi != null &&
+        !ffi.closed &&
+        ffi.ffiModel.permissions['clipboard'] != false &&
+        tabController.state.value.tabs.any((tab) => tab.key == source.tabKey) &&
+        ffi.terminalModels.containsKey(source.terminalId);
+  }
+
+  void _handleTerminalClipboardWriteSucceeded(
+    _TerminalClipboardSource source,
+  ) {
+    final request = _terminalClipboardNotice.currentForSource(source);
+    if (request == null) return;
+    _closeTerminalClipboardNotice(expected: request);
+  }
+
+  Future<void> _completeTerminalClipboardWrite(
+    TerminalClipboardNoticeRequest<_TerminalClipboardSource> request,
+  ) async {
+    final source = request.source;
+    try {
+      final completed = await completeTerminalClipboardWrite(
+        clipboardText: request.text,
+        canWrite: () => _canWriteTerminalClipboard(source),
+        writeClipboard: writeTerminalClipboard,
+        persistAllowed: request.persistAllowed
+            ? () => bind.mainSetLocalOption(
+                  key: kOptionAllowTerminalClipboardWrite,
+                  value: kTerminalClipboardWriteAllowed,
+                )
+            : null,
+      );
+      if (!completed) return;
+    } catch (error) {
+      debugPrint(
+          '[TerminalTabPage] Failed to complete terminal clipboard write: $error');
+      return;
+    }
+    _closeTerminalClipboardNotice(expected: request);
+  }
+
+  void _closeTerminalClipboardNoticeForTab(String tabKey) {
+    final current = _terminalClipboardNotice.current;
+    if (current?.source.tabKey != tabKey) return;
+    _closeTerminalClipboardNotice(
+      expected: current,
+    );
+  }
+
+  void _closeTerminalClipboardNotice({
+    TerminalClipboardNoticeRequest<_TerminalClipboardSource>? expected,
+  }) {
+    if (!_terminalClipboardNotice.beginClose(expected: expected)) return;
+    final cancel = _terminalClipboardNoticeCancel;
+    if (cancel == null) {
+      debugPrint('[TerminalTabPage] Clipboard notice controller is missing');
+      _terminalClipboardNotice.noticeClosed();
+      return;
+    }
+    cancel();
   }
 
   /// Unified tab close handler for all close paths (button, shortcut, programmatic).
@@ -147,6 +324,8 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
     // Remove all UI tabs immediately (same instant behavior as the old tabController.clear())
     // Keep the cleanup target lookup below synchronous before its first await:
     // it relies on the current frame still retaining each TerminalPage's FFI/model.
+    _terminalClipboardNotice.clear();
+    _terminalClipboardNoticeCancel?.call();
     tabController.clear();
     // Run session cleanup in parallel with bounded timeout (closeTerminal() has internal 3s timeout).
     // Skip tabs already being closed by a concurrent _closeTab() to avoid duplicate FFI calls.
@@ -357,6 +536,8 @@ class _TerminalTabPageState extends State<TerminalTabPage> {
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    _terminalClipboardNotice.clear();
+    _terminalClipboardNoticeCancel?.call();
     super.dispose();
   }
 
