@@ -81,30 +81,45 @@ fn macos_service_ipc_allows_gui_and_service_binaries(
     if postfix != crate::POSTFIX_SERVICE {
         return false;
     }
-    let Some(peer_dir) = peer_exe.parent() else {
+    let app_name = crate::get_app_name();
+    let Ok(helper) =
+        crate::platform::macos::privileged_helper::HelperPaths::for_app_name(&app_name)
+    else {
         return false;
     };
-    let Some(current_dir) = current_exe.parent() else {
+    let Ok(gui) = crate::platform::macos::privileged_helper::expected_gui_executable(&app_name)
+    else {
         return false;
     };
-    if !executable_paths_match(peer_dir, current_dir) {
-        return false;
-    }
+    macos_service_ipc_policy_allows(
+        (peer_exe, current_exe),
+        (&helper.service, &gui),
+        MacosServiceIpcAccess {
+            protected: crate::platform::macos::privileged_helper::protected_service_ipc_enabled(),
+            legacy_rollback: crate::platform::macos::privileged_helper::legacy_rollback_ipc_enabled(
+            ),
+        },
+    )
+}
 
-    // On installed macOS builds, `_service` is listened by the `service` binary while the GUI
-    // process connects from the app executable within the same app bundle.
-    let gui_exe_name = std::ffi::OsString::from(crate::get_app_name());
-    let gui_exe = gui_exe_name.as_os_str();
-    let service_exe = std::ffi::OsStr::new("service");
-    let allowed_exe = [Some(gui_exe), Some(service_exe)];
-    let peer_name = peer_exe.file_name();
-    let current_name = current_exe.file_name();
-    allowed_exe
-        .iter()
-        .any(|name| os_str_eq_ignore_ascii_case(peer_name, *name))
-        && allowed_exe
-            .iter()
-            .any(|name| os_str_eq_ignore_ascii_case(current_name, *name))
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacosServiceIpcAccess {
+    protected: bool,
+    legacy_rollback: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_ipc_policy_allows(
+    actual: (&Path, &Path),
+    expected: (&Path, &Path),
+    access: MacosServiceIpcAccess,
+) -> bool {
+    let (peer, current) = actual;
+    let (helper, gui) = expected;
+    let protected_pair = (peer == gui && current == helper) || (peer == helper && current == gui);
+    (access.protected && protected_pair)
+        || (access.legacy_rollback && peer == gui && current == gui.with_file_name("service"))
 }
 
 #[cfg(target_os = "windows")]
@@ -404,19 +419,6 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(target_os = "macos")]
-#[inline]
-fn os_str_eq_ignore_ascii_case(
-    left: Option<&std::ffi::OsStr>,
-    right: Option<&std::ffi::OsStr>,
-) -> bool {
-    let (Some(left), Some(right)) = (left, right) else {
-        return false;
-    };
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
 #[cfg(all(windows, not(feature = "flutter")))]
 #[inline]
 fn file_sha256(path: &Path) -> ResultType<[u8; 32]> {
@@ -473,11 +475,19 @@ fn portable_service_helper_is_trusted(
 fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -> ResultType<()> {
     let peer_exe = peer_exe_canonical_path_by_pid(peer_pid)?;
     let current_exe = current_exe_canonical_path()?;
-    if executable_paths_match(&peer_exe, &current_exe) {
-        return Ok(());
-    }
     #[cfg(target_os = "macos")]
-    if macos_service_ipc_allows_gui_and_service_binaries(&peer_exe, &current_exe, postfix) {
+    if postfix == crate::POSTFIX_SERVICE {
+        if macos_service_ipc_allows_gui_and_service_binaries(&peer_exe, &current_exe, postfix) {
+            return Ok(());
+        }
+        bail!(
+            "Peer executable path mismatch on protected macOS service channel: peer_pid={}, peer_exe='{}', current_exe='{}'",
+            peer_pid,
+            peer_exe.display(),
+            current_exe.display()
+        );
+    }
+    if executable_paths_match(&peer_exe, &current_exe) {
         return Ok(());
     }
     #[cfg(target_os = "windows")]
@@ -1023,14 +1033,55 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn test_os_str_eq_ignore_ascii_case_for_process_names() {
-        assert!(super::os_str_eq_ignore_ascii_case(
-            Some(std::ffi::OsStr::new("RustDesk")),
-            Some(std::ffi::OsStr::new("rustdesk"))
+    fn test_macos_service_ipc_requires_protected_helper_and_expected_gui() {
+        let app_name = crate::get_app_name();
+        let helper =
+            crate::platform::macos::privileged_helper::HelperPaths::for_app_name(&app_name)
+                .unwrap()
+                .service;
+        let gui = std::path::PathBuf::from(format!(
+            "/Applications/{app_name}.app/Contents/MacOS/{app_name}"
         ));
-        assert!(!super::os_str_eq_ignore_ascii_case(
-            Some(std::ffi::OsStr::new("RustDesk")),
-            Some(std::ffi::OsStr::new("service"))
+        let legacy = gui.with_file_name("service");
+        let wrong_gui = std::path::Path::new("/Applications/Other.app/Contents/MacOS/Other");
+        let wrong_helper = std::path::Path::new(
+            "/Library/PrivilegedHelperTools/com.carriez.Other_service.bundle/Contents/MacOS/service",
+        );
+        let protected = super::MacosServiceIpcAccess {
+            protected: true,
+            legacy_rollback: false,
+        };
+        let unavailable = super::MacosServiceIpcAccess {
+            protected: false,
+            legacy_rollback: false,
+        };
+        let rollback = super::MacosServiceIpcAccess {
+            protected: true,
+            legacy_rollback: true,
+        };
+
+        for (access, peer, current, expected) in [
+            (protected, gui.as_path(), helper.as_path(), true),
+            (protected, gui.as_path(), legacy.as_path(), false),
+            (protected, wrong_gui, helper.as_path(), false),
+            (protected, gui.as_path(), wrong_helper, false),
+            (unavailable, gui.as_path(), helper.as_path(), false),
+            (rollback, gui.as_path(), legacy.as_path(), true),
+            (rollback, wrong_gui, legacy.as_path(), false),
+        ] {
+            assert_eq!(
+                super::macos_service_ipc_policy_allows(
+                    (peer, current),
+                    (helper.as_path(), gui.as_path()),
+                    access,
+                ),
+                expected
+            );
+        }
+        assert!(!super::macos_service_ipc_allows_gui_and_service_binaries(
+            &gui,
+            &helper,
+            "_service-replaced"
         ));
     }
 

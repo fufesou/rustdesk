@@ -2,12 +2,17 @@
 // https://github.com/servo/core-foundation-rs
 // https://github.com/rust-windowing/winit
 
+pub(crate) mod privileged_helper;
 mod update_temp;
 mod verified_dmg;
 
 #[cfg(test)]
 #[path = "macos/verified_dmg_tests.rs"]
 mod verified_dmg_tests;
+
+#[cfg(test)]
+#[path = "macos/plist_transaction_tests.rs"]
+mod plist_transaction_tests;
 
 use super::{validate_install_app_name, CursorData, ResultType};
 use cocoa::{
@@ -36,7 +41,6 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
-    io::Write,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -55,33 +59,45 @@ type BooleanT = hbb_common::libc::c_int;
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
+const INSTALL_CLEANUP_FAILED_AFTER_COMMIT: &str = "INSTALL_CLEANUP_FAILED_AFTER_COMMIT";
 const UPDATE_CLEANUP_FAILED_AFTER_COMMIT: &str = "UPDATE_CLEANUP_FAILED_AFTER_COMMIT";
+const PLIST_MODE: u32 = 0o644;
 // `kill -9` may not work without administrator privileges.
 const PRIVILEGED_UPDATE_BODY: &str = r#"
 	on run {app_name, cur_pid, source_path, user_name, restore_owner, expected_sha256}
 	    set app_bundle to "/Applications/" & app_name & ".app"
+	    set daemon_target to "system/com.carriez." & app_name & "_service"
+	    set migration_state to "/Library/PrivilegedHelperTools/.com.carriez." & app_name & "_service.migration"
+	    set transaction_lock to "/var/run/com.carriez.service-maintenance.lock"
 	    set app_bundle_q to quoted form of app_bundle
+	    set daemon_target_q to quoted form of daemon_target
+	    set migration_state_q to quoted form of migration_state
+	    set transaction_lock_q to quoted form of transaction_lock
 	    set source_path_q to quoted form of source_path
 	    set user_name_q to quoted form of user_name
 	    set expected_sha256_q to quoted form of expected_sha256
 
 	    set check_source to "if [ -n " & expected_sha256_q & " ]; then test -f " & source_path_q & "; else test -d " & source_path_q & "; fi;"
+	    set lock_transaction to "if [ -e " & transaction_lock_q & " ] || [ -L " & transaction_lock_q & " ]; then [ ! -L " & transaction_lock_q & " ] && [ -f " & transaction_lock_q & " ] && [ \"$(/usr/bin/stat -f '%u' " & transaction_lock_q & ")\" = '0' ] || { echo 'UNSAFE_UPDATE_LOCK' >&2; exit 1; }; else umask 077; : > " & transaction_lock_q & "; /usr/sbin/chown root:wheel " & transaction_lock_q & "; fi; /bin/chmod -N " & transaction_lock_q & "; /bin/chmod 0600 " & transaction_lock_q & "; [ \"$(/usr/bin/stat -f '%u:%g:%Lp' " & transaction_lock_q & ")\" = '0:0:600' ] || exit 1; exec /usr/bin/lockf -knw -t 0 " & transaction_lock_q & " /bin/sh -c "
+	    set ensure_service_inactive to "if launchctl print " & daemon_target_q & " >/dev/null 2>&1 || [ -e " & migration_state_q & " ] || [ -L " & migration_state_q & " ]; then echo 'SERVICE_ACTIVE_DURING_APP_UPDATE' >&2; exit 1; fi;"
 	    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
 	    -- Rehash the root-owned copy in a clean environment before staging bytes.
-	    set prepare_verified to "verified_dir=$(/usr/bin/mktemp -d /tmp/.rustdeskupdate-verified.XXXXXX); /bin/chmod 0700 \"$verified_dir\"; verified_app=\"$verified_dir/" & app_name & ".app\"; dmg_attached=0; if [ -n " & expected_sha256_q & " ]; then verified_dmg=\"$verified_dir/update.dmg\"; /bin/cp " & source_path_q & " \"$verified_dmg\"; /usr/sbin/chown root:wheel \"$verified_dmg\"; /bin/chmod 0400 \"$verified_dmg\"; actual_sha256=$(/usr/bin/env -i /usr/bin/shasum -a 256 \"$verified_dmg\"); actual_sha256=${actual_sha256%% *}; if [ \"$actual_sha256\" != " & expected_sha256_q & " ]; then echo 'Update DMG SHA256 mismatch' >&2; exit 1; fi; dmg_mount=\"$verified_dir/mount\"; /bin/mkdir \"$dmg_mount\"; dmg_attached=1; /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint \"$dmg_mount\" \"$verified_dmg\" >/dev/null; /usr/bin/ditto \"$dmg_mount/" & app_name & ".app\" \"$verified_app\"; /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null; dmg_attached=0; /bin/rm -f \"$verified_dmg\"; else /usr/bin/ditto " & source_path_q & " \"$verified_app\"; fi; /usr/sbin/chown -R root:wheel \"$verified_app\"; /bin/chmod -R go-w \"$verified_app\";"
-	    set prepare_swap_paths to "temp_bundle=" & app_bundle_q & ".new.$$; old_bundle=" & app_bundle_q & ".old.$$;"
+	    set prepare_verified to "verified_dir=$(/usr/bin/mktemp -d /tmp/.rustdeskupdate-verified.XXXXXX); /usr/sbin/chown root:wheel \"$verified_dir\"; /bin/chmod -N \"$verified_dir\"; /bin/chmod 0700 \"$verified_dir\"; verified_app=\"$verified_dir/" & app_name & ".app\"; dmg_attached=0; if [ -n " & expected_sha256_q & " ]; then verified_dmg=\"$verified_dir/update.dmg\"; /bin/cp " & source_path_q & " \"$verified_dmg\"; /usr/sbin/chown root:wheel \"$verified_dmg\"; /bin/chmod 0400 \"$verified_dmg\"; actual_sha256=$(/usr/bin/env -i /usr/bin/shasum -a 256 \"$verified_dmg\"); actual_sha256=${actual_sha256%% *}; if [ \"$actual_sha256\" != " & expected_sha256_q & " ]; then echo 'Update DMG SHA256 mismatch' >&2; exit 1; fi; dmg_mount=\"$verified_dir/mount\"; /bin/mkdir \"$dmg_mount\"; dmg_attached=1; /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint \"$dmg_mount\" \"$verified_dmg\" >/dev/null; /usr/bin/ditto \"$dmg_mount/" & app_name & ".app\" \"$verified_app\"; /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null; dmg_attached=0; /bin/rm -f \"$verified_dmg\"; else /usr/bin/ditto " & source_path_q & " \"$verified_app\"; fi; /usr/sbin/chown -R root:wheel \"$verified_app\"; /bin/chmod -R go-w \"$verified_app\";"
+	    set ensure_atomic_bundle_swap to "verified_device=$(/usr/bin/stat -f '%d' \"$verified_dir\"); applications_device=$(/usr/bin/stat -f '%d' /Applications); [ -n \"$verified_device\" ] && [ \"$verified_device\" = \"$applications_device\" ] || { echo 'APP_UPDATE_REQUIRES_ONE_FILESYSTEM' >&2; exit 1; };"
+	    set prepare_swap_paths to "temp_bundle=\"$verified_dir/staged.app\"; old_bundle=\"$verified_dir/previous.app\";"
 	    set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
 	    set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
 	    set protect_staged_bundle to "chown -R root:wheel \"$temp_bundle\"; chmod -R go-w \"$temp_bundle\"; (xattr -r -d com.apple.quarantine \"$temp_bundle\" || true);"
 	    set move_current_bundle to "if [ -e " & app_bundle_q & " ]; then mv " & app_bundle_q & " \"$old_bundle\"; bundle_backed_up=1; fi;"
-	    set install_staged_bundle to "mv \"$temp_bundle\" " & app_bundle_q & "; bundle_swapped=1;"
+	    set install_staged_bundle to "staged_bundle_identity=$(/usr/bin/stat -f '%d:%i' \"$temp_bundle\"); mv \"$temp_bundle\" " & app_bundle_q & "; bundle_swapped=1; installed_bundle_identity=$(/usr/bin/stat -f '%d:%i' " & app_bundle_q & "); [ \"$installed_bundle_identity\" = \"$staged_bundle_identity\" ];"
 	    set restore_installed_owner to "if [ " & quoted form of restore_owner & " = '1' ]; then chown -R " & user_name_q & ":staff " & app_bundle_q & "; fi;"
 	    set rollback_bundle to "if [ \"${bundle_backed_up:-0}\" -eq 1 ]; then if [ ! -e \"$old_bundle\" ]; then rollback_status=1; elif ! rm -rf " & app_bundle_q & "; then rollback_status=1; elif ! mv \"$old_bundle\" " & app_bundle_q & "; then rollback_status=1; fi; elif [ \"${bundle_swapped:-0}\" -eq 1 ]; then rm -rf " & app_bundle_q & " || rollback_status=1; fi;"
 	    set cleanup_verified to "if [ \"${dmg_attached:-0}\" -eq 1 ]; then /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null 2>&1 || cleanup_status=1; fi; if [ -n \"${temp_bundle:-}\" ]; then rm -rf \"$temp_bundle\" || cleanup_status=1; fi; if [ -n \"${verified_dir:-}\" ]; then rm -rf \"$verified_dir\" || cleanup_status=1; fi;"
 	    set rollback_update to "status=$?; trap - EXIT; set +e; cleanup_status=0; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; if [ \"$cleanup_status\" -ne 0 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then status=1; elif [ \"$cleanup_status\" -ne 0 ]; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi; exit \"$status\";"
 	    set commit_update to "transaction_committed=1; if ! rm -rf \"$old_bundle\"; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi;"
 	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & "transaction_started=1;" & move_current_bundle & install_staged_bundle & restore_installed_owner & commit_update
-	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
+	    set sh to "umask 077; set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & ensure_service_inactive & kill_others & prepare_verified & ensure_atomic_bundle_swap & copy_files
+	    set sh to lock_transaction & quoted form of sh
 
 	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
 	end run
@@ -217,6 +233,20 @@ pub fn install_service() -> bool {
     is_installed_daemon(false)
 }
 
+fn require_successful_osascript(
+    result: std::io::Result<std::process::Output>,
+) -> ResultType<std::process::Output> {
+    let output = result.map_err(|err| anyhow!("run osascript failed: {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "run osascript failed with status: {}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
 // Remember to check if `update_daemon_agent()` need to be changed if changing `is_installed_daemon()`.
 // No need to merge the existing dup code, because the code in these two functions are too critical.
 // New code should be written in a common function.
@@ -238,45 +268,63 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     let Some(install_script) = PRIVILEGES_SCRIPTS_DIR.get_file("install.scpt") else {
         return false;
     };
-    let Some(install_script_body) = install_script.contents_utf8().map(correct_app_name) else {
+    let Some(install_script_body) = install_script.contents_utf8() else {
+        return false;
+    };
+    let Ok(install_script_body) = correct_app_name(install_script_body) else {
+        log::error!("Refusing to render install script with an invalid application identity");
         return false;
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         return false;
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8() else {
+        return false;
+    };
+    let Ok(daemon_plist_body) = correct_app_name(daemon_plist_body) else {
+        log::error!("Refusing to render daemon plist with an invalid application identity");
         return false;
     };
 
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         return false;
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8() else {
+        return false;
+    };
+    let Ok(agent_plist_body) = correct_app_name(agent_plist_body) else {
+        log::error!("Refusing to render agent plist with an invalid application identity");
         return false;
     };
 
     std::thread::spawn(move || {
-        match std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(install_script_body)
-            .arg(daemon_plist_body)
-            .arg(agent_plist_body)
-            .arg(&get_active_username())
-            .status()
-        {
+        match require_successful_osascript(
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(install_script_body)
+                .arg(daemon_plist_body)
+                .arg(agent_plist_body)
+                .arg(&get_active_username())
+                .output(),
+        ) {
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
             }
-            _ => {
+            Ok(output) => {
+                log_install_cleanup_warning(&output);
                 let installed = std::path::Path::new(&agent_plist_file).exists();
                 log::info!("Agent file {} installed: {}", agent_plist_file, installed);
                 if installed {
                     log::info!("launch server");
-                    std::process::Command::new("launchctl")
+                    match std::process::Command::new("launchctl")
                         .args(&["load", "-w", &agent_plist_file])
                         .status()
-                        .ok();
+                    {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => log::error!("launchctl load failed: {status}"),
+                        Err(err) => log::error!("failed to run launchctl load: {err}"),
+                    }
                 }
             }
         }
@@ -295,6 +343,12 @@ enum UpdateSource {
 fn log_update_cleanup_warning(output: &std::process::Output) {
     if String::from_utf8_lossy(&output.stdout).contains(UPDATE_CLEANUP_FAILED_AFTER_COMMIT) {
         log::warn!("Update committed, but temporary update cleanup failed");
+    }
+}
+
+fn log_install_cleanup_warning(output: &std::process::Output) {
+    if String::from_utf8_lossy(&output.stdout).contains(INSTALL_CLEANUP_FAILED_AFTER_COMMIT) {
+        log::warn!("Service installation committed, but temporary cleanup failed");
     }
 }
 
@@ -319,9 +373,10 @@ fn update_daemon_agent(
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
         bail!("Failed to find {}", update_script_file);
     };
-    let Some(update_script_body) = update_script.contents_utf8().map(correct_app_name) else {
+    let Some(update_script_body) = update_script.contents_utf8() else {
         bail!("Failed to read {}", update_script_file);
     };
+    let update_script_body = correct_app_name(update_script_body)?;
 
     let current_pid = std::process::id().to_string();
     let (update_source_path, expected_sha256) = update_source.into_script_args();
@@ -370,63 +425,214 @@ fn update_daemon_agent(
     }
 }
 
-fn correct_app_name(s: &str) -> String {
-    let mut s = s.to_owned();
-    if let Some(bundleid) = get_bundle_id() {
-        s = s.replace("com.carriez.rustdesk", &bundleid);
-    }
-    s = s.replace("rustdesk", &crate::get_app_name().to_lowercase());
-    s = s.replace("RustDesk", &crate::get_app_name());
-    s
+fn correct_app_name(s: &str) -> ResultType<String> {
+    let app_name = crate::get_app_name();
+    let bundle_id = get_bundle_id();
+    render_privileged_template(s, &app_name, bundle_id.as_deref())
 }
 
-fn write_plist_atomically(path: &str, body: &str) -> ResultType<()> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+fn render_privileged_template(
+    s: &str,
+    app_name: &str,
+    bundle_id: Option<&str>,
+) -> ResultType<String> {
+    validate_install_app_name(app_name)?;
+    if let Some(bundle_id) = bundle_id {
+        validate_bundle_identifier(bundle_id)?;
+    }
+    Ok(replace_app_identity(s, app_name, bundle_id))
+}
 
-    let temporary = format!("{}.tmp.{}", path, std::process::id());
-    let result = (|| {
+fn replace_app_identity(s: &str, app_name: &str, bundle_id: Option<&str>) -> String {
+    const DEFAULT_BUNDLE_ID: &str = "com.carriez.rustdesk";
+    const BUNDLE_ID_TOKEN: &str = "@@BUNDLE_IDENTIFIER@@";
+
+    let mut rendered = match bundle_id {
+        Some(_) => s.replace(DEFAULT_BUNDLE_ID, BUNDLE_ID_TOKEN),
+        None => s.to_owned(),
+    };
+    rendered = rendered.replace("rustdesk", &app_name.to_lowercase());
+    rendered = rendered.replace("RustDesk", app_name);
+    match bundle_id {
+        Some(bundle_id) => rendered.replace(BUNDLE_ID_TOKEN, bundle_id),
+        None => rendered,
+    }
+}
+
+fn render_plist_body(s: &str, app_name: &str, bundle_id: &str) -> ResultType<String> {
+    render_privileged_template(s, app_name, Some(bundle_id))
+}
+
+fn validate_bundle_identifier(bundle_id: &str) -> ResultType<()> {
+    if bundle_id.is_empty()
+        || !bundle_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        bail!("Invalid application bundle identifier");
+    }
+    Ok(())
+}
+
+fn render_installed_plist_body(s: &str, app_name: &str) -> ResultType<String> {
+    let bundle_id = get_installed_bundle_id(app_name)?;
+    render_plist_body(s, app_name, &bundle_id)
+}
+
+#[derive(Clone, Copy)]
+struct PlistDefinition<'a> {
+    path: &'a Path,
+    body: &'a [u8],
+}
+
+fn write_plist_atomically(path: &Path, body: &[u8]) -> ResultType<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let Some(file_name) = path.file_name() else {
+        bail!("plist path has no file name: {}", path.display());
+    };
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(format!(".tmp.{}", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    let result = (|| -> ResultType<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(PLIST_MODE)
             .open(&temporary)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        file.write_all(body.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(PLIST_MODE))?;
+        file.write_all(body)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
-        Ok::<(), std::io::Error>(())
+        sync_plist_parent(path)?;
+        Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    match result {
+        Ok(()) => Ok(()),
+        Err(operation_error) => report_failed_plist_cleanup(&temporary, operation_error),
     }
-    result.map_err(Into::into)
+}
+
+fn report_failed_plist_cleanup(
+    temporary: &Path,
+    operation_error: hbb_common::anyhow::Error,
+) -> ResultType<()> {
+    match std::fs::remove_file(temporary) {
+        Ok(()) => Err(operation_error),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(operation_error),
+        Err(cleanup_error) => Err(anyhow!(
+            "plist write failed ({operation_error}); temporary cleanup failed ({cleanup_error})"
+        )),
+    }
+}
+
+fn write_plist_pair_atomically(definitions: [PlistDefinition<'_>; 2]) -> ResultType<()> {
+    write_plist_pair_with(definitions, write_plist_atomically)
+}
+
+fn write_plist_pair_with(
+    definitions: [PlistDefinition<'_>; 2],
+    mut writer: impl FnMut(&Path, &[u8]) -> ResultType<()>,
+) -> ResultType<()> {
+    let [daemon, agent] = definitions;
+    let daemon_backup = read_optional_plist(daemon.path)?;
+    let agent_backup = read_optional_plist(agent.path)?;
+    let write_result =
+        writer(daemon.path, daemon.body).and_then(|_| writer(agent.path, agent.body));
+    let Err(write_error) = write_result else {
+        return Ok(());
+    };
+    let daemon_rollback = restore_plist(daemon.path, daemon_backup.as_deref());
+    let agent_rollback = restore_plist(agent.path, agent_backup.as_deref());
+    if daemon_rollback.is_ok() && agent_rollback.is_ok() {
+        return Err(write_error);
+    }
+    bail!(
+        "plist write failed ({write_error}); rollback results: daemon={daemon_rollback:?}, agent={agent_rollback:?}"
+    )
+}
+
+fn read_optional_plist(path: &Path) -> ResultType<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(std::fs::read(path)?)),
+        Ok(_) => bail!("plist is not a regular file: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_plist(path: &Path, backup: Option<&[u8]>) -> ResultType<()> {
+    if let Some(backup) = backup {
+        return write_plist_atomically(path, backup);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("new plist path is not a regular file: {}", path.display());
+    }
+    std::fs::remove_file(path)?;
+    sync_plist_parent(path)
+}
+
+fn sync_plist_parent(path: &Path) -> ResultType<()> {
+    let Some(parent) = path.parent() else {
+        bail!("plist path has no parent: {}", path.display());
+    };
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 pub fn write_plists() -> ResultType<()> {
+    let app_name = crate::get_app_name();
+    privileged_helper::with_prepared_helper_for_plist_write(&app_name, || {
+        write_plists_for_app(&app_name)
+    })
+}
+
+fn write_plists_for_app(app_name: &str) -> ResultType<()> {
+    let bundle_id = get_installed_bundle_id(app_name)?;
     let daemon_plist_path = format!(
         "/Library/LaunchDaemons/com.carriez.{}_service.plist",
-        crate::get_app_name()
+        app_name
     );
     let agent_plist_path = format!(
         "/Library/LaunchAgents/com.carriez.{}_server.plist",
-        crate::get_app_name()
+        app_name
     );
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         bail!("daemon.plist not found in embedded resources");
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8() else {
         bail!("Failed to read daemon.plist");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         bail!("agent.plist not found in embedded resources");
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8() else {
         bail!("Failed to read agent.plist");
     };
-    write_plist_atomically(&daemon_plist_path, &daemon_plist_body)?;
-    write_plist_atomically(&agent_plist_path, &agent_plist_body)?;
+    let daemon_plist_body = render_plist_body(daemon_plist_body, app_name, &bundle_id)?;
+    let agent_plist_body = render_plist_body(agent_plist_body, app_name, &bundle_id)?;
+    write_plist_pair_atomically([
+        PlistDefinition {
+            path: Path::new(&daemon_plist_path),
+            body: daemon_plist_body.as_bytes(),
+        },
+        PlistDefinition {
+            path: Path::new(&agent_plist_path),
+            body: agent_plist_body.as_bytes(),
+        },
+    ])?;
     log::info!("[write-plists] Wrote daemon and agent plists");
     Ok(())
+}
+
+pub fn complete_helper_migration() -> ResultType<()> {
+    privileged_helper::complete_helper_migration()
 }
 
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
@@ -438,20 +644,26 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     let Some(script_file) = PRIVILEGES_SCRIPTS_DIR.get_file("uninstall.scpt") else {
         return false;
     };
-    let Some(script_body) = script_file.contents_utf8().map(correct_app_name) else {
+    let Some(script_body) = script_file.contents_utf8() else {
+        return false;
+    };
+    let Ok(script_body) = correct_app_name(script_body) else {
+        log::error!("Refusing to render uninstall script with an invalid application identity");
         return false;
     };
 
-    let func = move || {
-        match std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script_body)
-            .status()
-        {
+    let func = move || -> bool {
+        match require_successful_osascript(
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script_body)
+                .output(),
+        ) {
             Err(e) => {
                 log::error!("run osascript failed: {}", e);
+                return false;
             }
-            _ => {
+            Ok(_) => {
                 let agent = format!("{}_server.plist", crate::get_full_name());
                 let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
                 let uninstalled = !std::path::Path::new(&agent_plist_file).exists();
@@ -482,13 +694,16 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
                     }
                     quit_gui();
                 }
+                uninstalled
             }
         }
     };
     if sync {
-        func();
+        return func();
     } else {
-        std::thread::spawn(func);
+        std::thread::spawn(move || {
+            func();
+        });
     }
     true
 }
@@ -902,15 +1117,44 @@ pub fn lock_screen() {
 
 /// Starts the macOS system service IPC listener and the background
 /// silent auto-update thread.
-pub fn start_os_service() {
+pub fn start_os_service() -> ResultType<()> {
     log::info!("Username: {}", crate::username());
-    // Silent auto-update — runs as root via LaunchDaemon, no osascript dialog needed
-    crate::updater::start_auto_update_macos();
-    if let Err(err) = crate::ipc::start("_service") {
-        log::error!("Failed to start ipc_service: {}", err);
+    match privileged_helper::prepare_service_start()? {
+        privileged_helper::ServiceStartAction::ExitAfterMigrationLaunch => {
+            log::info!("Legacy helper migration launched; exiting old service");
+            return Ok(());
+        }
+        privileged_helper::ServiceStartAction::StartForMigrationReadiness => {
+            start_auto_update_after_migration()?;
+        }
+        privileged_helper::ServiceStartAction::StartForRollbackReadiness => {
+            log::warn!("Starting legacy IPC only to verify privileged helper rollback");
+        }
+        privileged_helper::ServiceStartAction::Start => {
+            crate::updater::start_auto_update_macos();
+        }
     }
+    crate::ipc::start("_service")
+}
 
-    /* // mouse/keyboard works in prelogin now with launchctl asuser.
+fn start_auto_update_after_migration() -> ResultType<()> {
+    std::thread::Builder::new()
+        .name("migration-update-gate".to_owned())
+        .spawn(|| {
+            let result = privileged_helper::wait_for_migration_completion()
+                .and_then(|_| privileged_helper::complete_migration_readiness());
+            if let Err(err) = result {
+                log::error!(
+                    "Privileged helper migration failed; IPC and automatic updates remain disabled: {err}"
+                );
+                return;
+            }
+            crate::updater::start_auto_update_macos();
+        })?;
+    Ok(())
+}
+
+/* // mouse/keyboard works in prelogin now with launchctl asuser.
        // below can avoid multi-users logged in problem, but having its own below problem.
        // Not find a good way to start --cm without root privilege (affect file transfer).
        // one way is to start with `launchctl asuser <uid> open -n -a /Applications/RustDesk.app/ --args --cm`,
@@ -966,8 +1210,7 @@ pub fn start_os_service() {
             hbb_common::allow_err!(ps.kill());
         }
         log::info!("Exit");
-    */
-}
+*/
 
 pub fn toggle_blank_screen(_v: bool) {
     // https://unix.stackexchange.com/questions/17115/disable-keyboard-mouse-temporarily
@@ -1130,7 +1373,10 @@ fn backup_update_plist(source: &str, backup: &str) -> ResultType<()> {
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!("[root-update] required installed plist is missing: {}", source)
+            bail!(
+                "[root-update] required installed plist is missing: {}",
+                source
+            )
         }
         Err(err) => Err(err.into()),
     }
@@ -1142,7 +1388,10 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
         // Frameworks legitimately use internal symlinks (Resources,
         // Versions/Current), but never allow a link to leave its framework.
         let Some(framework_root) = framework_root else {
-            bail!("[root-update] symlink outside framework: {}", path.display());
+            bail!(
+                "[root-update] symlink outside framework: {}",
+                path.display()
+            );
         };
         let target = std::fs::read_link(path)?;
         let target = if target.is_absolute() {
@@ -1173,9 +1422,62 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
             validate_update_tree(&child, child_framework_root)?;
         }
     } else if !metadata.file_type().is_file() {
-        bail!("[root-update] unsupported file in update bundle: {}", path.display());
+        bail!(
+            "[root-update] unsupported file in update bundle: {}",
+            path.display()
+        );
     }
     Ok(())
+}
+
+fn ensure_same_filesystem(left: &Path, right: &Path) -> ResultType<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left_device = std::fs::metadata(left)?.dev();
+    let right_device = std::fs::metadata(right)?.dev();
+    if left_device != right_device {
+        bail!(
+            "[root-update] atomic bundle swap requires one filesystem: {} and {}",
+            left.display(),
+            right.display()
+        );
+    }
+    Ok(())
+}
+
+struct RootUpdatePreparationDirectory {
+    path: Option<PathBuf>,
+}
+
+impl RootUpdatePreparationDirectory {
+    fn new(path: PathBuf) -> ResultType<Self> {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!("[root-update] preparation path is not a real directory");
+        }
+        Ok(Self { path: Some(path) })
+    }
+
+    fn retain_for_detached_update(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for RootUpdatePreparationDirectory {
+    fn drop(&mut self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_dir_all(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "[root-update] failed to clean preparation directory {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
 }
 
 /// Performs a silent update from a DMG file without any osascript dialog.
@@ -1187,6 +1489,12 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     let tmp_dir_output = std::process::Command::new("/usr/bin/mktemp")
         .args(&["-d", "/tmp/.rustdeskupdate-root-XXXXXX"])
         .output()?;
+    if !tmp_dir_output.status.success() {
+        bail!(
+            "[root-update] failed to create preparation directory: {}",
+            String::from_utf8_lossy(&tmp_dir_output.stderr).trim()
+        );
+    }
     let tmp_dir = String::from_utf8(tmp_dir_output.stdout)
         .map_err(|e| anyhow!("[root-update] mktemp output error: {}", e))?
         .trim()
@@ -1194,14 +1502,27 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     if tmp_dir.is_empty() {
         bail!("[root-update] Failed to create temp directory");
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
-    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+    let mut preparation_directory = RootUpdatePreparationDirectory::new(PathBuf::from(&tmp_dir))?;
+    privileged_helper::harden_root_private_directory(Path::new(&tmp_dir))?;
+    ensure_same_filesystem(Path::new(&tmp_dir), Path::new("/Applications"))?;
+    let agent_plist = format!(
+        "/Library/LaunchAgents/com.carriez.{}_server.plist",
+        app_name
+    );
+    let daemon_plist = format!(
+        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
+        app_name
+    );
+    let helper_bundle = format!(
+        "/Library/PrivilegedHelperTools/com.carriez.{}_service.bundle",
+        app_name
+    );
+    let helper_service = format!("{}/Contents/MacOS/service", helper_bundle);
 
-    log::info!("[root-update] Starting silent root update from {}", dmg_path);
+    log::info!(
+        "[root-update] Starting silent root update from {}",
+        dmg_path
+    );
     // Check sessions before extracting to avoid unnecessary work
     if !crate::updater::has_no_active_conns_ipc() {
         bail!("[root-update] Active session detected, deferring update.");
@@ -1234,27 +1555,8 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
         }
         Ok(version.trim().to_owned())
     })();
-    let staged_version = match staged_version_result {
-        Ok(version) => version,
-        Err(err) => {
-            if let Err(cleanup_err) = std::fs::remove_dir_all(&tmp_dir) {
-                log::warn!(
-                    "[root-update] Failed to remove temp dir {}: {}",
-                    tmp_dir,
-                    cleanup_err
-                );
-            }
-            return Err(err);
-        }
-    };
+    let staged_version = staged_version_result?;
     if staged_version != expected_version {
-        if let Err(err) = std::fs::remove_dir_all(&tmp_dir) {
-            log::warn!(
-                "[root-update] Failed to remove temp dir {}: {}",
-                tmp_dir,
-                err
-            );
-        }
         bail!(
             "[root-update] staged bundle version mismatch: expected {:?}, found {:?}",
             expected_version,
@@ -1262,26 +1564,27 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
         );
     }
 
-    // A leftover backup makes `mv app app.bak` nest the live bundle inside
-    // the old directory instead of creating a transaction backup. Never
-    // overwrite or guess at recovery state left by an earlier interrupted
-    // update; require an administrator to inspect it first.
-    let app_backup = format!("{}.bak", app_bundle);
-    let failed_bundle = format!("{}.failed-update", app_bundle);
-    for recovery_path in [&app_backup, &failed_bundle] {
+    // Application swap paths live in this fresh root-private directory. Never
+    // overwrite or guess at helper recovery state from an interrupted update.
+    let app_backup = format!("{}/previous.app", tmp_dir);
+    let failed_bundle = format!("{}/failed.app", tmp_dir);
+    let helper_transaction = format!(
+        "/Library/PrivilegedHelperTools/.com.carriez.{}_service.root-update",
+        app_name
+    );
+    let helper_backup = format!("{helper_transaction}/previous.bundle");
+    let helper_staging = format!("{helper_transaction}/staged.bundle");
+    let helper_failed = format!("{helper_transaction}/failed.bundle");
+    for recovery_path in [&app_backup, &failed_bundle, &helper_transaction] {
         match std::fs::symlink_metadata(recovery_path) {
             Ok(_) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 bail!(
-                    "[root-update] stale application recovery path requires inspection: {}",
+                    "[root-update] stale update recovery path requires inspection: {}",
                     recovery_path
                 );
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(err.into());
-            }
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -1295,19 +1598,20 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     backup_update_plist(&agent_plist, &agent_plist_bak)?;
 
     // Ensure the staged release contains the service executable before we
-    // proceed. Plist generation itself is done in this already-root process;
-    // launching a freshly extracted service binary from /tmp is not required.
+    // proceed. Plist generation runs only after these bytes are installed in
+    // the protected helper tree; never execute the extracted /tmp copy.
     let new_service = format!("{}/Contents/MacOS/service", src_app);
     if !std::path::Path::new(&new_service).is_file() {
-        bail!("[root-update] staged service binary is missing: {}", new_service);
+        bail!(
+            "[root-update] staged service binary is missing: {}",
+            new_service
+        );
     }
-    // The new binary writes its own plist definitions after the bundle is
-    // moved into its final root-owned location.  This avoids executing code
-    // directly from /tmp while ensuring the plist matches the new release.
+    // The protected helper writes plist definitions after both release trees
+    // reach their final root-owned locations.
 
     // Final session check after extraction — minimize race window
     if !crate::updater::has_no_active_conns_ipc() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
         bail!("[root-update] Active session detected after extraction, deferring update.");
     }
 
@@ -1335,8 +1639,98 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     let script_path = format!("{}/rustdesk_update.sh", tmp_dir);
     let script = format!(
         r#"#!/bin/sh
+umask 077
 rollback_done=0
 bundle_swapped=0
+helper_swapped=0
+helper_backed_up=0
+# Official unattended bytes are authenticated by signed update metadata and
+# SHA-256. Never execute an unverified or unsigned fallback here.
+helper_has_no_acl() {{
+    acl_mode=$(/bin/ls -lde "$1" | /usr/bin/awk 'NR == 1 {{ print $1 }}') || return 1
+    [ -n "$acl_mode" ] || return 1
+    case "$acl_mode" in
+        *+) return 1 ;;
+    esac
+}}
+validate_helper_base() {{
+    if [ -L /Library ] || [ ! -d /Library ] || [ -L /Library/PrivilegedHelperTools ]; then
+        return 1
+    fi
+    if [ ! -e /Library/PrivilegedHelperTools ]; then
+        mkdir /Library/PrivilegedHelperTools || return 1
+        chown root:wheel /Library/PrivilegedHelperTools || return 1
+        chmod -N /Library/PrivilegedHelperTools || return 1
+        chmod 0755 /Library/PrivilegedHelperTools || return 1
+    fi
+    [ -d /Library/PrivilegedHelperTools ] || return 1
+    helper_has_no_acl /Library/PrivilegedHelperTools || return 1
+    [ "$(stat -f '%u' /Library/PrivilegedHelperTools)" = "0" ] || return 1
+    helper_base_mode=$(stat -f '%Lp' /Library/PrivilegedHelperTools) || return 1
+    case "$helper_base_mode" in
+        ''|*[!0-7]*) return 1 ;;
+    esac
+    helper_base_bits=$((0$helper_base_mode))
+    if [ $((helper_base_bits & 0022)) -ne 0 ] && \
+       [ $((helper_base_bits & 01000)) -eq 0 ]; then
+        return 1
+    fi
+}}
+validate_helper_tree() {{
+    helper_root="$1"
+    for helper_dir in "$helper_root" "$helper_root/Contents" \
+        "$helper_root/Contents/MacOS" "$helper_root/Contents/Resources"; do
+        [ ! -L "$helper_dir" ] && [ -d "$helper_dir" ] && \
+            helper_has_no_acl "$helper_dir" && \
+            [ "$(stat -f '%u:%g:%Lp' "$helper_dir")" = "0:0:755" ] || return 1
+    done
+    helper_bin="$helper_root/Contents/MacOS/service"
+    [ ! -L "$helper_bin" ] && [ -f "$helper_bin" ] && \
+        helper_has_no_acl "$helper_bin" && \
+        [ "$(stat -f '%u:%g:%Lp' "$helper_bin")" = "0:0:755" ] || return 1
+    helper_custom="$helper_root/Contents/Resources/custom.txt"
+    if [ -e "$helper_custom" ] || [ -L "$helper_custom" ]; then
+        [ ! -L "$helper_custom" ] && [ -f "$helper_custom" ] && \
+            helper_has_no_acl "$helper_custom" && \
+            [ "$(stat -f '%u:%g:%Lp' "$helper_custom")" = "0:0:600" ] || return 1
+    fi
+}}
+validate_helper_transaction() {{
+    [ ! -L "{helper_transaction}" ] && [ -d "{helper_transaction}" ] && \
+        helper_has_no_acl "{helper_transaction}" && \
+        [ "$(stat -f '%u:%g:%Lp' "{helper_transaction}")" = "0:0:700" ]
+}}
+stage_helper() {{
+    staged_helper_bundle="{helper_staging}"
+    helper_source="{src_app}/Contents/MacOS/service"
+    custom_source="{src_app}/Contents/Resources/custom.txt"
+    [ ! -e "{helper_transaction}" ] && [ ! -L "{helper_transaction}" ] || return 1
+    mkdir "{helper_transaction}" || return 1
+    chown root:wheel "{helper_transaction}" || return 1
+    chmod 0700 "{helper_transaction}" || return 1
+    validate_helper_transaction || return 1
+    [ ! -e "$staged_helper_bundle" ] && [ ! -L "$staged_helper_bundle" ] || return 1
+    [ ! -L "$helper_source" ] && [ -f "$helper_source" ] || return 1
+    mkdir "$staged_helper_bundle" \
+        "$staged_helper_bundle/Contents" \
+        "$staged_helper_bundle/Contents/MacOS" \
+        "$staged_helper_bundle/Contents/Resources" || return 1
+    cp "$helper_source" "$staged_helper_bundle/Contents/MacOS/service" || return 1
+    if [ -e "$custom_source" ] || [ -L "$custom_source" ]; then
+        [ ! -L "$custom_source" ] && [ -f "$custom_source" ] || return 1
+        cp "$custom_source" "$staged_helper_bundle/Contents/Resources/custom.txt" || return 1
+    fi
+    chmod -RN "$staged_helper_bundle" || return 1
+    chown -R root:wheel "$staged_helper_bundle" || return 1
+    chmod 0755 "$staged_helper_bundle" "$staged_helper_bundle/Contents" \
+        "$staged_helper_bundle/Contents/MacOS" \
+        "$staged_helper_bundle/Contents/Resources" \
+        "$staged_helper_bundle/Contents/MacOS/service" || return 1
+    if [ -f "$staged_helper_bundle/Contents/Resources/custom.txt" ]; then
+        chmod 0600 "$staged_helper_bundle/Contents/Resources/custom.txt" || return 1
+    fi
+    validate_helper_tree "$staged_helper_bundle"
+}}
 bootstrap_agent() {{
     agent_uid="$1"
     if [ "$agent_uid" != "0" ]; then
@@ -1473,7 +1867,9 @@ user_bundle_processes_absent() {{
 }}
 stop_user_bundle_processes() {{
     terminate_user_bundle_processes
-    for _ in $(/usr/bin/seq 1 30); do
+    bundle_stop_attempt=0
+    while [ "$bundle_stop_attempt" -lt 30 ]; do
+        bundle_stop_attempt=$((bundle_stop_attempt + 1))
         if user_bundle_processes_absent; then
             sleep 2
             user_bundle_processes_absent && return 0
@@ -1516,7 +1912,9 @@ agents_stopped() {{
 stop_agents() {{
     bootout_agents
     terminate_agent_processes
-    for _ in $(/usr/bin/seq 1 30); do
+    agent_stop_attempt=0
+    while [ "$agent_stop_attempt" -lt 30 ]; do
+        agent_stop_attempt=$((agent_stop_attempt + 1))
         if agents_stopped; then
             sleep 2
             agents_stopped && return 0
@@ -1526,12 +1924,19 @@ stop_agents() {{
     done
     return 1
 }}
+socket_ready() {{
+    socket_path="$1"
+    socket_expected_uid="$2"
+    [ ! -L "$socket_path" ] && [ -S "$socket_path" ] && \
+        [ "$(/usr/bin/stat -f '%u' "$socket_path")" = "$socket_expected_uid" ] && \
+        /usr/bin/nc -zU "$socket_path"
+}}
 capture_agent_snapshot() {{
     agent_pids=""
     for agent_uid in {uid_list}; do
         agent_pid=$(agent_pid_for_uid "$agent_uid" || true)
         [ -n "$agent_pid" ] || return 1
-        [ -S "/tmp/{app_name}-$agent_uid/ipc" ] || return 1
+        socket_ready "/tmp/{app_name}-$agent_uid/ipc" "$agent_uid" || return 1
         kill -0 "$agent_pid" 2>/dev/null || return 1
         agent_process_matches "$agent_uid" "$agent_pid" || return 1
         agent_pids="$agent_pids $agent_uid:$agent_pid"
@@ -1544,14 +1949,16 @@ agent_snapshot_stable() {{
         expected_pid=$(printf '%s\n' "$agent_entry" | cut -d: -f2)
         current_pid=$(agent_pid_for_uid "$agent_uid" || true)
         [ -n "$current_pid" ] && [ "$current_pid" = "$expected_pid" ] || return 1
-        [ -S "/tmp/{app_name}-$agent_uid/ipc" ] || return 1
+        socket_ready "/tmp/{app_name}-$agent_uid/ipc" "$agent_uid" || return 1
         kill -0 "$current_pid" 2>/dev/null || return 1
         agent_process_matches "$agent_uid" "$current_pid" || return 1
     done
     return 0
 }}
 agent_ready() {{
-    for _ in $(/usr/bin/seq 1 30); do
+    agent_ready_attempt=0
+    while [ "$agent_ready_attempt" -lt 30 ]; do
+        agent_ready_attempt=$((agent_ready_attempt + 1))
         if capture_agent_snapshot; then
             sleep 2
             agent_snapshot_stable && return 0
@@ -1560,23 +1967,34 @@ agent_ready() {{
     done
     return 1
 }}
+daemon_program_matches_plist() {{
+    expected_daemon_program=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "{daemon_plist}") || return 1
+    actual_daemon_program=$(printf '%s\n' "$1" | \
+        /usr/bin/awk '/^[[:space:]]*program = / {{print $3; exit}}') || return 1
+    [ -n "$expected_daemon_program" ] && \
+        [ "$actual_daemon_program" = "$expected_daemon_program" ]
+}}
 daemon_snapshot_stable() {{
     stable_daemon_info=$(launchctl print system/{daemon_label} 2>/dev/null || true)
     stable_daemon_pid=$(printf '%s\n' "$stable_daemon_info" | awk '/^[[:space:]]*pid = / {{print $3; exit}}')
     [ -n "$daemon_pid" ] && \
         [ "$stable_daemon_pid" = "$daemon_pid" ] && \
         printf '%s\n' "$stable_daemon_info" | grep -E '^[[:space:]]*state = running[[:space:]]*$' >/dev/null && \
-        [ -S "/tmp/{app_name}-service/ipc_service" ] && \
+        daemon_program_matches_plist "$stable_daemon_info" && \
+        socket_ready "/tmp/{app_name}-service/ipc_service" 0 && \
         kill -0 "$daemon_pid" 2>/dev/null
 }}
 daemon_ready() {{
     daemon_pid=""
-    for _ in $(/usr/bin/seq 1 30); do
+    daemon_ready_attempt=0
+    while [ "$daemon_ready_attempt" -lt 30 ]; do
+        daemon_ready_attempt=$((daemon_ready_attempt + 1))
         daemon_info=$(launchctl print system/{daemon_label} 2>/dev/null || true)
         daemon_pid=$(printf '%s\n' "$daemon_info" | awk '/^[[:space:]]*pid = / {{print $3; exit}}')
         if [ -n "$daemon_pid" ] && \
            printf '%s\n' "$daemon_info" | grep -E '^[[:space:]]*state = running[[:space:]]*$' >/dev/null && \
-           [ -S "/tmp/{app_name}-service/ipc_service" ] && \
+           daemon_program_matches_plist "$daemon_info" && \
+           socket_ready "/tmp/{app_name}-service/ipc_service" 0 && \
            kill -0 "$daemon_pid" 2>/dev/null; then
             sleep 2
             daemon_snapshot_stable && return 0
@@ -1601,7 +2019,9 @@ stop_daemon() {{
     # captured process generation and launchd registration are gone.
     launchctl bootout system/{daemon_label} 2>/dev/null || \
         launchctl unload -w "{daemon_plist}" 2>/dev/null || true
-    for _ in $(/usr/bin/seq 1 30); do
+    daemon_stop_attempt=0
+    while [ "$daemon_stop_attempt" -lt 30 ]; do
+        daemon_stop_attempt=$((daemon_stop_attempt + 1))
         if daemon_stopped; then
             sleep 2
             daemon_stopped && return 0
@@ -1611,10 +2031,12 @@ stop_daemon() {{
     return 1
 }}
 write_new_plists() {{
-    /Applications/{app_name}.app/Contents/MacOS/service --write-plists \
+    {helper_service} --write-plists \
         >"{tmp_dir}/write-plists.log" 2>&1 &
     write_pid=$!
-    for _ in $(/usr/bin/seq 1 60); do
+    plist_write_attempt=0
+    while [ "$plist_write_attempt" -lt 60 ]; do
+        plist_write_attempt=$((plist_write_attempt + 1))
         if ! kill -0 "$write_pid" 2>/dev/null; then
             wait "$write_pid"
             return $?
@@ -1627,29 +2049,69 @@ write_new_plists() {{
     wait "$write_pid" 2>/dev/null || true
     return 124
 }}
+restore_plist_atomically() {{
+    restore_source="$1"
+    restore_target="$2"
+    restore_stage="$restore_target.rollback.$$"
+    [ ! -e "$restore_stage" ] && [ ! -L "$restore_stage" ] || return 1
+    if ! cp -p "$restore_source" "$restore_stage" || \
+       ! chown root:wheel "$restore_stage" || \
+       ! chmod -N "$restore_stage" || \
+       ! chmod 0644 "$restore_stage" || \
+       ! mv "$restore_stage" "$restore_target"; then
+        rm -f "$restore_stage"
+        return 1
+    fi
+    [ ! -L "$restore_target" ] && [ -f "$restore_target" ] && \
+        [ "$(stat -f '%u:%g:%Lp' "$restore_target")" = "0:0:644" ]
+}}
 restore_old_bundle() {{
     [ "$bundle_swapped" -eq 1 ] || return 0
-    if [ ! -d "{app_bundle}.bak" ] || [ -L "{app_bundle}.bak" ]; then
+    if [ ! -d "{app_backup}" ] || [ -L "{app_backup}" ]; then
         echo "[root-update] CRITICAL: valid application backup is unavailable" >> {tmp_dir}/rustdesk_root_update.log
         return 1
     fi
     if [ -e "{app_bundle}" ] || [ -L "{app_bundle}" ]; then
-        if [ -e "{app_bundle}.failed-update" ] || [ -L "{app_bundle}.failed-update" ] || \
-           ! mv "{app_bundle}" "{app_bundle}.failed-update"; then
+        if [ -e "{failed_bundle}" ] || [ -L "{failed_bundle}" ] || \
+           ! mv "{app_bundle}" "{failed_bundle}"; then
             echo "[root-update] CRITICAL: could not vacate failed bundle safely" >> {tmp_dir}/rustdesk_root_update.log
             return 1
         fi
     fi
-    if ! mv "{app_bundle}.bak" "{app_bundle}"; then
+    if ! mv "{app_backup}" "{app_bundle}"; then
         echo "[root-update] CRITICAL: failed to restore application bundle" >> {tmp_dir}/rustdesk_root_update.log
         if [ ! -e "{app_bundle}" ] && [ ! -L "{app_bundle}" ]; then
-            mv "{app_bundle}.failed-update" "{app_bundle}" 2>/dev/null || true
+            mv "{failed_bundle}" "{app_bundle}" 2>/dev/null || true
         fi
         return 1
     fi
-    rm -rf "{app_bundle}.failed-update" 2>/dev/null || true
     bundle_swapped=0
     return 0
+}}
+restore_old_helper() {{
+    validate_helper_base || return 1
+    if [ ! -e "{helper_transaction}" ] && [ ! -L "{helper_transaction}" ]; then
+        [ "$helper_swapped" -eq 0 ] && [ "$helper_backed_up" -eq 0 ]
+        return $?
+    fi
+    validate_helper_transaction || return 1
+    if [ "$helper_swapped" -eq 1 ]; then
+        if [ -e "{helper_bundle}" ] || [ -L "{helper_bundle}" ]; then
+            [ ! -e "{helper_failed}" ] && [ ! -L "{helper_failed}" ] || return 1
+            mv "{helper_bundle}" "{helper_failed}" || return 1
+        fi
+        helper_swapped=0
+    fi
+    if [ "$helper_backed_up" -eq 1 ]; then
+        validate_helper_tree "{helper_backup}" || return 1
+        if [ -e "{helper_bundle}" ] || [ -L "{helper_bundle}" ]; then
+            return 1
+        fi
+        mv "{helper_backup}" "{helper_bundle}" || return 1
+        validate_helper_tree "{helper_bundle}" || return 1
+        helper_backed_up=0
+    fi
+    rm -rf "{helper_transaction}"
 }}
 rollback_transaction() {{
     # Rollback restores and verifies unattended service state. It does not
@@ -1657,22 +2119,28 @@ rollback_transaction() {{
     [ "$rollback_done" -eq 0 ] || return 0
     rollback_done=1
     restore_failed=0
-    stop_daemon || restore_failed=1
+    rollback_jobs_stopped=1
+    stop_daemon || rollback_jobs_stopped=0
     capture_stopping_agent_pids
-    stop_agents || restore_failed=1
-    restore_old_bundle || restore_failed=1
-    cp "{daemon_plist_bak}" "{daemon_plist}" || restore_failed=1
-    cp "{agent_plist_bak}" "{agent_plist}" || restore_failed=1
+    stop_agents || rollback_jobs_stopped=0
     touch /var/root/.rustdeskupdate_failed || restore_failed=1
-    if ! launchctl load -w "{daemon_plist}" 2>/dev/null && \
-       ! launchctl bootstrap system "{daemon_plist}" 2>/dev/null; then
-        restore_failed=1
-    fi
-    daemon_ready || restore_failed=1
-    bootstrap_agents || restore_failed=1
-    agent_ready || restore_failed=1
-    if [ "$restore_failed" -eq 0 ] && \
-       {{ ! daemon_snapshot_stable || ! agent_snapshot_stable; }}; then
+    if [ "$rollback_jobs_stopped" -eq 1 ]; then
+        restore_old_bundle || restore_failed=1
+        restore_old_helper || restore_failed=1
+        restore_plist_atomically "{daemon_plist_bak}" "{daemon_plist}" || restore_failed=1
+        restore_plist_atomically "{agent_plist_bak}" "{agent_plist}" || restore_failed=1
+        if ! launchctl load -w "{daemon_plist}" 2>/dev/null && \
+           ! launchctl bootstrap system "{daemon_plist}" 2>/dev/null; then
+            restore_failed=1
+        fi
+        daemon_ready || restore_failed=1
+        bootstrap_agents || restore_failed=1
+        agent_ready || restore_failed=1
+        if [ "$restore_failed" -eq 0 ] && \
+           {{ ! daemon_snapshot_stable || ! agent_snapshot_stable; }}; then
+            restore_failed=1
+        fi
+    else
         restore_failed=1
     fi
     if [ "$restore_failed" -ne 0 ]; then
@@ -1682,6 +2150,14 @@ rollback_transaction() {{
     fi
 }}
 trap rollback_transaction EXIT
+if ! validate_helper_base; then
+    echo "[root-update] privileged helper base validation failed" >> {tmp_dir}/rustdesk_root_update.log
+    exit 1
+fi
+if ! stage_helper; then
+    echo "[root-update] protected helper staging failed" >> {tmp_dir}/rustdesk_root_update.log
+    exit 1
+fi
 gui_uids=""
 for agent_uid in {uid_list}; do
     for pid in $(pgrep -u "$agent_uid" -x {app_name} || true); do
@@ -1731,19 +2207,25 @@ if [ ! -d "$staged_bundle/Contents/MacOS" ] || \
     rm -rf "$staged_bundle"
     exit 1
 fi
-if ! mv {app_bundle} {app_bundle}.bak; then
+if ! mv {app_bundle} {app_backup}; then
     echo "[root-update] backup mv failed, aborting" >> {tmp_dir}/rustdesk_root_update.log
     rm -rf "$staged_bundle"
     exit 1
 fi
 bundle_swapped=1
+staged_bundle_identity=$(stat -f '%d:%i' "$staged_bundle") || exit 1
 if ! mv "$staged_bundle" {app_bundle}; then
     echo "[root-update] replacement mv failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
     exit 1
 fi
-# Install the entire bundle as root-owned.  The LaunchDaemon executes code
-# from this bundle, so no nested framework, helper, or resource may remain
-# user-writable.
+installed_bundle_identity=$(stat -f '%d:%i' {app_bundle}) || exit 1
+if [ "$installed_bundle_identity" != "$staged_bundle_identity" ]; then
+    echo "[root-update] replacement mv did not atomically install staged bundle" >> {tmp_dir}/rustdesk_root_update.log
+    exit 1
+fi
+# Install the application bundle as root-owned so the GUI and LaunchAgent
+# cannot be replaced during the transaction. The LaunchDaemon runs only the
+# separately protected helper installed below.
 if ! chown -R root:wheel {app_bundle} || ! chmod -R go-w {app_bundle}; then
     echo "[root-update] chown failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
     exit 1
@@ -1761,6 +2243,24 @@ if ! chown root:wheel {app_bundle} || \
    ! chown root:wheel {app_bundle}/Contents/MacOS/{app_name} || \
    ! chmod 755 {app_bundle}/Contents/MacOS/{app_name}; then
     echo "[root-update] hardening failed, restoring backup" >> {tmp_dir}/rustdesk_root_update.log
+    exit 1
+fi
+# Atomically replace the protected helper before it generates the new plist.
+if [ -e "{helper_bundle}" ] || [ -L "{helper_bundle}" ]; then
+    if ! validate_helper_tree "{helper_bundle}" || \
+       ! mv "{helper_bundle}" "{helper_backup}"; then
+        echo "[root-update] protected helper backup failed" >> {tmp_dir}/rustdesk_root_update.log
+        exit 1
+    fi
+    helper_backed_up=1
+fi
+if ! mv "{helper_staging}" "{helper_bundle}"; then
+    echo "[root-update] protected helper swap failed" >> {tmp_dir}/rustdesk_root_update.log
+    exit 1
+fi
+helper_swapped=1
+if ! validate_helper_tree "{helper_bundle}"; then
+    echo "[root-update] installed helper validation failed" >> {tmp_dir}/rustdesk_root_update.log
     exit 1
 fi
 # Generate launchd definitions from the new, final-location binary.  The
@@ -1798,17 +2298,32 @@ fi
 # Only remove backup after BOTH daemon AND agent confirmed running
 rollback_done=1
 bundle_swapped=0
-if ! rm -rf "{app_bundle}.bak"; then
-    echo "[root-update] WARNING: committed update but could not remove backup" >> {tmp_dir}/rustdesk_root_update.log
+helper_swapped=0
+if ! rm -rf "{app_backup}"; then
+    cleanup_warning="[root-update] WARNING: committed update but could not remove application backup"
+    echo "$cleanup_warning" >> {tmp_dir}/rustdesk_root_update.log
+    /usr/bin/logger -t RustDesk "$cleanup_warning" || true
+fi
+if validate_helper_transaction && rm -rf "{helper_transaction}"; then
+    helper_backed_up=0
+else
+    cleanup_warning="[root-update] WARNING: committed update but could not remove helper transaction"
+    echo "$cleanup_warning" >> {tmp_dir}/rustdesk_root_update.log
+    /usr/bin/logger -t RustDesk "$cleanup_warning" || true
 fi
 for gui_uid in $gui_uids; do
     launchctl asuser "$gui_uid" open -a "{app_bundle}" || true
 done
 echo "[root-update] Done!" >> {tmp_dir}/rustdesk_root_update.log
-rm -rf {tmp_dir}
+if ! rm -rf {tmp_dir}; then
+    cleanup_warning="[root-update] WARNING: committed update but could not remove update temp directory"
+    /usr/bin/logger -t RustDesk "$cleanup_warning" || true
+fi
 "#,
         app_name = app_name,
         app_bundle = app_bundle,
+        app_backup = app_backup,
+        failed_bundle = failed_bundle,
         src_app = src_app,
         uid_list = uid_list,
         daemon_plist = daemon_plist,
@@ -1818,6 +2333,12 @@ rm -rf {tmp_dir}
         agent_label = agent_label,
         daemon_plist_bak = daemon_plist_bak,
         agent_plist_bak = agent_plist_bak,
+        helper_bundle = helper_bundle,
+        helper_service = helper_service,
+        helper_transaction = helper_transaction,
+        helper_backup = helper_backup,
+        helper_staging = helper_staging,
+        helper_failed = helper_failed,
     );
 
     {
@@ -1854,7 +2375,9 @@ rm -rf {tmp_dir}
     if !crate::updater::has_no_active_conns_ipc() {
         bail!("[root-update] active session started before update launch");
     }
-    if let Err(err) = Command::new("/bin/bash")
+    if let Err(err) = Command::new("/usr/bin/lockf")
+        .args(["-kw", crate::updater::MAC_UPDATE_LOCK_PATH])
+        .arg("/bin/bash")
         .arg(&script_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1864,6 +2387,7 @@ rm -rf {tmp_dir}
     {
         return Err(err.into());
     }
+    preparation_directory.retain_for_detached_update();
 
     log::info!("[root-update] Update script launched.");
     Ok(())
@@ -1899,7 +2423,10 @@ fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
 fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let target_path = Path::new(target_dir);
     if !target_path.exists() {
-        bail!("[root-update] Temp directory does not exist: {:?}", target_path);
+        bail!(
+            "[root-update] Temp directory does not exist: {:?}",
+            target_path
+        );
     }
     extract_dmg_inner(dmg_path, target_dir)
 }
@@ -2122,38 +2649,99 @@ impl WakeLock {
 fn get_bundle_id() -> Option<String> {
     unsafe {
         let bundle: id = msg_send![class!(NSBundle), mainBundle];
-        if bundle.is_null() {
-            return None;
-        }
-
-        let bundle_id: id = msg_send![bundle, bundleIdentifier];
-        if bundle_id.is_null() {
-            return None;
-        }
-
-        let c_str: *const std::os::raw::c_char = msg_send![bundle_id, UTF8String];
-        if c_str.is_null() {
-            return None;
-        }
-
-        let bundle_id_str = std::ffi::CStr::from_ptr(c_str)
-            .to_string_lossy()
-            .to_string();
-        Some(bundle_id_str)
+        bundle_identifier(bundle)
     }
+}
+
+fn get_installed_bundle_id(app_name: &str) -> ResultType<String> {
+    validate_install_app_name(app_name)?;
+    let bundle_path = format!("/Applications/{app_name}.app");
+    let bundle_id = autoreleasepool(|| unsafe {
+        let path = NSString::alloc(nil).init_str(&bundle_path);
+        let bundle: id = msg_send![class!(NSBundle), bundleWithPath: path];
+        bundle_identifier(bundle)
+    });
+    let Some(bundle_id) = bundle_id else {
+        bail!("Failed to read installed application bundle identifier");
+    };
+    validate_bundle_identifier(&bundle_id)?;
+    Ok(bundle_id)
+}
+
+unsafe fn bundle_identifier(bundle: id) -> Option<String> {
+    if bundle.is_null() {
+        return None;
+    }
+    let bundle_id: id = msg_send![bundle, bundleIdentifier];
+    if bundle_id.is_null() {
+        return None;
+    }
+    let c_str: *const std::os::raw::c_char = msg_send![bundle_id, UTF8String];
+    if c_str.is_null() {
+        return None;
+    }
+    Some(
+        std::ffi::CStr::from_ptr(c_str)
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
 mod update_tests {
     use super::*;
 
-    fn privileged_update_scripts() -> [&'static str; 2] {
-        let daemon_script = PRIVILEGES_SCRIPTS_DIR
-            .get_file("update.scpt")
+    fn privilege_script(name: &str) -> &'static str {
+        PRIVILEGES_SCRIPTS_DIR
+            .get_file(name)
             .unwrap()
             .contents_utf8()
-            .unwrap();
-        [daemon_script, PRIVILEGED_UPDATE_BODY]
+            .unwrap()
+    }
+
+    fn production_source() -> &'static str {
+        include_str!("macos.rs")
+            .rsplit_once("#[cfg(test)]\nmod update_tests")
+            .unwrap()
+            .0
+    }
+
+    fn privileged_update_scripts() -> [&'static str; 2] {
+        [privilege_script("update.scpt"), PRIVILEGED_UPDATE_BODY]
+    }
+
+    fn script_line<'a>(script: &'a str, marker: &str) -> &'a str {
+        script.lines().find(|line| line.contains(marker)).unwrap()
+    }
+
+    fn assert_contains_all(source: &str, expected: &[&str]) {
+        for value in expected {
+            assert!(source.contains(value), "missing {value}");
+        }
+    }
+
+    fn assert_in_order(source: &str, markers: &[&str]) {
+        let mut offset = 0;
+        for marker in markers {
+            let position = source[offset..].find(marker).unwrap();
+            offset += position + marker.len();
+        }
+    }
+
+    #[test]
+    fn privileged_template_identity_rejects_shell_and_xml_injection() {
+        assert!(render_privileged_template(
+            "RustDesk com.carriez.rustdesk",
+            "RustDesk;touch",
+            Some("com.example.safe")
+        )
+        .is_err());
+        assert!(render_privileged_template(
+            "RustDesk com.carriez.rustdesk",
+            "RustDesk",
+            Some("com.example</string><key>RunAtLoad")
+        )
+        .is_err());
     }
 
     #[test]
@@ -2208,8 +2796,9 @@ mod update_tests {
             assert!(script.contains("bundle_backed_up"));
             assert!(script.contains(r#"if [ \"${rollback_status:-0}\" -eq 0 ]"#));
         }
-        assert!(daemon_script
-            .contains("rollback_bundle & rollback_plists & restore_service & restore_agent"));
+        assert!(daemon_script.contains(
+            "rollback_bundle & rollback_helper & rollback_plists & restore_service & restore_agent"
+        ));
         assert!(daemon_script.contains(
             "load_service & wait_for_service & load_agent & wait_for_agent & verify_readiness & commit_update"
         ));
@@ -2310,5 +2899,321 @@ mod update_tests {
         }
         assert!(kickstart_agent.contains(r#"\"gui/$uid/$agent_label\""#));
         assert!(kickstart_agent.contains(r#"\"user/$uid/$agent_label\""#));
+    }
+
+    #[test]
+    fn manual_update_transactions_protected_state_atomically() {
+        let script = privilege_script("update.scpt");
+
+        assert_contains_all(
+            script,
+            &[
+                "/Library/PrivilegedHelperTools/com.carriez.RustDesk_service.bundle",
+                "rollback_bundle & rollback_helper & rollback_plists",
+                r#"validate_helper_transaction && rm -rf \"$helper_transaction\""#,
+                "Refusing symlink plist backup source",
+                "signed update metadata",
+                "restore_plist_atomically()",
+                "plists_swapped=1",
+                "$helper_transaction/previous.bundle",
+                "$helper_transaction/failed.bundle",
+            ],
+        );
+        assert_in_order(
+            script,
+            &[
+                "set stage_helper",
+                "set install_staged_helper",
+                "set write_new_plists",
+                "set load_service",
+            ],
+        );
+        assert!(!script.contains("app_bundle & \\\"/Contents/MacOS/service\\\" --write-plists"));
+    }
+
+    #[test]
+    fn reviewed_transaction_guards_remain_ordered() {
+        let update = privilege_script("update.scpt");
+        assert_in_order(
+            script_line(update, "set sh to"),
+            &[
+                "agent_label_cmd",
+                "transaction_started=1",
+                "capture_stopping_jobs",
+                "wait_for_stopped_jobs;",
+                "move_current_bundle",
+            ],
+        );
+        assert_in_order(
+            script_line(update, "set rollback_update"),
+            &["rollback_jobs_stopped", "rollback_bundle"],
+        );
+        let root_rollback = production_source()
+            .split("rollback_transaction() {{")
+            .nth(1)
+            .unwrap()
+            .split("trap rollback_transaction EXIT")
+            .next()
+            .unwrap();
+        assert_in_order(
+            root_rollback,
+            &["rollback_jobs_stopped", "restore_old_bundle"],
+        );
+
+        for (name, wait, swap) in [
+            ("install.scpt", "wait_for_stop", "backup_installed"),
+            (
+                "update.scpt",
+                "wait_for_stopped_jobs;",
+                "move_current_bundle",
+            ),
+            ("uninstall.scpt", "wait_for_daemon_exit", "remove_helper"),
+        ] {
+            let shell = script_line(privilege_script(name), "set sh to");
+            assert_in_order(shell, &[wait, "ensure_no_pending_migration", swap]);
+        }
+        assert_in_order(
+            script_line(PRIVILEGED_UPDATE_BODY, "set sh to"),
+            &["ensure_service_inactive", "copy_files"],
+        );
+    }
+
+    #[test]
+    fn reviewed_readiness_guards_remain() {
+        let manual = privilege_script("update.scpt");
+        let check_service = script_line(manual, "set check_service");
+        let check_agent = script_line(manual, "set check_agent");
+        for readiness in ["set wait_for_service", "set wait_for_agent"] {
+            assert_contains_all(script_line(manual, readiness), &["ready_pid", "sleep 2"]);
+        }
+        assert_contains_all(
+            check_service,
+            &["PlistBuddy", "service_program", "[ ! -L", "'0'"],
+        );
+        assert_contains_all(check_agent, &["[ ! -L", "stat -f '%u'", "$uid"]);
+        for (script, marker) in [
+            ("install.scpt", "set service_ready_snapshot_function"),
+            ("uninstall.scpt", "set daemon_ready_snapshot_function"),
+        ] {
+            assert_contains_all(
+                script_line(privilege_script(script), marker),
+                &["PlistBuddy", "kill -0", "[ ! -L", "stat -f '%u'"],
+            );
+        }
+        assert_contains_all(
+            production_source(),
+            &[
+                "socket_expected_uid=\"$2\"",
+                "socket_ready \"/tmp/{app_name}-service/ipc_service\" 0",
+                "socket_ready \"/tmp/{app_name}-$agent_uid/ipc\" \"$agent_uid\"",
+                "daemon_program_matches_plist",
+            ],
+        );
+    }
+
+    #[test]
+    fn reviewed_lock_acl_and_atomic_swap_guards_remain() {
+        for script in [
+            privilege_script("install.scpt"),
+            privilege_script("update.scpt"),
+            privilege_script("uninstall.scpt"),
+            PRIVILEGED_UPDATE_BODY,
+        ] {
+            assert_contains_all(
+                script,
+                &[
+                    "/var/run/com.carriez.service-maintenance.lock",
+                    "/usr/bin/lockf -knw -t 0",
+                    "set sh to lock_transaction & quoted form of sh",
+                ],
+            );
+            assert!(!script.contains("/usr/bin/seq"));
+        }
+        for name in ["install.scpt", "update.scpt", "uninstall.scpt"] {
+            assert_contains_all(
+                privilege_script(name),
+                &["helper_has_no_acl", "/bin/ls -lde"],
+            );
+            if name != "uninstall.scpt" {
+                assert!(privilege_script(name).contains("/bin/chmod -RN"));
+            }
+        }
+        let source = production_source();
+        assert_contains_all(
+            source,
+            &[
+                "Command::new(\"/usr/bin/lockf\")",
+                "crate::updater::MAC_UPDATE_LOCK_PATH",
+                "staged_bundle_identity=$(stat -f '%d:%i'",
+                "ensure_same_filesystem(Path::new(&tmp_dir), Path::new(\"/Applications\"))",
+                "helper_has_no_acl()",
+                "chmod -RN \"$staged_helper_bundle\"",
+            ],
+        );
+        assert_in_order(
+            source,
+            &[
+                "harden_root_private_directory(Path::new(&tmp_dir))",
+                "extract_dmg_into_existing_dir",
+            ],
+        );
+        for (script, swap) in [
+            (privilege_script("update.scpt"), "move_current_bundle"),
+            (PRIVILEGED_UPDATE_BODY, "copy_files"),
+        ] {
+            assert_contains_all(
+                script_line(script, "set install_staged_bundle"),
+                &["staged_bundle_identity", "/usr/bin/stat -f '%d:%i'"],
+            );
+            assert_in_order(
+                script_line(script, "set sh to"),
+                &["ensure_atomic_bundle_swap", swap],
+            );
+        }
+    }
+
+    #[test]
+    fn root_update_transactions_protected_helper() {
+        let source = production_source();
+        let stage = source.find("staged_helper_bundle=").unwrap();
+        let swap = source.find("helper_swapped=1").unwrap();
+        let write_plists = source.rfind("if ! write_new_plists; then").unwrap();
+        let commit = source.rfind("rollback_done=1").unwrap();
+        let cleanup = source
+            .find("committed update but could not remove helper transaction")
+            .unwrap();
+
+        assert!(source.contains("/Library/PrivilegedHelperTools/com.carriez.{}_service.bundle"));
+        assert!(source.contains("restore_old_helper"));
+        assert!(source.contains("signed update metadata"));
+        assert!(source.contains("{helper_service} --write-plists"));
+        assert!(source.contains("restore_plist_atomically()"));
+        assert!(source.contains("/usr/bin/logger -t RustDesk \"$cleanup_warning\""));
+        assert!(source.contains("{helper_transaction}/previous.bundle"));
+        assert!(source.contains("{helper_transaction}/failed.bundle"));
+        assert!(
+            !source.contains("/Applications/{app_name}.app/Contents/MacOS/service --write-plists")
+        );
+        assert!(stage < swap && swap < write_plists && write_plists < commit && commit < cleanup);
+    }
+
+    #[test]
+    fn install_transaction_stages_before_stable_daemon_start() {
+        let script = privilege_script("install.scpt");
+        let wait_for_service = script_line(script, "set wait_for_service");
+        let restore_service = script_line(script, "set restore_service");
+
+        assert_contains_all(
+            script,
+            &[
+                "set rollback_install",
+                "validate_helper_tree",
+                "stopping_pid",
+            ],
+        );
+        assert_in_order(
+            script,
+            &[
+                "set stage_helper",
+                "set install_staged_helper",
+                "set install_staged_plists",
+                "set load_service",
+            ],
+        );
+        for readiness in [wait_for_service, restore_service] {
+            assert!(readiness.contains("ready_pid"));
+            assert!(readiness.contains("sleep 2"));
+        }
+        let wait = script_line(script, "set wait_for_failed_service_exit");
+        let rollback = script_line(script, "set rollback_install");
+        assert_contains_all(wait, &["failed_stopping_pid", "kill -0", "launchctl print"]);
+        assert_contains_all(script, &["daemon_was_loaded=1", "${daemon_was_loaded:-0}"]);
+        assert_in_order(
+            rollback,
+            &["wait_for_failed_service_exit", "rollback_helper"],
+        );
+    }
+
+    #[test]
+    fn uninstall_validates_helper_and_restores_only_a_stable_daemon() {
+        let script = privilege_script("uninstall.scpt");
+        let restore = script_line(script, "set restore_daemon");
+        let restore_targets = script_line(script, "set restore_targets");
+
+        assert_contains_all(
+            script,
+            &[
+                "set rollback_uninstall",
+                "daemon_was_loaded",
+                "${daemon_was_loaded:-0}",
+            ],
+        );
+        assert_eq!(restore_targets.matches("validate_helper_tree").count(), 2);
+        assert!(restore.contains("daemon_ready_snapshot"));
+        assert!(restore.contains("ready_pid"));
+        assert!(restore.contains("sleep 2"));
+        assert_in_order(
+            script,
+            &[
+                "set stop_daemon",
+                "set wait_for_daemon_exit",
+                "set remove_helper",
+            ],
+        );
+    }
+
+    #[test]
+    fn nonzero_osascript_status_is_an_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"authorization denied".to_vec(),
+        };
+
+        assert!(require_successful_osascript(Ok(output)).is_err());
+    }
+
+    #[test]
+    fn service_entrypoints_use_the_protected_transaction_path() {
+        let source = production_source();
+        let start = source
+            .find("pub fn start_os_service() -> ResultType<()>")
+            .unwrap();
+        let body = &source[start..];
+        let plist = privilege_script("daemon.plist");
+        let helper = "/Library/PrivilegedHelperTools/com.carriez.RustDesk_service.bundle/Contents/MacOS/service";
+
+        assert!(body.contains("wait_for_migration_completion()"));
+        assert_in_order(
+            body,
+            &[
+                "prepare_service_start()",
+                "start_auto_update_macos()",
+                "crate::ipc::start(\"_service\")",
+            ],
+        );
+        assert!(plist.contains(helper));
+        assert!(plist.contains(
+            "/Library/PrivilegedHelperTools/com.carriez.RustDesk_service.bundle/Contents/MacOS/"
+        ));
+        assert!(!plist.contains("/bin/sh"));
+        assert!(!plist.contains("<string>-c</string>"));
+        assert!(!plist.contains("/Applications/RustDesk.app/Contents/MacOS/service"));
+    }
+
+    #[test]
+    fn plist_rendering_uses_validated_explicit_white_label_bundle_id() {
+        let template = "<string>com.carriez.rustdesk</string><string>RustDesk</string>";
+        let rendered = render_plist_body(template, "AcmeDesk", "com.example.acme-desktop").unwrap();
+        let runtime = include_str!("macos/privileged_helper/runtime.rs");
+        let embedded = runtime.split("fn embedded_daemon_plist(").nth(1).unwrap();
+
+        assert!(rendered.contains("com.example.acme-desktop"));
+        assert!(rendered.contains("AcmeDesk"));
+        assert!(render_plist_body(template, "AcmeDesk", "</string><key>Injected</key>").is_err());
+        assert!(embedded.contains("render_installed_plist_body"));
+        assert!(!embedded.contains("correct_app_name"));
     }
 }

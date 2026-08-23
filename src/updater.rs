@@ -22,48 +22,19 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
-use std::os::{
-    fd::AsRawFd,
-    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-};
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(target_os = "macos")]
-struct MacUpdateLock {
-    _file: std::fs::File,
-}
+pub(crate) use crate::platform::macos::privileged_helper::SERVICE_MAINTENANCE_LOCK_PATH as MAC_UPDATE_LOCK_PATH;
 
 #[cfg(target_os = "macos")]
-fn acquire_mac_update_lock() -> ResultType<MacUpdateLock> {
-    let path = std::path::PathBuf::from("/var/run/rustdesk-update.lock");
-    let handle = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .custom_flags(hbb_common::libc::O_NOFOLLOW | hbb_common::libc::O_CLOEXEC)
-        .open(&path)?;
-    let metadata = handle.metadata()?;
-    if !metadata.file_type().is_file() || metadata.uid() != 0 {
-        bail!("[root-update] update lock is not a root-owned regular file");
-    }
-    handle.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-
-    // Keep the descriptor open through update preparation and detached-script
-    // launch. O_CLOEXEC means this lock does not cover the detached bundle
-    // swap; flock is released when this guard is dropped or the process exits.
-    let lock_result = unsafe {
-        hbb_common::libc::flock(
-            handle.as_raw_fd(),
-            hbb_common::libc::LOCK_EX | hbb_common::libc::LOCK_NB,
-        )
-    };
-    if lock_result != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            bail!("[root-update] another update is already running");
-        }
-        return Err(err.into());
-    }
-    Ok(MacUpdateLock { _file: handle })
+fn acquire_mac_update_lock(
+) -> ResultType<crate::platform::macos::privileged_helper::ServiceMaintenanceLock> {
+    // The detached installer queues on this same lock before this guard is
+    // dropped, extending serialization through the bundle swap.
+    crate::platform::macos::privileged_helper::acquire_mac_service_maintenance_lock(
+        crate::platform::macos::privileged_helper::ServiceMaintenanceLockMode::FailIfLocked,
+    )
 }
 
 enum UpdateMsg {
@@ -523,17 +494,14 @@ pub fn check_update_as_root() -> ResultType<bool> {
         log::info!("[root-update] Custom client detected, skipping stock update.");
         return Ok(false);
     }
-    // Clean up only old temp dirs from previous failed updates. The detached
-    // installer keeps using its update directory after this process exits and
-    // releases the advisory lock, so a newly-started daemon must not remove a
-    // directory that still belongs to the active transaction.
+    // Root-update directories can contain the only rollback artifacts after
+    // an interrupted transaction and must remain available for inspection.
+    // Download-only directories are safe to remove after they become stale.
     if let Ok(entries) = std::fs::read_dir("/tmp") {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with(".rustdeskupdate-root-")
-                || name_str.starts_with(".rustdeskdownload-")
-            {
+            if name_str.starts_with(".rustdeskdownload-") {
                 let path = entry.path();
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     continue;
@@ -596,9 +564,17 @@ pub fn check_update_as_root() -> ResultType<bool> {
     if private_tmp.is_empty() {
         bail!("[root-update] mktemp returned an empty download directory");
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&private_tmp, std::fs::Permissions::from_mode(0o700))?;
+    if let Err(err) = crate::platform::macos::privileged_helper::harden_root_private_directory(
+        Path::new(&private_tmp),
+    ) {
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&private_tmp) {
+            log::warn!(
+                "[root-update] Failed to remove unhardened temp dir {}: {}",
+                private_tmp,
+                cleanup_err
+            );
+        }
+        return Err(err);
     }
     let file_path = Path::new(&private_tmp).join(&artifact.file_name);
     let tmp_path = file_path.to_string_lossy().to_string();
