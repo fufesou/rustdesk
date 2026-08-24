@@ -764,5 +764,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Sync clipboard between sessions", "सत्रों के बीच क्लिपबोर्ड सिंक करें"),
         ("sync-clipboard-between-sessions-tip", "एक रिमोट सत्र में कॉपी किए गए टेक्स्ट या चित्र आपके अन्य जुड़े सत्रों के क्लिपबोर्ड पर भी भेजे जाते हैं।"),
         ("Enable WebRTC P2P connection", "WebRTC P2P कनेक्शन सक्षम करें"),
+        ("Enable TCP hole punching", "TCP होल पंचिंग सक्षम करें"),
     ].iter().cloned().collect();
 }

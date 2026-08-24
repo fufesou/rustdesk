@@ -764,5 +764,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Sync clipboard between sessions", "Sinchronizuoti iškarpinę tarp seansų"),
         ("sync-clipboard-between-sessions-tip", "Viename nuotoliniame seanse nukopijuotas tekstas ar vaizdai taip pat siunčiami į kitų prijungtų seansų iškarpinę."),
         ("Enable WebRTC P2P connection", "Įgalinti WebRTC P2P ryšį"),
+        ("Enable TCP hole punching", "Įgalinti TCP gręžimą (hole punching)"),
     ].iter().cloned().collect();
 }

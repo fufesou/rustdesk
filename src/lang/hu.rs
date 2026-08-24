@@ -764,5 +764,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Sync clipboard between sessions", "Vágólap szinkronizálása a munkamenetek között"),
         ("sync-clipboard-between-sessions-tip", "Az egyik távoli munkamenetben másolt szöveg vagy kép a többi csatlakoztatott munkamenet vágólapjára is elküldésre kerül."),
         ("Enable WebRTC P2P connection", "WebRTC P2P kapcsolat engedélyezése"),
+        ("Enable TCP hole punching", "TCP résszűrés engedélyezése"),
     ].iter().cloned().collect();
 }

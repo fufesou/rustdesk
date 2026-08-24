@@ -764,5 +764,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Sync clipboard between sessions", "Synkroniser utklippstavlen mellom økter"),
         ("sync-clipboard-between-sessions-tip", "Tekst eller bilder som kopieres i én ekstern økt, sendes også til utklippstavlen i de andre tilkoblede øktene dine."),
         ("Enable WebRTC P2P connection", "Aktiver WebRTC P2P-tilkobling"),
+        ("Enable TCP hole punching", "Aktiver TCP hole punching"),
     ].iter().cloned().collect();
 }

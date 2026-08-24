@@ -764,5 +764,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Sync clipboard between sessions", ""),
         ("sync-clipboard-between-sessions-tip", ""),
         ("Enable WebRTC P2P connection", ""),
+        ("Enable TCP hole punching", ""),
     ].iter().cloned().collect();
 }
