@@ -12,4 +12,4 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "nightly"
+      upload-tag: "test-fix-error-privacy-mode-2-is-turned-on-while-the-08-21-2026-60081f"
