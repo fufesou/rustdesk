@@ -12,4 +12,4 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "nightly"
+      upload-tag: "test-fix-error-mouse-control-arbitration-blocks-08-21-2026-218994"
