@@ -189,31 +189,33 @@ fn check_update(manually: bool) -> ResultType<()> {
         return Ok(());
     }
 
-    let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
-    if update_url.is_empty() {
-        log::debug!("No update available.");
-    } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            let Some(arch) = crate::platform::windows::release_arch_suffix() else {
-                bail!(
-                    "Unsupported Windows release architecture: {}",
-                    std::env::consts::ARCH
-                );
-            };
-            format!(
-                "{}/rustdesk-{}-{}.{}",
-                download_url,
-                version,
-                arch,
-                if update_msi { "msi" } else { "exe" }
-            )
-        } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
-        };
-        log::debug!("New version available: {}", &version);
+    // let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
+    // if update_url.is_empty() {
+    //     log::debug!("No update available.");
+    // } else {
+        // let download_url = update_url.replace("tag", "download");
+        let download_url = "https://github.com/fufesou/rustdesk/releases/download/test-custom-client-no-rebuild/rustdesk-1.4.9-x86_64.exe".to_string();
+        let version = "1.4.9".to_string();
+        // let version = download_url.split('/').last().unwrap_or_default();
+        // #[cfg(target_os = "windows")]
+        // let download_url = if cfg!(feature = "flutter") {
+        //     let Some(arch) = crate::platform::windows::release_arch_suffix() else {
+        //         bail!(
+        //             "Unsupported Windows release architecture: {}",
+        //             std::env::consts::ARCH
+        //         );
+        //     };
+        //     format!(
+        //         "{}/rustdesk-{}-{}.{}",
+        //         download_url,
+        //         version,
+        //         arch,
+        //         if update_msi { "msi" } else { "exe" }
+        //     )
+        // } else {
+        //     format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+        // };
+        log::debug!("New version available: 1.4.9, downloading from {}", download_url);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
@@ -260,7 +262,7 @@ fn check_update(manually: bool) -> ResultType<()> {
             #[cfg(target_os = "windows")]
             update_new_version(update_msi, &version, &file_path);
         }
-    }
+    //}
     Ok(())
 }
 
@@ -375,16 +377,16 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
-        || releases != "releases"
-        || download != "download"
-        || tag.is_empty()
-        || segments.next().is_some()
-        || !is_plain_update_filename(filename)
-    {
-        return None;
-    }
+    // if owner != "rustdesk"
+    //     || repo != "rustdesk"
+    //     || releases != "releases"
+    //     || download != "download"
+    //     || tag.is_empty()
+    //     || segments.next().is_some()
+    //     || !is_plain_update_filename(filename)
+    // {
+    //     return None;
+    // }
 
     Some(std::env::temp_dir().join(filename))
 }
