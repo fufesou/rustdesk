@@ -91,6 +91,9 @@ extern crate serde;
 ///
 pub type ResultType = std::result::Result<(), Box<dyn std::error::Error>>;
 
+/// Number of high-resolution scroll units in one legacy wheel detent.
+pub const HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP: i32 = 120;
+
 #[cfg_attr(feature = "with_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 /// MouseButton represents a mouse button,
@@ -256,6 +259,18 @@ pub trait MouseControllable {
     /// enigo.mouse_scroll_y(2);
     /// ```
     fn mouse_scroll_y(&mut self, length: i32);
+
+    /// Returns whether this backend can inject high-resolution scroll events.
+    fn supports_high_resolution_scroll(&self) -> bool {
+        false
+    }
+
+    /// Scrolls both axes in high-resolution units.
+    /// Positive values scroll right and down; 120 units equal one legacy detent.
+    /// Passing zero for both axes ends the current smooth-scroll sequence.
+    fn mouse_scroll_high_resolution(&mut self, _x: i32, _y: i32) -> ResultType {
+        Err("high-resolution scrolling is not supported".into())
+    }
 }
 
 /// A key on the keyboard.
@@ -529,6 +544,18 @@ impl fmt::Debug for Enigo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_resolution_scroll_is_unsupported_without_a_capable_backend() {
+        let mut mouse = Enigo::new();
+
+        assert_eq!(HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP, 120);
+        assert!(!mouse.supports_high_resolution_scroll());
+        assert!(mouse
+            .mouse_scroll_high_resolution(0, HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP)
+            .is_err());
+    }
+
     #[test]
     fn test_get_key_state() {
         let mut enigo = Enigo::new();

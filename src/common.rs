@@ -79,10 +79,12 @@ pub mod input {
     /// 2. Lack of pointer lock API in Sciter/TIS
     /// 3. No OS cursor control (hide/show/clip) FFI bindings in Sciter UI
     pub const MOUSE_TYPE_MOVE_RELATIVE: i32 = 5;
+    /// High-resolution trackpad scrolling using 120 units per legacy wheel detent.
+    pub const MOUSE_TYPE_TRACKPAD_HIGH_RESOLUTION: i32 = 6;
 
     /// Mask to extract the mouse event type from the mask field.
     /// The lower 3 bits contain the event type (MOUSE_TYPE_*), giving a valid range of 0-7.
-    /// Currently defined types use values 0-5; values 6 and 7 are reserved for future use.
+    /// Currently defined types use values 0-6; value 7 is reserved for future use.
     pub const MOUSE_TYPE_MASK: i32 = 0x7;
 
     pub const MOUSE_BUTTON_LEFT: i32 = 0x01;
@@ -3096,6 +3098,7 @@ mod tests {
             MOUSE_TYPE_WHEEL,
             MOUSE_TYPE_TRACKPAD,
             MOUSE_TYPE_MOVE_RELATIVE,
+            MOUSE_TYPE_TRACKPAD_HIGH_RESOLUTION,
         ];
 
         let mut seen = std::collections::HashSet::new();

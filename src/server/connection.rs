@@ -1982,16 +1982,36 @@ impl Connection {
                         })
                         .into();
                     }
-                    res.set_peer_info(pi);
-                    sub_service = true;
-
                     #[cfg(target_os = "linux")]
                     {
                         // use rdp_input when uinput is not available in wayland. Ex: flatpak
-                        if input_service::wayland_use_rdp_input() {
-                            let _ = setup_rdp_input().await;
+                        let high_resolution_scroll_ready = if input_service::wayland_use_rdp_input()
+                        {
+                            match setup_rdp_input().await {
+                                Ok(ready) => ready,
+                                Err(err) => {
+                                    log::error!("Failed to initialize RDP input: {err}");
+                                    false
+                                }
+                            }
+                        } else {
+                            input_service::supports_high_resolution_scroll()
+                        };
+                        if high_resolution_scroll_ready {
+                            platform_additions
+                                .insert("supports_high_resolution_scroll".into(), json!(true));
+                            match serde_json::to_string(&platform_additions) {
+                                Ok(additions) => pi.platform_additions = additions,
+                                Err(err) => {
+                                    log::error!(
+                                        "Failed to serialize Linux platform additions: {err}"
+                                    )
+                                }
+                            }
                         }
                     }
+                    res.set_peer_info(pi);
+                    sub_service = true;
                 }
             }
             self.on_remote_authorized();
