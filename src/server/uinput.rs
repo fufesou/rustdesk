@@ -5,7 +5,9 @@ use evdev::{
     AttributeSet, EventType, InputEvent,
 };
 use hbb_common::{
-    allow_err, bail, log,
+    allow_err,
+    anyhow::anyhow,
+    bail, log,
     tokio::{self, runtime::Runtime},
     ResultType,
 };
@@ -14,10 +16,12 @@ static IPC_CONN_TIMEOUT: u64 = 1000;
 static IPC_REQUEST_TIMEOUT: u64 = 1000;
 static IPC_POSTFIX_KEYBOARD: &str = "_uinput_keyboard";
 static IPC_POSTFIX_MOUSE: &str = "_uinput_mouse";
+static IPC_POSTFIX_HIGH_RESOLUTION_SCROLL: &str = "_uinput_high_resolution_scroll";
 static IPC_POSTFIX_CONTROL: &str = "_uinput_control";
 
 pub mod client {
     use super::*;
+    use hbb_common::tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
     pub struct UInputKeyboard {
         conn: Connection,
@@ -113,32 +117,97 @@ pub mod client {
         }
     }
 
-    pub struct UInputMouse {
+    struct RegularUInputMouse {
         conn: Connection,
         rt: Runtime,
+    }
+
+    pub struct UInputMouse {
+        regular: Option<RegularUInputMouse>,
+        high_resolution_tx: Option<UnboundedSender<Data>>,
     }
 
     impl UInputMouse {
         pub async fn new() -> ResultType<Self> {
             let conn = ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_MOUSE).await?;
             let rt = Runtime::new()?;
-            Ok(Self { conn, rt })
+            Ok(Self {
+                regular: Some(RegularUInputMouse { conn, rt }),
+                high_resolution_tx: None,
+            })
+        }
+
+        pub async fn new_high_resolution_scroll() -> ResultType<Self> {
+            let mut mouse = Self::new_high_resolution_scroll_state();
+            mouse.enable_high_resolution_scroll().await?;
+            Ok(mouse)
+        }
+
+        fn new_high_resolution_scroll_state() -> Self {
+            Self {
+                regular: None,
+                high_resolution_tx: None,
+            }
         }
 
         fn send(&mut self, data: Data) -> ResultType<()> {
-            self.rt.block_on(self.conn.send(&data))
+            match &mut self.regular {
+                Some(regular) => regular.rt.block_on(regular.conn.send(&data)),
+                _ => bail!("regular uinput mouse service is not connected"),
+            }
+        }
+
+        fn send_high_resolution(&mut self, data: Data) -> enigo::ResultType {
+            let tx = self
+                .high_resolution_tx
+                .as_ref()
+                .ok_or("high-resolution uinput scroll service is not connected")?;
+            tx.send(data)?;
+            Ok(())
+        }
+
+        pub async fn enable_high_resolution_scroll(&mut self) -> ResultType<()> {
+            let mut conn =
+                ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_HIGH_RESOLUTION_SCROLL).await?;
+            match conn.next_timeout(IPC_REQUEST_TIMEOUT).await? {
+                Some(Data::Empty) => {}
+                Some(resp) => bail!(
+                    "unexpected high-resolution uinput scroll response: {:?}",
+                    &resp
+                ),
+                None => bail!("high-resolution uinput scroll service closed"),
+            }
+            let (tx, mut rx) = unbounded_channel();
+            tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    if let Err(err) = conn.send(&data).await {
+                        log::error!("Failed to send high-resolution uinput scroll: {err}");
+                        return;
+                    }
+                }
+            });
+            self.high_resolution_tx = Some(tx);
+            Ok(())
         }
 
         pub fn send_refresh(&mut self) -> ResultType<()> {
-            self.rt
-                .block_on(self.conn.send(&Data::Mouse(DataMouse::Refresh)))?;
+            let regular = match &mut self.regular {
+                Some(regular) => regular,
+                _ => bail!("regular uinput mouse service is not connected"),
+            };
+            regular
+                .rt
+                .block_on(regular.conn.send(&Data::Mouse(DataMouse::Refresh)))?;
             // Wait for the service to confirm it recreated the device, so a
             // failed refresh is distinguishable from a good one.
-            match self.rt.block_on(self.conn.next_timeout(IPC_REQUEST_TIMEOUT)) {
+            match regular
+                .rt
+                .block_on(regular.conn.next_timeout(IPC_REQUEST_TIMEOUT))
+            {
                 Ok(Some(Data::Empty)) => Ok(()),
                 Ok(Some(resp)) => bail!("unexpected uinput mouse refresh response: {:?}", &resp),
                 Ok(None) => bail!("uinput mouse refresh failed, connection closed"),
-                Err(e) => bail!("uinput mouse refresh timeout {}, {}", IPC_REQUEST_TIMEOUT, e),
+                Err(e) => bail!("uinput mouse refresh timed out: {e}"),
             }
         }
     }
@@ -175,6 +244,14 @@ pub mod client {
         fn mouse_scroll_y(&mut self, length: i32) {
             allow_err!(self.send(Data::Mouse(DataMouse::ScrollY(length))));
         }
+        fn supports_high_resolution_scroll(&self) -> bool {
+            self.high_resolution_tx
+                .as_ref()
+                .is_some_and(|tx| !tx.is_closed())
+        }
+        fn mouse_scroll_high_resolution(&mut self, x: i32, y: i32) -> enigo::ResultType {
+            self.send_high_resolution(Data::Mouse(DataMouse::ScrollHighResolution(x, y)))
+        }
     }
 
     pub async fn set_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
@@ -188,6 +265,29 @@ pub mod client {
         .await?;
         let _ = conn.next().await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::UInputMouse;
+        use crate::ipc::Data;
+        use enigo::MouseControllable;
+        use hbb_common::tokio::sync::mpsc::unbounded_channel;
+
+        #[test]
+        fn high_resolution_channel_preserves_bursts_and_reports_closure() {
+            let mut mouse = UInputMouse::new_high_resolution_scroll_state();
+            let (tx, mut rx) = unbounded_channel();
+            mouse.high_resolution_tx = Some(tx);
+
+            assert!(mouse.send_high_resolution(Data::Empty).is_ok());
+            assert!(mouse.send_high_resolution(Data::Empty).is_ok());
+            assert!(mouse.supports_high_resolution_scroll());
+            assert!(matches!(rx.try_recv(), Ok(Data::Empty)));
+            assert!(matches!(rx.try_recv(), Ok(Data::Empty)));
+            drop(rx);
+            assert!(!mouse.supports_high_resolution_scroll());
+        }
     }
 }
 
@@ -781,6 +881,9 @@ pub mod service {
                     allow_err!(mouse.scroll_wheel(&scroll))
                 }
             }
+            DataMouse::ScrollHighResolution(_, _) => {
+                log::warn!("High-resolution scroll event sent to regular uinput service")
+            }
             DataMouse::Refresh => {
                 // unreachable!()
             }
@@ -902,6 +1005,190 @@ pub mod service {
         });
     }
 
+    fn split_high_resolution_scroll(remainder: i32, delta: i32) -> (i32, i32) {
+        let total = i64::from(remainder) + i64::from(delta);
+        let step = i64::from(enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP);
+        ((total / step) as i32, (total % step) as i32)
+    }
+
+    const HIGH_RESOLUTION_SCROLL_BUTTON: evdev::Key = evdev::Key::BTN_LEFT;
+    const HIGH_RESOLUTION_SCROLL_AXIS_COUNT: usize = 2;
+    const HIGH_RESOLUTION_SCROLL_AXES: [evdev::RelativeAxisType; 6] = [
+        evdev::RelativeAxisType::REL_X,
+        evdev::RelativeAxisType::REL_Y,
+        evdev::RelativeAxisType::REL_WHEEL,
+        evdev::RelativeAxisType::REL_HWHEEL,
+        evdev::RelativeAxisType::REL_WHEEL_HI_RES,
+        evdev::RelativeAxisType::REL_HWHEEL_HI_RES,
+    ];
+
+    struct HighResolutionScrollDevice {
+        device: VirtualDevice,
+        remainders: [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+    }
+
+    fn high_resolution_scroll_axis_events(
+        horizontal: bool,
+        length: i32,
+        remainder: i32,
+    ) -> ResultType<(Vec<InputEvent>, i32)> {
+        if length == 0 {
+            return Ok((Vec::new(), remainder));
+        }
+        let (high_axis, legacy_axis, delta) = if horizontal {
+            (
+                evdev::RelativeAxisType::REL_HWHEEL_HI_RES,
+                evdev::RelativeAxisType::REL_HWHEEL,
+                length,
+            )
+        } else {
+            (
+                evdev::RelativeAxisType::REL_WHEEL_HI_RES,
+                evdev::RelativeAxisType::REL_WHEEL,
+                length
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("vertical scroll delta overflow"))?,
+            )
+        };
+        let (legacy_delta, remainder) = split_high_resolution_scroll(remainder, delta);
+        let mut events = vec![InputEvent::new(EventType::RELATIVE, high_axis.0, delta)];
+        if legacy_delta != 0 {
+            events.push(InputEvent::new(
+                EventType::RELATIVE,
+                legacy_axis.0,
+                legacy_delta,
+            ));
+        }
+        Ok((events, remainder))
+    }
+
+    fn high_resolution_scroll_events(
+        x: i32,
+        y: i32,
+        remainders: [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+    ) -> ResultType<(Vec<InputEvent>, [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT])> {
+        let mut events = Vec::new();
+        let mut next_remainders = remainders;
+        for (horizontal, length) in [(false, y), (true, x)] {
+            let index = usize::from(horizontal);
+            let (axis_events, remainder) =
+                high_resolution_scroll_axis_events(horizontal, length, remainders[index])?;
+            events.extend(axis_events);
+            next_remainders[index] = remainder;
+        }
+        Ok((events, next_remainders))
+    }
+
+    impl HighResolutionScrollDevice {
+        fn new() -> ResultType<Self> {
+            // udev needs mouse buttons and relative coordinates to classify this as a mouse.
+            let keys: AttributeSet<_> = [HIGH_RESOLUTION_SCROLL_BUTTON].into_iter().collect();
+            let axes: AttributeSet<_> = HIGH_RESOLUTION_SCROLL_AXES.into_iter().collect();
+            let device = VirtualDeviceBuilder::new()?
+                .name("RustDesk High Resolution Scroll")
+                .with_keys(&keys)?
+                .with_relative_axes(&axes)?
+                .build()?;
+            Ok(Self {
+                device,
+                remainders: [0; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+            })
+        }
+
+        fn scroll(&mut self, x: i32, y: i32) -> ResultType<()> {
+            let (events, remainders) = high_resolution_scroll_events(x, y, self.remainders)?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            self.device.emit(&events)?;
+            self.remainders = remainders;
+            Ok(())
+        }
+    }
+
+    fn spawn_high_resolution_scroll_handler(mut stream: ipc::Connection) {
+        tokio::spawn(async move {
+            let mut mouse = match HighResolutionScrollDevice::new() {
+                Ok(mouse) => mouse,
+                Err(err) => {
+                    log::error!("Failed to create high-resolution uinput scroll device: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = stream.send(&Data::Empty).await {
+                log::error!("Failed to acknowledge high-resolution uinput scroll device: {err}");
+                return;
+            }
+            loop {
+                let (x, y) = match stream.next().await {
+                    Ok(Some(Data::Mouse(DataMouse::ScrollHighResolution(x, y)))) => (x, y),
+                    Ok(Some(data)) => {
+                        log::warn!("Unexpected high-resolution uinput data: {data:?}");
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        log::info!("High-resolution uinput ipc connection closed: {err}");
+                        break;
+                    }
+                };
+                if let Err(err) = mouse.scroll(x, y) {
+                    log::error!("Failed to inject high-resolution uinput scroll: {err}");
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    mod high_resolution_scroll_tests {
+        use super::*;
+
+        #[test]
+        fn advertises_mouse_classification_capabilities() {
+            assert_eq!(HIGH_RESOLUTION_SCROLL_BUTTON, evdev::Key::BTN_LEFT);
+            assert!(HIGH_RESOLUTION_SCROLL_AXES.contains(&evdev::RelativeAxisType::REL_X));
+            assert!(HIGH_RESOLUTION_SCROLL_AXES.contains(&evdev::RelativeAxisType::REL_Y));
+        }
+
+        #[test]
+        fn accumulates_legacy_companion_events_at_detent_boundaries() {
+            let half_step = enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP / 2;
+
+            assert_eq!(split_high_resolution_scroll(0, half_step), (0, half_step));
+            assert_eq!(split_high_resolution_scroll(half_step, half_step), (1, 0));
+            assert_eq!(
+                split_high_resolution_scroll(-half_step, -half_step),
+                (-1, 0)
+            );
+            assert_eq!(split_high_resolution_scroll(100, -half_step), (0, 40));
+        }
+
+        #[test]
+        fn rejects_overflowing_vertical_scroll_delta() {
+            assert!(high_resolution_scroll_axis_events(false, i32::MIN, 0).is_err());
+        }
+
+        #[test]
+        fn batches_diagonal_scroll_axes_in_one_frame() {
+            let half_step = enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP / 2;
+            let (events, remainders) = high_resolution_scroll_events(
+                half_step,
+                -half_step,
+                [0; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+            )
+            .unwrap();
+
+            assert_eq!(remainders, [half_step, half_step]);
+            assert_eq!(
+                events.iter().map(InputEvent::code).collect::<Vec<_>>(),
+                vec![
+                    evdev::RelativeAxisType::REL_WHEEL_HI_RES.0,
+                    evdev::RelativeAxisType::REL_HWHEEL_HI_RES.0,
+                ]
+            );
+        }
+    }
+
     fn spawn_controller_handler(mut stream: ipc::Connection) {
         tokio::spawn(async move {
             loop {
@@ -1004,6 +1291,17 @@ pub mod service {
     pub async fn start_service_mouse() {
         log::info!("start uinput mouse service");
         start_service(IPC_POSTFIX_MOUSE, spawn_mouse_handler).await;
+    }
+
+    /// Start the high-resolution uinput scroll service.
+    #[tokio::main(flavor = "current_thread")]
+    pub async fn start_service_high_resolution_scroll() {
+        log::info!("start high-resolution uinput scroll service");
+        start_service(
+            IPC_POSTFIX_HIGH_RESOLUTION_SCROLL,
+            spawn_high_resolution_scroll_handler,
+        )
+        .await;
     }
 
     /// Start uinput mouse service.

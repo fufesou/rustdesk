@@ -279,6 +279,7 @@ pub enum DataMouse {
     Click(enigo::MouseButton),
     ScrollX(i32),
     ScrollY(i32),
+    ScrollHighResolution(i32, i32),
     Refresh,
 }
 
@@ -2222,6 +2223,16 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[test]
+    fn high_resolution_mouse_delta_round_trips_through_ipc() {
+        const X: i32 = 23;
+        const Y: i32 = -37;
+        let encoded = serde_json::to_string(&DataMouse::ScrollHighResolution(X, Y)).unwrap();
+        let decoded: DataMouse = serde_json::from_str(&encoded).unwrap();
+
+        assert!(matches!(decoded, DataMouse::ScrollHighResolution(X, Y)));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -660,7 +660,10 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
 
     let keyboard = super::uinput::client::UInputKeyboard::new().await?;
     log::info!("UInput keyboard created");
-    let mouse = super::uinput::client::UInputMouse::new().await?;
+    let mut mouse = super::uinput::client::UInputMouse::new().await?;
+    if let Err(err) = mouse.enable_high_resolution_scroll().await {
+        log::warn!("High-resolution uinput scrolling is unavailable: {err}");
+    }
     log::info!("UInput mouse created");
 
     let mut en = ENIGO.lock().unwrap();
@@ -675,7 +678,7 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
 }
 
 #[cfg(target_os = "linux")]
-pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
+pub async fn setup_rdp_input() -> ResultType<bool, Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
     // Same as `setup_uinput`: the caller is gated on `wayland_use_rdp_input()`.
     en.set_is_x11(false);
@@ -700,9 +703,23 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
         )?;
         en.set_custom_mouse(Box::new(mouse));
         log::info!("RdpInput mouse created");
+        return Ok(en.supports_high_resolution_scroll());
     }
 
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+pub async fn setup_uinput_scroll() -> ResultType<()> {
+    let mouse = super::uinput::client::UInputMouse::new_high_resolution_scroll().await?;
+    log::info!("UInput high-resolution scroll mouse created");
+    ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn supports_high_resolution_scroll() -> bool {
+    ENIGO.lock().unwrap().supports_high_resolution_scroll()
 }
 
 #[cfg(target_os = "linux")]
@@ -1280,11 +1297,68 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        MOUSE_TYPE_TRACKPAD_HIGH_RESOLUTION => handle_high_resolution_scroll(&mut en, evt),
         _ => {}
     }
     #[cfg(not(target_os = "macos"))]
     for key in to_release {
         en.key_up(key.clone());
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn inverted_high_resolution_scroll_delta(x: i32, y: i32) -> Option<(i32, i32)> {
+    Some((x.checked_neg()?, y.checked_neg()?))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn dispatch_inverted_high_resolution_scroll(
+    x: i32,
+    y: i32,
+    dispatch: impl FnOnce(i32, i32) -> enigo::ResultType,
+) -> Option<enigo::ResultType> {
+    let (x, y) = inverted_high_resolution_scroll_delta(x, y)?;
+    Some(dispatch(x, y))
+}
+
+#[cfg(target_os = "linux")]
+fn handle_high_resolution_scroll(en: &mut Enigo, evt: &MouseEvent) {
+    match dispatch_inverted_high_resolution_scroll(evt.x, evt.y, |x, y| {
+        en.mouse_scroll_high_resolution(x, y)
+    }) {
+        None => log::error!(
+            "Rejected overflowing high-resolution scroll delta ({}, {})",
+            evt.x,
+            evt.y
+        ),
+        Some(Err(err)) => log::error!("Failed to inject high-resolution scroll: {err}"),
+        Some(Ok(())) => {}
+    }
+}
+
+#[cfg(test)]
+mod high_resolution_scroll_tests {
+    use super::{dispatch_inverted_high_resolution_scroll, inverted_high_resolution_scroll_delta};
+
+    #[test]
+    fn inverts_scroll_axes_without_overflow() {
+        let invert = inverted_high_resolution_scroll_delta;
+        assert_eq!(invert(12, -34), Some((-12, 34)));
+        assert_eq!(invert(i32::MIN, 0), None);
+        assert_eq!(invert(0, i32::MIN), None);
+    }
+
+    #[test]
+    fn dispatches_zero_delta_as_scroll_sequence_end() {
+        let mut dispatched = None;
+        let result = dispatch_inverted_high_resolution_scroll(0, 0, |x, y| {
+            dispatched = Some((x, y));
+            Ok(())
+        });
+
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(dispatched, Some((0, 0)));
     }
 }
 
