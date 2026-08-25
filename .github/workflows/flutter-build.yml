@@ -613,6 +613,33 @@ jobs:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
           path: Release
 
+      - name: Build x86 portable packer template
+        # The x86 custom-client pipeline keeps the Sciter runner in the generic
+        # payload, so the packer must be built for i686 and must include Release/rustdesk.exe.
+        if: ${{ env.UPLOAD_ARTIFACT == 'true' && matrix.job.arch == 'x86' }}
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py \
+            -f ../../Release/ \
+            -o . \
+            -e ../../Release/rustdesk.exe \
+            -l 11 \
+            -t i686-pc-windows-msvc
+          popd
+          mkdir -p ./template-packer-x86
+          mv ./target/i686-pc-windows-msvc/release/rustdesk-portable-packer.exe \
+            ./template-packer-x86/packer.exe
+
+      - name: Upload x86 portable packer template
+        if: ${{ env.UPLOAD_ARTIFACT == 'true' && matrix.job.arch == 'x86' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-unsigned-template-packer-x86
+          path: ./template-packer-x86/packer.exe
+
       - name: Sign rustdesk files
         if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
         shell: bash
@@ -1022,6 +1049,12 @@ jobs:
           name: rustdesk-unsigned-template-packer-aarch64
           path: ./template-packer-aarch64/
 
+      - name: Download x86 portable packer template
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustdesk-unsigned-template-packer-x86
+          path: ./template-packer-x86/
+
       - name: Download Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1044,10 +1077,14 @@ jobs:
       - name: Verify ARM64 portable packer template
         run: test -f ./template-packer-aarch64/packer.exe
 
+      - name: Verify x86 portable packer template
+        run: test -f ./template-packer-x86/packer.exe
+
       - name: Combine unsigned app
         run: |
-          tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-aarch64 windows-x86 msi-template template-packer-aarch64
+          tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-aarch64 windows-x86 msi-template template-packer-aarch64 template-packer-x86
           tar tzf rustdesk-${{ env.VERSION }}-unsigned.tar.gz | grep -Fx 'template-packer-aarch64/packer.exe'
+          tar tzf rustdesk-${{ env.VERSION }}-unsigned.tar.gz | grep -Fx 'template-packer-x86/packer.exe'
 
       - name: Publish unsigned app
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
