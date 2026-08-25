@@ -1444,6 +1444,7 @@ class FfiModel with ChangeNotifier {
           sessionId: sessionId, arg: kOptionToggleShowMyCursor));
     }
     if (connType == ConnType.defaultConn || connType == ConnType.viewCamera) {
+      _pi.platformAdditions = {};
       final platformAdditions = evt['platform_additions'];
       if (platformAdditions != null && platformAdditions != '') {
         try {

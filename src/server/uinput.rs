@@ -5,19 +5,42 @@ use evdev::{
     AttributeSet, EventType, InputEvent,
 };
 use hbb_common::{
-    allow_err, bail, log,
-    tokio::{self, runtime::Runtime},
+    allow_err,
+    anyhow::anyhow,
+    bail, log,
+    tokio::{self, runtime::Runtime, task::JoinHandle},
     ResultType,
 };
+
+mod smooth_scroll;
 
 static IPC_CONN_TIMEOUT: u64 = 1000;
 static IPC_REQUEST_TIMEOUT: u64 = 1000;
 static IPC_POSTFIX_KEYBOARD: &str = "_uinput_keyboard";
 static IPC_POSTFIX_MOUSE: &str = "_uinput_mouse";
+static IPC_POSTFIX_HIGH_RESOLUTION_SCROLL: &str = "_uinput_high_resolution_scroll";
+static IPC_POSTFIX_SMOOTH_SCROLL: &str = "_uinput_smooth_scroll";
 static IPC_POSTFIX_CONTROL: &str = "_uinput_control";
+const SCROLL_IPC_QUEUE_CAPACITY: usize = 256;
+const HIGH_RESOLUTION_SCROLL_DEVICE_READY_DELAY_MS: u64 = 300;
+const SMOOTH_SCROLL_READY_POLL_MS: u64 = 50;
+const SMOOTH_SCROLL_READY_TIMEOUT_MS: u64 = 1_500;
+const SMOOTH_SCROLL_HANDSHAKE_TIMEOUT_MS: u64 = SMOOTH_SCROLL_READY_TIMEOUT_MS + 500;
+const SCROLL_FINISH_RESPONSE_TIMEOUT_MS: u64 = IPC_REQUEST_TIMEOUT + 500;
+const SMOOTH_SCROLL_DEVICE_NAME_PREFIX: &str = "RustDesk Smooth Scroll";
+const SCROLL_SERVICE_READY_KEY: &str = "scroll_service_ready";
 
 pub mod client {
     use super::*;
+    use hbb_common::tokio::sync::mpsc::{channel, error::TrySendError, Sender};
+    use hbb_common::x11::{xinput2, xlib};
+    use std::{
+        ffi::CStr,
+        io::{Error, ErrorKind},
+        slice,
+        sync::mpsc as std_mpsc,
+        time::Duration,
+    };
 
     pub struct UInputKeyboard {
         conn: Connection,
@@ -113,32 +136,147 @@ pub mod client {
         }
     }
 
-    pub struct UInputMouse {
+    struct RegularUInputMouse {
         conn: Connection,
         rt: Runtime,
+    }
+
+    struct ScrollRequest {
+        data: Data,
+        completion: Option<std_mpsc::SyncSender<Result<(), String>>>,
+    }
+
+    impl ScrollRequest {
+        fn new(data: Data) -> (Self, Option<std_mpsc::Receiver<Result<(), String>>>) {
+            if !is_scroll_finish(&data) {
+                return (
+                    Self {
+                        data,
+                        completion: None,
+                    },
+                    None,
+                );
+            }
+            let (sender, receiver) = std_mpsc::sync_channel(1);
+            (
+                Self {
+                    data,
+                    completion: Some(sender),
+                },
+                Some(receiver),
+            )
+        }
+
+        fn acknowledge(self, result: Result<(), String>) {
+            if let Some(completion) = self.completion {
+                let _ = completion.send(result);
+            }
+        }
+    }
+
+    struct ScrollConnection {
+        tx: Sender<ScrollRequest>,
+        task: JoinHandle<()>,
+    }
+
+    impl ScrollConnection {
+        fn is_connected(&self) -> bool {
+            !self.tx.is_closed()
+        }
+    }
+
+    impl Drop for ScrollConnection {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    pub struct UInputMouse {
+        regular: Option<RegularUInputMouse>,
+        high_resolution: Option<ScrollConnection>,
+        smooth: Option<ScrollConnection>,
     }
 
     impl UInputMouse {
         pub async fn new() -> ResultType<Self> {
             let conn = ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_MOUSE).await?;
             let rt = Runtime::new()?;
-            Ok(Self { conn, rt })
+            Ok(Self {
+                regular: Some(RegularUInputMouse { conn, rt }),
+                high_resolution: None,
+                smooth: None,
+            })
+        }
+
+        pub async fn new_high_resolution_scroll() -> ResultType<Self> {
+            let mut mouse = Self::new_high_resolution_scroll_state();
+            mouse.enable_high_resolution_scroll().await?;
+            Ok(mouse)
+        }
+
+        fn new_high_resolution_scroll_state() -> Self {
+            Self {
+                regular: None,
+                high_resolution: None,
+                smooth: None,
+            }
         }
 
         fn send(&mut self, data: Data) -> ResultType<()> {
-            self.rt.block_on(self.conn.send(&data))
+            match &mut self.regular {
+                Some(regular) => regular.rt.block_on(regular.conn.send(&data)),
+                _ => bail!("regular uinput mouse service is not connected"),
+            }
+        }
+
+        fn send_high_resolution(&mut self, data: Data) -> enigo::ResultType {
+            send_scroll_data(&mut self.high_resolution, data, "high-resolution")
+        }
+
+        fn send_smooth(&mut self, data: Data) -> enigo::ResultType {
+            send_scroll_data(&mut self.smooth, data, "smooth")
+        }
+
+        pub async fn enable_high_resolution_scroll(&mut self) -> ResultType<()> {
+            let mut conn =
+                ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_HIGH_RESOLUTION_SCROLL).await?;
+            match conn.next_timeout(IPC_REQUEST_TIMEOUT).await? {
+                Some(Data::Config((key, None))) if key == SCROLL_SERVICE_READY_KEY => {}
+                Some(resp) => bail!(
+                    "unexpected high-resolution uinput scroll response: {:?}",
+                    &resp
+                ),
+                None => bail!("high-resolution uinput scroll service closed"),
+            }
+            let (tx, rx) = channel(SCROLL_IPC_QUEUE_CAPACITY);
+            let task = tokio::spawn(forward_scroll_requests(conn, rx, "high-resolution"));
+            self.high_resolution = Some(ScrollConnection { tx, task });
+            Ok(())
+        }
+
+        pub async fn enable_smooth_scroll(&mut self) -> ResultType<()> {
+            self.smooth = Some(connect_smooth_scroll_service().await?);
+            Ok(())
         }
 
         pub fn send_refresh(&mut self) -> ResultType<()> {
-            self.rt
-                .block_on(self.conn.send(&Data::Mouse(DataMouse::Refresh)))?;
+            let regular = match &mut self.regular {
+                Some(regular) => regular,
+                _ => bail!("regular uinput mouse service is not connected"),
+            };
+            regular
+                .rt
+                .block_on(regular.conn.send(&Data::Mouse(DataMouse::Refresh)))?;
             // Wait for the service to confirm it recreated the device, so a
             // failed refresh is distinguishable from a good one.
-            match self.rt.block_on(self.conn.next_timeout(IPC_REQUEST_TIMEOUT)) {
+            match regular
+                .rt
+                .block_on(regular.conn.next_timeout(IPC_REQUEST_TIMEOUT))
+            {
                 Ok(Some(Data::Empty)) => Ok(()),
                 Ok(Some(resp)) => bail!("unexpected uinput mouse refresh response: {:?}", &resp),
                 Ok(None) => bail!("uinput mouse refresh failed, connection closed"),
-                Err(e) => bail!("uinput mouse refresh timeout {}, {}", IPC_REQUEST_TIMEOUT, e),
+                Err(e) => bail!("uinput mouse refresh timed out: {e}"),
             }
         }
     }
@@ -175,6 +313,249 @@ pub mod client {
         fn mouse_scroll_y(&mut self, length: i32) {
             allow_err!(self.send(Data::Mouse(DataMouse::ScrollY(length))));
         }
+        fn supports_high_resolution_scroll(&self) -> bool {
+            self.high_resolution
+                .as_ref()
+                .is_some_and(ScrollConnection::is_connected)
+        }
+        fn mouse_scroll_high_resolution(&mut self, x: i32, y: i32) -> enigo::ResultType {
+            self.send_high_resolution(Data::Mouse(DataMouse::ScrollHighResolution(x, y)))
+        }
+        fn supports_smooth_scroll(&self) -> bool {
+            self.smooth
+                .as_ref()
+                .is_some_and(ScrollConnection::is_connected)
+        }
+        fn mouse_scroll_smooth(&mut self, x: i32, y: i32) -> enigo::ResultType {
+            self.send_smooth(Data::Mouse(DataMouse::ScrollSmooth(x, y)))
+        }
+    }
+
+    fn send_scroll_data(
+        connection: &mut Option<ScrollConnection>,
+        data: Data,
+        scroll_kind: &str,
+    ) -> enigo::ResultType {
+        let (request, completion) = ScrollRequest::new(data);
+        let result = connection
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotConnected,
+                    format!("{scroll_kind} uinput scroll service is not connected"),
+                )
+            })?
+            .tx
+            .try_send(request);
+        match result {
+            Ok(()) => match wait_for_scroll_completion(completion, scroll_kind) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    connection.take();
+                    Err(err)
+                }
+            },
+            Err(TrySendError::Full(_)) => {
+                connection.take();
+                Err(Error::new(
+                    ErrorKind::WouldBlock,
+                    format!("{scroll_kind} uinput scroll queue is full; disconnected"),
+                )
+                .into())
+            }
+            Err(TrySendError::Closed(_)) => {
+                connection.take();
+                Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    format!("{scroll_kind} uinput scroll service is closed"),
+                )
+                .into())
+            }
+        }
+    }
+
+    fn wait_for_scroll_completion(
+        completion: Option<std_mpsc::Receiver<Result<(), String>>>,
+        scroll_kind: &str,
+    ) -> enigo::ResultType {
+        let Some(completion) = completion else {
+            return Ok(());
+        };
+        match completion.recv_timeout(Duration::from_millis(SCROLL_FINISH_RESPONSE_TIMEOUT_MS)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(Error::new(ErrorKind::BrokenPipe, err).into()),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(Error::new(
+                ErrorKind::TimedOut,
+                format!("{scroll_kind} uinput scroll finish acknowledgement timed out"),
+            )
+            .into()),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(Error::new(
+                ErrorKind::BrokenPipe,
+                format!("{scroll_kind} uinput scroll sender stopped before acknowledgement"),
+            )
+            .into()),
+        }
+    }
+
+    fn is_scroll_finish(data: &Data) -> bool {
+        matches!(
+            data,
+            Data::Mouse(DataMouse::ScrollHighResolution(0, 0))
+                | Data::Mouse(DataMouse::ScrollSmooth(0, 0))
+        )
+    }
+
+    async fn forward_scroll_requests(
+        mut conn: Connection,
+        mut rx: hbb_common::tokio::sync::mpsc::Receiver<ScrollRequest>,
+        scroll_kind: &'static str,
+    ) {
+        while let Some(request) = rx.recv().await {
+            let needs_ack = request.completion.is_some();
+            let mut result = conn
+                .send(&request.data)
+                .await
+                .map_err(|err| err.to_string());
+            if result.is_ok() && needs_ack {
+                result = receive_scroll_ack(&mut conn, scroll_kind).await;
+            }
+            request.acknowledge(result.clone());
+            if let Err(err) = result {
+                log::error!("Failed to send {scroll_kind} uinput scroll: {err}");
+                return;
+            }
+        }
+    }
+
+    async fn receive_scroll_ack(conn: &mut Connection, scroll_kind: &str) -> Result<(), String> {
+        match conn.next_timeout(IPC_REQUEST_TIMEOUT).await {
+            Ok(Some(Data::Empty)) => Ok(()),
+            Ok(Some(response)) => Err(format!(
+                "unexpected {scroll_kind} uinput scroll acknowledgement: {response:?}"
+            )),
+            Ok(None) => Err(format!(
+                "{scroll_kind} uinput scroll service closed before acknowledgement"
+            )),
+            Err(err) => Err(format!(
+                "{scroll_kind} uinput scroll acknowledgement timed out: {err}"
+            )),
+        }
+    }
+
+    async fn connect_smooth_scroll_service() -> ResultType<ScrollConnection> {
+        let mut conn = ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_SMOOTH_SCROLL).await?;
+        let device_name = match conn
+            .next_timeout(SMOOTH_SCROLL_HANDSHAKE_TIMEOUT_MS)
+            .await?
+        {
+            Some(Data::Config((key, Some(device_name)))) if key == SCROLL_SERVICE_READY_KEY => {
+                device_name
+            }
+            Some(resp) => bail!("unexpected smooth uinput scroll response: {:?}", &resp),
+            None => bail!("smooth uinput scroll service closed"),
+        };
+        if crate::platform::is_x11() {
+            wait_for_x11_smooth_scroll_device(device_name).await?;
+        }
+        let (tx, rx) = channel(SCROLL_IPC_QUEUE_CAPACITY);
+        let task = tokio::spawn(forward_scroll_requests(conn, rx, "smooth"));
+        Ok(ScrollConnection { tx, task })
+    }
+
+    const XI_MAJOR_VERSION: i32 = 2;
+    const XI_MINOR_VERSION: i32 = 1;
+
+    async fn wait_for_x11_smooth_scroll_device(device_name: String) -> ResultType<()> {
+        tokio::task::spawn_blocking(move || -> ResultType<()> {
+            let attempts = SMOOTH_SCROLL_READY_TIMEOUT_MS / SMOOTH_SCROLL_READY_POLL_MS;
+            for _ in 0..attempts {
+                if x11_smooth_scroll_device_ready(device_name.as_bytes()) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(SMOOTH_SCROLL_READY_POLL_MS));
+            }
+            bail!("X11 did not expose the smooth uinput device as scroll-capable")
+        })
+        .await?
+    }
+
+    fn x11_smooth_scroll_device_ready(device_name: &[u8]) -> bool {
+        let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+        if display.is_null() {
+            return false;
+        }
+        let ready = unsafe { x11_smooth_scroll_device_ready_on_display(display, device_name) };
+        unsafe {
+            xlib::XCloseDisplay(display);
+        }
+        ready
+    }
+
+    unsafe fn x11_smooth_scroll_device_ready_on_display(
+        display: *mut xlib::Display,
+        device_name: &[u8],
+    ) -> bool {
+        let extension_name = b"XInputExtension\0";
+        let (mut opcode, mut event, mut error) = (0, 0, 0);
+        if xlib::XQueryExtension(
+            display,
+            extension_name.as_ptr().cast(),
+            &mut opcode,
+            &mut event,
+            &mut error,
+        ) == 0
+        {
+            return false;
+        }
+        let (mut major, mut minor) = (XI_MAJOR_VERSION, XI_MINOR_VERSION);
+        if xinput2::XIQueryVersion(display, &mut major, &mut minor) != 0
+            || major < XI_MAJOR_VERSION
+            || (major == XI_MAJOR_VERSION && minor < XI_MINOR_VERSION)
+        {
+            return false;
+        }
+        let mut device_count = 0;
+        let devices = xinput2::XIQueryDevice(display, xinput2::XIAllDevices, &mut device_count);
+        if devices.is_null() {
+            return false;
+        }
+        let ready = device_count > 0
+            && slice::from_raw_parts(devices, device_count as usize)
+                .iter()
+                .any(|info| x11_device_supports_smooth_scroll(info, device_name));
+        xinput2::XIFreeDeviceInfo(devices);
+        ready
+    }
+
+    unsafe fn x11_device_supports_smooth_scroll(
+        info: &xinput2::XIDeviceInfo,
+        device_name: &[u8],
+    ) -> bool {
+        if info.enabled == 0 || info.name.is_null() || info.classes.is_null() {
+            return false;
+        }
+        if CStr::from_ptr(info.name).to_bytes() != device_name {
+            return false;
+        }
+        let classes = slice::from_raw_parts(info.classes, info.num_classes.max(0) as usize);
+        let scroll_types = classes.iter().filter_map(|class| {
+            let class = *class;
+            if class.is_null() || (*class)._type != xinput2::XIScrollClass {
+                return None;
+            }
+            Some((*(class.cast::<xinput2::XIScrollClassInfo>())).scroll_type)
+        });
+        has_required_x11_scroll_axes(scroll_types)
+    }
+
+    fn has_required_x11_scroll_axes(scroll_types: impl IntoIterator<Item = i32>) -> bool {
+        let mut vertical = false;
+        let mut horizontal = false;
+        for scroll_type in scroll_types {
+            vertical |= scroll_type == xinput2::XIScrollTypeVertical;
+            horizontal |= scroll_type == xinput2::XIScrollTypeHorizontal;
+        }
+        vertical && horizontal
     }
 
     pub async fn set_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
@@ -189,9 +570,81 @@ pub mod client {
         let _ = conn.next().await?;
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            has_required_x11_scroll_axes, xinput2, ScrollConnection, ScrollRequest, UInputMouse,
+        };
+        use crate::ipc::Data;
+        use enigo::MouseControllable;
+        use hbb_common::tokio::{runtime::Runtime, sync::mpsc::channel};
+        use std::{sync::mpsc as std_mpsc, thread, time::Duration};
+
+        #[test]
+        fn high_resolution_channel_disconnects_when_its_queue_is_full() {
+            let mut mouse = UInputMouse::new_high_resolution_scroll_state();
+            let runtime = Runtime::new().unwrap();
+            let (tx, rx) = channel(super::super::SCROLL_IPC_QUEUE_CAPACITY);
+            let task = runtime.spawn(async move {
+                let _receiver = rx;
+                std::future::pending::<()>().await;
+            });
+            mouse.high_resolution = Some(ScrollConnection { tx, task });
+
+            for _ in 0..super::super::SCROLL_IPC_QUEUE_CAPACITY {
+                assert!(mouse.send_high_resolution(Data::Empty).is_ok());
+            }
+            assert!(mouse.send_high_resolution(Data::Empty).is_err());
+            assert!(!mouse.supports_high_resolution_scroll());
+        }
+
+        #[test]
+        fn finish_waits_for_service_acknowledgement() {
+            let runtime = Runtime::new().unwrap();
+            let (tx, mut rx) = channel(super::super::SCROLL_IPC_QUEUE_CAPACITY);
+            let (request_seen_tx, request_seen_rx) = std_mpsc::channel();
+            let (release_tx, release_rx) = hbb_common::tokio::sync::oneshot::channel();
+            let task = runtime.spawn(async move {
+                let request: ScrollRequest = rx.recv().await.unwrap();
+                request_seen_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                request.acknowledge(Ok(()));
+            });
+            let mut mouse = UInputMouse::new_high_resolution_scroll_state();
+            mouse.smooth = Some(ScrollConnection { tx, task });
+            let (result_tx, result_rx) = std_mpsc::channel();
+
+            thread::spawn(move || result_tx.send(mouse.mouse_scroll_smooth(0, 0)).unwrap());
+            request_seen_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert!(result_rx.recv_timeout(Duration::from_millis(20)).is_err());
+            release_tx.send(()).unwrap();
+            assert!(result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok());
+        }
+
+        #[test]
+        fn x11_readiness_requires_both_scroll_axes() {
+            assert!(!has_required_x11_scroll_axes([
+                xinput2::XIScrollTypeVertical
+            ]));
+            assert!(!has_required_x11_scroll_axes([
+                xinput2::XIScrollTypeHorizontal
+            ]));
+            assert!(has_required_x11_scroll_axes([
+                xinput2::XIScrollTypeVertical,
+                xinput2::XIScrollTypeHorizontal,
+            ]));
+        }
+    }
 }
 
 pub mod service {
+    use super::smooth_scroll::SmoothScrollDevice;
     use super::*;
     use hbb_common::lazy_static;
     #[cfg(target_os = "linux")]
@@ -201,7 +654,13 @@ pub mod service {
     };
     #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicU64, atomic::Ordering, Mutex},
+        time::Duration,
+    };
+
+    static SMOOTH_SCROLL_DEVICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     lazy_static::lazy_static! {
     static ref KEY_MAP: HashMap<enigo::Key, evdev::Key> = HashMap::from(
@@ -781,6 +1240,12 @@ pub mod service {
                     allow_err!(mouse.scroll_wheel(&scroll))
                 }
             }
+            DataMouse::ScrollHighResolution(_, _) => {
+                log::warn!("High-resolution scroll event sent to regular uinput service")
+            }
+            DataMouse::ScrollSmooth(_, _) => {
+                log::warn!("Smooth scroll event sent to regular uinput service")
+            }
             DataMouse::Refresh => {
                 // unreachable!()
             }
@@ -902,6 +1367,284 @@ pub mod service {
         });
     }
 
+    fn split_high_resolution_scroll(remainder: i32, delta: i32) -> (i32, i32) {
+        let total = i64::from(remainder) + i64::from(delta);
+        let step = i64::from(enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP);
+        ((total / step) as i32, (total % step) as i32)
+    }
+
+    const HIGH_RESOLUTION_SCROLL_BUTTON: evdev::Key = evdev::Key::BTN_LEFT;
+    const HIGH_RESOLUTION_SCROLL_AXIS_COUNT: usize = 2;
+    const HIGH_RESOLUTION_SCROLL_AXES: [evdev::RelativeAxisType; 6] = [
+        evdev::RelativeAxisType::REL_X,
+        evdev::RelativeAxisType::REL_Y,
+        evdev::RelativeAxisType::REL_WHEEL,
+        evdev::RelativeAxisType::REL_HWHEEL,
+        evdev::RelativeAxisType::REL_WHEEL_HI_RES,
+        evdev::RelativeAxisType::REL_HWHEEL_HI_RES,
+    ];
+
+    struct HighResolutionScrollDevice {
+        device: VirtualDevice,
+        remainders: [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+    }
+
+    fn high_resolution_scroll_axis_events(
+        horizontal: bool,
+        length: i32,
+        remainder: i32,
+    ) -> ResultType<(Vec<InputEvent>, i32)> {
+        if length == 0 {
+            return Ok((Vec::new(), remainder));
+        }
+        let (high_axis, legacy_axis, delta) = if horizontal {
+            (
+                evdev::RelativeAxisType::REL_HWHEEL_HI_RES,
+                evdev::RelativeAxisType::REL_HWHEEL,
+                length,
+            )
+        } else {
+            (
+                evdev::RelativeAxisType::REL_WHEEL_HI_RES,
+                evdev::RelativeAxisType::REL_WHEEL,
+                length
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("vertical scroll delta overflow"))?,
+            )
+        };
+        let (legacy_delta, remainder) = split_high_resolution_scroll(remainder, delta);
+        let mut events = vec![InputEvent::new(EventType::RELATIVE, high_axis.0, delta)];
+        if legacy_delta != 0 {
+            events.push(InputEvent::new(
+                EventType::RELATIVE,
+                legacy_axis.0,
+                legacy_delta,
+            ));
+        }
+        Ok((events, remainder))
+    }
+
+    fn high_resolution_scroll_events(
+        x: i32,
+        y: i32,
+        remainders: [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+    ) -> ResultType<(Vec<InputEvent>, [i32; HIGH_RESOLUTION_SCROLL_AXIS_COUNT])> {
+        let mut events = Vec::new();
+        let mut next_remainders = remainders;
+        for (horizontal, length) in [(false, y), (true, x)] {
+            let index = usize::from(horizontal);
+            let (axis_events, remainder) =
+                high_resolution_scroll_axis_events(horizontal, length, remainders[index])?;
+            events.extend(axis_events);
+            next_remainders[index] = remainder;
+        }
+        Ok((events, next_remainders))
+    }
+
+    impl HighResolutionScrollDevice {
+        fn new() -> ResultType<Self> {
+            // udev needs mouse buttons and relative coordinates to classify this as a mouse.
+            let keys: AttributeSet<_> = [HIGH_RESOLUTION_SCROLL_BUTTON].into_iter().collect();
+            let axes: AttributeSet<_> = HIGH_RESOLUTION_SCROLL_AXES.into_iter().collect();
+            let device = VirtualDeviceBuilder::new()?
+                .name("RustDesk High Resolution Scroll")
+                .with_keys(&keys)?
+                .with_relative_axes(&axes)?
+                .build()?;
+            Ok(Self {
+                device,
+                remainders: [0; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+            })
+        }
+
+        fn scroll(&mut self, x: i32, y: i32) -> ResultType<()> {
+            let (events, remainders) = high_resolution_scroll_events(x, y, self.remainders)?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            self.device.emit(&events)?;
+            self.remainders = remainders;
+            Ok(())
+        }
+    }
+
+    fn spawn_high_resolution_scroll_handler(mut stream: ipc::Connection) {
+        tokio::spawn(async move {
+            let mut mouse = match HighResolutionScrollDevice::new() {
+                Ok(mouse) => mouse,
+                Err(err) => {
+                    log::error!("Failed to create high-resolution uinput scroll device: {err}");
+                    return;
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(
+                HIGH_RESOLUTION_SCROLL_DEVICE_READY_DELAY_MS,
+            ))
+            .await;
+            if let Err(err) = stream
+                .send(&Data::Config((SCROLL_SERVICE_READY_KEY.to_owned(), None)))
+                .await
+            {
+                log::error!("Failed to acknowledge high-resolution uinput scroll device: {err}");
+                return;
+            }
+            loop {
+                let (x, y) = match stream.next().await {
+                    Ok(Some(Data::Mouse(DataMouse::ScrollHighResolution(x, y)))) => (x, y),
+                    Ok(Some(data)) => {
+                        log::warn!("Unexpected high-resolution uinput data: {data:?}");
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        log::info!("High-resolution uinput ipc connection closed: {err}");
+                        break;
+                    }
+                };
+                if let Err(err) = mouse.scroll(x, y) {
+                    log::error!("Failed to inject high-resolution uinput scroll: {err}");
+                    continue;
+                }
+                if let Err(err) = acknowledge_scroll_finish(&mut stream, (x, y)).await {
+                    log::error!("Failed to acknowledge high-resolution scroll finish: {err}");
+                    break;
+                }
+            }
+        });
+    }
+
+    fn spawn_smooth_scroll_handler(mut stream: ipc::Connection) {
+        tokio::spawn(async move {
+            let (mut touchpad, device_name) = match prepare_smooth_scroll_device().await {
+                Ok(device) => device,
+                Err(err) => {
+                    log::error!("Failed to prepare smooth uinput scroll device: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = stream
+                .send(&Data::Config((
+                    SCROLL_SERVICE_READY_KEY.to_owned(),
+                    Some(device_name),
+                )))
+                .await
+            {
+                log::error!("Failed to acknowledge smooth uinput scroll device: {err}");
+                return;
+            }
+            loop {
+                let (x, y) = match stream.next().await {
+                    Ok(Some(Data::Mouse(DataMouse::ScrollSmooth(x, y)))) => (x, y),
+                    Ok(Some(data)) => {
+                        log::warn!("Unexpected smooth uinput data: {data:?}");
+                        continue;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        log::info!("Smooth uinput ipc connection closed: {err}");
+                        break;
+                    }
+                };
+                if let Err(err) = touchpad.scroll(x, y) {
+                    log::error!("Failed to inject smooth uinput scroll: {err}");
+                    break;
+                }
+                if let Err(err) = acknowledge_scroll_finish(&mut stream, (x, y)).await {
+                    log::error!("Failed to acknowledge smooth scroll finish: {err}");
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn prepare_smooth_scroll_device() -> ResultType<(SmoothScrollDevice, String)> {
+        let device_name = format!(
+            "{} {}-{}",
+            SMOOTH_SCROLL_DEVICE_NAME_PREFIX,
+            std::process::id(),
+            SMOOTH_SCROLL_DEVICE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let touchpad = SmoothScrollDevice::new(device_name.as_bytes())?;
+        let touchpad = wait_for_smooth_scroll_device_ready(touchpad).await?;
+        Ok((touchpad, device_name))
+    }
+
+    async fn wait_for_smooth_scroll_device_ready(
+        touchpad: SmoothScrollDevice,
+    ) -> ResultType<SmoothScrollDevice> {
+        tokio::task::spawn_blocking(move || -> ResultType<_> {
+            let attempts = SMOOTH_SCROLL_READY_TIMEOUT_MS / SMOOTH_SCROLL_READY_POLL_MS;
+            for _ in 0..attempts {
+                if touchpad.is_classified_as_touchpad()? {
+                    return Ok(touchpad);
+                }
+                std::thread::sleep(Duration::from_millis(SMOOTH_SCROLL_READY_POLL_MS));
+            }
+            bail!("udev did not classify the uinput device as a touchpad")
+        })
+        .await?
+    }
+
+    async fn acknowledge_scroll_finish(
+        stream: &mut ipc::Connection,
+        delta: (i32, i32),
+    ) -> ResultType<()> {
+        if delta == (0, 0) {
+            stream.send(&Data::Empty).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod high_resolution_scroll_tests {
+        use super::*;
+
+        #[test]
+        fn advertises_mouse_classification_capabilities() {
+            assert_eq!(HIGH_RESOLUTION_SCROLL_BUTTON, evdev::Key::BTN_LEFT);
+            assert!(HIGH_RESOLUTION_SCROLL_AXES.contains(&evdev::RelativeAxisType::REL_X));
+            assert!(HIGH_RESOLUTION_SCROLL_AXES.contains(&evdev::RelativeAxisType::REL_Y));
+        }
+
+        #[test]
+        fn accumulates_legacy_companion_events_at_detent_boundaries() {
+            let half_step = enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP / 2;
+
+            assert_eq!(split_high_resolution_scroll(0, half_step), (0, half_step));
+            assert_eq!(split_high_resolution_scroll(half_step, half_step), (1, 0));
+            assert_eq!(
+                split_high_resolution_scroll(-half_step, -half_step),
+                (-1, 0)
+            );
+            assert_eq!(split_high_resolution_scroll(100, -half_step), (0, 40));
+        }
+
+        #[test]
+        fn rejects_overflowing_vertical_scroll_delta() {
+            assert!(high_resolution_scroll_axis_events(false, i32::MIN, 0).is_err());
+        }
+
+        #[test]
+        fn batches_diagonal_scroll_axes_in_one_frame() {
+            let half_step = enigo::HIGH_RESOLUTION_SCROLL_UNITS_PER_STEP / 2;
+            let (events, remainders) = high_resolution_scroll_events(
+                half_step,
+                -half_step,
+                [0; HIGH_RESOLUTION_SCROLL_AXIS_COUNT],
+            )
+            .unwrap();
+
+            assert_eq!(remainders, [half_step, half_step]);
+            assert_eq!(
+                events.iter().map(InputEvent::code).collect::<Vec<_>>(),
+                vec![
+                    evdev::RelativeAxisType::REL_WHEEL_HI_RES.0,
+                    evdev::RelativeAxisType::REL_HWHEEL_HI_RES.0,
+                ]
+            );
+        }
+    }
+
     fn spawn_controller_handler(mut stream: ipc::Connection) {
         tokio::spawn(async move {
             loop {
@@ -1004,6 +1747,18 @@ pub mod service {
     pub async fn start_service_mouse() {
         log::info!("start uinput mouse service");
         start_service(IPC_POSTFIX_MOUSE, spawn_mouse_handler).await;
+    }
+
+    /// Start the high-resolution and smooth uinput scroll services.
+    #[tokio::main(flavor = "current_thread")]
+    pub async fn start_service_high_resolution_scroll() {
+        log::info!("start high-resolution and smooth uinput scroll services");
+        let high_resolution = start_service(
+            IPC_POSTFIX_HIGH_RESOLUTION_SCROLL,
+            spawn_high_resolution_scroll_handler,
+        );
+        let smooth = start_service(IPC_POSTFIX_SMOOTH_SCROLL, spawn_smooth_scroll_handler);
+        tokio::join!(high_resolution, smooth);
     }
 
     /// Start uinput mouse service.

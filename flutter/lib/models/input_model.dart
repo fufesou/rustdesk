@@ -18,11 +18,14 @@ import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'input_modifier_utils.dart';
 import 'relative_mouse_model.dart';
+import 'trackpad_scroll_accumulator.dart';
 import '../common.dart';
 import '../consts.dart';
 
 /// Mouse button enum.
 enum MouseButtons { left, right, wheel, back, forward }
+
+enum _LinuxTrackpadScrollMode { legacy, highResolutionWheel, smooth }
 
 const _kMouseEventDown = 'mousedown';
 const _kMouseEventUp = 'mouseup';
@@ -421,9 +424,14 @@ class InputModel {
   var _trackpadLastDelta = Offset.zero;
   var _stopFling = true;
   var _fling = false;
+  String? _activeTrackpadScrollEventType;
+  var _activeLinuxTrackpadScrollMode = _LinuxTrackpadScrollMode.legacy;
   Timer? _flingTimer;
   final _flingBaseDelay = 30;
   final _trackpadAdjustPeerLinux = 0.06;
+  static const _trackpadEventType = 'trackpad';
+  static const _trackpadHighResolutionEventType = 'trackpad_high_resolution';
+  static const _trackpadSmoothEventType = 'trackpad_smooth';
   // This is an experience value.
   final _trackpadAdjustMacToWin = 2.50;
   // Ignore directional locking for very small deltas on both axes (including
@@ -434,7 +442,7 @@ class InputModel {
   static const double _trackpadAxisLockRatio = 1.6;
   int _trackpadSpeed = kDefaultTrackpadSpeed;
   double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
-  var _trackpadScrollUnsent = Offset.zero;
+  final _trackpadScrollAccumulator = TrackpadScrollAccumulator();
 
   // Mobile relative mouse delta accumulators (for slow/fine movements).
   double _mobileDeltaRemainderX = 0.0;
@@ -487,6 +495,24 @@ class InputModel {
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
   bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
   int get trackpadSpeed => _trackpadSpeed;
+  bool get _supportsHighResolutionScroll =>
+      peerPlatform == kPeerPlatformLinux &&
+      parent.target?.ffiModel.pi.platformAdditions[
+              kPlatformAdditionsSupportsHighResolutionScroll] ==
+          true;
+  bool get _supportsSmoothScroll =>
+      peerPlatform == kPeerPlatformLinux &&
+      parent.target?.ffiModel.pi
+              .platformAdditions[kPlatformAdditionsSupportsSmoothScroll] ==
+          true;
+  _LinuxTrackpadScrollMode get _linuxTrackpadScrollMode {
+    if (_supportsSmoothScroll) return _LinuxTrackpadScrollMode.smooth;
+    if (_supportsHighResolutionScroll) {
+      return _LinuxTrackpadScrollMode.highResolutionWheel;
+    }
+    return _LinuxTrackpadScrollMode.legacy;
+  }
+
   bool get useEdgeScroll =>
       parent.target!.canvasModel.scrollStyle == ScrollStyle.scrolledge;
 
@@ -1154,7 +1180,7 @@ class InputModel {
       resetModifiers();
     }
     _relativeMouse.onEnterOrLeaveImage(enter);
-    _flingTimer?.cancel();
+    _interruptFling(finishScroll: true);
     if (!isInputSourceFlutter) {
       bind.sessionEnterOrLeave(sessionId: sessionId, enter: enter);
     }
@@ -1276,6 +1302,8 @@ class InputModel {
   }
 
   void onWindowBlur() {
+    _interruptFling(finishScroll: true);
+    _trackpadLastDelta = Offset.zero;
     _relativeMouse.onWindowBlur();
   }
 
@@ -1284,7 +1312,7 @@ class InputModel {
   }
 
   void onPointHoverImage(PointerHoverEvent e) {
-    _stopFling = true;
+    _interruptFling();
     if (isViewOnly && !showMyCursor) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
 
@@ -1316,9 +1344,10 @@ class InputModel {
 
   void onPointerPanZoomStart(PointerPanZoomStartEvent e) {
     _lastScale = 1.0;
-    _stopFling = true;
+    _interruptFling(finishScroll: true);
     if (isViewOnly) return;
     if (isViewCamera) return;
+    _activeLinuxTrackpadScrollMode = _linuxTrackpadScrollMode;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanStart, e.position);
     }
@@ -1326,13 +1355,18 @@ class InputModel {
 
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
-    if (isViewOnly) return;
-    if (isViewCamera) return;
+    if (isViewOnly || isViewCamera) {
+      _interruptFling(finishScroll: true);
+      _trackpadLastDelta = Offset.zero;
+      return;
+    }
     if (peerPlatform != kPeerPlatformAndroid) {
       final scale = ((e.scale - _lastScale) * 1000).toInt();
       _lastScale = e.scale;
 
       if (scale != 0) {
+        _finishTrackpadScroll();
+        _trackpadLastDelta = Offset.zero;
         bind.sessionSendPointer(
             sessionId: sessionId,
             msg: json.encode(
@@ -1351,11 +1385,12 @@ class InputModel {
 
     var x = delta.dx.toInt();
     var y = delta.dy.toInt();
+    var scrollMode = _LinuxTrackpadScrollMode.legacy;
     if (peerPlatform == kPeerPlatformLinux) {
-      _trackpadScrollUnsent += (delta * _trackpadAdjustPeerLinux);
-      x = _trackpadScrollUnsent.dx.truncate();
-      y = _trackpadScrollUnsent.dy.truncate();
-      _trackpadScrollUnsent -= Offset(x.toDouble(), y.toDouble());
+      scrollMode = _activeLinuxTrackpadScrollMode;
+      final emitted = _takeLinuxTrackpadDelta(delta, scrollMode);
+      x = emitted.dx.toInt();
+      y = emitted.dy.toInt();
     } else {
       if (x == 0 && y == 0) {
         final thr = 0.1;
@@ -1372,10 +1407,54 @@ class InputModel {
             Offset(x.toDouble(), y.toDouble()));
       } else {
         if (isViewCamera) return;
-        bind.sessionSendMouse(
-            sessionId: sessionId,
-            msg: '{"type": "trackpad", "x": "$x", "y": "$y"}');
+        _sendTrackpadScroll(x, y, scrollMode);
       }
+    }
+  }
+
+  Offset _takeLinuxTrackpadDelta(Offset delta, _LinuxTrackpadScrollMode mode) {
+    final unitsPerPoint = switch (mode) {
+      _LinuxTrackpadScrollMode.legacy => _trackpadAdjustPeerLinux,
+      _LinuxTrackpadScrollMode.highResolutionWheel =>
+        _trackpadAdjustPeerLinux * kHighResolutionScrollUnitsPerStep,
+      _LinuxTrackpadScrollMode.smooth => kSmoothScrollUnitsPerPoint.toDouble(),
+    };
+    return _trackpadScrollAccumulator.take(delta, unitsPerPoint);
+  }
+
+  String _trackpadEventTypeFor(_LinuxTrackpadScrollMode mode) => switch (mode) {
+        _LinuxTrackpadScrollMode.legacy => _trackpadEventType,
+        _LinuxTrackpadScrollMode.highResolutionWheel =>
+          _trackpadHighResolutionEventType,
+        _LinuxTrackpadScrollMode.smooth => _trackpadSmoothEventType,
+      };
+
+  void _sendTrackpadScroll(int x, int y, _LinuxTrackpadScrollMode scrollMode) {
+    final eventType = _trackpadEventTypeFor(scrollMode);
+    bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: '{"type": "$eventType", "x": "$x", "y": "$y"}');
+    if (scrollMode != _LinuxTrackpadScrollMode.legacy) {
+      _activeTrackpadScrollEventType = eventType;
+    }
+  }
+
+  void _finishTrackpadScroll() {
+    final eventType = _activeTrackpadScrollEventType;
+    if (eventType == null) return;
+    bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: '{"type": "$eventType", "x": "0", "y": "0"}');
+    _activeTrackpadScrollEventType = null;
+  }
+
+  void _interruptFling({bool finishScroll = false}) {
+    final shouldFinishScroll = finishScroll || _fling;
+    _stopFling = true;
+    _flingTimer?.cancel();
+    _fling = false;
+    if (shouldFinishScroll) {
+      _finishTrackpadScroll();
     }
   }
 
@@ -1399,7 +1478,12 @@ class InputModel {
 
   void _scheduleFling(double x, double y, int delay) {
     if (isViewCamera) return;
-    if ((x == 0 && y == 0) || _stopFling) {
+    if (x == 0 && y == 0) {
+      _fling = false;
+      _finishTrackpadScroll();
+      return;
+    }
+    if (_stopFling) {
       _fling = false;
       return;
     }
@@ -1417,21 +1501,28 @@ class InputModel {
       // Try set delta (x,y) and delay.
       var dx = x.toInt();
       var dy = y.toInt();
+      var scrollMode = _LinuxTrackpadScrollMode.legacy;
       if (parent.target?.ffiModel.pi.platform == kPeerPlatformLinux) {
-        dx = (x * _trackpadAdjustPeerLinux).toInt();
-        dy = (y * _trackpadAdjustPeerLinux).toInt();
+        scrollMode = _activeLinuxTrackpadScrollMode;
+        if (scrollMode == _LinuxTrackpadScrollMode.highResolutionWheel) {
+          final emitted = _takeLinuxTrackpadDelta(Offset(x, y), scrollMode);
+          dx = emitted.dx.toInt();
+          dy = emitted.dy.toInt();
+        } else {
+          dx = (x * _trackpadAdjustPeerLinux).toInt();
+          dy = (y * _trackpadAdjustPeerLinux).toInt();
+        }
       }
 
       var delay = _flingBaseDelay;
 
       if (dx == 0 && dy == 0) {
         _fling = false;
+        _finishTrackpadScroll();
         return;
       }
 
-      bind.sessionSendMouse(
-          sessionId: sessionId,
-          msg: '{"type": "trackpad", "x": "$dx", "y": "$dy"}');
+      _sendTrackpadScroll(dx, dy, scrollMode);
       _scheduleFling(x, y, delay);
     });
   }
@@ -1450,7 +1541,11 @@ class InputModel {
   }
 
   void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
-    if (isViewCamera) return;
+    if (isViewCamera) {
+      _interruptFling(finishScroll: true);
+      _trackpadLastDelta = Offset.zero;
+      return;
+    }
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanEnd, e.position);
       return;
@@ -1464,6 +1559,14 @@ class InputModel {
     waitLastFlingDone();
     _stopFling = false;
 
+    if (isViewOnly ||
+        _activeLinuxTrackpadScrollMode == _LinuxTrackpadScrollMode.smooth) {
+      // Smooth scrolling leaves momentum to the target; view-only must not start a client fling.
+      _finishTrackpadScroll();
+      _trackpadLastDelta = Offset.zero;
+      return;
+    }
+
     // 2.0 is an experience value
     double minFlingValue = 2.0 * _trackpadSpeedInner;
     if (isMacOS && peerPlatform == kPeerPlatformWindows) {
@@ -1474,6 +1577,8 @@ class InputModel {
       _fling = true;
       _scheduleFling(
           _trackpadLastDelta.dx, _trackpadLastDelta.dy, _flingBaseDelay);
+    } else {
+      _finishTrackpadScroll();
     }
     _trackpadLastDelta = Offset.zero;
   }
@@ -1512,7 +1617,7 @@ class InputModel {
 
   void onPointDownImage(PointerDownEvent e) {
     debugPrint("onPointDownImage ${e.kind}");
-    _stopFling = true;
+    _interruptFling(finishScroll: true);
     if (isDesktop) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
     _windowRect = null;
