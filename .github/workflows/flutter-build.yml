@@ -44,7 +44,7 @@ env:
   # 2. Update the `VCPKG_COMMIT_ID` in `ci.yml` and `playground.yml`.
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836" # 2025.01.13, got "/opt/artifacts/vcpkg/vcpkg: No such file or directory" with latest version
-  VERSION: "1.4.9"
+  VERSION: "1.4.8"
   NDK_VERSION: "r28c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
@@ -1939,7 +1939,7 @@ jobs:
             # use the .so built on the runner; build.py checks it is the pinned checkout
             export DRMTAP_PREBUILT_DIR=/workspace/third_party/libdrmtap/build-pkg
             # ask build.py for the features so this line and the packaging line cannot drift
-            FEATURES=$(python3 ./build.py --flutter --drm --hwcodec --unix-file-copy-paste --print-features)
+            FEATURES=$(python3 ./build.py --flutter --drm --drm-wake --hwcodec --unix-file-copy-paste --print-features)
             # an empty or error-shaped value would silently build a stock binary
             for want in drm drm-wake; do
               case ",$FEATURES," in
