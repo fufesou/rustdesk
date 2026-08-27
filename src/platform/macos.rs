@@ -9,7 +9,7 @@ mod verified_dmg;
 #[path = "macos/verified_dmg_tests.rs"]
 mod verified_dmg_tests;
 
-use super::{CursorData, ResultType};
+use super::{validate_install_app_name, CursorData, ResultType};
 use cocoa::{
     appkit::{NSApp, NSApplication, NSApplicationActivationPolicy::*},
     base::{id, nil, BOOL, NO, YES},
@@ -35,7 +35,6 @@ use objc::rc::autoreleasepool;
 use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
-    collections::HashMap,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -55,11 +54,14 @@ static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
 const UPDATE_CLEANUP_FAILED_AFTER_COMMIT: &str = "UPDATE_CLEANUP_FAILED_AFTER_COMMIT";
+const CODESIGN_VERIFY_ARGS: &[&str] = &["--verify", "--deep", "--strict", "--verbose=2"];
+const SPCTL_ASSESS_ARGS: &[&str] = &["--assess", "--type", "execute", "--verbose=2"];
 // `kill -9` may not work without administrator privileges.
 const PRIVILEGED_UPDATE_BODY: &str = r#"
 	on run {app_name, cur_pid, source_path, user_name, restore_owner, expected_sha256}
 	    set app_bundle to "/Applications/" & app_name & ".app"
 	    set app_bundle_q to quoted form of app_bundle
+	    set installed_info_q to quoted form of (app_bundle & "/Contents/Info.plist")
 	    set source_path_q to quoted form of source_path
 	    set user_name_q to quoted form of user_name
 	    set expected_sha256_q to quoted form of expected_sha256
@@ -68,6 +70,7 @@ const PRIVILEGED_UPDATE_BODY: &str = r#"
 	    set kill_others to "pids=$(pgrep -x '" & app_name & "' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
 	    -- Rehash the root-owned copy in a clean environment before staging bytes.
 	    set prepare_verified to "verified_dir=$(/usr/bin/mktemp -d /tmp/.rustdeskupdate-verified.XXXXXX); /bin/chmod 0700 \"$verified_dir\"; verified_app=\"$verified_dir/" & app_name & ".app\"; dmg_attached=0; if [ -n " & expected_sha256_q & " ]; then verified_dmg=\"$verified_dir/update.dmg\"; /bin/cp " & source_path_q & " \"$verified_dmg\"; /usr/sbin/chown root:wheel \"$verified_dmg\"; /bin/chmod 0400 \"$verified_dmg\"; actual_sha256=$(/usr/bin/env -i /usr/bin/shasum -a 256 \"$verified_dmg\"); actual_sha256=${actual_sha256%% *}; if [ \"$actual_sha256\" != " & expected_sha256_q & " ]; then echo 'Update DMG SHA256 mismatch' >&2; exit 1; fi; dmg_mount=\"$verified_dir/mount\"; /bin/mkdir \"$dmg_mount\"; dmg_attached=1; /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint \"$dmg_mount\" \"$verified_dmg\" >/dev/null; /usr/bin/ditto \"$dmg_mount/" & app_name & ".app\" \"$verified_app\"; /usr/bin/hdiutil detach \"$dmg_mount\" -force >/dev/null; dmg_attached=0; /bin/rm -f \"$verified_dmg\"; else /usr/bin/ditto " & source_path_q & " \"$verified_app\"; fi; /usr/sbin/chown -R root:wheel \"$verified_app\"; /bin/chmod -R go-w \"$verified_app\";"
+	    set validate_verified_app to "installed_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' " & installed_info_q & "); candidate_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \"$verified_app/Contents/Info.plist\"); if [ -z \"$installed_bundle_id\" ] || [ -z \"$candidate_bundle_id\" ] || [ \"$installed_bundle_id\" != \"$candidate_bundle_id\" ]; then echo 'Update app bundle identifier mismatch' >&2; exit 1; fi; /usr/bin/codesign --verify --deep --strict --verbose=2 \"$verified_app\"; /usr/sbin/spctl --assess --type execute --verbose=2 \"$verified_app\";"
 	    set prepare_swap_paths to "temp_bundle=" & app_bundle_q & ".new.$$; old_bundle=" & app_bundle_q & ".old.$$;"
 	    set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
 	    set stage_bundle to "ditto \"$verified_app\" \"$temp_bundle\";"
@@ -80,7 +83,7 @@ const PRIVILEGED_UPDATE_BODY: &str = r#"
 	    set rollback_update to "status=$?; trap - EXIT; set +e; cleanup_status=0; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & rollback_bundle & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; if [ \"$cleanup_status\" -ne 0 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then status=1; elif [ \"$cleanup_status\" -ne 0 ]; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi; exit \"$status\";"
 	    set commit_update to "transaction_committed=1; if ! rm -rf \"$old_bundle\"; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi;"
 	    set copy_files to prepare_swap_paths & cleanup_swap_paths & stage_bundle & protect_staged_bundle & "transaction_started=1;" & move_current_bundle & install_staged_bundle & restore_installed_owner & commit_update
-	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & kill_others & prepare_verified & copy_files
+	    set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & prepare_verified & validate_verified_app & kill_others & copy_files
 
 	    do shell script sh with prompt app_name & " wants to update itself" with administrator privileges
 	end run
@@ -309,11 +312,7 @@ impl UpdateSource {
     }
 }
 
-fn update_daemon_agent(
-    agent_plist_file: String,
-    update_source: UpdateSource,
-    sync: bool,
-) -> ResultType<()> {
+fn update_daemon_agent(agent_plist_file: String, update_source: UpdateSource) -> ResultType<()> {
     let update_script_file = "update.scpt";
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
         bail!("Failed to find {}", update_script_file);
@@ -359,14 +358,7 @@ fn update_daemon_agent(
         }
         Ok(())
     };
-    if sync {
-        func()
-    } else {
-        std::thread::spawn(move || {
-            hbb_common::allow_err!(func());
-        });
-        Ok(())
-    }
+    func()
 }
 
 fn correct_app_name(s: &str) -> String {
@@ -1011,6 +1003,8 @@ fn update_me_from_app_dir(app_dir: String) -> ResultType<()> {
 }
 
 fn update_me_from_source(update_source: UpdateSource) -> ResultType<()> {
+    let app_name = crate::get_app_name();
+    validate_install_app_name(&app_name)?;
     let is_installed_daemon = is_installed_daemon(false);
     let option_stop_service = "stop-service";
     let is_service_stopped = hbb_common::config::option2bool(
@@ -1018,11 +1012,10 @@ fn update_me_from_source(update_source: UpdateSource) -> ResultType<()> {
         &crate::ui_interface::get_option(option_stop_service),
     );
 
-    let app_name = crate::get_app_name();
     if is_installed_daemon && !is_service_stopped {
         let agent = format!("{}_server.plist", crate::get_full_name());
         let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
-        update_daemon_agent(agent_plist_file, update_source, true)?;
+        update_daemon_agent(agent_plist_file, update_source)?;
     } else {
         let (update_source_path, expected_sha256) = update_source.into_script_args();
         let output = Command::new("osascript")
@@ -1112,12 +1105,6 @@ fn update_from_verified_dmg(verified_dmg: &VerifiedDmg) -> ResultType<()> {
     Ok(())
 }
 
-pub fn update_to(_file: &str) -> ResultType<()> {
-    let update_temp_dir = get_update_temp_dir_string();
-    update_extracted(&update_temp_dir)?;
-    Ok(())
-}
-
 fn backup_update_plist(source: &str, backup: &str) -> ResultType<()> {
     match std::fs::symlink_metadata(source) {
         Ok(metadata) => {
@@ -1176,17 +1163,61 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
     Ok(())
 }
 
+fn read_bundle_plist_value(app: &Path, key: &str) -> ResultType<String> {
+    let info_plist = app.join("Contents/Info.plist");
+    let plist_command = format!("Print :{key}");
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", plist_command.as_str()])
+        .arg(info_plist)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "[root-update] failed to read bundle plist value {key}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|err| anyhow!("[root-update] bundle plist value {key} is not UTF-8: {err}"))?;
+    if value.trim().is_empty() {
+        bail!("[root-update] bundle plist value {key} is empty");
+    }
+    Ok(value.trim().to_owned())
+}
+
+fn verify_update_app_identity_and_signature(installed: &Path, candidate: &Path) -> ResultType<()> {
+    let installed_id = read_bundle_plist_value(installed, "CFBundleIdentifier")?;
+    let candidate_id = read_bundle_plist_value(candidate, "CFBundleIdentifier")?;
+    if installed_id != candidate_id {
+        bail!("[root-update] candidate bundle identifier mismatch");
+    }
+    let codesign = Command::new("/usr/bin/codesign")
+        .args(CODESIGN_VERIFY_ARGS)
+        .arg(candidate)
+        .output()?;
+    if !codesign.status.success() {
+        bail!(
+            "[root-update] candidate code signature is invalid: {}",
+            String::from_utf8_lossy(&codesign.stderr).trim()
+        );
+    }
+    let assessment = Command::new("/usr/sbin/spctl")
+        .args(SPCTL_ASSESS_ARGS)
+        .arg(candidate)
+        .output()?;
+    if !assessment.status.success() {
+        bail!(
+            "[root-update] candidate Gatekeeper assessment failed: {}",
+            String::from_utf8_lossy(&assessment.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Performs a silent update from a DMG file without any osascript dialog.
 /// Must be called from a process running as root (e.g. the service binary).
 pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> ResultType<()> {
     let app_name = crate::get_app_name();
-    if app_name.is_empty()
-        || !app_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("[root-update] unsafe application name");
-    }
+    validate_install_app_name(&app_name)?;
     let app_bundle = format!("/Applications/{}.app", app_name);
     let tmp_dir_output = std::process::Command::new("/usr/bin/mktemp")
         .args(&["-d", "/tmp/.rustdeskupdate-root-XXXXXX"])
@@ -1215,6 +1246,7 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     let src_app = format!("{}/{}.app", tmp_dir, app_name);
     log::info!("[root-update] DMG extracted to {}", tmp_dir);
     validate_update_tree(Path::new(&src_app), None)?;
+    verify_update_app_identity_and_signature(Path::new(&app_bundle), Path::new(&src_app))?;
 
     // Bind the downloaded asset to the version returned by the update
     // service before changing plists or executing anything from the staged
@@ -1873,33 +1905,6 @@ rm -rf {tmp_dir}
     Ok(())
 }
 
-pub fn extract_update_dmg(file: &str) {
-    let update_temp_dir = get_update_temp_dir_string();
-    let mut evt: HashMap<&str, String> =
-        HashMap::from([("name", "extract-update-dmg".to_string())]);
-    match extract_dmg(file, &update_temp_dir) {
-        Ok(_) => {
-            log::info!("Extracted dmg file to {}", update_temp_dir);
-        }
-        Err(e) => {
-            evt.insert("err", e.to_string());
-            log::error!("Failed to extract dmg file {}: {}", file, e);
-        }
-    }
-    let evt = serde_json::ser::to_string(&evt).unwrap_or("".to_owned());
-    #[cfg(feature = "flutter")]
-    crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
-}
-
-fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let target_path = Path::new(target_dir);
-    if target_path.exists() {
-        std::fs::remove_dir_all(target_path)?;
-    }
-    std::fs::create_dir_all(target_path)?;
-    extract_dmg_inner(dmg_path, target_dir)
-}
-
 fn extract_dmg_into_existing_dir(dmg_path: &str, target_dir: &str) -> ResultType<()> {
     let target_path = Path::new(target_dir);
     if !target_path.exists() {
@@ -1914,17 +1919,6 @@ fn verified_dmg_update_source(verified_dmg: &VerifiedDmg) -> ResultType<UpdateSo
         path: verified_dmg_path(verified_dmg)?.to_owned(),
         expected_sha256: verified_dmg.expected_sha256.clone(),
     })
-}
-
-fn update_extracted(target_dir: &str) -> ResultType<()> {
-    let result = update_me_from_app_dir(
-        Path::new(target_dir)
-            .join(format!("{}.app", crate::get_app_name()))
-            .to_string_lossy()
-            .into_owned(),
-    );
-    try_remove_temp_update_dir(Some(target_dir));
-    result
 }
 
 pub fn get_double_click_time() -> u32 {
@@ -2123,7 +2117,7 @@ impl WakeLock {
     }
 }
 
-fn get_bundle_id() -> Option<String> {
+pub(crate) fn get_bundle_id() -> Option<String> {
     unsafe {
         let bundle: id = msg_send![class!(NSBundle), mainBundle];
         if bundle.is_null() {

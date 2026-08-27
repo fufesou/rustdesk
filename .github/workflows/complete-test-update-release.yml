@@ -247,7 +247,6 @@ jobs:
       - name: Generate, sign, and verify metadata
         shell: bash
         env:
-          RUSTDESK_UPDATE_GITHUB_REPOSITORY: ${{ env.TARGET_REPOSITORY }}
           RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
           RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
           GH_TOKEN: ${{ github.token }}
@@ -273,13 +272,17 @@ jobs:
           macos x86_64 dmg rustdesk-${VERSION}-x86_64.dmg
           EOF
           published_at=$(gh release view "$RELEASE_ID" --repo "$TARGET_REPOSITORY" --json publishedAt --jq .publishedAt)
-          python res/generate_update_metadata.py sign "${sign_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID" --published-at "$published_at" --metadata-out rustdesk-update.json --signature-out rustdesk-update.json.sig
-          python res/generate_update_metadata.py verify --metadata rustdesk-update.json --signature rustdesk-update.json.sig "${artifact_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID"
+          python res/generate_update_metadata.py sign "${sign_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID" --package-id rustdesk --release-base-url "https://github.com/${TARGET_REPOSITORY}/releases/download" --published-at "$published_at" --metadata-out rustdesk-update.json --signature-out rustdesk-update.json.sig
+          python res/generate_update_metadata.py verify --metadata rustdesk-update.json --signature rustdesk-update.json.sig "${artifact_args[@]}" --version "$VERSION" --release-id "$RELEASE_ID" --package-id rustdesk --release-base-url "https://github.com/${TARGET_REPOSITORY}/releases/download"
       - name: Publish ARM64 packages before metadata
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$RELEASE_ID" "artifacts/rustdesk-${VERSION}-aarch64.exe" "artifacts/rustdesk-${VERSION}-aarch64.msi" --repo "$TARGET_REPOSITORY" --clobber
-      - name: Publish signed metadata last
+      - name: Publish signed metadata signature
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$RELEASE_ID" rustdesk-update.json rustdesk-update.json.sig --repo "$TARGET_REPOSITORY" --clobber
+        run: gh release upload "$RELEASE_ID" rustdesk-update.json.sig --repo "$TARGET_REPOSITORY" --clobber
+      - name: Publish signed update metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_ID" rustdesk-update.json --repo "$TARGET_REPOSITORY" --clobber

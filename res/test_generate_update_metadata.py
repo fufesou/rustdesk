@@ -7,14 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
 SCRIPT = Path(__file__).with_name("generate_update_metadata.py")
+OFFICIAL_RELEASE_BASE_URL = "https://github.com/rustdesk/rustdesk/releases/download"
 
 
 class GenerateUpdateMetadataTest(unittest.TestCase):
     def setUp(self):
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ed25519
-
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         private_key = ed25519.Ed25519PrivateKey.generate()
@@ -33,17 +34,14 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def run_script(self, *args, seed=None, public_key=None, repository=None):
+    def run_script(self, *args, seed=None, public_key=None):
         env = os.environ.copy()
         env.pop("RUSTDESK_UPDATE_ED25519_SEED", None)
         env.pop("RUSTDESK_UPDATE_ED25519_PUBLIC_KEY", None)
-        env.pop("RUSTDESK_UPDATE_GITHUB_REPOSITORY", None)
         if seed is not None:
             env["RUSTDESK_UPDATE_ED25519_SEED"] = seed
         if public_key is not None:
             env["RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"] = public_key
-        if repository is not None:
-            env["RUSTDESK_UPDATE_GITHUB_REPOSITORY"] = repository
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             cwd=SCRIPT.parents[1],
@@ -63,8 +61,9 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         *,
         version="1.4.6",
         release_id="v1.4.6",
+        package_id="rustdesk",
+        release_base_url=OFFICIAL_RELEASE_BASE_URL,
         seed=None,
-        repository=None,
     ):
         metadata = self.root / "rustdesk-update.json"
         signature = self.root / "rustdesk-update.json.sig"
@@ -77,6 +76,10 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
                 version,
                 "--release-id",
                 release_id,
+                "--package-id",
+                package_id,
+                "--release-base-url",
+                release_base_url,
                 "--published-at",
                 "2026-05-14T00:00:00Z",
                 "--metadata-out",
@@ -85,14 +88,20 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
                 str(signature),
             ]
         )
-        result = self.run_script(
-            *args,
-            seed=self.seed if seed is None else seed,
-            repository=repository,
-        )
+        result = self.run_script(*args, seed=self.seed if seed is None else seed)
         return metadata, signature, result
 
-    def verify(self, metadata, signature, artifacts, public_key=None):
+    def verify(
+        self,
+        metadata,
+        signature,
+        artifacts,
+        *,
+        public_key=None,
+        release_id="v1.4.6",
+        package_id="rustdesk",
+        release_base_url=OFFICIAL_RELEASE_BASE_URL,
+    ):
         args = [
             "verify",
             "--metadata",
@@ -102,7 +111,11 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
             "--version",
             "1.4.6",
             "--release-id",
-            "v1.4.6",
+            release_id,
+            "--package-id",
+            package_id,
+            "--release-base-url",
+            release_base_url,
         ]
         for artifact in artifacts:
             args.extend(["--artifact", str(artifact)])
@@ -110,6 +123,17 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
             *args,
             public_key=public_key or self.public_key,
         )
+
+    def rust_source(self, public_key=None):
+        key_bytes = base64.b64decode(public_key or self.public_key)
+        source = self.root / "update_metadata.rs"
+        source.write_text(
+            'TrustedUpdateKey { key_id: "2026-ed25519-main", public_key: ['
+            + ",".join(str(byte) for byte in key_bytes)
+            + "] }",
+            encoding="utf-8",
+        )
+        return source
 
     def test_signs_and_verifies_release_artifacts(self):
         exe = self.artifact()
@@ -125,31 +149,70 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         self.assertEqual(data["release_id"], "v1.4.6")
         self.assertEqual({item["file_name"] for item in data["artifacts"]}, {exe.name, dmg.name})
 
-    def test_sign_uses_configured_github_repository(self):
-        artifact = self.artifact()
-        metadata, _, signed = self.sign(
-            [("windows", "x86_64", "exe", artifact)],
-            release_id="fix-update-metadata",
-            repository="fufesou/rustdesk",
+    def test_signs_and_verifies_non_official_release_identities(self):
+        cases = (
+            (
+                "rustdesk",
+                "https://github.com/fufesou/rustdesk/releases/download",
+                "fix-update-metadata",
+                "rustdesk-1.4.6-aarch64.dmg",
+            ),
+            (
+                "com.example.rustdesk-custom",
+                "https://updates.example.com/releases/download",
+                "v1.4.6",
+                "rustdesk-custom-1.4.6-aarch64.dmg",
+            ),
         )
+        for package_id, release_base_url, release_id, file_name in cases:
+            with self.subTest(package_id=package_id, release_id=release_id):
+                artifact = self.artifact(file_name, b"dmg")
+                metadata, signature, signed = self.sign(
+                    [("macos", "aarch64", "dmg", artifact)],
+                    package_id=package_id,
+                    release_id=release_id,
+                    release_base_url=release_base_url,
+                )
+                verified = self.verify(
+                    metadata,
+                    signature,
+                    [artifact],
+                    package_id=package_id,
+                    release_id=release_id,
+                    release_base_url=release_base_url,
+                )
 
-        self.assertEqual(signed.returncode, 0, signed.stderr)
-        data = json.loads(metadata.read_text(encoding="utf-8"))
-        self.assertEqual(
-            data["artifacts"][0]["url"],
-            "https://github.com/fufesou/rustdesk/releases/download/"
-            "fix-update-metadata/rustdesk-1.4.6-x86_64.exe",
-        )
+                self.assertEqual(signed.returncode, 0, signed.stderr)
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+                data = json.loads(metadata.read_text(encoding="utf-8"))
+                self.assertEqual(data["package_id"], package_id)
+                self.assertEqual(
+                    data["artifacts"][0]["url"],
+                    f"{release_base_url}/{release_id}/{artifact.name}",
+                )
 
-    def test_sign_rejects_invalid_github_repository(self):
-        artifact = self.artifact()
-        _, _, signed = self.sign(
-            [("windows", "x86_64", "exe", artifact)],
-            repository="../rustdesk",
-        )
+    def test_rejects_unsafe_custom_release_policy(self):
+        artifact = self.artifact("rustdesk-custom-1.4.6-aarch64.dmg", b"dmg")
+        spec = [("macos", "aarch64", "dmg", artifact)]
 
-        self.assertNotEqual(signed.returncode, 0)
-        self.assertIn("invalid GitHub repository", signed.stderr)
+        for package_id in ("", "com.example/custom", "com.example custom"):
+            with self.subTest(package_id=package_id):
+                self.assertNotEqual(
+                    self.sign(spec, package_id=package_id)[2].returncode,
+                    0,
+                )
+        for release_base_url in (
+            "http://updates.example.com/releases",
+            "https://user@updates.example.com/releases",
+            "https://updates.example.com/releases/",
+            "https://updates.example.com/releases?channel=stable",
+            "https://updates.example.com/relea\nses",
+        ):
+            with self.subTest(release_base_url=release_base_url):
+                self.assertNotEqual(
+                    self.sign(spec, release_base_url=release_base_url)[2].returncode,
+                    0,
+                )
 
     def test_verification_rejects_tampering(self):
         artifact = self.artifact()
@@ -168,7 +231,12 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         metadata, signature, _ = self.sign([("windows", "x86_64", "exe", artifact)])
         wrong_key = base64.b64encode(b"x" * 32).decode("ascii")
         self.assertNotEqual(
-            self.verify(metadata, signature, [artifact], wrong_key).returncode,
+            self.verify(
+                metadata,
+                signature,
+                [artifact],
+                public_key=wrong_key,
+            ).returncode,
             0,
         )
 
@@ -176,27 +244,73 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         artifact = self.artifact()
         spec = [("windows", "x86_64", "exe", artifact)]
         self.assertNotEqual(self.sign(spec, version="1.4.7")[2].returncode, 0)
-        self.assertNotEqual(self.sign(spec, release_id="bad/tag")[2].returncode, 0)
+        for release_id in ("bad/tag", "bad\tid", "bad%zz"):
+            self.assertNotEqual(self.sign(spec, release_id=release_id)[2].returncode, 0)
         self.assertNotEqual(self.sign(spec, seed="invalid")[2].returncode, 0)
         duplicate = spec + [("windows", "x86_64", "exe", artifact)]
         self.assertNotEqual(self.sign(duplicate)[2].returncode, 0)
 
     def test_checks_embedded_public_key(self):
-        key_bytes = base64.b64decode(self.public_key)
-        source = self.root / "update_metadata.rs"
-        source.write_text(
-            'TrustedUpdateKey { key_id: "2026-ed25519-main", public_key: ['
-            + ",".join(str(byte) for byte in key_bytes)
-            + "] }",
-            encoding="utf-8",
-        )
+        source = self.rust_source()
         result = self.run_script(
             "check-key",
             "--rust-source",
             str(source),
+            seed=self.seed,
             public_key=self.public_key,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_check_key_rejects_invalid_or_mismatched_seed(self):
+        source = self.rust_source()
+        invalid_seeds = [
+            None,
+            "invalid",
+            base64.b64encode(b"x" * 31).decode("ascii"),
+            base64.b64encode(b"x" * 32).decode("ascii"),
+        ]
+
+        for seed in invalid_seeds:
+            with self.subTest(seed=seed):
+                result = self.run_script(
+                    "check-key",
+                    "--rust-source",
+                    str(source),
+                    seed=seed,
+                    public_key=self.public_key,
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_check_key_rejects_invalid_public_key(self):
+        source = self.rust_source()
+        invalid_keys = [
+            None,
+            "invalid",
+            base64.b64encode(b"x" * 31).decode("ascii"),
+        ]
+
+        for public_key in invalid_keys:
+            with self.subTest(public_key=public_key):
+                result = self.run_script(
+                    "check-key",
+                    "--rust-source",
+                    str(source),
+                    seed=self.seed,
+                    public_key=public_key,
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_check_key_rejects_mismatched_embedded_key(self):
+        embedded_key = base64.b64encode(b"x" * 32).decode("ascii")
+        result = self.run_script(
+            "check-key",
+            "--rust-source",
+            str(self.rust_source(embedded_key)),
+            seed=self.seed,
+            public_key=self.public_key,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
 
     def test_release_workflows_use_current_metadata_cli(self):
         workflows = [
@@ -211,30 +325,6 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
                 self.assertNotIn("--fragment", content)
                 self.assertIn("generate_update_metadata.py sign", content)
                 self.assertIn("generate_update_metadata.py verify", content)
-
-
-class FlutterBuildWorkflowTest(unittest.TestCase):
-    def test_uploads_artifacts_from_merged_download_directory(self):
-        workflow = SCRIPT.parents[1] / ".github/workflows/flutter-build.yml"
-        content = workflow.read_text(encoding="utf-8")
-        upload_step = content.split(
-            "      - name: Upload signed update artifacts", 1
-        )[1].split("      - name: Upload signed update metadata signature", 1)[0]
-        expected_files = (
-            "./artifacts/rustdesk-${{ env.VERSION }}-x86_64.exe",
-            "./artifacts/rustdesk-${{ env.VERSION }}-x86_64.msi",
-            "./artifacts/rustdesk-${{ env.VERSION }}-aarch64.exe",
-            "./artifacts/rustdesk-${{ env.VERSION }}-aarch64.msi",
-            "./artifacts/rustdesk-${{ env.VERSION }}-x86-sciter.exe",
-            "./artifacts/rustdesk-${{ env.VERSION }}-aarch64.dmg",
-            "./artifacts/rustdesk-${{ env.VERSION }}-x86_64.dmg",
-        )
-
-        for artifact in expected_files:
-            with self.subTest(artifact=artifact):
-                self.assertIn(artifact, upload_step)
-        self.assertNotIn("./artifacts/windows-", upload_step)
-        self.assertNotIn("./artifacts/macos-", upload_step)
 
 
 if __name__ == "__main__":

@@ -1138,19 +1138,14 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     };
     let response_bytes = match latest_release_response {
         Ok((used_tls_type, response)) => {
+            upsert_tls_cache(tls_url, used_tls_type, false);
             let status = response.status();
             if !status.is_success() {
                 Err(anyhow!(
                     "Software update check failed with HTTP status: {status}"
                 ))
             } else {
-                match response.bytes().await {
-                    Ok(bytes) => {
-                        upsert_tls_cache(tls_url, used_tls_type, false);
-                        Ok(bytes)
-                    }
-                    Err(err) => Err(err.into()),
-                }
+                Ok(response.bytes().await?)
             }
         }
         Err(err) => Err(err),

@@ -207,11 +207,6 @@ fn check_update(manually: bool) -> ResultType<()> {
             log::debug!("Automatic update is not supported on this platform.");
             return Ok(());
         }
-        #[cfg(target_os = "macos")]
-        if !manually {
-            log::debug!("Background auto-install is not supported on macOS.");
-            return Ok(());
-        }
         let query = crate::update_metadata::UpdateArtifactQuery {
             platform: current_update_platform(),
             arch: current_update_arch(),
@@ -257,6 +252,7 @@ fn verified_update_path(
     file_path: &Path,
 ) -> Option<(crate::platform::VerifiedUpdateFile, String)> {
     let update_file = match crate::platform::copy_and_verify_update_file_sha256(p, expected_sha256)
+        .and_then(crate::platform::VerifiedUpdateFile::verify_authenticode)
     {
         Ok(update_file) => update_file,
         Err(e) => {
