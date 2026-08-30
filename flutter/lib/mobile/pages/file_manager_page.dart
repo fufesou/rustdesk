@@ -213,10 +213,10 @@ class _FileManagerPageState extends State<FileManagerPage> {
       showToast(translate('Failed'));
       return;
     }
-    final rustDeskDir = PathUtil.join(home, 'RustDesk', false);
+    final appDir = PathUtil.join(home, appName, false);
     final paths = [
-      PathUtil.join(rustDeskDir, 'Logs', false),
-      PathUtil.join(rustDeskDir, 'ScreenRecord', false),
+      PathUtil.join(appDir, 'Logs', false),
+      PathUtil.join(appDir, 'ScreenRecord', false),
     ].where((p) => File(p).existsSync() || Directory(p).existsSync()).toList();
     if (paths.isEmpty) {
       showToast(translate('Failed'));
@@ -600,8 +600,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
           return BottomSheetBody(
             leading: CircularProgressIndicator(),
             title: translate("Waiting"),
-            text:
-                "${translate("Speed")}:  ${readableFileSize(activeJob.speed)}/s",
+            text: "${readableFileSize(activeJob.speed)}/s",
             onCanceled: () {
               model.jobController.cancelJob(activeJob.id);
               jobTable.clear();

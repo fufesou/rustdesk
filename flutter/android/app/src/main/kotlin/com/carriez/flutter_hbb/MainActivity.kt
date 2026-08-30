@@ -228,6 +228,16 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         Log.e(logTag, "onDestroy")
+        // The process can outlive the UI whenever something keeps it alive:
+        // MainService, or the accessibility InputService on its own. Only the
+        // former gets onTaskRemoved, so close outgoing sessions here too,
+        // otherwise a session survives with no UI left to close it.
+        // `isFinishing` distinguishes the user really leaving from a destroy
+        // for recreation (configuration change, "don't keep activities"),
+        // which must not tear down a live session.
+        if (isFinishing) {
+            FFI.closeAllSessions()
+        }
         mainService?.let {
             unbindService(serviceConnection)
         }
@@ -554,11 +564,26 @@ class MainActivity : FlutterActivity() {
                                     }
                                 }
                                 if (!temporary!!.renameTo(destination)) {
-                                    backup?.renameTo(destination)
+                                    val destinationBackup = backup
+                                    if (destinationBackup != null &&
+                                        !destinationBackup.renameTo(destination)
+                                    ) {
+                                        throw IllegalStateException(
+                                            "Unable to move the imported folder and restore " +
+                                                "the destination from $destinationBackup"
+                                        )
+                                    }
                                     throw IllegalStateException("Unable to move the imported folder")
                                 }
                                 temporary = null
-                                backup?.deleteRecursively()
+                                val destinationBackup = backup
+                                if (destinationBackup != null &&
+                                    !destinationBackup.deleteRecursively()
+                                ) {
+                                    throw IllegalStateException(
+                                        "Unable to remove the destination backup: $destinationBackup"
+                                    )
+                                }
                                 backup = null
                                 true
                             } catch (e: Exception) {
@@ -734,13 +759,12 @@ class MainActivity : FlutterActivity() {
                 .getMimeTypeFromExtension(safeSource.extension.lowercase())
                 ?: "application/octet-stream"
             val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocId)
-            val existing = findChildDocId(treeUri, parentDocId, safeSource.name)
-            val docUri = if (existing != null) {
-                DocumentsContract.buildDocumentUriUsingTree(treeUri, existing)
-            } else {
-                DocumentsContract.createDocument(contentResolver, parentUri, mime, safeSource.name)
-                    ?: return false
-            }
+            val docUri = DocumentsContract.createDocument(
+                contentResolver,
+                parentUri,
+                mime,
+                safeSource.name
+            ) ?: return false
             contentResolver.openOutputStream(docUri, "wt")?.use { output ->
                 FileInputStream(safeSource).use { input -> input.copyTo(output) }
             } ?: return false
