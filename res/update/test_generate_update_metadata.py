@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 SCRIPT = Path(__file__).with_name("generate_update_metadata.py")
-OFFICIAL_RELEASE_BASE_URL = "https://github.com/rustdesk/rustdesk/releases/download"
+OFFICIAL_RELEASE_BASE_URL = "https://github.com/fufesou/rustdesk/releases/download"
 
 
 class GenerateUpdateMetadataTest(unittest.TestCase):
