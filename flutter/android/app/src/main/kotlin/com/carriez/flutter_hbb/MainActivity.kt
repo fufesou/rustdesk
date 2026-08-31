@@ -539,6 +539,9 @@ class MainActivity : FlutterActivity() {
                             val ok = try {
                                 val parent = destination.parentFile
                                     ?: throw IllegalStateException("The destination has no parent")
+                                // If the selected SAF tree contains this parent, the staging
+                                // directory can appear in the source traversal. The copy then
+                                // fails before replacement, and `finally` removes the staging tree.
                                 temporary = File.createTempFile(
                                     ".rustdesk-import-dir-",
                                     ".tmp",
