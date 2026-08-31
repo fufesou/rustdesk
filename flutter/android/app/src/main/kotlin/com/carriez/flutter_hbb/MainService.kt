@@ -509,13 +509,28 @@ class MainService : Service() {
 
     @Synchronized
     private fun startMicrophoneCapture(startAudio: () -> Boolean): Boolean {
+        Log.d(
+            logTag,
+            "startMicrophoneCapture begin, sdk=${Build.VERSION.SDK_INT}, " +
+                    "mediaProjectionPresent=${mediaProjection != null}, " +
+                    "captureRestartPending=$captureRestartPending, " +
+                    "mediaProjectionFgs=$mediaProjectionForegroundService, " +
+                    "microphoneFgs=$microphoneForegroundService"
+        )
         if (!setMicrophoneForegroundService(true)) {
+            Log.e(logTag, "startMicrophoneCapture failed to enable microphone FGS")
             return false
         }
-        if (startAudio()) {
+        val audioStarted = startAudio()
+        Log.d(logTag, "startMicrophoneCapture audioStarted=$audioStarted")
+        if (audioStarted) {
             return true
         }
-        setMicrophoneForegroundService(false)
+        val foregroundServiceRestored = setMicrophoneForegroundService(false)
+        Log.d(
+            logTag,
+            "startMicrophoneCapture rollback, foregroundServiceRestored=$foregroundServiceRestored"
+        )
         return false
     }
 
@@ -546,12 +561,19 @@ class MainService : Service() {
 
     @Synchronized
     fun onVoiceCallStarted(): Boolean {
+        Log.d(
+            logTag,
+            "onVoiceCallStarted begin, captureRestartPending=$captureRestartPending, " +
+                    "mediaProjectionPresent=${mediaProjection != null}"
+        )
         if (captureRestartPending) {
             captureRestartInVoiceCall = true
         }
-        return startMicrophoneCapture {
+        val started = startMicrophoneCapture {
             audioRecordHandle.onVoiceCallStarted(mediaProjection)
         }
+        Log.d(logTag, "onVoiceCallStarted result=$started")
+        return started
     }
 
     @Synchronized
@@ -858,8 +880,16 @@ class MainService : Service() {
             .setWhen(System.currentTimeMillis())
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(DEFAULT_NOTIFY_ID, notification, foregroundServiceType())
+            val serviceType = foregroundServiceType()
+            Log.d(
+                logTag,
+                "startForeground, sdk=${Build.VERSION.SDK_INT}, serviceType=$serviceType, " +
+                        "mediaProjectionFgs=$mediaProjectionForegroundService, " +
+                        "microphoneFgs=$microphoneForegroundService"
+            )
+            startForeground(DEFAULT_NOTIFY_ID, notification, serviceType)
         } else {
+            Log.d(logTag, "startForeground, sdk=${Build.VERSION.SDK_INT}, legacy service type")
             startForeground(DEFAULT_NOTIFY_ID, notification)
         }
     }
@@ -892,8 +922,10 @@ class MainService : Service() {
         mediaProjectionEnabled: Boolean,
         microphoneEnabled: Boolean,
     ): Boolean {
+        Log.d(logTag, "updateForegroundServiceTypes, currentMediaProjection=$mediaProjectionForegroundService, currentMicrophone=$microphoneForegroundService, requestedMediaProjection=$mediaProjectionEnabled, requestedMicrophone=$microphoneEnabled")
         if (mediaProjectionForegroundService == mediaProjectionEnabled &&
             microphoneForegroundService == microphoneEnabled) {
+            Log.d(logTag, "updateForegroundServiceTypes unchanged")
             return true
         }
         val previousMediaProjection = mediaProjectionForegroundService
@@ -902,16 +934,17 @@ class MainService : Service() {
         microphoneForegroundService = microphoneEnabled
         return try {
             createForegroundNotification()
+            Log.d(logTag, "updateForegroundServiceTypes success, mediaProjection=$mediaProjectionForegroundService, microphone=$microphoneForegroundService")
             true
         } catch (error: SecurityException) {
             mediaProjectionForegroundService = previousMediaProjection
             microphoneForegroundService = previousMicrophone
-            Log.e(logTag, "Failed to update foreground service types", error)
+            Log.e(logTag, "Failed to update foreground service types, restoredMediaProjection=$mediaProjectionForegroundService, restoredMicrophone=$microphoneForegroundService", error)
             false
         } catch (error: IllegalStateException) {
             mediaProjectionForegroundService = previousMediaProjection
             microphoneForegroundService = previousMicrophone
-            Log.e(logTag, "Failed to update foreground service types", error)
+            Log.e(logTag, "Failed to update foreground service types, restoredMediaProjection=$mediaProjectionForegroundService, restoredMicrophone=$microphoneForegroundService", error)
             false
         }
     }

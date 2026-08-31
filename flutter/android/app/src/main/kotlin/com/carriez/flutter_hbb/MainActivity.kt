@@ -956,6 +956,10 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun onVoiceCallStarted() {
+        Log.d(
+            logTag,
+            "onVoiceCallStarted begin, sdk=${Build.VERSION.SDK_INT}, mainServiceBound=${mainService != null}"
+        )
         var ok = false
         mainService?.let {
             ok = it.onVoiceCallStarted()
