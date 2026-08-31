@@ -21,7 +21,10 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     companion object {
         private const val LOG_TAG = "LOG_AUDIO_RECORD_HANDLE"
         private const val NO_ACTIVE_PUBLISHERS = 0
+        private const val NO_ACTIVE_COMMUNICATION_MODE_OWNERS = 0
         private var activeAudioFramePublishers = NO_ACTIVE_PUBLISHERS
+        // Audio mode requests are process-scoped, so all AudioRecordHandle instances share ownership.
+        private var activeCommunicationModeOwners = NO_ACTIVE_COMMUNICATION_MODE_OWNERS
 
         @Synchronized
         private fun acquireAudioFramePublisher() {
@@ -42,6 +45,92 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 FFI.setFrameRawEnable("audio", false)
             }
         }
+
+        private fun getAudioManager(context: Context): AudioManager? {
+            val audioManager = try {
+                context.applicationContext.getSystemService(Context.AUDIO_SERVICE)
+            } catch (error: Exception) {
+                Log.e(LOG_TAG, "Failed to get AudioManager", error)
+                return null
+            }
+            if (audioManager !is AudioManager) {
+                Log.e(LOG_TAG, "AudioManager is unavailable")
+                return null
+            }
+            return audioManager
+        }
+
+        private fun logCommunicationMode(
+            operation: String,
+            owners: Int,
+            audioManager: AudioManager,
+        ) {
+            try {
+                Log.d(LOG_TAG, "$operation, owners=$owners, currentMode=${audioManager.mode}")
+            } catch (error: Exception) {
+                Log.e(LOG_TAG, "$operation, owners=$owners, failed to read current mode", error)
+            }
+        }
+
+        @Synchronized
+        private fun acquireCommunicationMode(context: Context): Boolean {
+            val audioManager = getAudioManager(context) ?: return false
+            logCommunicationMode(
+                "acquireCommunicationMode begin",
+                activeCommunicationModeOwners,
+                audioManager,
+            )
+            if (activeCommunicationModeOwners == NO_ACTIVE_COMMUNICATION_MODE_OWNERS) {
+                try {
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                } catch (error: Exception) {
+                    Log.e(LOG_TAG, "Failed to set MODE_IN_COMMUNICATION", error)
+                    return false
+                }
+            }
+            activeCommunicationModeOwners++
+            logCommunicationMode(
+                "acquireCommunicationMode done",
+                activeCommunicationModeOwners,
+                audioManager,
+            )
+            return true
+        }
+
+        @Synchronized
+        private fun releaseCommunicationMode(context: Context) {
+            if (activeCommunicationModeOwners == NO_ACTIVE_COMMUNICATION_MODE_OWNERS) {
+                Log.e(LOG_TAG, "No active communication mode owner to release")
+                return
+            }
+            val ownersBeforeRelease = activeCommunicationModeOwners
+            activeCommunicationModeOwners--
+            val audioManager = getAudioManager(context)
+            if (audioManager == null) {
+                Log.e(
+                    LOG_TAG,
+                    "releaseCommunicationMode failed, owners=$activeCommunicationModeOwners"
+                )
+                return
+            }
+            logCommunicationMode(
+                "releaseCommunicationMode begin",
+                ownersBeforeRelease,
+                audioManager,
+            )
+            if (activeCommunicationModeOwners == NO_ACTIVE_COMMUNICATION_MODE_OWNERS) {
+                try {
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                } catch (error: Exception) {
+                    Log.e(LOG_TAG, "Failed to set MODE_NORMAL", error)
+                }
+            }
+            logCommunicationMode(
+                "releaseCommunicationMode done",
+                activeCommunicationModeOwners,
+                audioManager,
+            )
+        }
     }
 
     private val logTag = LOG_TAG
@@ -51,6 +140,25 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     private var minBufferSize = 0
     private var audioRecordStat = false
     private var audioThread: Thread? = null
+    private var communicationModeAcquired = false
+
+    @Synchronized
+    private fun acquireVoiceCallAudioMode(): Boolean {
+        if (communicationModeAcquired) {
+            return true
+        }
+        communicationModeAcquired = acquireCommunicationMode(context)
+        return communicationModeAcquired
+    }
+
+    @Synchronized
+    private fun releaseVoiceCallAudioMode() {
+        if (!communicationModeAcquired) {
+            return
+        }
+        communicationModeAcquired = false
+        releaseCommunicationMode(context)
+    }
 
     @RequiresApi(Build.VERSION_CODES.M)
     fun createAudioRecorder(inVoiceCall: Boolean, mediaProjection: MediaProjection?): Boolean {
@@ -128,9 +236,14 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     }
 
     private fun releaseRecorder(recorder: AudioRecord) {
+        val voiceCallRecorder =
+            recorder.audioSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION
         try {
             recorder.release()
         } finally {
+            if (voiceCallRecorder) {
+                releaseVoiceCallAudioMode()
+            }
             if (audioRecorder === recorder) {
                 audioRecorder = null
             }
@@ -253,7 +366,18 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
         audioThread = null
         Log.d(logTag, "switchToVoiceCall previous audio thread stopped")
 
-        if (!createAudioRecorder(true, mediaProjection)) {
+        if (!acquireVoiceCallAudioMode()) {
+            Log.e(logTag, "Failed to acquire voice-call audio mode")
+            return false
+        }
+        val recorderCreated = try {
+            createAudioRecorder(true, mediaProjection)
+        } catch (error: Exception) {
+            Log.e(logTag, "createAudioRecorder threw", error)
+            false
+        }
+        if (!recorderCreated) {
+            releaseVoiceCallAudioMode()
             Log.e(logTag, "createAudioRecorder fail")
             return false
         }
