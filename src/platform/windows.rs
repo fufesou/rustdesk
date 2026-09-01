@@ -3877,12 +3877,8 @@ pub fn handle_custom_client_staging_dir_before_update(
 //    3. Restore the tray app sessions.
 //    `1` and `3` must be done in custom actions.
 //    We need also to handle the command line parsing to find the tray processes.
-pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
-    let quiet_args = if quiet { " /qn LAUNCH_TRAY_APP=N" } else { "" };
-    let cmds =
-        format!("chcp 65001 && msiexec /i \"{msi}\"{quiet_args} REBOOT=ReallySuppress /norestart");
-    run_cmds(cmds, false, "update-msi")?;
-    Ok(())
+pub fn update_me_msi(msi: &str, expected_sha256: &str, quiet: bool) -> ResultType<()> {
+    verified_update::install_verified_msi(msi, expected_sha256, quiet)
 }
 
 fn get_import_config(exe: &str) -> String {
@@ -3951,9 +3947,10 @@ pub fn try_remove_temp_update_files() {
         if let Ok(entry) = entry {
             let path = entry.path();
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match files like rustdesk-*.msi or rustdesk-*.exe
-                if file_name.starts_with("rustdesk-")
-                    && (file_name.ends_with(".msi") || file_name.ends_with(".exe"))
+                // Match downloaded installers, verified copies, and abandoned handoff scripts.
+                if (file_name.starts_with("rustdesk-")
+                    && (file_name.ends_with(".msi") || file_name.ends_with(".exe")))
+                    || (file_name.starts_with("rustdesk_install_") && file_name.ends_with(".bat"))
                 {
                     // Skip files modified within the last hour to avoid deleting files being downloaded
                     if let Ok(metadata) = std::fs::metadata(&path) {

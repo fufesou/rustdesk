@@ -286,8 +286,8 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                 else {
                     return;
                 };
-                let result = crate::platform::update_me_msi(&update_path, true);
-                match crate::platform::finish_verified_update_launch(update_file, "msi", result) {
+                let result = crate::platform::update_me_msi(&update_path, expected_sha256, true);
+                match crate::platform::finish_verified_update_launch(update_file, result) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);
                     }
