@@ -12,6 +12,6 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "test-update-metadata"
+      upload-tag: "fix-update-metadata"
       publish-update-metadata: true
       allow-unsigned-update-artifacts: true
