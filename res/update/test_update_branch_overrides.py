@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
+REPOSITORY_ROOT = Path(__file__).parents[2]
 EXPECTED_VERSION = "1.4.5"
 EXPECTED_TEST_RELEASE = "https://github.com/fufesou/rustdesk/releases/tag/fix-update-metadata"
 VERSION_MARKERS = (
