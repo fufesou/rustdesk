@@ -15,6 +15,17 @@ def step_body(step_name):
 
 
 class FlutterBuildWorkflowTests(unittest.TestCase):
+    def test_update_branch_overrides_run_for_all_builds(self):
+        checkout_step = step_body("Checkout source code")
+        override_step = step_body("Test update branch overrides")
+
+        self.assertNotIn("if:", checkout_step)
+        self.assertNotIn("if:", override_step)
+        self.assertIn(
+            "python3 -m unittest res/update/test_update_branch_overrides.py",
+            override_step,
+        )
+
     def test_update_validation_job_runs_all_update_tests(self):
         test_step = step_body("Test update metadata signer")
 

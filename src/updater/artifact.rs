@@ -1,5 +1,9 @@
 use crate::{
-    common::{display_version_from_release_id, release_id_from_update_url},
+    common::{
+        display_version_from_release_id, release_id_from_update_url,
+        FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL, FIXED_TEST_UPDATE_RELEASE_ID,
+        FIXED_TEST_UPDATE_RELEASE_PAGE_URL,
+    },
     hbbs_http::create_http_client_with_url_strict,
     update_metadata::{UpdateArtifactQuery, UpdateMetadataRequirements, VerifiedUpdateArtifact},
 };
@@ -106,8 +110,7 @@ pub(super) fn verified_update_artifact_from_release_page_url(
 ) -> ResultType<VerifiedUpdateArtifact> {
     let release_id = release_id_from_update_url(update_url)?;
     let display_version = display_version_from_release_id(&release_id)?;
-    let expected_artifact_url_prefix =
-        format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/");
+    let expected_artifact_url_prefix = release_download_base_url(update_url, &release_id);
     let metadata_url = format!("{expected_artifact_url_prefix}rustdesk-update.json");
     let signature_url = format!("{metadata_url}.sig");
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
@@ -119,6 +122,13 @@ pub(super) fn verified_update_artifact_from_release_page_url(
         artifact: *query,
     };
     crate::update_metadata::verify_update_metadata(&metadata_bytes, &signature_bytes, requirements)
+}
+
+fn release_download_base_url(update_url: &str, release_id: &str) -> String {
+    if update_url == FIXED_TEST_UPDATE_RELEASE_PAGE_URL {
+        return FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL.to_owned();
+    }
+    format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/")
 }
 
 fn fetch_update_sidecar_bytes(url: &str) -> ResultType<Vec<u8>> {
@@ -177,8 +187,7 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
+    if !is_allowed_update_release(owner, repo, tag)
         || releases != "releases"
         || download != "download"
         || tag.is_empty()
@@ -189,6 +198,11 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     }
 
     Some(std::env::temp_dir().join(filename))
+}
+
+fn is_allowed_update_release(owner: &str, repo: &str, tag: &str) -> bool {
+    (owner == "rustdesk" && repo == "rustdesk")
+        || (owner == "fufesou" && repo == "rustdesk" && tag == FIXED_TEST_UPDATE_RELEASE_ID)
 }
 
 fn is_plain_update_filename(filename: &str) -> bool {
@@ -225,11 +239,32 @@ mod tests {
     }
 
     #[test]
+    fn update_download_file_accepts_fixed_test_release_asset() {
+        assert_eq!(
+            release_download_base_url(
+                FIXED_TEST_UPDATE_RELEASE_PAGE_URL,
+                FIXED_TEST_UPDATE_RELEASE_ID
+            ),
+            FIXED_TEST_UPDATE_DOWNLOAD_BASE_URL
+        );
+        let file = get_update_download_file_from_url(
+            "https://github.com/fufesou/rustdesk/releases/download/fix-update-metadata/rustdesk-1.4.6-x86_64.exe",
+        )
+        .expect("fixed test release asset URL");
+
+        assert_eq!(
+            file.file_name().and_then(|name| name.to_str()),
+            Some("rustdesk-1.4.6-x86_64.exe")
+        );
+    }
+
+    #[test]
     fn update_download_file_rejects_untrusted_or_malformed_urls() {
         for url in [
             "http://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
             "https://example.com/rustdesk.exe",
             "https://github.com/other/project/releases/download/1/rustdesk.exe",
+            "https://github.com/fufesou/rustdesk/releases/download/other/rustdesk.exe",
             "https://github.com/rustdesk/rustdesk/releases/download/1/",
             "https://github.com/rustdesk/rustdesk/releases/download/1/nested/rustdesk.exe",
             "https://github.com/rustdesk/rustdesk/releases/download/1/C:rustdesk.exe",
