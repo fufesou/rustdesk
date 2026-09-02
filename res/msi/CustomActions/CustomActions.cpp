@@ -300,7 +300,7 @@ bool TerminateProcessesByNameW(LPCWSTR processName, LPCWSTR excludeParam)
         {
             do
             {
-                if (lstrcmpW(processName, processEntry.szExeFile) == 0)
+                if (lstrcmpiW(processName, processEntry.szExeFile) == 0)
                 {
                     HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processEntry.th32ProcessID);
                     if (process != NULL)
@@ -1077,7 +1077,9 @@ UINT __stdcall UninstallPrinter(
 
     // Must match the name install used, otherwise the printer is left behind. Absent
     // on packages built before this was passed in, where it was the stock name.
-    if (SUCCEEDED(WcaGetProperty(L"CustomActionData", &pwzData)) && pwzData)
+    hr = WcaGetProperty(L"CustomActionData", &pwzData);
+    ExitOnFailure(hr, "failed to get CustomActionData");
+    if (pwzData)
     {
         appNameValue = pwzData;
     }
