@@ -25,6 +25,7 @@ def normalize(path: str) -> str:
 def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
     res: dict = dict()
     skip = normalize(exclude) if exclude else None
+    excluded = False
     # os.curdir is the literal ".", so restoring it left us inside `folder`.
     curdir = os.getcwd()
     os.chdir(folder)
@@ -35,6 +36,7 @@ def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
             full_path = os.path.join(root, f)
             if skip and normalize(full_path) == skip:
                 print(f"Excluding {full_path}...")
+                excluded = True
                 continue
             print(f"Processing {full_path}...")
             f = open(full_path, "rb")
@@ -45,6 +47,8 @@ def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
             md5_code = md5_generator.hexdigest().encode(encoding=encoding)
             res[full_path] = (content_compressed, md5_code)
     os.chdir(curdir)
+    if skip and not excluded:
+        raise ValueError(f"excluded file was not found in {folder}: {exclude}")
     return res
 
 
@@ -123,11 +127,22 @@ if __name__ == '__main__':
         options.executable = 'rustdesk.exe'
     if not options.executable.startswith(folder):
         options.executable = folder + '/' + options.executable
+    # Note: the simple check `options.executable.startswith(folder)` is incorrect.
+    # `python generate.py -f rustdesk -e rustdesk.exe` or `python generate.py -f rustdesk`
+    # will result the print "Executable path: ..exe".
+    # So we need to check if the executable is in the folder, and if so, concat again.
+    if os.path.exists(os.path.join(folder, options.executable)):
+        options.executable = os.path.join(folder, options.executable)
+    folder_path = os.path.abspath(folder)
     exe: str = os.path.abspath(options.executable)
-    if not exe.startswith(os.path.abspath(folder)):
+    try:
+        in_source_folder = os.path.commonpath([folder_path, exe]) == folder_path
+    except ValueError:
+        in_source_folder = False
+    if not in_source_folder:
         print("The executable must locate in source folder")
         exit(-1)
-    exe = '.' + exe[len(os.path.abspath(folder)):]
+    exe = '.' + exe[len(folder_path):]
     print("Executable path: " + exe)
     print("Compression level: " + str(options.level))
     md5_table = generate_md5_table(
