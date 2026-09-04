@@ -809,6 +809,24 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut second_instant,
             &sp.name(),
         )?;
+        let (static_refresh, static_ratio) = {
+            let mut video_qos = VIDEO_QOS.lock().unwrap();
+            let static_refresh = video_qos.take_static_refresh(&sp.name());
+            (static_refresh, video_qos.ratio())
+        };
+        let Some(static_refresh) = static_refresh else {
+            bail!("Missing video QoS display state for {}", sp.name());
+        };
+        if static_refresh {
+            if let Some(test_id) = video_diag_test_id() {
+                log::debug!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] test={test_id} side=host event=static_refresh display={display_idx} previous_ratio={quality:.4} next_ratio={static_ratio:.4} previous_bitrate_kbps={}",
+                    encoder.bitrate(),
+                );
+            }
+            bail!("SWITCH");
+        }
         if sp.is_option_true(OPTION_REFRESH) {
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);

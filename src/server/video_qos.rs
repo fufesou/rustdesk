@@ -135,6 +135,7 @@ struct UserData {
 struct DisplayData {
     send_counter: usize, // Number of times encode during period
     support_changing_quality: bool,
+    static_refresh_pending: bool,
 }
 
 // Main QoS controller structure
@@ -208,6 +209,12 @@ impl VideoQoS {
         if let Some(display) = self.displays.get_mut(video_service_name) {
             display.support_changing_quality = support;
         }
+    }
+
+    pub fn take_static_refresh(&mut self, video_service_name: &str) -> Option<bool> {
+        self.displays
+            .get_mut(video_service_name)
+            .map(|display| std::mem::take(&mut display.static_refresh_pending))
     }
 
     // Check if variable bitrate encoding is supported and enabled
@@ -520,35 +527,30 @@ impl VideoQoS {
         };
         let max = target_ratio * MAX_BR_MULTIPLE;
 
-        let mut v = current_ratio;
-
-        // Adjust ratio based on network delay thresholds
-        if max_delay < 50 {
-            if dynamic_screen {
-                v = current_ratio * 1.15;
-            }
+        // A static frame can favor clarity because it only needs to be sent once.
+        let mut v = if !dynamic_screen {
+            target_ratio
+        } else if max_delay < 50 {
+            current_ratio * 1.15
         } else if max_delay < 100 {
-            if dynamic_screen {
-                v = current_ratio * 1.1;
-            }
+            current_ratio * 1.1
         } else if max_delay < DELAY_THRESHOLD_150MS {
-            if dynamic_screen {
-                v = current_ratio * 1.05;
-            }
+            current_ratio * 1.05
         } else if max_delay < 200 {
-            v = current_ratio * 0.95;
+            current_ratio * 0.95
         } else if max_delay < 300 {
-            v = current_ratio * 0.9;
+            current_ratio * 0.9
         } else if max_delay < 500 {
-            v = current_ratio * 0.85;
+            current_ratio * 0.85
         } else {
-            v = current_ratio * 0.8;
-        }
+            current_ratio * 0.8
+        };
         let delay_adjusted_ratio = v;
 
         // Limit quality increase rate for better stability
         if let Some(ratio_add_150kbps) = ratio_add_150kbps {
-            if v > ratio_add_150kbps
+            if dynamic_screen
+                && v > ratio_add_150kbps
                 && ratio_add_150kbps > current_ratio
                 && current_ratio >= BR_SPEED
             {
@@ -559,24 +561,17 @@ impl VideoQoS {
         let rate_limited = v != delay_adjusted_ratio;
         let unclamped_ratio = v;
         let applied_ratio = v.clamp(min, max);
-        let decision = if max_delay < 50 {
-            if dynamic_screen {
-                "increase_delay_lt_50"
-            } else {
-                "hold_static_delay_lt_50"
-            }
+        let static_refresh = !dynamic_screen && applied_ratio > current_ratio;
+        let decision = if static_refresh {
+            "restore_static"
+        } else if !dynamic_screen {
+            "hold_static"
+        } else if max_delay < 50 {
+            "increase_delay_lt_50"
         } else if max_delay < 100 {
-            if dynamic_screen {
-                "increase_delay_lt_100"
-            } else {
-                "hold_static_delay_lt_100"
-            }
+            "increase_delay_lt_100"
         } else if max_delay < DELAY_THRESHOLD_150MS {
-            if dynamic_screen {
-                "increase_delay_lt_150"
-            } else {
-                "hold_static_delay_lt_150"
-            }
+            "increase_delay_lt_150"
         } else if max_delay < 200 {
             "decrease_delay_lt_200"
         } else if max_delay < 300 {
@@ -587,11 +582,16 @@ impl VideoQoS {
             "decrease_delay_gte_500"
         };
         self.ratio = applied_ratio;
+        if static_refresh {
+            self.displays.values_mut().for_each(|display| {
+                display.static_refresh_pending = true;
+            });
+        }
         self.adjust_ratio_instant = Instant::now();
         if let Some(test_id) = video_diag_test_id() {
             log::debug!(
                 target: "video_diag",
-                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={}",
+                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh}",
                 applied_ratio != unclamped_ratio,
                 applied_ratio != current_ratio,
             );
@@ -684,3 +684,7 @@ impl RttCalculator {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "video_qos_tests.rs"]
+mod tests;
