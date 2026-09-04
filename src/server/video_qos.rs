@@ -43,6 +43,7 @@ const MAX_BR_MULTIPLE: f32 = 1.0;
 const HISTORY_DELAY_LEN: usize = 2;
 const ADJUST_RATIO_INTERVAL: usize = 3; // Adjust quality ratio every 3 seconds
 const DYNAMIC_SCREEN_THRESHOLD: usize = 2; // Allow increase quality ratio if encode more than 2 times in one second
+const SETTLE_REFRESH_MIN_FRAMES: usize = 2; // Ignore the single frame emitted by an encoder refresh
 const DELAY_THRESHOLD_150MS: u32 = 150; // 150ms is the threshold for good network condition
 const VIDEO_DIAG_TEST_ID_ENV: &str = "RUSTDESK_VIDEO_TEST_ID";
 const VIDEO_DIAG_TEST_ID_MAX_LEN: usize = 64;
@@ -146,6 +147,7 @@ pub struct VideoQoS {
     displays: HashMap<String, DisplayData>,
     bitrate_store: u32,
     adjust_ratio_instant: Instant,
+    settle_refresh_armed: bool,
     abr_config: bool,
     new_user_instant: Instant,
 }
@@ -159,6 +161,7 @@ impl Default for VideoQoS {
             displays: Default::default(),
             bitrate_store: 0,
             adjust_ratio_instant: Instant::now(),
+            settle_refresh_armed: false,
             abr_config: true,
             new_user_instant: Instant::now(),
         }
@@ -486,6 +489,7 @@ impl VideoQoS {
         let target_ratio = self.latest_quality().ratio();
         let current_ratio = self.ratio;
         let current_bitrate = self.bitrate();
+        let settle_refresh = self.update_settle_refresh(max_send_counter);
 
         // Calculate minimum ratio for high resolution (1Mbps baseline)
         let ratio_1mbps = if current_bitrate > 0 {
@@ -561,8 +565,11 @@ impl VideoQoS {
         let rate_limited = v != delay_adjusted_ratio;
         let unclamped_ratio = v;
         let applied_ratio = v.clamp(min, max);
-        let static_refresh = !dynamic_screen && applied_ratio > current_ratio;
-        let decision = if static_refresh {
+        let quality_refresh = !dynamic_screen && applied_ratio > current_ratio;
+        let static_refresh = quality_refresh || settle_refresh;
+        let decision = if settle_refresh {
+            "refresh_settled"
+        } else if quality_refresh {
             "restore_static"
         } else if !dynamic_screen {
             "hold_static"
@@ -583,6 +590,7 @@ impl VideoQoS {
         };
         self.ratio = applied_ratio;
         if static_refresh {
+            self.settle_refresh_armed = false;
             self.displays.values_mut().for_each(|display| {
                 display.static_refresh_pending = true;
             });
@@ -591,11 +599,22 @@ impl VideoQoS {
         if let Some(test_id) = video_diag_test_id() {
             log::debug!(
                 target: "video_diag",
-                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh}",
+                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh} settle_refresh={settle_refresh}",
                 applied_ratio != unclamped_ratio,
                 applied_ratio != current_ratio,
             );
         }
+    }
+
+    fn update_settle_refresh(&mut self, max_send_counter: usize) -> bool {
+        if max_send_counter >= SETTLE_REFRESH_MIN_FRAMES {
+            self.settle_refresh_armed = true;
+            return false;
+        }
+        if max_send_counter == 0 {
+            return std::mem::take(&mut self.settle_refresh_armed);
+        }
+        false
     }
 
     // Adjust fps based on network delay and user response time

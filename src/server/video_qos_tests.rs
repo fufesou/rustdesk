@@ -8,6 +8,8 @@ const LOW_RATIO: f32 = 0.1;
 const TARGET_RATIO: f32 = 1.0;
 const STATIC_SEND_COUNT: usize = 0;
 const DYNAMIC_SEND_COUNT: usize = 6;
+const SETTLE_CHANGE_SEND_COUNT: usize = 3;
+const REFRESH_FIRST_FRAME_SEND_COUNT: usize = 1;
 
 fn qos_with_high_delay(initial_ratio: f32) -> VideoQoS {
     let mut qos = VideoQoS::default();
@@ -46,6 +48,22 @@ fn static_screen_at_target_quality_does_not_request_refresh() {
     qos.adjust_ratio(false, STATIC_SEND_COUNT);
 
     assert_eq!(qos.ratio(), TARGET_RATIO);
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
+}
+
+#[test]
+fn settled_screen_at_target_quality_requests_one_refresh() {
+    let mut qos = qos_with_high_delay(TARGET_RATIO);
+
+    qos.adjust_ratio(false, SETTLE_CHANGE_SEND_COUNT);
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
+
+    qos.adjust_ratio(false, STATIC_SEND_COUNT);
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(true));
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
+
+    qos.adjust_ratio(false, REFRESH_FIRST_FRAME_SEND_COUNT);
+    qos.adjust_ratio(false, STATIC_SEND_COUNT);
     assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
 }
 
