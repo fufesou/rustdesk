@@ -14,6 +14,8 @@ use magnum_opus::{Channels::*, Decoder as AudioDecoder};
 #[cfg(not(target_os = "linux"))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{
     collections::HashMap,
     ffi::c_void,
@@ -121,6 +123,8 @@ pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#
 
 #[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
+#[cfg(not(target_os = "linux"))]
+const AUDIO_DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1186,6 +1190,132 @@ pub struct AudioHandler {
     device_channel: u16,
     #[cfg(not(target_os = "linux"))]
     ready: Arc<std::sync::Mutex<bool>>,
+    #[cfg(not(target_os = "linux"))]
+    diagnostics: AudioDiagnostics,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+struct AudioCallbackDiagnostics {
+    underflows: AtomicUsize,
+    sleeps: AtomicUsize,
+    sleep_millis: AtomicUsize,
+    zero_fill_events: AtomicUsize,
+    zero_filled_samples: AtomicUsize,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl AudioCallbackDiagnostics {
+    fn record_underflow(&self) {
+        self.underflows.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn record_sleep(&self, duration: Duration) {
+        self.sleeps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.sleep_millis
+            .fetch_add(duration.as_millis() as usize, AtomicOrdering::Relaxed);
+    }
+
+    fn record_zero_fill(&self, samples: usize) {
+        self.zero_fill_events.fetch_add(1, AtomicOrdering::Relaxed);
+        self.zero_filled_samples
+            .fetch_add(samples, AtomicOrdering::Relaxed);
+    }
+
+    fn take(&self) -> [usize; 5] {
+        [
+            self.underflows.swap(0, AtomicOrdering::Relaxed),
+            self.sleeps.swap(0, AtomicOrdering::Relaxed),
+            self.sleep_millis.swap(0, AtomicOrdering::Relaxed),
+            self.zero_fill_events.swap(0, AtomicOrdering::Relaxed),
+            self.zero_filled_samples.swap(0, AtomicOrdering::Relaxed),
+        ]
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+struct AudioDiagnostics {
+    callback: Arc<AudioCallbackDiagnostics>,
+    interval_started_at: Option<Instant>,
+    last_packet_at: Option<Instant>,
+    received_packets: usize,
+    received_bytes: usize,
+    decoded_packets: usize,
+    decoded_samples: usize,
+    resampled_packets: usize,
+    decode_errors: usize,
+    dropped_before_ready: usize,
+    max_packet_gap: Duration,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl AudioDiagnostics {
+    fn record_received(&mut self, bytes: usize) {
+        let now = Instant::now();
+        if self.interval_started_at.is_none() {
+            self.interval_started_at = Some(now);
+        }
+        if let Some(last_packet_at) = self.last_packet_at {
+            self.max_packet_gap = self.max_packet_gap.max(now.duration_since(last_packet_at));
+        }
+        self.last_packet_at = Some(now);
+        self.received_packets += 1;
+        self.received_bytes += bytes;
+    }
+
+    fn record_decoded(&mut self, samples: usize, resampled: bool) {
+        self.decoded_packets += 1;
+        self.decoded_samples += samples;
+        if resampled {
+            self.resampled_packets += 1;
+        }
+    }
+
+    fn is_log_due(&self) -> bool {
+        self.interval_started_at
+            .as_ref()
+            .is_some_and(|started_at| started_at.elapsed() >= AUDIO_DIAGNOSTIC_LOG_INTERVAL)
+    }
+
+    fn log_if_due(&mut self, buffered_samples: usize) {
+        let Some(started_at) = self.interval_started_at else {
+            return;
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed < AUDIO_DIAGNOSTIC_LOG_INTERVAL {
+            return;
+        }
+        let [underflows, sleeps, sleep_millis, zero_fill_events, zero_filled_samples] =
+            self.callback.take();
+        log::info!(
+            "Audio playback diagnostics: interval_ms={}, packets={}, bytes={}, decoded_packets={}, decoded_samples={}, resampled_packets={}, decode_errors={}, dropped_before_ready={}, max_packet_gap_ms={}, callback_underflows={}, callback_sleeps={}, callback_requested_sleep_ms={}, zero_fill_events={}, zero_filled_samples={}, buffered_samples={}",
+            elapsed.as_millis(),
+            self.received_packets,
+            self.received_bytes,
+            self.decoded_packets,
+            self.decoded_samples,
+            self.resampled_packets,
+            self.decode_errors,
+            self.dropped_before_ready,
+            self.max_packet_gap.as_millis(),
+            underflows,
+            sleeps,
+            sleep_millis,
+            zero_fill_events,
+            zero_filled_samples,
+            buffered_samples,
+        );
+        self.interval_started_at = Some(Instant::now());
+        self.received_packets = 0;
+        self.received_bytes = 0;
+        self.decoded_packets = 0;
+        self.decoded_samples = 0;
+        self.resampled_packets = 0;
+        self.decode_errors = 0;
+        self.dropped_before_ready = 0;
+        self.max_packet_gap = Duration::ZERO;
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1340,6 +1470,15 @@ impl AudioHandler {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn log_audio_diagnostics(&mut self) {
+        if !self.diagnostics.is_log_due() {
+            return;
+        }
+        let buffered_samples = self.audio_buffer.0.lock().unwrap().occupied_len();
+        self.diagnostics.log_if_due(buffered_samples);
+    }
+
     /// Start the audio playback.
     #[cfg(not(target_os = "linux"))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
@@ -1414,8 +1553,13 @@ impl AudioHandler {
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
         #[cfg(not(target_os = "linux"))]
-        if self.audio_stream.is_none() || !self.ready.lock().unwrap().clone() {
-            return;
+        {
+            self.diagnostics.record_received(frame.data.len());
+            if self.audio_stream.is_none() || !*self.ready.lock().unwrap() {
+                self.diagnostics.dropped_before_ready += 1;
+                self.log_audio_diagnostics();
+                return;
+            }
         }
         #[cfg(target_os = "linux")]
         if self.simple.is_none() {
@@ -1423,41 +1567,50 @@ impl AudioHandler {
             return;
         }
         self.audio_decoder.as_mut().map(|(d, buffer)| {
-            if let Ok(n) = d.decode_float(&frame.data, buffer, false) {
-                let channels = self.channels;
-                let n = n * (channels as usize);
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let sample_rate0 = self.sample_rate.0;
-                    let sample_rate = self.sample_rate.1;
-                    let mut buffer = buffer[0..n].to_owned();
-                    if sample_rate != sample_rate0 {
-                        buffer = crate::audio_resample(
-                            &buffer[0..n],
-                            sample_rate0,
-                            sample_rate,
-                            channels,
-                        );
+            let decoded_frames = match d.decode_float(&frame.data, buffer, false) {
+                Ok(decoded_frames) => decoded_frames,
+                Err(err) => {
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        self.diagnostics.decode_errors += 1;
                     }
-                    if self.channels != self.device_channel {
-                        buffer = crate::audio_rechannel(
-                            buffer,
-                            sample_rate,
-                            sample_rate,
-                            self.channels,
-                            self.device_channel,
-                        );
-                    }
-                    self.audio_buffer.append_pcm(&buffer);
+                    log::warn!("Failed to decode audio frame: {err:?}");
+                    return;
                 }
-                #[cfg(target_os = "linux")]
-                {
-                    let data_u8 =
-                        unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
-                    self.simple.as_mut().map(|x| x.write(data_u8));
+            };
+            let channels = self.channels;
+            let n = decoded_frames * (channels as usize);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let sample_rate0 = self.sample_rate.0;
+                let sample_rate = self.sample_rate.1;
+                let resampled = sample_rate != sample_rate0;
+                let mut buffer = buffer[0..n].to_owned();
+                if resampled {
+                    buffer =
+                        crate::audio_resample(&buffer[0..n], sample_rate0, sample_rate, channels);
                 }
+                if self.channels != self.device_channel {
+                    buffer = crate::audio_rechannel(
+                        buffer,
+                        sample_rate,
+                        sample_rate,
+                        self.channels,
+                        self.device_channel,
+                    );
+                }
+                self.diagnostics.record_decoded(n, resampled);
+                self.audio_buffer.append_pcm(&buffer);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let data_u8 =
+                    unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
+                self.simple.as_mut().map(|x| x.write(data_u8));
             }
         });
+        #[cfg(not(target_os = "linux"))]
+        self.log_audio_diagnostics();
     }
 
     /// Build audio output stream for current device.
@@ -1468,6 +1621,7 @@ impl AudioHandler {
         device: &Device,
     ) -> ResultType<()> {
         self.device_channel = config.channels;
+        self.diagnostics = AudioDiagnostics::default();
         let err_fn = move |err| {
             // too many errors, will improve later
             log::trace!("an error occurred on stream: {}", err);
@@ -1475,6 +1629,7 @@ impl AudioHandler {
         self.audio_buffer
             .resize(config.sample_rate.0 as _, config.channels as _);
         let audio_buffer = self.audio_buffer.0.clone();
+        let diagnostics = self.diagnostics.callback.clone();
         let ready = self.ready.clone();
         let timeout = None;
         let stream = device.build_output_stream(
@@ -1490,6 +1645,7 @@ impl AudioHandler {
                 // android two timestamps, one from zero, another not
                 #[cfg(not(target_os = "android"))]
                 if having < n {
+                    diagnostics.record_underflow();
                     let tms = info.timestamp();
                     let how_long = tms
                         .playback
@@ -1499,6 +1655,7 @@ impl AudioHandler {
                     // must long enough to fight back scheuler delay
                     if how_long > Duration::from_millis(6) && how_long < Duration::from_millis(3000)
                     {
+                        diagnostics.record_sleep(how_long.div_f32(1.2));
                         drop(lock);
                         std::thread::sleep(how_long.div_f32(1.2));
                         lock = audio_buffer.lock().unwrap();
@@ -1506,11 +1663,14 @@ impl AudioHandler {
                     }
 
                     if having < n {
+                        diagnostics.record_zero_fill(n - having);
                         n = having;
                     }
                 }
                 #[cfg(target_os = "android")]
                 if having < n {
+                    diagnostics.record_underflow();
+                    diagnostics.record_zero_fill(n - having);
                     n = having;
                 }
                 let mut elems = vec![0.0f32; n];
@@ -1531,6 +1691,15 @@ impl AudioHandler {
             timeout,
         )?;
         stream.play()?;
+        log::info!(
+            "Audio playback diagnostics configured: remote_rate={}, output_rate={}, remote_channels={}, output_channels={}, buffer_size={:?}, resampling={}",
+            self.sample_rate.0,
+            config.sample_rate.0,
+            self.channels,
+            config.channels,
+            config.buffer_size,
+            self.sample_rate.0 != config.sample_rate.0,
+        );
         self.audio_stream = Some(Box::new(stream));
         Ok(())
     }

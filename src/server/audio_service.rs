@@ -420,6 +420,15 @@ mod cpal_impl {
         let frame_size = sample_rate_0 as usize / 100; // 10 ms
         let encode_len = frame_size * encode_channel as usize;
         let rechannel_len = encode_len * device_channel as usize / encode_channel as usize;
+        log::info!(
+            "Audio capture diagnostics: device_rate={}, opus_rate={}, device_channels={}, opus_channels={}, frame_samples={}, resampling={}",
+            sample_rate_0,
+            sample_rate,
+            device_channel,
+            encode_channel as u16,
+            frame_size,
+            sample_rate_0 != sample_rate,
+        );
         INPUT_BUFFER.lock().unwrap().clear();
         let timeout = None;
         let stream_config = StreamConfig {
@@ -475,13 +484,16 @@ static mut AUDIO_ZERO_COUNT: u16 = 0;
 fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
     if data.iter().filter(|x| **x != 0.).next().is_some() {
         unsafe {
+            if AUDIO_ZERO_COUNT > MAX_AUDIO_ZERO_COUNT {
+                log::info!("Audio zero gate released");
+            }
             AUDIO_ZERO_COUNT = 0;
         }
     } else {
         unsafe {
             if AUDIO_ZERO_COUNT > MAX_AUDIO_ZERO_COUNT {
                 if AUDIO_ZERO_COUNT == MAX_AUDIO_ZERO_COUNT + 1 {
-                    log::debug!("Audio Zero Gate Attack");
+                    log::info!("Audio zero gate entered");
                     AUDIO_ZERO_COUNT += 1;
                 }
                 return;
@@ -510,7 +522,7 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
                         });
                         sp.send(msg_out);
                     }
-                    Err(_) => {}
+                    Err(err) => log::warn!("Failed to encode audio frame: {err:?}"),
                 }
             }
         } else {
@@ -529,6 +541,6 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
             });
             sp.send(msg_out);
         }
-        Err(_) => {}
+        Err(err) => log::warn!("Failed to encode audio frame: {err:?}"),
     }
 }
