@@ -2,6 +2,7 @@ use super::*;
 use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
 use std::{
     collections::VecDeque,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -43,6 +44,41 @@ const HISTORY_DELAY_LEN: usize = 2;
 const ADJUST_RATIO_INTERVAL: usize = 3; // Adjust quality ratio every 3 seconds
 const DYNAMIC_SCREEN_THRESHOLD: usize = 2; // Allow increase quality ratio if encode more than 2 times in one second
 const DELAY_THRESHOLD_150MS: u32 = 150; // 150ms is the threshold for good network condition
+const VIDEO_DIAG_TEST_ID_ENV: &str = "RUSTDESK_VIDEO_TEST_ID";
+const VIDEO_DIAG_TEST_ID_MAX_LEN: usize = 64;
+
+static VIDEO_DIAG_TEST_ID: OnceLock<Option<String>> = OnceLock::new();
+
+pub(super) fn video_diag_test_id() -> Option<&'static str> {
+    VIDEO_DIAG_TEST_ID
+        .get_or_init(|| match std::env::var(VIDEO_DIAG_TEST_ID_ENV) {
+            Ok(value)
+                if !value.is_empty()
+                    && value.len() <= VIDEO_DIAG_TEST_ID_MAX_LEN
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    }) =>
+            {
+                Some(value)
+            }
+            Ok(_) => {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=disabled reason=invalid_test_id env={VIDEO_DIAG_TEST_ID_ENV}"
+                );
+                None
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(err) => {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=disabled reason=test_id_read_failed env={VIDEO_DIAG_TEST_ID_ENV} error={err}"
+                );
+                None
+            }
+        })
+        .as_deref()
+}
 
 #[derive(Default, Debug, Clone)]
 struct UserDelay {
@@ -325,11 +361,21 @@ impl VideoQoS {
             // first network delay message
             adjust_ratio = user.delay.fps.is_none();
             user.delay.fps = Some(fps);
+            if let Some(test_id) = video_diag_test_id() {
+                let rtt = user.delay.rtt_calculator.get_rtt();
+                log::debug!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] test={test_id} side=host event=network_sample conn={id} sample_delay_ms={delay} old_avg_delay_ms={old_avg_delay} avg_delay_ms={avg_delay} rtt_ready={} rtt_ms={} fps={fps} response_delayed={}",
+                    rtt.is_some(),
+                    rtt.unwrap_or_default(),
+                    user.delay.response_delayed,
+                );
+            }
         }
         self.adjust_fps();
         if adjust_ratio && !cfg!(target_os = "linux") {
             //Reduce the possibility of vaapi being created twice
-            self.adjust_ratio(false);
+            self.adjust_ratio(false, 0);
         }
     }
 
@@ -363,6 +409,12 @@ impl VideoQoS {
         let abr_enabled = self.in_vbr_state();
         if abr_enabled {
             if self.adjust_ratio_instant.elapsed().as_secs() >= ADJUST_RATIO_INTERVAL as u64 {
+                let max_send_counter = self
+                    .displays
+                    .values()
+                    .map(|display| display.send_counter)
+                    .max()
+                    .unwrap_or_default();
                 let dynamic_screen = self
                     .displays
                     .iter()
@@ -370,7 +422,7 @@ impl VideoQoS {
                 self.displays.iter_mut().for_each(|d| {
                     d.1.send_counter = 0;
                 });
-                self.adjust_ratio(dynamic_screen);
+                self.adjust_ratio(dynamic_screen, max_send_counter);
             }
         } else {
             self.ratio = self.latest_quality().ratio();
@@ -413,7 +465,7 @@ impl VideoQoS {
     }
 
     // Adjust quality ratio based on network delay and screen changes
-    fn adjust_ratio(&mut self, dynamic_screen: bool) {
+    fn adjust_ratio(&mut self, dynamic_screen: bool, max_send_counter: usize) {
         if !self.in_vbr_state() {
             return;
         }
@@ -492,6 +544,7 @@ impl VideoQoS {
         } else {
             v = current_ratio * 0.8;
         }
+        let delay_adjusted_ratio = v;
 
         // Limit quality increase rate for better stability
         if let Some(ratio_add_150kbps) = ratio_add_150kbps {
@@ -503,8 +556,46 @@ impl VideoQoS {
             }
         }
 
-        self.ratio = v.clamp(min, max);
+        let rate_limited = v != delay_adjusted_ratio;
+        let unclamped_ratio = v;
+        let applied_ratio = v.clamp(min, max);
+        let decision = if max_delay < 50 {
+            if dynamic_screen {
+                "increase_delay_lt_50"
+            } else {
+                "hold_static_delay_lt_50"
+            }
+        } else if max_delay < 100 {
+            if dynamic_screen {
+                "increase_delay_lt_100"
+            } else {
+                "hold_static_delay_lt_100"
+            }
+        } else if max_delay < DELAY_THRESHOLD_150MS {
+            if dynamic_screen {
+                "increase_delay_lt_150"
+            } else {
+                "hold_static_delay_lt_150"
+            }
+        } else if max_delay < 200 {
+            "decrease_delay_lt_200"
+        } else if max_delay < 300 {
+            "decrease_delay_lt_300"
+        } else if max_delay < 500 {
+            "decrease_delay_lt_500"
+        } else {
+            "decrease_delay_gte_500"
+        };
+        self.ratio = applied_ratio;
         self.adjust_ratio_instant = Instant::now();
+        if let Some(test_id) = video_diag_test_id() {
+            log::debug!(
+                target: "video_diag",
+                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={}",
+                applied_ratio != unclamped_ratio,
+                applied_ratio != current_ratio,
+            );
+        }
     }
 
     // Adjust fps based on network delay and user response time

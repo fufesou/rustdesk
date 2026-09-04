@@ -18,7 +18,12 @@
 // to-do:
 // https://slhck.info/video/2017/03/01/rate-control.html
 
-use super::{display_service::check_display_changed, service::ServiceTmpl, video_qos::VideoQoS, *};
+use super::{
+    display_service::check_display_changed,
+    service::ServiceTmpl,
+    video_qos::{video_diag_test_id, VideoQoS},
+    *,
+};
 #[cfg(target_os = "linux")]
 use crate::common::SimpleCallOnReturn;
 #[cfg(target_os = "linux")]
@@ -84,6 +89,132 @@ struct Screenshot {
     sid: String,
     tx: Sender,
     restore_vram: bool,
+}
+
+const VIDEO_DIAG_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+struct VideoDiagStats {
+    test_id: String,
+    display: usize,
+    codec: CodecFormat,
+    period_started: Instant,
+    last_valid_frame: Option<Instant>,
+    valid_captures: u64,
+    invalid_captures: u64,
+    would_block: u64,
+    encode_attempts: u64,
+    repeated_encodes: u64,
+    fetch_samples: u64,
+    expected_receivers: u64,
+    fetched_receivers: u64,
+    fetch_wait_ms_total: u128,
+    fetch_wait_ms_max: u128,
+    fetch_timeouts: u64,
+}
+
+impl VideoDiagStats {
+    fn new(test_id: String, display: usize, codec: CodecFormat) -> Self {
+        Self {
+            test_id,
+            display,
+            codec,
+            period_started: Instant::now(),
+            last_valid_frame: None,
+            valid_captures: 0,
+            invalid_captures: 0,
+            would_block: 0,
+            encode_attempts: 0,
+            repeated_encodes: 0,
+            fetch_samples: 0,
+            expected_receivers: 0,
+            fetched_receivers: 0,
+            fetch_wait_ms_total: 0,
+            fetch_wait_ms_max: 0,
+            fetch_timeouts: 0,
+        }
+    }
+
+    fn record_valid_capture(&mut self) {
+        self.valid_captures += 1;
+        self.last_valid_frame = Some(Instant::now());
+    }
+
+    fn record_invalid_capture(&mut self) {
+        self.invalid_captures += 1;
+    }
+
+    fn record_would_block(&mut self) {
+        self.would_block += 1;
+    }
+
+    fn record_encode(&mut self, repeated: bool) {
+        self.encode_attempts += 1;
+        if repeated {
+            self.repeated_encodes += 1;
+        }
+    }
+
+    fn record_fetch(&mut self, expected: usize, fetched: usize, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_millis();
+        self.fetch_samples += 1;
+        self.expected_receivers += expected as u64;
+        self.fetched_receivers += fetched as u64;
+        self.fetch_wait_ms_total += elapsed_ms;
+        self.fetch_wait_ms_max = self.fetch_wait_ms_max.max(elapsed_ms);
+        if fetched < expected {
+            self.fetch_timeouts += 1;
+        }
+    }
+
+    fn report_if_due(&mut self, ratio: f32, bitrate_kbps: u32) {
+        if self.period_started.elapsed() < VIDEO_DIAG_REPORT_INTERVAL {
+            return;
+        }
+        let last_valid_seen = self.last_valid_frame.is_some();
+        let last_valid_age_ms = self
+            .last_valid_frame
+            .map(|instant| instant.elapsed().as_millis())
+            .unwrap_or_default();
+        log::debug!(
+            target: "video_diag",
+            "[VIDEO_DIAG] test={} side=host event=stream_window display={} codec={:?} period_ms={} valid_captures={} invalid_captures={} would_block={} encode_attempts={} repeated_encodes={} last_valid_seen={} last_valid_age_ms={} fetch_samples={} expected_receivers={} fetched_receivers={} fetch_wait_ms_total={} fetch_wait_ms_max={} fetch_timeouts={} ratio={:.4} bitrate_kbps={}",
+            self.test_id,
+            self.display,
+            self.codec,
+            self.period_started.elapsed().as_millis(),
+            self.valid_captures,
+            self.invalid_captures,
+            self.would_block,
+            self.encode_attempts,
+            self.repeated_encodes,
+            last_valid_seen,
+            last_valid_age_ms,
+            self.fetch_samples,
+            self.expected_receivers,
+            self.fetched_receivers,
+            self.fetch_wait_ms_total,
+            self.fetch_wait_ms_max,
+            self.fetch_timeouts,
+            ratio,
+            bitrate_kbps,
+        );
+        self.reset_period();
+    }
+
+    fn reset_period(&mut self) {
+        self.period_started = Instant::now();
+        self.valid_captures = 0;
+        self.invalid_captures = 0;
+        self.would_block = 0;
+        self.encode_attempts = 0;
+        self.repeated_encodes = 0;
+        self.fetch_samples = 0;
+        self.expected_receivers = 0;
+        self.fetched_receivers = 0;
+        self.fetch_wait_ms_total = 0;
+        self.fetch_wait_ms_max = 0;
+        self.fetch_timeouts = 0;
+    }
 }
 
 #[inline]
@@ -655,6 +786,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    let mut video_diag = video_diag_test_id().map(|test_id| {
+        log::info!(
+            target: "video_diag",
+            "[VIDEO_DIAG] test={test_id} side=host event=stream_start display={display_idx} codec={codec_format:?} hardware={} latency_free={} quality={quality:.4} bitrate_kbps={}",
+            encoder.is_hardware(),
+            encoder.latency_free(),
+            encoder.bitrate(),
+        );
+        VideoDiagStats::new(test_id.to_owned(), display_idx, codec_format)
+    });
 
     while sp.ok() {
         #[cfg(windows)]
@@ -725,6 +866,9 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    if let Some(stats) = video_diag.as_mut() {
+                        stats.record_valid_capture();
+                    }
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {
@@ -773,6 +917,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    if let Some(stats) = video_diag.as_mut() {
+                        stats.record_encode(false);
+                    }
                     let send_conn_ids = handle_one_frame(
                         display_idx,
                         &sp,
@@ -787,6 +934,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                     )?;
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
+                } else if let Some(stats) = video_diag.as_mut() {
+                    stats.record_invalid_capture();
                 }
                 #[cfg(windows)]
                 {
@@ -803,6 +952,9 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         match res {
             Err(ref e) if e.kind() == WouldBlock => {
+                if let Some(stats) = video_diag.as_mut() {
+                    stats.record_would_block();
+                }
                 #[cfg(windows)]
                 if try_gdi > 0 && !c.is_gdi() {
                     if try_gdi > 3 {
@@ -832,6 +984,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                     // yun.len() > 0 means the frame is not texture.
                     if repeat_encode_counter < repeat_encode_max {
                         repeat_encode_counter += 1;
+                        if let Some(stats) = video_diag.as_mut() {
+                            stats.record_encode(true);
+                        }
                         let send_conn_ids = handle_one_frame(
                             display_idx,
                             &sp,
@@ -873,6 +1028,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         let mut fetched_conn_ids = HashSet::new();
+        let expected_receivers = frame_controller.send_conn_ids.len();
         let timeout_millis = 3_000u64;
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
@@ -884,6 +1040,14 @@ fn run(vs: VideoService) -> ResultType<()> {
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
                 break;
             }
+        }
+        if let Some(stats) = video_diag.as_mut() {
+            stats.record_fetch(
+                expected_receivers,
+                fetched_conn_ids.len(),
+                wait_begin.elapsed(),
+            );
+            stats.report_if_due(quality, encoder.bitrate());
         }
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
@@ -1327,11 +1491,41 @@ fn check_qos(
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     *spf = video_qos.spf();
     if *ratio != video_qos.ratio() {
+        let previous_ratio = *ratio;
         *ratio = video_qos.ratio();
         if encoder.support_changing_quality() {
-            allow_err!(encoder.set_quality(*ratio));
+            let bitrate_before = encoder.bitrate();
+            let result = encoder.set_quality(*ratio);
+            if let Some(test_id) = video_diag_test_id() {
+                match &result {
+                    Ok(()) => log::debug!(
+                        target: "video_diag",
+                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=ok hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={}",
+                        encoder.is_hardware(),
+                        *ratio,
+                        encoder.bitrate(),
+                    ),
+                    Err(err) => log::warn!(
+                        target: "video_diag",
+                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=error hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={} error={err:?}",
+                        encoder.is_hardware(),
+                        *ratio,
+                        encoder.bitrate(),
+                    ),
+                }
+            }
+            allow_err!(result);
             video_qos.store_bitrate(encoder.bitrate());
         } else {
+            if let Some(test_id) = video_diag_test_id() {
+                log::debug!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=unsupported hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_kbps={}",
+                    encoder.is_hardware(),
+                    *ratio,
+                    encoder.bitrate(),
+                );
+            }
             // Now only vaapi doesn't support changing quality
             if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
                 log::info!("switch to change quality");

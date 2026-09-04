@@ -54,9 +54,123 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
     },
 };
+
+const VIDEO_DIAG_TEST_ID_ENV: &str = "RUSTDESK_VIDEO_TEST_ID";
+const VIDEO_DIAG_TEST_ID_MAX_LEN: usize = 64;
+
+static VIDEO_DIAG_TEST_ID: OnceLock<Option<String>> = OnceLock::new();
+
+fn video_diag_test_id() -> Option<&'static str> {
+    VIDEO_DIAG_TEST_ID
+        .get_or_init(|| match std::env::var(VIDEO_DIAG_TEST_ID_ENV) {
+            Ok(value)
+                if !value.is_empty()
+                    && value.len() <= VIDEO_DIAG_TEST_ID_MAX_LEN
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    }) =>
+            {
+                Some(value)
+            }
+            Ok(_) => {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=disabled reason=invalid_test_id env={VIDEO_DIAG_TEST_ID_ENV}"
+                );
+                None
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(err) => {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=disabled reason=test_id_read_failed env={VIDEO_DIAG_TEST_ID_ENV} error={err}"
+                );
+                None
+            }
+        })
+        .as_deref()
+}
+
+struct VideoDiagStats {
+    test_id: String,
+    period_started: Instant,
+    received_messages: u64,
+    keyframe_messages: u64,
+    queue_overwrites: u64,
+    queue_pressure_refreshes: u64,
+    refresh_requests: u64,
+    max_queue_len: usize,
+}
+
+impl VideoDiagStats {
+    fn new(test_id: String) -> Self {
+        Self {
+            test_id,
+            period_started: Instant::now(),
+            received_messages: 0,
+            keyframe_messages: 0,
+            queue_overwrites: 0,
+            queue_pressure_refreshes: 0,
+            refresh_requests: 0,
+            max_queue_len: 0,
+        }
+    }
+
+    fn record_message(&mut self, keyframe: bool) {
+        self.received_messages += 1;
+        if keyframe {
+            self.keyframe_messages += 1;
+        }
+    }
+
+    fn observe_queue(&mut self, queue_len: usize) {
+        self.max_queue_len = self.max_queue_len.max(queue_len);
+    }
+
+    fn record_queue_overwrite(&mut self, queue_len: usize) {
+        self.queue_overwrites += 1;
+        self.refresh_requests += 1;
+        self.observe_queue(queue_len);
+    }
+
+    fn record_queue_pressure_refresh(&mut self) {
+        self.queue_pressure_refreshes += 1;
+        self.refresh_requests += 1;
+    }
+
+    fn report(&mut self, codec: CodecFormat, rendered_fps: i32, current_queue_len: usize) {
+        self.observe_queue(current_queue_len);
+        log::debug!(
+            target: "video_diag",
+            "[VIDEO_DIAG] test={} side=client event=receive_window period_ms={} codec={:?} received_messages={} keyframe_messages={} queue_overwrites={} queue_pressure_refreshes={} refresh_requests={} max_queue_len={} current_queue_len={} rendered_fps={}",
+            self.test_id,
+            self.period_started.elapsed().as_millis(),
+            codec,
+            self.received_messages,
+            self.keyframe_messages,
+            self.queue_overwrites,
+            self.queue_pressure_refreshes,
+            self.refresh_requests,
+            self.max_queue_len,
+            current_queue_len,
+            rendered_fps,
+        );
+        self.reset_period();
+    }
+
+    fn reset_period(&mut self) {
+        self.period_started = Instant::now();
+        self.received_messages = 0;
+        self.keyframe_messages = 0;
+        self.queue_overwrites = 0;
+        self.queue_pressure_refreshes = 0;
+        self.refresh_requests = 0;
+        self.max_queue_len = 0;
+    }
+}
 
 pub struct Remote<T: InvokeUiSession> {
     handler: Session<T>,
@@ -77,6 +191,7 @@ pub struct Remote<T: InvokeUiSession> {
     client_conn_id: i32, // used for file clipboard
     data_count: Arc<AtomicUsize>,
     video_format: CodecFormat,
+    video_diag: Option<VideoDiagStats>,
     elevation_requested: bool,
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
@@ -124,6 +239,7 @@ impl<T: InvokeUiSession> Remote<T> {
             client_conn_id: 0,
             data_count: Arc::new(AtomicUsize::new(0)),
             video_format: CodecFormat::Unknown,
+            video_diag: video_diag_test_id().map(|test_id| VideoDiagStats::new(test_id.to_owned())),
             stop_voice_call_sender: None,
             voice_call_request_timestamp: None,
             elevation_requested: false,
@@ -326,7 +442,17 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
+                            let rendered_fps = fps.values().copied().sum();
                             self.fps_control(direct, fps.clone());
+                            let current_queue_len = self
+                                .video_threads
+                                .values()
+                                .map(|thread| thread.video_queue.read().unwrap().len())
+                                .max()
+                                .unwrap_or_default();
+                            if let Some(stats) = self.video_diag.as_mut() {
+                                stats.report(self.video_format, rendered_fps, current_queue_len);
+                            }
                             let chroma = self.chroma.read().unwrap().clone();
                             let chroma = match chroma {
                                 Some(Chroma::I444) => "4:4:4",
@@ -1278,8 +1404,20 @@ impl<T: InvokeUiSession> Remote<T> {
                     && (video_queue.len() > tolerable
                             && (ctl.refresh_times == 0 || ctl.last_refresh_instant.map(|t|t.elapsed().as_secs() > 10).unwrap_or(false)))
             {
+                let queue_len = video_queue.len();
                 // Refresh causes client set_display, left frames cause flickering.
                 drop(video_queue);
+                if let Some(stats) = self.video_diag.as_mut() {
+                    stats.record_queue_pressure_refresh();
+                    log::warn!(
+                        target: "video_diag",
+                        "[VIDEO_DIAG] test={} side=client event=refresh_request reason=queue_pressure display={} queue_len={} tolerable={}",
+                        stats.test_id,
+                        display,
+                        queue_len,
+                        tolerable,
+                    );
+                }
                 self.handler.refresh_video(*display as _);
                 log::info!("Refresh display {} to reduce delay", display);
                 ctl.refresh_times += 1;
@@ -1342,10 +1480,23 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !self.video_threads.contains_key(&display) {
                         self.new_video_thread(display);
                     }
+                    let is_keyframe = Self::contains_key_frame(&vf);
+                    if let Some(stats) = self.video_diag.as_mut() {
+                        stats.record_message(is_keyframe);
+                        if is_keyframe {
+                            log::debug!(
+                                target: "video_diag",
+                                "[VIDEO_DIAG] test={} side=client event=keyframe_received display={} codec={:?}",
+                                stats.test_id,
+                                display,
+                                self.video_format,
+                            );
+                        }
+                    }
                     let Some(thread) = self.video_threads.get_mut(&display) else {
                         return true;
                     };
-                    if Self::contains_key_frame(&vf) {
+                    if is_keyframe {
                         thread
                             .video_sender
                             .send(MediaData::VideoFrame(Box::new(vf)))
@@ -1353,7 +1504,18 @@ impl<T: InvokeUiSession> Remote<T> {
                     } else {
                         let video_queue = thread.video_queue.read().unwrap();
                         if video_queue.force_push(vf).is_some() {
+                            let queue_len = video_queue.len();
                             drop(video_queue);
+                            if let Some(stats) = self.video_diag.as_mut() {
+                                stats.record_queue_overwrite(queue_len);
+                                log::warn!(
+                                    target: "video_diag",
+                                    "[VIDEO_DIAG] test={} side=client event=refresh_request reason=queue_overwrite display={} queue_len={}",
+                                    stats.test_id,
+                                    display,
+                                    queue_len,
+                                );
+                            }
                             self.handler.refresh_video(display as _);
                         } else {
                             thread.video_sender.send(MediaData::VideoQueue).ok();
