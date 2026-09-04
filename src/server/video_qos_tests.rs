@@ -30,6 +30,13 @@ fn qos_with_high_delay(initial_ratio: f32) -> VideoQoS {
     qos
 }
 
+fn qos_with_balanced_high_delay(initial_ratio: f32) -> VideoQoS {
+    let mut qos = qos_with_high_delay(initial_ratio);
+    qos.users.get_mut(&CONNECTION_ID).unwrap().quality =
+        Some((QUALITY_TIMESTAMP, Quality::Balanced));
+    qos
+}
+
 #[test]
 fn static_screen_restores_target_quality_during_high_delay() {
     let mut qos = qos_with_high_delay(LOW_RATIO);
@@ -68,11 +75,38 @@ fn settled_screen_at_target_quality_requests_one_refresh() {
 }
 
 #[test]
-fn dynamic_screen_still_reduces_quality_during_high_delay() {
+fn high_delay_reduces_fps_before_dynamic_quality() {
+    let mut qos = qos_with_balanced_high_delay(BR_BALANCED);
+    let initial_fps = qos.fps();
+
+    qos.user_network_delay(CONNECTION_ID, HIGH_DELAY_MS);
+    qos.adjust_ratio(true, DYNAMIC_SEND_COUNT);
+
+    assert!(qos.fps() < initial_fps);
+    assert_eq!(qos.ratio(), BR_BALANCED);
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
+}
+
+#[test]
+fn dynamic_screen_reduces_quality_after_fps_reaches_minimum() {
     let mut qos = qos_with_high_delay(TARGET_RATIO);
+    qos.fps = MIN_FPS;
 
     qos.adjust_ratio(true, DYNAMIC_SEND_COUNT);
 
     assert!(qos.ratio() < TARGET_RATIO);
+    assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
+}
+
+#[test]
+fn repeated_dynamic_high_delay_respects_balanced_quality_floor() {
+    let mut qos = qos_with_balanced_high_delay(BR_BALANCED);
+    qos.fps = MIN_FPS;
+
+    for _ in 0..10 {
+        qos.adjust_ratio(true, DYNAMIC_SEND_COUNT);
+    }
+
+    assert_eq!(qos.ratio(), BR_SPEED);
     assert_eq!(qos.take_static_refresh(DISPLAY_NAME), Some(false));
 }

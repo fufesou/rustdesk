@@ -517,23 +517,20 @@ impl VideoQoS {
                 }
                 min.max(BR_MIN)
             }
-            Quality::Balanced => {
-                let mut min = (BR_BALANCED / 2.0).min(0.4);
-                if let Some(ratio_1mbps) = ratio_1mbps {
-                    if min > ratio_1mbps {
-                        min = ratio_1mbps;
-                    }
-                }
-                min.max(BR_MIN_HIGH_RESOLUTION)
-            }
+            Quality::Balanced => BR_SPEED,
             Quality::Low => BR_MIN_HIGH_RESOLUTION,
             Quality::Custom(_) => BR_MIN_HIGH_RESOLUTION,
         };
         let max = target_ratio * MAX_BR_MULTIPLE;
 
         // A static frame can favor clarity because it only needs to be sent once.
+        let current_fps = self.fps();
+        let preserve_ratio_for_fps =
+            dynamic_screen && max_delay >= DELAY_THRESHOLD_150MS && current_fps > MIN_FPS;
         let mut v = if !dynamic_screen {
             target_ratio
+        } else if preserve_ratio_for_fps {
+            current_ratio
         } else if max_delay < 50 {
             current_ratio * 1.15
         } else if max_delay < 100 {
@@ -573,6 +570,8 @@ impl VideoQoS {
             "restore_static"
         } else if !dynamic_screen {
             "hold_static"
+        } else if preserve_ratio_for_fps {
+            "hold_quality_reduce_fps"
         } else if max_delay < 50 {
             "increase_delay_lt_50"
         } else if max_delay < 100 {
@@ -599,7 +598,7 @@ impl VideoQoS {
         if let Some(test_id) = video_diag_test_id() {
             log::debug!(
                 target: "video_diag",
-                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh} settle_refresh={settle_refresh}",
+                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} fps={current_fps} fps_priority={preserve_ratio_for_fps} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh} settle_refresh={settle_refresh}",
                 applied_ratio != unclamped_ratio,
                 applied_ratio != current_ratio,
             );
