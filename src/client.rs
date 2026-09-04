@@ -95,6 +95,8 @@ pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
 pub mod screenshot;
+#[cfg(target_os = "windows")]
+mod audio_fault_injection;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
@@ -1192,6 +1194,8 @@ pub struct AudioHandler {
     ready: Arc<std::sync::Mutex<bool>>,
     #[cfg(not(target_os = "linux"))]
     diagnostics: AudioDiagnostics,
+    #[cfg(target_os = "windows")]
+    audio_fault_injection: audio_fault_injection::AudioFaultInjection,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1600,6 +1604,10 @@ impl AudioHandler {
                     );
                 }
                 self.diagnostics.record_decoded(n, resampled);
+                #[cfg(target_os = "windows")]
+                if self.audio_fault_injection.should_drop(&buffer) {
+                    return;
+                }
                 self.audio_buffer.append_pcm(&buffer);
             }
             #[cfg(target_os = "linux")]
