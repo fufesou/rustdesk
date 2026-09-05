@@ -12,4 +12,4 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "fix-android-trackpad-1finger-cursor"
+      upload-tag: "test-android-trackpad-1finger-cursor"
