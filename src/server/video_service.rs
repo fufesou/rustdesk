@@ -21,7 +21,7 @@
 use super::{
     display_service::check_display_changed,
     service::ServiceTmpl,
-    video_qos::{video_diag_test_id, VideoQoS},
+    video_qos::{video_diag_test_id, StaticRefresh, VideoQoS},
     *,
 };
 #[cfg(target_os = "linux")]
@@ -51,7 +51,7 @@ use scrap::vram::{VRamEncoder, VRamEncoderConfig};
 use scrap::Capturer;
 use scrap::{
     aom::AomEncoderConfig,
-    codec::{Encoder, EncoderCfg},
+    codec::{Encoder, EncoderCfg, EncoderRateControl},
     record::{Recorder, RecorderContext},
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
     CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
@@ -92,6 +92,15 @@ struct Screenshot {
 }
 
 const VIDEO_DIAG_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct VideoDiagRateSnapshot {
+    ratio: f32,
+    capture_fps: u32,
+    frame_budget_fps: u32,
+    logical_bitrate_kbps: u32,
+    configured_bitrate_kbps: u32,
+}
 
 struct VideoDiagStats {
     test_id: String,
@@ -166,7 +175,7 @@ impl VideoDiagStats {
         }
     }
 
-    fn report_if_due(&mut self, ratio: f32, bitrate_kbps: u32) {
+    fn report_if_due(&mut self, rate: VideoDiagRateSnapshot) {
         if self.period_started.elapsed() < VIDEO_DIAG_REPORT_INTERVAL {
             return;
         }
@@ -177,7 +186,7 @@ impl VideoDiagStats {
             .unwrap_or_default();
         log::debug!(
             target: "video_diag",
-            "[VIDEO_DIAG] test={} side=host event=stream_window display={} codec={:?} period_ms={} valid_captures={} invalid_captures={} would_block={} encode_attempts={} repeated_encodes={} last_valid_seen={} last_valid_age_ms={} fetch_samples={} expected_receivers={} fetched_receivers={} fetch_wait_ms_total={} fetch_wait_ms_max={} fetch_timeouts={} ratio={:.4} bitrate_kbps={}",
+            "[VIDEO_DIAG] test={} side=host event=stream_window display={} codec={:?} period_ms={} valid_captures={} invalid_captures={} would_block={} encode_attempts={} repeated_encodes={} last_valid_seen={} last_valid_age_ms={} fetch_samples={} expected_receivers={} fetched_receivers={} fetch_wait_ms_total={} fetch_wait_ms_max={} fetch_timeouts={} ratio={:.4} bitrate_kbps={} capture_fps={} frame_budget_fps={} configured_bitrate_kbps={}",
             self.test_id,
             self.display,
             self.codec,
@@ -195,8 +204,11 @@ impl VideoDiagStats {
             self.fetch_wait_ms_total,
             self.fetch_wait_ms_max,
             self.fetch_timeouts,
-            ratio,
-            bitrate_kbps,
+            rate.ratio,
+            rate.logical_bitrate_kbps,
+            rate.capture_fps,
+            rate.frame_budget_fps,
+            rate.configured_bitrate_kbps,
         );
         self.reset_period();
     }
@@ -519,6 +531,72 @@ impl DerefMut for CapturerInfo {
     }
 }
 
+enum StaticRefreshOutcome {
+    FullFrameRequested,
+    StreamRestart,
+    Unsupported(String),
+}
+
+impl StaticRefreshOutcome {
+    fn action(&self) -> &'static str {
+        match self {
+            Self::FullFrameRequested => "request_full_frame",
+            Self::StreamRestart | Self::Unsupported(_) => "stream_restart",
+        }
+    }
+
+    fn result(&self) -> &'static str {
+        match self {
+            Self::Unsupported(_) => "unsupported",
+            _ => "ok",
+        }
+    }
+
+    fn error(&self) -> &str {
+        match self {
+            Self::Unsupported(error) => error,
+            _ => "none",
+        }
+    }
+
+    fn restarts_stream(&self) -> bool {
+        !matches!(self, Self::FullFrameRequested)
+    }
+}
+
+fn apply_static_refresh(
+    capturer: &mut CapturerInfo,
+    static_refresh: StaticRefresh,
+) -> std::io::Result<Option<StaticRefreshOutcome>> {
+    match static_refresh {
+        StaticRefresh::None => Ok(None),
+        StaticRefresh::Quality => Ok(Some(StaticRefreshOutcome::StreamRestart)),
+        StaticRefresh::Settled => request_settled_full_frame(capturer).map(Some),
+    }
+}
+
+#[cfg(windows)]
+fn request_settled_full_frame(
+    capturer: &mut CapturerInfo,
+) -> std::io::Result<StaticRefreshOutcome> {
+    match capturer.request_full_frame() {
+        Ok(()) => Ok(StaticRefreshOutcome::FullFrameRequested),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            Ok(StaticRefreshOutcome::Unsupported(error.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn request_settled_full_frame(
+    _capturer: &mut CapturerInfo,
+) -> std::io::Result<StaticRefreshOutcome> {
+    Ok(StaticRefreshOutcome::Unsupported(
+        "Full-frame capture refresh is not supported on this platform".to_owned(),
+    ))
+}
+
 fn get_capturer_monitor(
     current: usize,
     portable_service_running: bool,
@@ -789,10 +867,12 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut video_diag = video_diag_test_id().map(|test_id| {
         log::info!(
             target: "video_diag",
-            "[VIDEO_DIAG] test={test_id} side=host event=stream_start display={display_idx} codec={codec_format:?} hardware={} latency_free={} quality={quality:.4} bitrate_kbps={}",
+            "[VIDEO_DIAG] test={test_id} side=host event=stream_start display={display_idx} codec={codec_format:?} hardware={} latency_free={} quality={quality:.4} bitrate_kbps={} fps_aware_rate_control={} configured_bitrate_kbps={}",
             encoder.is_hardware(),
             encoder.latency_free(),
             encoder.bitrate(),
+            encoder.support_fps_aware_rate_control(),
+            encoder.configured_bitrate(),
         );
         VideoDiagStats::new(test_id.to_owned(), display_idx, codec_format)
     });
@@ -817,15 +897,37 @@ fn run(vs: VideoService) -> ResultType<()> {
         let Some(static_refresh) = static_refresh else {
             bail!("Missing video QoS display state for {}", sp.name());
         };
-        if static_refresh {
+        let static_refresh_outcome = match apply_static_refresh(&mut c, static_refresh) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(test_id) = video_diag_test_id() {
+                    log::error!(
+                        target: "video_diag",
+                        "[VIDEO_DIAG] test={test_id} side=host event=static_refresh display={display_idx} previous_ratio={quality:.4} next_ratio={static_ratio:.4} previous_bitrate_kbps={} previous_configured_bitrate_kbps={} refresh_kind={} action=request_full_frame result=error error={error}",
+                        encoder.bitrate(),
+                        encoder.configured_bitrate(),
+                        static_refresh.as_str(),
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if let Some(outcome) = static_refresh_outcome {
             if let Some(test_id) = video_diag_test_id() {
                 log::debug!(
                     target: "video_diag",
-                    "[VIDEO_DIAG] test={test_id} side=host event=static_refresh display={display_idx} previous_ratio={quality:.4} next_ratio={static_ratio:.4} previous_bitrate_kbps={}",
+                    "[VIDEO_DIAG] test={test_id} side=host event=static_refresh display={display_idx} previous_ratio={quality:.4} next_ratio={static_ratio:.4} previous_bitrate_kbps={} previous_configured_bitrate_kbps={} refresh_kind={} action={} result={} error={}",
                     encoder.bitrate(),
+                    encoder.configured_bitrate(),
+                    static_refresh.as_str(),
+                    outcome.action(),
+                    outcome.result(),
+                    outcome.error(),
                 );
             }
-            bail!("SWITCH");
+            if outcome.restarts_stream() {
+                bail!("SWITCH");
+            }
         }
         if sp.is_option_true(OPTION_REFRESH) {
             if vs.source.is_monitor() {
@@ -1065,7 +1167,19 @@ fn run(vs: VideoService) -> ResultType<()> {
                 fetched_conn_ids.len(),
                 wait_begin.elapsed(),
             );
-            stats.report_if_due(quality, encoder.bitrate());
+            if stats.period_started.elapsed() >= VIDEO_DIAG_REPORT_INTERVAL {
+                let (capture_fps, frame_budget_fps) = {
+                    let video_qos = VIDEO_QOS.lock().unwrap();
+                    (video_qos.fps(), video_qos.encoder_frame_budget_fps())
+                };
+                stats.report_if_due(VideoDiagRateSnapshot {
+                    ratio: quality,
+                    capture_fps,
+                    frame_budget_fps,
+                    logical_bitrate_kbps: encoder.bitrate(),
+                    configured_bitrate_kbps: encoder.configured_bitrate(),
+                });
+            }
         }
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
@@ -1497,6 +1611,63 @@ pub fn make_display_changed_msg(
     Some(msg_out)
 }
 
+struct VideoRateControlRequest<'a> {
+    stream_name: &'a str,
+    previous_ratio: f32,
+    target_ratio: f32,
+    capture_fps: u32,
+    frame_budget_fps: u32,
+}
+
+fn apply_fps_aware_rate_control(
+    encoder: &mut Encoder,
+    request: VideoRateControlRequest,
+) -> ResultType<bool> {
+    let logical_bitrate_before = encoder.bitrate();
+    let configured_bitrate_before = encoder.configured_bitrate();
+    let result = encoder.set_rate_control(EncoderRateControl {
+        quality: request.target_ratio,
+        frame_budget_fps: request.frame_budget_fps,
+    });
+    match result {
+        Ok(changed) => {
+            if changed {
+                if let Some(test_id) = video_diag_test_id() {
+                    log::debug!(
+                        target: "video_diag",
+                        "[VIDEO_DIAG] test={test_id} side=host event=rate_control_apply stream={} result=ok hardware={} previous_ratio={:.4} requested_ratio={:.4} capture_fps={} frame_budget_fps={} logical_bitrate_before_kbps={} logical_bitrate_after_kbps={} configured_bitrate_before_kbps={} configured_bitrate_after_kbps={}",
+                        request.stream_name,
+                        encoder.is_hardware(),
+                        request.previous_ratio,
+                        request.target_ratio,
+                        request.capture_fps,
+                        request.frame_budget_fps,
+                        logical_bitrate_before,
+                        encoder.bitrate(),
+                        configured_bitrate_before,
+                        encoder.configured_bitrate(),
+                    );
+                }
+            }
+            Ok(changed)
+        }
+        Err(err) => {
+            log::error!("Failed to apply FPS-aware video rate control: {err:?}");
+            if let Some(test_id) = video_diag_test_id() {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] test={test_id} side=host event=rate_control_apply stream={} result=error requested_ratio={:.4} capture_fps={} frame_budget_fps={} error={err:?}",
+                    request.stream_name,
+                    request.target_ratio,
+                    request.capture_fps,
+                    request.frame_budget_fps,
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
 fn check_qos(
     encoder: &mut Encoder,
     ratio: &mut f32,
@@ -1507,28 +1678,49 @@ fn check_qos(
     name: &str,
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
+    let capture_fps = video_qos.fps();
+    let frame_budget_fps = video_qos.encoder_frame_budget_fps();
+    let target_ratio = video_qos.ratio();
     *spf = video_qos.spf();
-    if *ratio != video_qos.ratio() {
+    if encoder.support_fps_aware_rate_control() {
+        let changed = apply_fps_aware_rate_control(
+            encoder,
+            VideoRateControlRequest {
+                stream_name: name,
+                previous_ratio: *ratio,
+                target_ratio,
+                capture_fps,
+                frame_budget_fps,
+            },
+        )?;
+        *ratio = target_ratio;
+        if changed {
+            video_qos.store_bitrate(encoder.bitrate());
+        }
+    } else if *ratio != target_ratio {
         let previous_ratio = *ratio;
-        *ratio = video_qos.ratio();
+        *ratio = target_ratio;
         if encoder.support_changing_quality() {
             let bitrate_before = encoder.bitrate();
+            let configured_bitrate_before = encoder.configured_bitrate();
             let result = encoder.set_quality(*ratio);
             if let Some(test_id) = video_diag_test_id() {
                 match &result {
                     Ok(()) => log::debug!(
                         target: "video_diag",
-                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=ok hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={}",
+                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=ok hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={} configured_bitrate_before_kbps={configured_bitrate_before} configured_bitrate_after_kbps={}",
                         encoder.is_hardware(),
                         *ratio,
                         encoder.bitrate(),
+                        encoder.configured_bitrate(),
                     ),
                     Err(err) => log::warn!(
                         target: "video_diag",
-                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=error hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={} error={err:?}",
+                        "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=error hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_before_kbps={bitrate_before} bitrate_after_kbps={} configured_bitrate_before_kbps={configured_bitrate_before} configured_bitrate_after_kbps={} error={err:?}",
                         encoder.is_hardware(),
                         *ratio,
                         encoder.bitrate(),
+                        encoder.configured_bitrate(),
                     ),
                 }
             }
@@ -1538,10 +1730,11 @@ fn check_qos(
             if let Some(test_id) = video_diag_test_id() {
                 log::debug!(
                     target: "video_diag",
-                    "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=unsupported hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_kbps={}",
+                    "[VIDEO_DIAG] test={test_id} side=host event=quality_apply stream={name} result=unsupported hardware={} previous_ratio={previous_ratio:.4} requested_ratio={:.4} bitrate_kbps={} configured_bitrate_kbps={}",
                     encoder.is_hardware(),
                     *ratio,
                     encoder.bitrate(),
+                    encoder.configured_bitrate(),
                 );
             }
             // Now only vaapi doesn't support changing quality

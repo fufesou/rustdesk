@@ -329,6 +329,36 @@ impl Capturer {
         self.output_texture = texture;
     }
 
+    pub fn request_full_frame(&mut self) -> io::Result<()> {
+        if self.is_gdi() {
+            self.saved_raw_data.clear();
+            return Ok(());
+        }
+        if self.duplication.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "DXGI output duplication is unavailable",
+            ));
+        }
+        unsafe {
+            self.unmap();
+            self.surface = ComPtr(ptr::null_mut());
+            self.texture = ComPtr(ptr::null_mut());
+            self.duplication = ComPtr(ptr::null_mut());
+
+            let mut duplication = ptr::null_mut();
+            wrap_hresult(
+                (*self.display.inner.0).DuplicateOutput(self.device.0 as *mut _, &mut duplication),
+            )?;
+            let duplication = ComPtr(duplication);
+            let mut desc: DXGI_OUTDUPL_DESC = mem::zeroed();
+            (*duplication.0).GetDesc(&mut desc);
+            self.fastlane = desc.DesktopImageInSystemMemory == TRUE;
+            self.duplication = duplication;
+        }
+        Ok(())
+    }
+
     unsafe fn load_frame(&mut self, timeout: UINT) -> io::Result<(*const u8, i32)> {
         let mut frame = ptr::null_mut();
         #[allow(invalid_value)]

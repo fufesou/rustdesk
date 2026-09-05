@@ -43,12 +43,83 @@ const MAX_BR_MULTIPLE: f32 = 1.0;
 const HISTORY_DELAY_LEN: usize = 2;
 const ADJUST_RATIO_INTERVAL: usize = 3; // Adjust quality ratio every 3 seconds
 const DYNAMIC_SCREEN_THRESHOLD: usize = 2; // Allow increase quality ratio if encode more than 2 times in one second
-const SETTLE_REFRESH_MIN_FRAMES: usize = 2; // Ignore the single frame emitted by an encoder refresh
 const DELAY_THRESHOLD_150MS: u32 = 150; // 150ms is the threshold for good network condition
+const BEST_MIN_FPS: u32 = 8;
+const BEST_NORMAL_FPS: u32 = 16;
+const BALANCED_MIN_FPS: u32 = 10;
+const BALANCED_NORMAL_FPS: u32 = 20;
+const SPEED_MIN_FPS: u32 = 12;
+const SPEED_NORMAL_FPS: u32 = 24;
 const VIDEO_DIAG_TEST_ID_ENV: &str = "RUSTDESK_VIDEO_TEST_ID";
 const VIDEO_DIAG_TEST_ID_MAX_LEN: usize = 64;
+const VIDEO_CLARITY_FPS_ENV: &str = "RUSTDESK_VIDEO_CLARITY_FPS";
 
 static VIDEO_DIAG_TEST_ID: OnceLock<Option<String>> = OnceLock::new();
+static VIDEO_CLARITY_FPS_OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct QualityFpsRange {
+    minimum: u32,
+    normal: u32,
+}
+
+fn quality_fps_range(target_ratio: f32) -> QualityFpsRange {
+    if target_ratio >= BR_BEST {
+        QualityFpsRange {
+            minimum: BEST_MIN_FPS,
+            normal: BEST_NORMAL_FPS,
+        }
+    } else if target_ratio >= BR_BALANCED {
+        QualityFpsRange {
+            minimum: BALANCED_MIN_FPS,
+            normal: BALANCED_NORMAL_FPS,
+        }
+    } else {
+        QualityFpsRange {
+            minimum: SPEED_MIN_FPS,
+            normal: SPEED_NORMAL_FPS,
+        }
+    }
+}
+
+fn parse_clarity_fps(value: &str) -> Result<u32, &'static str> {
+    let fps = value
+        .parse::<u32>()
+        .map_err(|_| "value_is_not_an_unsigned_integer")?;
+    if !(MIN_FPS..=FPS).contains(&fps) {
+        return Err("value_is_out_of_range");
+    }
+    Ok(fps)
+}
+
+fn configured_clarity_fps() -> Option<u32> {
+    *VIDEO_CLARITY_FPS_OVERRIDE.get_or_init(|| match std::env::var(VIDEO_CLARITY_FPS_ENV) {
+        Ok(value) => match parse_clarity_fps(&value) {
+            Ok(fps) => {
+                log::info!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=clarity_fps_config result=active env={VIDEO_CLARITY_FPS_ENV} clarity_fps={fps}"
+                );
+                Some(fps)
+            }
+            Err(reason) => {
+                log::warn!(
+                    target: "video_diag",
+                    "[VIDEO_DIAG] event=clarity_fps_config result=invalid env={VIDEO_CLARITY_FPS_ENV} value={value:?} reason={reason} valid_min={MIN_FPS} valid_max={FPS}"
+                );
+                None
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => {
+            log::warn!(
+                target: "video_diag",
+                "[VIDEO_DIAG] event=clarity_fps_config result=read_failed env={VIDEO_CLARITY_FPS_ENV} error={err}"
+            );
+            None
+        }
+    })
+}
 
 pub(super) fn video_diag_test_id() -> Option<&'static str> {
     VIDEO_DIAG_TEST_ID
@@ -135,8 +206,36 @@ struct UserData {
 #[derive(Default, Debug, Clone)]
 struct DisplayData {
     send_counter: usize, // Number of times encode during period
+    recent_send_counter: usize,
     support_changing_quality: bool,
-    static_refresh_pending: bool,
+    static_refresh_pending: StaticRefresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StaticRefresh {
+    None,
+    Quality,
+    Settled,
+}
+
+impl Default for StaticRefresh {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl StaticRefresh {
+    pub(super) fn is_requested(self) -> bool {
+        self != Self::None
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Quality => "quality",
+            Self::Settled => "settled",
+        }
+    }
 }
 
 // Main QoS controller structure
@@ -150,6 +249,7 @@ pub struct VideoQoS {
     settle_refresh_armed: bool,
     abr_config: bool,
     new_user_instant: Instant,
+    clarity_fps_override: Option<u32>,
 }
 
 impl Default for VideoQoS {
@@ -164,6 +264,7 @@ impl Default for VideoQoS {
             settle_refresh_armed: false,
             abr_config: true,
             new_user_instant: Instant::now(),
+            clarity_fps_override: configured_clarity_fps(),
         }
     }
 }
@@ -214,7 +315,20 @@ impl VideoQoS {
         }
     }
 
-    pub fn take_static_refresh(&mut self, video_service_name: &str) -> Option<bool> {
+    pub fn encoder_frame_budget_fps(&self) -> u32 {
+        self.fps()
+            .max(self.clarity_fps_limit(self.latest_quality().ratio()))
+    }
+
+    fn clarity_fps_limit(&self, target_ratio: f32) -> u32 {
+        self.clarity_fps_override
+            .unwrap_or_else(|| quality_fps_range(target_ratio).minimum)
+    }
+
+    pub(super) fn take_static_refresh(
+        &mut self,
+        video_service_name: &str,
+    ) -> Option<StaticRefresh> {
         self.displays
             .get_mut(video_service_name)
             .map(|display| std::mem::take(&mut display.static_refresh_pending))
@@ -292,15 +406,13 @@ impl VideoQoS {
     pub fn user_network_delay(&mut self, id: i32, delay: u32) {
         let highest_fps = self.highest_fps();
         let target_ratio = self.latest_quality().ratio();
-
-        // For bad network, small fps means quick reaction and high quality
-        let (min_fps, normal_fps) = if target_ratio >= BR_BEST {
-            (8, 16)
-        } else if target_ratio >= BR_BALANCED {
-            (10, 20)
-        } else {
-            (12, 24)
-        };
+        let fps_range = quality_fps_range(target_ratio);
+        let min_fps = fps_range.minimum;
+        let normal_fps = fps_range.normal;
+        let clarity_fps = self.clarity_fps_limit(target_ratio);
+        let clarity_fps_overridden = self.clarity_fps_override.is_some();
+        let clarity_recovery_pending = clarity_fps_overridden && self.settle_refresh_armed;
+        let dynamic_screen = self.is_dynamic_screen();
 
         // Calculate minimum acceptable delay-fps product
         let dividend_ms = DELAY_THRESHOLD_150MS * min_fps;
@@ -367,15 +479,26 @@ impl VideoQoS {
                 user.delay.quick_increase_fps_count = 0;
             }
 
+            let rtt = user.delay.rtt_calculator.get_rtt();
+            let high_rtt = rtt
+                .map(|value| value >= DELAY_THRESHOLD_150MS)
+                .unwrap_or(false);
+            let clarity_mode = high_rtt && (dynamic_screen || clarity_recovery_pending);
+            let clarity_fps_limited = clarity_mode && fps > clarity_fps;
+            if clarity_mode {
+                fps = fps.min(clarity_fps);
+                user.delay.quick_increase_fps_count = 0;
+                user.delay.increase_fps_count = 0;
+            }
+
             fps = fps.clamp(MIN_FPS, highest_fps);
             // first network delay message
             adjust_ratio = user.delay.fps.is_none();
             user.delay.fps = Some(fps);
             if let Some(test_id) = video_diag_test_id() {
-                let rtt = user.delay.rtt_calculator.get_rtt();
                 log::debug!(
                     target: "video_diag",
-                    "[VIDEO_DIAG] test={test_id} side=host event=network_sample conn={id} sample_delay_ms={delay} old_avg_delay_ms={old_avg_delay} avg_delay_ms={avg_delay} rtt_ready={} rtt_ms={} fps={fps} response_delayed={}",
+                    "[VIDEO_DIAG] test={test_id} side=host event=network_sample conn={id} sample_delay_ms={delay} old_avg_delay_ms={old_avg_delay} avg_delay_ms={avg_delay} rtt_ready={} rtt_ms={} fps={fps} response_delayed={} dynamic_screen={dynamic_screen} high_rtt={high_rtt} clarity_limit_fps={clarity_fps} clarity_fps_overridden={clarity_fps_overridden} clarity_recovery_pending={clarity_recovery_pending} clarity_fps_limited={clarity_fps_limited}",
                     rtt.is_some(),
                     rtt.unwrap_or_default(),
                     user.delay.response_delayed,
@@ -414,6 +537,7 @@ impl VideoQoS {
     pub fn update_display_data(&mut self, video_service_name: &str, send_counter: usize) {
         if let Some(display) = self.displays.get_mut(video_service_name) {
             display.send_counter += send_counter;
+            display.recent_send_counter = send_counter;
         }
         self.adjust_fps();
         let abr_enabled = self.in_vbr_state();
@@ -437,6 +561,12 @@ impl VideoQoS {
         } else {
             self.ratio = self.latest_quality().ratio();
         }
+    }
+
+    fn is_dynamic_screen(&self) -> bool {
+        self.displays
+            .values()
+            .any(|display| display.recent_send_counter >= DYNAMIC_SCREEN_THRESHOLD)
     }
 
     #[inline]
@@ -489,7 +619,7 @@ impl VideoQoS {
         let target_ratio = self.latest_quality().ratio();
         let current_ratio = self.ratio;
         let current_bitrate = self.bitrate();
-        let settle_refresh = self.update_settle_refresh(max_send_counter);
+        let settle_refresh = self.update_settle_refresh(dynamic_screen, max_send_counter);
 
         // Calculate minimum ratio for high resolution (1Mbps baseline)
         let ratio_1mbps = if current_bitrate > 0 {
@@ -563,11 +693,17 @@ impl VideoQoS {
         let unclamped_ratio = v;
         let applied_ratio = v.clamp(min, max);
         let quality_refresh = !dynamic_screen && applied_ratio > current_ratio;
-        let static_refresh = quality_refresh || settle_refresh;
-        let decision = if settle_refresh {
-            "refresh_settled"
-        } else if quality_refresh {
+        let static_refresh = if quality_refresh {
+            StaticRefresh::Quality
+        } else if settle_refresh {
+            StaticRefresh::Settled
+        } else {
+            StaticRefresh::None
+        };
+        let decision = if quality_refresh {
             "restore_static"
+        } else if settle_refresh {
+            "refresh_settled"
         } else if !dynamic_screen {
             "hold_static"
         } else if preserve_ratio_for_fps {
@@ -588,25 +724,27 @@ impl VideoQoS {
             "decrease_delay_gte_500"
         };
         self.ratio = applied_ratio;
-        if static_refresh {
+        if static_refresh.is_requested() {
             self.settle_refresh_armed = false;
             self.displays.values_mut().for_each(|display| {
-                display.static_refresh_pending = true;
+                display.static_refresh_pending = static_refresh;
             });
         }
         self.adjust_ratio_instant = Instant::now();
         if let Some(test_id) = video_diag_test_id() {
             log::debug!(
                 target: "video_diag",
-                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} fps={current_fps} fps_priority={preserve_ratio_for_fps} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={static_refresh} settle_refresh={settle_refresh}",
+                "[VIDEO_DIAG] test={test_id} side=host event=qos_decision decision={decision} dynamic={dynamic_screen} window_max_frames={max_send_counter} max_delay_ms={max_delay} fps={current_fps} fps_priority={preserve_ratio_for_fps} quality={target_quality:?} current_ratio={current_ratio:.4} target_ratio={target_ratio:.4} delay_ratio={delay_adjusted_ratio:.4} final_ratio={applied_ratio:.4} min_ratio={min:.4} max_ratio={max:.4} bitrate_kbps={current_bitrate} rate_limited={rate_limited} clamped={} changed={} static_refresh={} settle_refresh={settle_refresh} refresh_kind={}",
                 applied_ratio != unclamped_ratio,
                 applied_ratio != current_ratio,
+                static_refresh.is_requested(),
+                static_refresh.as_str(),
             );
         }
     }
 
-    fn update_settle_refresh(&mut self, max_send_counter: usize) -> bool {
-        if max_send_counter >= SETTLE_REFRESH_MIN_FRAMES {
+    fn update_settle_refresh(&mut self, dynamic_screen: bool, max_send_counter: usize) -> bool {
+        if dynamic_screen {
             self.settle_refresh_armed = true;
             return false;
         }

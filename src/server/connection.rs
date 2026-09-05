@@ -1,3 +1,6 @@
+mod video_send_diag;
+
+use self::video_send_diag::{VideoSendDiagnostics, VideoSendStart};
 #[cfg(target_os = "windows")]
 use super::login_failure_check::try_acquire_os_credential_login_gate;
 use super::login_failure_check::{
@@ -619,6 +622,9 @@ impl Connection {
             (_tx_clip, rx_clip) = mpsc::unbounded_channel::<i32>();
         }
 
+        let mut video_send_diagnostics =
+            VideoSendDiagnostics::new(super::video_qos::video_diag_test_id());
+
         loop {
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
@@ -944,12 +950,23 @@ impl Connection {
                     }
                 }
                 Some((instant, value)) = rx_video.recv() => {
+                    let send_trace = video_send_diagnostics.start(VideoSendStart {
+                        conn_id: id,
+                        enqueued_at: &instant,
+                        message: &value,
+                        queued_after_recv: rx_video.len(),
+                        ack_required: conn.video_ack_required,
+                    });
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
-                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                    let send_result = conn.stream.send(&value as &Message).await;
+                    if let Some(trace) = send_trace {
+                        trace.complete(rx_video.len(), send_result.is_ok());
+                    }
+                    if let Err(err) = send_result {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }

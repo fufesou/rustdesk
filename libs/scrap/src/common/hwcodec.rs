@@ -1,5 +1,10 @@
+use std::convert::TryFrom;
+
 use crate::{
-    codec::{base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg},
+    codec::{
+        base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg,
+        EncoderRateControl,
+    },
     convert::*,
     CodecFormat, EncodeInput, ImageFormat, ImageRgb, Pixfmt, HW_STRIDE_ALIGN,
 };
@@ -27,6 +32,7 @@ use hwcodec::{
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
+const ENCODER_NOMINAL_FPS: u32 = DEFAULT_FPS as u32;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
@@ -54,7 +60,69 @@ pub struct HwRamEncoder {
     pub format: DataFormat,
     pub pixfmt: AVPixelFormat,
     bitrate: u32, //kbs
+    configured_bitrate: u32,
+    frame_budget_fps: u32,
     config: HwRamEncoderConfig,
+}
+
+fn supports_fps_aware_rate_control(name: &str) -> bool {
+    !name.contains("vaapi")
+}
+
+fn scale_bitrate_for_rate_control(
+    logical_bitrate: u32,
+    nominal_fps: u32,
+    frame_budget_fps: u32,
+) -> ResultType<u32> {
+    if nominal_fps == 0 || frame_budget_fps == 0 {
+        bail!("Encoder frame rates must be greater than zero");
+    }
+    let numerator = u64::from(logical_bitrate) * u64::from(nominal_fps);
+    let denominator = u64::from(frame_budget_fps);
+    let configured_bitrate = numerator / denominator + u64::from(numerator % denominator != 0);
+    u32::try_from(configured_bitrate)
+        .map_err(|_| anyhow!("Configured HWRAM encoder bitrate exceeds u32"))
+}
+
+impl HwRamEncoder {
+    fn apply_rate_control(&mut self, rate_control: EncoderRateControl) -> ResultType<bool> {
+        if self.config.quality == rate_control.quality
+            && self.frame_budget_fps == rate_control.frame_budget_fps
+        {
+            return Ok(false);
+        }
+        let bitrate = Self::check_bitrate_range(
+            &self.config,
+            Self::bitrate(
+                &self.config.name,
+                self.config.width,
+                self.config.height,
+                rate_control.quality,
+            ),
+        );
+        let configured_bitrate = Self::check_bitrate_range(
+            &self.config,
+            scale_bitrate_for_rate_control(
+                bitrate,
+                ENCODER_NOMINAL_FPS,
+                rate_control.frame_budget_fps,
+            )?,
+        );
+        let encoder_bitrate = i32::try_from(configured_bitrate)
+            .map_err(|_| anyhow!("Configured HWRAM encoder bitrate exceeds i32"))?;
+        self.encoder.set_bitrate(encoder_bitrate).map_err(|_| {
+            anyhow!(
+                "Failed to set HWRAM encoder {} bitrate to {} kbps",
+                self.config.name,
+                configured_bitrate
+            )
+        })?;
+        self.bitrate = bitrate;
+        self.configured_bitrate = configured_bitrate;
+        self.config.quality = rate_control.quality;
+        self.frame_budget_fps = rate_control.frame_budget_fps;
+        Ok(true)
+    }
 }
 
 impl EncoderApi for HwRamEncoder {
@@ -99,6 +167,8 @@ impl EncoderApi for HwRamEncoder {
                         format,
                         pixfmt: ctx.pixfmt,
                         bitrate,
+                        configured_bitrate: bitrate,
+                        frame_budget_fps: ENCODER_NOMINAL_FPS,
                         config,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
@@ -171,27 +241,31 @@ impl EncoderApi for HwRamEncoder {
     }
 
     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
-        let mut bitrate = Self::bitrate(
-            &self.config.name,
-            self.config.width,
-            self.config.height,
-            ratio,
-        );
-        if bitrate > 0 {
-            bitrate = Self::check_bitrate_range(&self.config, bitrate);
-            self.encoder.set_bitrate(bitrate as _).ok();
-            self.bitrate = bitrate;
-        }
-        self.config.quality = ratio;
-        Ok(())
+        self.apply_rate_control(EncoderRateControl {
+            quality: ratio,
+            frame_budget_fps: self.frame_budget_fps,
+        })
+        .map(|_| ())
+    }
+
+    fn support_fps_aware_rate_control(&self) -> bool {
+        supports_fps_aware_rate_control(&self.config.name)
+    }
+
+    fn set_rate_control(&mut self, rate_control: EncoderRateControl) -> ResultType<bool> {
+        self.apply_rate_control(rate_control)
     }
 
     fn bitrate(&self) -> u32 {
         self.bitrate
     }
 
+    fn configured_bitrate(&self) -> u32 {
+        self.configured_bitrate
+    }
+
     fn support_changing_quality(&self) -> bool {
-        ["vaapi"].iter().all(|&x| !self.config.name.contains(x))
+        supports_fps_aware_rate_control(&self.config.name)
     }
 
     fn latency_free(&self) -> bool {
@@ -761,3 +835,7 @@ pub fn start_check_process() {
         std::thread::spawn(f);
     });
 }
+
+#[cfg(test)]
+#[path = "hwcodec_tests.rs"]
+mod tests;

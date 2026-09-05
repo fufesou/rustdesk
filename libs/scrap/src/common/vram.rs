@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::TryFrom,
     ffi::c_void,
     sync::{Arc, Mutex},
 };
 
 use crate::{
-    codec::{enable_vram_option, EncoderApi, EncoderCfg},
+    codec::{enable_vram_option, EncoderApi, EncoderCfg, EncoderRateControl},
     hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
@@ -34,6 +35,22 @@ lazy_static::lazy_static! {
     static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<String>>> = Default::default();
 }
 
+const ENCODER_NOMINAL_FPS: u32 = 30;
+
+fn scale_bitrate_for_rate_control(
+    logical_bitrate: u32,
+    nominal_fps: u32,
+    frame_budget_fps: u32,
+) -> ResultType<u32> {
+    if nominal_fps == 0 || frame_budget_fps == 0 {
+        bail!("Encoder frame rates must be greater than zero");
+    }
+    let numerator = u64::from(logical_bitrate) * u64::from(nominal_fps);
+    let denominator = u64::from(frame_budget_fps);
+    let configured_bitrate = numerator / denominator + u64::from(numerator % denominator != 0);
+    u32::try_from(configured_bitrate).map_err(|_| anyhow!("Configured encoder bitrate exceeds u32"))
+}
+
 #[derive(Debug, Clone)]
 pub struct VRamEncoderConfig {
     pub device: AdapterDevice,
@@ -49,8 +66,42 @@ pub struct VRamEncoder {
     pub format: DataFormat,
     ctx: EncodeContext,
     bitrate: u32,
+    configured_bitrate: u32,
+    quality: f32,
+    frame_budget_fps: u32,
     last_frame_len: usize,
     same_bad_len_counter: usize,
+}
+
+impl VRamEncoder {
+    fn apply_rate_control(&mut self, rate_control: EncoderRateControl) -> ResultType<bool> {
+        if self.quality == rate_control.quality
+            && self.frame_budget_fps == rate_control.frame_budget_fps
+        {
+            return Ok(false);
+        }
+        let bitrate = Self::bitrate(
+            self.ctx.f.data_format,
+            self.ctx.d.width as _,
+            self.ctx.d.height as _,
+            rate_control.quality,
+        );
+        let configured_bitrate = scale_bitrate_for_rate_control(
+            bitrate,
+            ENCODER_NOMINAL_FPS,
+            rate_control.frame_budget_fps,
+        )?;
+        let configured_bitrate_i32 = i32::try_from(configured_bitrate)
+            .map_err(|_| anyhow!("Configured encoder bitrate exceeds i32"))?;
+        self.encoder
+            .set_bitrate(configured_bitrate_i32)
+            .map_err(|code| anyhow!("Failed to set VRAM encoder bitrate, code: {code}"))?;
+        self.bitrate = bitrate;
+        self.configured_bitrate = configured_bitrate;
+        self.quality = rate_control.quality;
+        self.frame_budget_fps = rate_control.frame_budget_fps;
+        Ok(true)
+    }
 }
 
 impl EncoderApi for VRamEncoder {
@@ -74,7 +125,7 @@ impl EncoderApi for VRamEncoder {
                         width: config.width as _,
                         height: config.height as _,
                         kbitrate: bitrate as _,
-                        framerate: 30,
+                        framerate: ENCODER_NOMINAL_FPS as _,
                         gop,
                     },
                 };
@@ -84,6 +135,9 @@ impl EncoderApi for VRamEncoder {
                         ctx,
                         format: config.feature.data_format,
                         bitrate,
+                        configured_bitrate: bitrate,
+                        quality: config.quality,
+                        frame_budget_fps: ENCODER_NOMINAL_FPS,
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
                     }),
@@ -171,22 +225,27 @@ impl EncoderApi for VRamEncoder {
     }
 
     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
-        let bitrate = Self::bitrate(
-            self.ctx.f.data_format,
-            self.ctx.d.width as _,
-            self.ctx.d.height as _,
-            ratio,
-        );
-        if bitrate > 0 {
-            if self.encoder.set_bitrate((bitrate) as _).is_ok() {
-                self.bitrate = bitrate;
-            }
-        }
-        Ok(())
+        self.apply_rate_control(EncoderRateControl {
+            quality: ratio,
+            frame_budget_fps: self.frame_budget_fps,
+        })
+        .map(|_| ())
+    }
+
+    fn support_fps_aware_rate_control(&self) -> bool {
+        true
+    }
+
+    fn set_rate_control(&mut self, rate_control: EncoderRateControl) -> ResultType<bool> {
+        self.apply_rate_control(rate_control)
     }
 
     fn bitrate(&self) -> u32 {
         self.bitrate
+    }
+
+    fn configured_bitrate(&self) -> u32 {
+        self.configured_bitrate
     }
 
     fn support_changing_quality(&self) -> bool {
@@ -402,3 +461,7 @@ pub(crate) fn check_available_vram() -> (Vec<FeatureContext>, Vec<DecodeContext>
         available.serialize().unwrap_or_default(),
     )
 }
+
+#[cfg(test)]
+#[path = "vram_tests.rs"]
+mod tests;

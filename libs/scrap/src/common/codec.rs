@@ -57,6 +57,12 @@ pub enum EncoderCfg {
     VRAM(VRamEncoderConfig),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EncoderRateControl {
+    pub quality: f32,
+    pub frame_budget_fps: u32,
+}
+
 pub trait EncoderApi {
     fn new(cfg: EncoderCfg, i444: bool) -> ResultType<Self>
     where
@@ -71,7 +77,19 @@ pub trait EncoderApi {
 
     fn set_quality(&mut self, ratio: f32) -> ResultType<()>;
 
+    fn support_fps_aware_rate_control(&self) -> bool {
+        false
+    }
+
+    fn set_rate_control(&mut self, _rate_control: EncoderRateControl) -> ResultType<bool> {
+        bail!("FPS-aware rate control is not supported")
+    }
+
     fn bitrate(&self) -> u32;
+
+    fn configured_bitrate(&self) -> u32 {
+        self.bitrate()
+    }
 
     fn support_changing_quality(&self) -> bool;
 

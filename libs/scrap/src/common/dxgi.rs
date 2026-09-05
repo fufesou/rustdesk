@@ -57,6 +57,10 @@ impl TraitCapturer for Capturer {
         self.inner.set_gdi()
     }
 
+    fn request_full_frame(&mut self) -> io::Result<()> {
+        self.inner.request_full_frame()
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice {
         self.inner.device()

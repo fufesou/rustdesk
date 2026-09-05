@@ -142,6 +142,14 @@ pub trait TraitCapturer {
     #[cfg(windows)]
     fn set_gdi(&mut self) -> bool;
 
+    #[cfg(windows)]
+    fn request_full_frame(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Full-frame capture refresh is not supported",
+        ))
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice;
 
