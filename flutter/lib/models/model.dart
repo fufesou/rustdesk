@@ -2920,8 +2920,8 @@ class CursorData {
           img2.encodePng(
             img2.copyResize(
               image,
-              width: (width * scale).toInt(),
-              height: (height * scale).toInt(),
+              width: isWeb ? (width * scale).round() : (width * scale).toInt(),
+              height: isWeb ? (height * scale).round() : (height * scale).toInt(),
               interpolation: img2.Interpolation.average,
             ),
           ),
@@ -2932,6 +2932,11 @@ class CursorData {
     this.scale = scale;
     hotx = hotxOrigin * scale;
     hoty = hotyOrigin * scale;
+    if (isWeb) {
+      // CSS hotspots must follow the actual rounded PNG dimensions.
+      hotx = hotxOrigin * (width * scale).round() / width;
+      hoty = hotyOrigin * (height * scale).round() / height;
+    }
     return scale;
   }
 
