@@ -1401,22 +1401,20 @@ class CursorPaint extends StatelessWidget {
     final imageOffset = _softwareImageOffset(c);
     double cx = imageOffset?.dx ?? c.x;
     double cy = imageOffset?.dy ?? c.y;
-    if (c.viewStyle.style == kRemoteViewStyleOriginal &&
-        c.scrollStyle == ScrollStyle.scrollbar) {
+    if (c.imageOverflow.isTrue && c.scrollStyle == ScrollStyle.scrollbar) {
       final rect = c.parent.target!.ffiModel.rect;
       if (rect == null) {
         // unreachable!
         debugPrint('unreachable! The displays rect is null.');
         return Container();
       }
-      if (cx < 0) {
-        final imageWidth = rect.width * c.scale;
-        cx = -imageWidth * c.scrollX;
-      }
-      if (cy < 0) {
-        final imageHeight = rect.height * c.scale;
-        cy = -imageHeight * c.scrollY;
-      }
+      // Pan offsets can be stale after leaving the image; scrollbars do not use them.
+      final imageWidth = rect.width * c.scale;
+      final imageHeight = rect.height * c.scale;
+      cx = (c.size.width > imageWidth ? (c.size.width - imageWidth) / 2 : 0) -
+          imageWidth * c.scrollX;
+      cy = (c.size.height > imageHeight ? (c.size.height - imageHeight) / 2 : 0) -
+          imageHeight * c.scrollY;
     }
 
     final image = m.image ?? preDefaultCursor.image;

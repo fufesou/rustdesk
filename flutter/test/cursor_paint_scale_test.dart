@@ -45,6 +45,8 @@ class _Peer extends Fake implements FfiModel {
   final pi = PeerInfo();
   @override
   bool get isPeerLinux => false;
+  @override
+  Rect get rect => Offset.zero & _viewport;
 }
 
 class _FFI extends Fake implements FFI {
@@ -82,9 +84,24 @@ class _CanvasModel extends ChangeNotifier implements CanvasModel {
   final double scale;
   @override
   ScrollStyle get scrollStyle => ScrollStyle.scrollauto;
+  @override
+  Size get size => _viewport;
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _ScrollbarCanvasModel extends _CanvasModel {
+  _ScrollbarCanvasModel(String style) : super(style, 2, true) {
+    imageOverflow.value = true;
+  }
+
+  @override
+  ScrollStyle get scrollStyle => ScrollStyle.scrollbar;
+  @override
+  double get scrollX => 0.1;
+  @override
+  double get scrollY => 0.2;
 }
 
 class _Canvas extends Fake implements Canvas {
@@ -159,6 +176,33 @@ void main() {
       final position = canvas.position! + _hotspot * canvas.factor;
       expect(position.dx, closeTo(target.dx, 1e-9));
       expect(position.dy, closeTo(target.dy, 1e-9));
+    });
+  }
+  for (final style in [kRemoteViewStyleOriginal, kRemoteViewStyleCustom]) {
+    testWidgets('$style painted cursor follows scrollbar position',
+        (tester) async {
+      final image = (await tester.runAsync(
+          () => createTestImage(width: 48, height: 64)))!;
+      addTearDown(image.dispose);
+      await tester.pumpWidget(MediaQuery(
+        data: const MediaQueryData(devicePixelRatio: 2),
+        child: MultiProvider(
+          providers: [
+            ChangeNotifierProvider<CursorModel>(
+                create: (_) => _CursorModel(image)),
+            ChangeNotifierProvider<CanvasModel>(
+                create: (_) => _ScrollbarCanvasModel(style)),
+          ],
+          child: CursorPaint(id: 'cursor-test', zoomCursor: true.obs),
+        ),
+      ));
+      final painter = tester
+          .widget<CustomPaint>(find.byType(CustomPaint))
+          .painter! as ImagePainter;
+      final target = _remotePosition * 2 -
+          Offset(_viewport.width * 2 * 0.1, _viewport.height * 2 * 0.2);
+      expect(
+          (Offset(painter.x, painter.y) + _hotspot) * painter.scale, target);
     });
   }
 }
