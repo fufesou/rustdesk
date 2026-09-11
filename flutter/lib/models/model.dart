@@ -2858,6 +2858,8 @@ class CursorData {
   // Borrowed from CursorModel/PredefinedCursor, which own its lifetime.
   // The plugin clones the handle before starting asynchronous encoding.
   final ui.Image nativeImage;
+  // Zero preserves sizing for peers that predate cursor density metadata.
+  final double pixelRatio;
   double scale;
   Uint8List? data;
   final double hotxOrigin;
@@ -2872,6 +2874,7 @@ class CursorData {
     required this.id,
     required this.image,
     required this.nativeImage,
+    this.pixelRatio = 0,
     required this.scale,
     required this.data,
     required this.hotxOrigin,
@@ -2885,9 +2888,13 @@ class CursorData {
 
   // Keep the minimum-size policy here. Native callers let the plugin rasterize
   // the original ui.Image; Web keeps the encoded-image resizing path.
-  double _checkUpdateScale(double scale, {bool resizeImage = true}) {
+  double _checkUpdateScale(double scale,
+      {bool resizeImage = true, bool useLegacyMinimum = true}) {
     double oldScale = this.scale;
-    if (scale != 1.0) {
+    if (!useLegacyMinimum) {
+      scale = max(scale, kMinCursorSize / max(width, height));
+    }
+    if (useLegacyMinimum && scale != 1.0) {
       // Update data if scale changed.
       final tgtWidth = (width * scale).toInt();
       final tgtHeight = (height * scale).toInt();
@@ -2928,8 +2935,10 @@ class CursorData {
     return scale;
   }
 
-  String updateGetKey(double scale, {bool resizeImage = true}) {
-    scale = _checkUpdateScale(scale, resizeImage: resizeImage);
+  String updateGetKey(double scale,
+      {bool resizeImage = true, bool useLegacyMinimum = true}) {
+    scale = _checkUpdateScale(scale,
+        resizeImage: resizeImage, useLegacyMinimum: useLegacyMinimum);
     return '${peerId}_${id}_${_doubleToInt(width * scale)}_${_doubleToInt(height * scale)}';
   }
 }
@@ -3436,6 +3445,10 @@ class CursorModel with ChangeNotifier {
     final hoty = double.parse(evt['hoty']);
     final width = int.parse(evt['width']);
     final height = int.parse(evt['height']);
+    final pixelRatio = double.parse(evt['scale'] ?? '0');
+    if (!pixelRatio.isFinite || pixelRatio < 0) {
+      throw FormatException('Invalid cursor pixel ratio: $pixelRatio');
+    }
     List<dynamic> colors = json.decode(evt['colors']);
     final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
     final image = await img.decodeImageFromPixels(
@@ -3443,9 +3456,12 @@ class CursorModel with ChangeNotifier {
     if (image == null) {
       return;
     }
-    if (await _updateCache(rgba, image, id, hotx, hoty, width, height)) {
+    if (await _updateCache(rgba, image, id, hotx, hoty, width, height,
+        pixelRatio: pixelRatio)) {
       _images[id]?.item1.dispose();
       _images[id] = Tuple3(image, hotx, hoty);
+    } else {
+      image.dispose();
     }
 
     // Update last cursor data.
@@ -3460,8 +3476,9 @@ class CursorModel with ChangeNotifier {
     double hotx,
     double hoty,
     int w,
-    int h,
-  ) async {
+    int h, {
+    required double pixelRatio,
+  }) async {
     Uint8List? data;
     img2.Image imgOrigin = img2.Image.fromBytes(
         width: w, height: h, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
@@ -3471,6 +3488,7 @@ class CursorModel with ChangeNotifier {
       ByteData? imgBytes =
           await image.toByteData(format: ui.ImageByteFormat.png);
       if (imgBytes == null) {
+        debugPrint('Unable to encode cursor $id as PNG');
         return false;
       }
       data = imgBytes.buffer.asUint8List();
@@ -3480,6 +3498,7 @@ class CursorModel with ChangeNotifier {
       id: id,
       image: imgOrigin,
       nativeImage: image,
+      pixelRatio: pixelRatio,
       scale: 1.0,
       data: data,
       hotxOrigin: hotx,

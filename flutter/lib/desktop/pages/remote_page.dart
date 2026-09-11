@@ -1105,17 +1105,22 @@ class _ImagePaintState extends State<ImagePaint> {
     // changes, so read it live to follow the window across monitors.
     final dpr = MediaQuery.devicePixelRatioOf(context);
 
-    bool isViewAdaptive() => c.viewStyle.style == kRemoteViewStyleAdaptive;
+    bool isViewScaled() =>
+        c.viewStyle.style == kRemoteViewStyleAdaptive ||
+        c.viewStyle.style == kRemoteViewStyleCustom;
     bool isViewOriginal() => c.viewStyle.style == kRemoteViewStyleOriginal;
 
     mouseRegion({child}) => Obx(() {
           double getCursorScale() {
-            var c = Provider.of<CanvasModel>(context);
+            final peerDpr = Provider.of<CursorModel>(context).cache?.pixelRatio ?? 0;
+            if (!isWeb && isViewScaled() && !zoomCursor.value && peerDpr > 0) {
+              return (isWindows ? dpr : 1.0) / peerDpr;
+            }
             var cursorScale = 1.0;
             if (isWindows) {
               // debug win10
-              if (zoomCursor.value && isViewAdaptive()) {
-                cursorScale = s * c.devicePixelRatio;
+              if (zoomCursor.value && isViewScaled()) {
+                cursorScale = s * dpr;
               }
             } else {
               if (zoomCursor.value || isViewOriginal()) {
@@ -1420,7 +1425,9 @@ class CursorPaint extends StatelessWidget {
     if (image != null && scale * nativePixels != 1.0) {
       final sx = kMinCursorSize / (image.width * nativePixels);
       final sy = kMinCursorSize / (image.height * nativePixels);
-      final minimumScale = sx > sy ? sx : sy;
+      final minimumScale = c.viewStyle.style == kRemoteViewStyleOriginal
+          ? (sx > sy ? sx : sy)
+          : (sx < sy ? sx : sy);
       if (scale < minimumScale) scale = minimumScale;
     }
     final x = (m.x * c.scale + cx) / scale - hotx;

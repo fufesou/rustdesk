@@ -113,7 +113,7 @@ void main() {
       2.0,
       (9, 18),
       0.1,
-      Platform.isWindows ? 2 / 3 : 4 / 3,
+      Platform.isWindows ? 1 / 3 : 2 / 3,
       true
     ),
   ]) {

@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' show WidgetsBinding;
 
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/model.dart';
 
 deleteCustomCursor(String key) =>
@@ -24,7 +25,11 @@ MouseCursor buildCursorOfCache(
     // bitmap even when the remote view scale has not changed.
     final dpr = WidgetsBinding
         .instance.platformDispatcher.views.single.devicePixelRatio;
-    final key = '${cache.updateGetKey(scale, resizeImage: false)}_$dpr';
+    // Keep Original and older peers unchanged. A long-edge minimum preserves
+    // the proportions of thin remote cursors when normalizing their DPI.
+    final legacyMinimum = cache.pixelRatio == 0 ||
+        cursor.parent.target?.canvasModel.viewStyle.style == kRemoteViewStyleOriginal;
+    final key = '${cache.updateGetKey(scale, resizeImage: false, useLegacyMinimum: legacyMinimum)}_$dpr';
     if (!cursor.cachedKeys.contains(key)) {
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
