@@ -1393,8 +1393,9 @@ class CursorPaint extends StatelessWidget {
       }
     }
 
-    double cx = c.x;
-    double cy = c.y;
+    final imageOffset = _softwareImageOffset(c);
+    double cx = imageOffset?.dx ?? c.x;
+    double cy = imageOffset?.dy ?? c.y;
     if (c.viewStyle.style == kRemoteViewStyleOriginal &&
         c.scrollStyle == ScrollStyle.scrollbar) {
       final rect = c.parent.target!.ffiModel.rect;
@@ -1413,38 +1414,44 @@ class CursorPaint extends StatelessWidget {
       }
     }
 
-    double x = m.x * c.scale + cx - hotx;
-    double y = m.y * c.scale + cy - hoty;
-    double scale = 1.0;
-    final isViewOriginal = c.viewStyle.style == kRemoteViewStyleOriginal;
-    if (zoomCursor.value || isViewOriginal) {
-      x = m.x - hotx + cx / c.scale;
-      y = m.y - hoty + cy / c.scale;
-      scale = c.scale;
-    } else if (!isWindows) {
-      // Keep the painted cursor the same physical size as the native one
-      // built by getCursorScale() above, including its min-size clamp.
-      scale = 1.0 / MediaQuery.devicePixelRatioOf(context);
-      final image = m.image ?? preDefaultCursor.image;
-      if (scale != 1.0 &&
-          image != null &&
-          ((image.width * scale).toInt() < kMinCursorSize ||
-              (image.height * scale).toInt() < kMinCursorSize)) {
-        final sw = kMinCursorSize / image.width;
-        final sh = kMinCursorSize / image.height;
-        scale = sw < sh ? sh : sw;
-      }
-      x = (m.x * c.scale + cx) / scale - hotx;
-      y = (m.y * c.scale + cy) / scale - hoty;
+    final image = m.image ?? preDefaultCursor.image;
+    final nativePixels = isWindows ? MediaQuery.devicePixelRatioOf(context) : 1.0;
+    double scale = c.scale;
+    if (image != null && scale * nativePixels != 1.0) {
+      final sx = kMinCursorSize / (image.width * nativePixels);
+      final sy = kMinCursorSize / (image.height * nativePixels);
+      final minimumScale = sx > sy ? sx : sy;
+      if (scale < minimumScale) scale = minimumScale;
     }
+    final x = (m.x * c.scale + cx) / scale - hotx;
+    final y = (m.y * c.scale + cy) / scale - hoty;
 
     return CustomPaint(
       painter: ImagePainter(
-        image: m.image ?? preDefaultCursor.image,
+        image: image,
         x: x,
         y: y,
         scale: scale,
+        useIntegerPosition: false,
       ),
     );
+  }
+
+  Offset? _softwareImageOffset(CanvasModel canvas) {
+    if (canvas.imageOverflow.isTrue &&
+        canvas.scrollStyle != ScrollStyle.scrollauto) {
+      return null;
+    }
+    final ffi = canvas.parent.target!;
+    final peer = ffi.ffiModel;
+    if (ffi.imageModel.useTextureRender || peer.pi.forceTextureRender) {
+      return null;
+    }
+    var scale = canvas.scale;
+    final displays = peer.pi.getCurDisplays();
+    if (peer.isPeerLinux && displays.isNotEmpty) scale /= displays[0].scale;
+    // Match the origin used by _buildScrollAutoNonTextureRender's ImagePainter.
+    return Offset(
+        (canvas.x / scale).toInt() * scale, (canvas.y / scale).toInt() * scale);
   }
 }
