@@ -2855,6 +2855,9 @@ class CursorData {
   final String peerId;
   final String id;
   final img2.Image image;
+  // Borrowed from CursorModel/PredefinedCursor, which own its lifetime.
+  // The plugin clones the handle before starting asynchronous encoding.
+  final ui.Image nativeImage;
   double scale;
   Uint8List? data;
   final double hotxOrigin;
@@ -2868,6 +2871,7 @@ class CursorData {
     required this.peerId,
     required this.id,
     required this.image,
+    required this.nativeImage,
     required this.scale,
     required this.data,
     required this.hotxOrigin,
@@ -2879,7 +2883,9 @@ class CursorData {
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
-  double _checkUpdateScale(double scale) {
+  // Keep the minimum-size policy here. Native callers let the plugin rasterize
+  // the original ui.Image; Web keeps the encoded-image resizing path.
+  double _checkUpdateScale(double scale, {bool resizeImage = true}) {
     double oldScale = this.scale;
     if (scale != 1.0) {
       // Update data if scale changed.
@@ -2892,7 +2898,7 @@ class CursorData {
       }
     }
 
-    if (_doubleToInt(oldScale) != _doubleToInt(scale)) {
+    if (resizeImage && _doubleToInt(oldScale) != _doubleToInt(scale)) {
       if (isWindows) {
         data = img2
             .copyResize(
@@ -2922,8 +2928,8 @@ class CursorData {
     return scale;
   }
 
-  String updateGetKey(double scale) {
-    scale = _checkUpdateScale(scale);
+  String updateGetKey(double scale, {bool resizeImage = true}) {
+    scale = _checkUpdateScale(scale, resizeImage: resizeImage);
     return '${peerId}_${id}_${_doubleToInt(width * scale)}_${_doubleToInt(height * scale)}';
   }
 }
@@ -2976,9 +2982,10 @@ class PredefinedCursor {
         // This function is called only one time, no need to care about the performance.
         Uint8List data = defaultImg.getBytes(order: img2.ChannelOrder.rgba);
         _image?.dispose();
-        _image = await img.decodeImageFromPixels(
+        final nativeImage = await img.decodeImageFromPixels(
             data, defaultImg.width, defaultImg.height, ui.PixelFormat.rgba8888);
-        if (_image == null) {
+        _image = nativeImage;
+        if (nativeImage == null) {
           print("decodeImageFromPixels failed, pre-defined cursor $id");
           return;
         }
@@ -2993,6 +3000,7 @@ class PredefinedCursor {
           peerId: '',
           id: id,
           image: _image2!.clone(),
+          nativeImage: nativeImage,
           scale: scale,
           data: data,
           hotxOrigin:
@@ -3471,6 +3479,7 @@ class CursorModel with ChangeNotifier {
       peerId: peerId,
       id: id,
       image: imgOrigin,
+      nativeImage: image,
       scale: 1.0,
       data: data,
       hotxOrigin: hotx,
