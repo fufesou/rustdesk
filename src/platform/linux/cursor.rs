@@ -1,0 +1,124 @@
+use hbb_common::{anyhow::Context, bail, ResultType};
+use std::{
+    cell::RefCell,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+use x11rb::{protocol::xproto::ConnectionExt, rust_connection::RustConnection, NONE};
+
+mod xsettings;
+
+thread_local! {
+    static SETTINGS: RefCell<Option<(RustConnection, usize)>> = const { RefCell::new(None) };
+}
+
+pub(super) fn cache_id(id: u64, scale: f64) -> u64 {
+    if scale == 0.0 {
+        return id;
+    }
+    let mut hash = DefaultHasher::new();
+    (id, scale.to_bits()).hash(&mut hash);
+    hash.finish()
+}
+
+pub(super) fn x11_scale() -> ResultType<f64> {
+    if !super::is_x11() {
+        return Ok(0.0);
+    }
+    SETTINGS.with(|settings| {
+        let mut state = settings.try_borrow_mut()?;
+        if state.is_none() {
+            *state = Some(x11rb::connect(None)?);
+        }
+        let (connection, screen) = state.as_ref().context("Missing XSETTINGS connection")?;
+        let result = read_settings(connection, *screen);
+        if result.is_err() {
+            *state = None;
+        }
+        result
+    })
+}
+
+fn read_settings(connection: &RustConnection, screen: usize) -> ResultType<f64> {
+    let selection = connection
+        .intern_atom(true, format!("_XSETTINGS_S{screen}").as_bytes())?
+        .reply()?
+        .atom;
+    if selection == NONE {
+        return Ok(0.0);
+    }
+    let owner = connection.get_selection_owner(selection)?.reply()?.owner;
+    if owner == NONE {
+        return Ok(0.0);
+    }
+    let property = connection
+        .intern_atom(true, b"_XSETTINGS_SETTINGS")?
+        .reply()?
+        .atom;
+    let reply = connection
+        .get_property(false, owner, property, property, 0, u32::MAX)?
+        .reply()?;
+    if reply.format != 8 || reply.bytes_after != 0 {
+        bail!("Incomplete XSETTINGS property");
+    }
+    // Xft/DPI includes text scaling; it is not the cursor's pixel density.
+    // Zero explicitly keeps the existing policy on desktops without a window scale.
+    Ok(xsettings::scale(&reply.value)?.unwrap_or(0.0))
+}
+
+#[cfg(feature = "drm")]
+pub(super) fn drm_snapshot<T>(
+    f: impl Fn(&crate::server::drm_capturer::DrmCursorData) -> T,
+) -> ResultType<Option<(T, f64)>> {
+    crate::server::drm_capturer::drm_cursor_snapshot(f)
+        .map(|(cursor, display)| {
+            // A hidden cursor or an unavailable display probe has no density metadata.
+            let scale = display
+                .as_ref()
+                .map(wayland_scale)
+                .transpose()?
+                .unwrap_or(0.0);
+            Ok((cursor, scale))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "drm")]
+fn wayland_scale(display: &base::platform::linux::WaylandDisplayInfo) -> ResultType<f64> {
+    // Missing logical geometry means unknown density, as with older senders.
+    let Some((logical_width, logical_height)) = display.logical_size else {
+        return Ok(0.0);
+    };
+    if logical_width <= 0 || logical_height <= 0 || display.width <= 0 || display.height <= 0 {
+        bail!("Invalid Wayland cursor display dimensions");
+    }
+    // Logical geometry is already rotated; the physical mode dimensions are not.
+    let width = if matches!(display.transform, 90 | 270) {
+        display.height
+    } else {
+        display.width
+    };
+    Ok(f64::from(width) / f64::from(logical_width))
+}
+
+#[cfg(all(test, feature = "drm"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_density_tracks_fractional_rotation_and_cache_identity() {
+        let display = base::platform::linux::WaylandDisplayInfo {
+            name: "test".into(),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+            logical_size: Some((600, 960)),
+            refresh_rate: 60000,
+            transform: 90,
+        };
+        assert_eq!(wayland_scale(&display).unwrap(), 4.0 / 3.0);
+        assert_ne!(cache_id(1, 1.0), cache_id(1, 2.0));
+        assert_eq!(cache_id(1, 0.0), 1);
+    }
+}

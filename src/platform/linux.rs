@@ -35,6 +35,9 @@ use std::{
 use terminfo::{capability as cap, Database};
 use wallpaper;
 
+#[cfg(feature = "flutter")]
+mod cursor;
+
 pub const PA_SAMPLE_RATE: u32 = 48000;
 static mut UNMODIFIED: bool = true;
 
@@ -570,7 +573,12 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
     // polled there is a live session, which is the case the latch reads correctly.
     #[cfg(feature = "drm")]
     if !is_x11() {
-        if let Some(id) = crate::server::drm_capturer::drm_cursor_id() {
+        #[cfg(feature = "flutter")]
+        let cursor = cursor::drm_snapshot(|c| c.id)?
+            .map(|(id, scale)| cursor::cache_id(id, scale));
+        #[cfg(not(feature = "flutter"))]
+        let cursor = crate::server::drm_capturer::drm_cursor_id();
+        if let Some(id) = cursor {
             // In a mixed DRM + PipeWire session the DRM streams only cover the DRM-backed displays;
             // when the pointer sits on a PipeWire-served display every DRM stream reports the hidden
             // sentinel. Returning that sentinel here would hide the cursor globally, including on the
@@ -598,6 +606,10 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
             }
         }
     });
+    #[cfg(feature = "flutter")]
+    let res = res
+        .map(|id| cursor::x11_scale().map(|scale| cursor::cache_id(id, scale)))
+        .transpose()?;
     Ok(res)
 }
 
@@ -610,7 +622,13 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     // agree anyway, since a caller that took the DRM branch there has to take it here.
     #[cfg(feature = "drm")]
     if !is_x11() {
-        if let Some(c) = crate::server::drm_capturer::drm_cursor() {
+        #[cfg(feature = "flutter")]
+        let cursor = cursor::drm_snapshot(Clone::clone)?;
+        #[cfg(not(feature = "flutter"))]
+        let cursor = crate::server::drm_capturer::drm_cursor();
+        if let Some(c) = cursor {
+            #[cfg(feature = "flutter")]
+            let (c, scale) = c;
             // See get_cursor(): a hidden DRM sentinel is authoritative only in a pure-DRM session. In
             // a mixed DRM + PipeWire session fall through so the PipeWire display's cursor is served
             // by the normal path instead of being hidden everywhere.
@@ -624,24 +642,39 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                 cd.hotx = c.hotx;
                 cd.hoty = c.hoty;
                 cd.colors = c.colors.into();
+                #[cfg(feature = "flutter")]
+                {
+                    cd.id = cursor::cache_id(cd.id, scale);
+                    cd.scale = scale;
+                }
                 return Ok(cd);
             }
         }
     }
+    #[cfg(feature = "flutter")]
+    let scale = cursor::x11_scale()?;
+    #[cfg(feature = "flutter")]
+    let matches = |id| cursor::cache_id(id, scale) == hcursor;
+    #[cfg(not(feature = "flutter"))]
+    let matches = |id| id == hcursor;
     let mut res = None;
     DISPLAY.with(|conn| {
         if let Ok(ref mut d) = conn.try_borrow_mut() {
             if !d.is_null() {
                 unsafe {
                     let img = XFixesGetCursorImage(**d);
-                    if !img.is_null() && hcursor == (*img).cursor_serial as u64 {
+                    if !img.is_null() && matches((*img).cursor_serial as u64) {
                         let mut cd: CursorData = Default::default();
                         cd.hotx = (*img).xhot as _;
                         cd.hoty = (*img).yhot as _;
                         cd.width = (*img).width as _;
                         cd.height = (*img).height as _;
                         // to-do: how about if it is 0
-                        cd.id = (*img).cursor_serial as _;
+                        cd.id = hcursor;
+                        #[cfg(feature = "flutter")]
+                        {
+                            cd.scale = scale;
+                        }
                         let pixels =
                             std::slice::from_raw_parts((*img).pixels, (cd.width * cd.height) as _);
                         // cd.colors.resize(pixels.len() * 4, 0);

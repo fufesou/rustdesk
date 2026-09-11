@@ -974,6 +974,38 @@ pub fn drm_cursor() -> Option<DrmCursorData> {
     with_drm_cursor(|c| c.clone())
 }
 
+#[cfg(feature = "flutter")]
+pub fn drm_cursor_snapshot<T>(
+    f: impl Fn(&DrmCursorData) -> T,
+) -> Option<(T, Option<base::platform::linux::WaylandDisplayInfo>)> {
+    // Keep cursor identity and output together, then release the map before DRM_STATE.
+    let (value, display, hidden) = {
+        let map = DRM_CURSOR.lock().unwrap();
+        let (display, (_, cursor)) = map
+            .iter()
+            .find(|(_, (_, cursor))| cursor.id != scrap::drm_reader::HIDDEN_CURSOR_ID)
+            .or_else(|| map.iter().next())?;
+        (
+            f(cursor),
+            *display,
+            cursor.id == scrap::drm_reader::HIDDEN_CURSOR_ID,
+        )
+    };
+    let monitor = if hidden {
+        None
+    } else {
+        display_info_of(display).and_then(|display| {
+            let wayland = scrap::wayland::display::get_displays();
+            let index = identity_matches(&[display], &wayland.displays)
+                .into_iter()
+                .next()
+                .flatten()?;
+            wayland.displays.get(index).cloned()
+        })
+    };
+    Some((value, monitor))
+}
+
 enum ProbeState {
     Unknown,
     Unavailable(Instant),
