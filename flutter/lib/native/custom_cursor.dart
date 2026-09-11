@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter_custom_cursor/cursor_manager.dart'
     as custom_cursor_manager;
@@ -29,7 +30,11 @@ MouseCursor buildCursorOfCache(
     // the proportions of thin remote cursors when normalizing their DPI.
     final legacyMinimum = cache.pixelRatio == 0 ||
         cursor.parent.target?.canvasModel.viewStyle.style == kRemoteViewStyleOriginal;
-    final key = '${cache.updateGetKey(scale, resizeImage: false, useLegacyMinimum: legacyMinimum)}_$dpr';
+    // The minimum is logical, while Windows callers pass a physical scale.
+    final effectiveScale = !legacyMinimum && isWindows
+        ? math.max(scale, kMinCursorSize * dpr / math.max(cache.width, cache.height))
+        : scale;
+    final key = '${cache.updateGetKey(effectiveScale, resizeImage: false, useLegacyMinimum: legacyMinimum)}_$dpr';
     if (!cursor.cachedKeys.contains(key)) {
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");

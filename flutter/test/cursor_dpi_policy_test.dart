@@ -123,8 +123,8 @@ void main() {
     (kRemoteViewStyleAdaptive, false, 1, 0.25, Platform.isWindows ? 2.0 : 1.0),
     (kRemoteViewStyleAdaptive, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
     (kRemoteViewStyleCustom, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
-    (kRemoteViewStyleAdaptive, true, 2, 0.25, 1 / 3),
-    (kRemoteViewStyleCustom, true, 2, 0.25, 1 / 3),
+    (kRemoteViewStyleAdaptive, true, 2, 0.25, Platform.isWindows ? 2 / 3 : 1 / 3),
+    (kRemoteViewStyleCustom, true, 2, 0.25, Platform.isWindows ? 2 / 3 : 1 / 3),
     (kRemoteViewStyleOriginal, false, 2, 0.5, Platform.isWindows ? 1.0 : 2 / 3),
   ]) {
     testWidgets(
