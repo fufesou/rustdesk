@@ -200,48 +200,31 @@ void _linuxDisplayTests() {
   }
 }
 
-void _minimumTests() {
-  for (final (style, dpr, source, viewScale, expected) in [
-    (kRemoteViewStyleAdaptive, 1.0, (48, 64), 0.05, 0.1875),
-    (kRemoteViewStyleAdaptive, 2.0, (48, 64), 0.05, 0.1875),
-    (kRemoteViewStyleCustom, 1.0, (48, 64), 0.05, 0.1875),
-    (kRemoteViewStyleCustom, 2.0, (48, 64), 0.05, 0.1875),
-    (kRemoteViewStyleCustom, 2.0, (8, 10), 1.0, 1.2),
-    (kRemoteViewStyleOriginal, 1.0, (48, 64), 0.05, 0.25),
-    (kRemoteViewStyleOriginal, 2.0, (48, 64), 0.05, Platform.isWindows ? 0.125 : 0.25),
-  ]) {
-    testWidgets('density-aware $style DPR=$dpr source=$source minimum',
-        (tester) async {
-      final painter = await _paintCursor(tester,
-          _CanvasModel(style, viewScale, true),
-          dpr: dpr, source: source, density: 2);
-      expect(painter.scale, expected);
-      final hotspot = (Offset(painter.x, painter.y) + _hotspot) * painter.scale;
-      final target = _remotePosition * viewScale + _canvasOffset;
-      expect(hotspot.dx, closeTo(target.dx, 1e-9));
-      expect(hotspot.dy, closeTo(target.dy, 1e-9));
-    });
-  }
-}
-
 void main() {
   _linuxDisplayTests();
-  _minimumTests();
   final minimumScale = Platform.isWindows ? 1 / 3 : 2 / 3;
-  for (final (style, zoom, dpr, source, canvasScale, scale, texture) in [
-    (kRemoteViewStyleAdaptive, false, 2.0, (48, 64), 0.375, 0.375, true),
-    (kRemoteViewStyleOriginal, false, 2.0, (48, 64), 0.5, 0.5, true),
-    (kRemoteViewStyleCustom, false, 2.0, (48, 64), 0.25, 0.25, false),
-    (kRemoteViewStyleCustom, true, 2.0, (48, 64), 2.0, 2.0, false),
-    (kRemoteViewStyleAdaptive, false, 2.25, (48, 48), 0.375, 0.375, false),
-    (kRemoteViewStyleAdaptive, true, 2.0, (9, 18), 0.1, minimumScale, true),
+  for (final (style, zoom, dpr, source, canvasScale, scale, texture, density) in [
+    (kRemoteViewStyleAdaptive, false, 2.0, (48, 64), 0.375, 0.375, true, 0.0),
+    (kRemoteViewStyleOriginal, false, 2.0, (48, 64), 0.5, 0.5, true, 0.0),
+    (kRemoteViewStyleCustom, false, 2.0, (48, 64), 0.25, 0.25, false, 0.0),
+    (kRemoteViewStyleCustom, true, 2.0, (48, 64), 2.0, 2.0, false, 0.0),
+    (kRemoteViewStyleAdaptive, false, 2.25, (48, 48), 0.375, 0.375, false, 0.0),
+    (kRemoteViewStyleAdaptive, true, 2.0, (9, 18), 0.1, minimumScale, true, 0.0),
+    (kRemoteViewStyleAdaptive, true, 1.0, (48, 64), 0.05, 0.1875, true, 2.0),
+    (kRemoteViewStyleAdaptive, true, 2.0, (48, 64), 0.05, 0.1875, true, 2.0),
+    (kRemoteViewStyleCustom, true, 1.0, (48, 64), 0.05, 0.1875, true, 2.0),
+    (kRemoteViewStyleCustom, true, 2.0, (48, 64), 0.05, 0.1875, true, 2.0),
+    (kRemoteViewStyleCustom, true, 2.0, (8, 10), 1.0, 1.2, true, 2.0),
+    (kRemoteViewStyleOriginal, true, 1.0, (48, 64), 0.05, 0.25, true, 2.0),
+    (kRemoteViewStyleOriginal, true, 2.0, (48, 64), 0.05,
+        Platform.isWindows ? 0.125 : 0.25, true, 2.0),
   ]) {
     testWidgets(
-        '$style zoom=$zoom dpr=$dpr source=$source texture=$texture keeps remote geometry',
+        '$style zoom=$zoom dpr=$dpr source=$source texture=$texture density=$density keeps remote geometry',
         (tester) async {
       final painter = await _paintCursor(
           tester, _CanvasModel(style, canvasScale, texture),
-          dpr: dpr, zoom: zoom, source: source);
+          dpr: dpr, zoom: zoom, source: source, density: density);
       expect(painter.scale, scale);
       var imageOrigin = _canvasOffset;
       if (!texture) {
@@ -255,7 +238,9 @@ void main() {
         imageOrigin = background.position!;
       }
       final target = _remotePosition * canvasScale + imageOrigin;
-      expect((Offset(painter.x, painter.y) + _hotspot) * scale, target);
+      final hotspot = (Offset(painter.x, painter.y) + _hotspot) * scale;
+      expect(hotspot.dx, closeTo(target.dx, 1e-9));
+      expect(hotspot.dy, closeTo(target.dy, 1e-9));
       final canvas = _Canvas();
       painter.paint(canvas, _viewport);
       final position = canvas.position! + _hotspot * canvas.factor;

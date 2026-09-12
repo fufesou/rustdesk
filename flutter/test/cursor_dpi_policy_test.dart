@@ -58,8 +58,8 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-class _Cursor extends ChangeNotifier implements CursorModel {
-  _Cursor(this.cache, this._ffi);
+class _Cursor extends CursorModel {
+  _Cursor(this.cache, this._ffi) : super(WeakReference(_ffi));
 
   final FFI _ffi;
   @override
@@ -68,17 +68,9 @@ class _Cursor extends ChangeNotifier implements CursorModel {
   @override
   CursorData cache;
   @override
-  ui.Image? get image => null;
-  @override
   double get hotx => cache.hotxOrigin;
   @override
   double get hoty => cache.hotyOrigin;
-  @override
-  final Set<String> cachedKeys = {};
-  @override
-  void addKey(String key) => cachedKeys.add(key);
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _Input extends Fake implements InputModel {
