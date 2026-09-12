@@ -1120,7 +1120,8 @@ class _ImagePaintState extends State<ImagePaint> {
             // Density metadata is optional. Keep the legacy path for hosts that
             // omit it so capture-backend upgrades are not a client prerequisite.
             final imageScale = isViewScaled() && zoomCursor.value
-                ? _cursorImageScale(widget.ffi, cursor) : s;
+                ? _cursorImageScale(widget.ffi, cursor, useLocalPointer: true)
+                : s;
             var cursorScale = 1.0;
             if (isWindows) {
               // debug win10
@@ -1477,7 +1478,8 @@ class CursorPaint extends StatelessWidget {
 
 // Match physical video pixels, independently of the cursor's density metadata:
 // a single DRM output keeps physical desktop coordinates even at high DPI.
-double _cursorImageScale(FFI ffi, CursorModel cursor) {
+double _cursorImageScale(FFI ffi, CursorModel cursor,
+    {bool useLocalPointer = false}) {
   final canvas = ffi.canvasModel;
   final peer = ffi.ffiModel;
   if (!peer.isPeerLinux) return canvas.scale;
@@ -1491,7 +1493,11 @@ double _cursorImageScale(FFI ffi, CursorModel cursor) {
   if (displays.length == 1) return canvas.scale / displays.first.scale;
   final rect = peer.rect;
   if (rect != null) {
-    final position = Offset(cursor.x + rect.left, cursor.y + rect.top);
+    // Local input drives native sizing; host positions still drive the overlay.
+    // Before the first local movement, retain the existing position source.
+    final position =
+        (useLocalPointer ? ffi.inputModel.remotePointerPosition.value : null) ??
+            Offset(cursor.x + rect.left, cursor.y + rect.top);
     for (final display in displays) {
       if (Rect.fromLTWH(display.x, display.y, display.width / display.scale,
               display.height / display.scale).contains(position)) {
