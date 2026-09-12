@@ -1,3 +1,6 @@
+// The test drives the cursor lifecycle normally owned by MouseTracker.
+// ignore_for_file: invalid_use_of_protected_member
+
 @TestOn('browser')
 library;
 

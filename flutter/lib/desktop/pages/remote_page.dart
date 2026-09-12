@@ -1421,15 +1421,19 @@ class CursorPaint extends StatelessWidget {
 
     final image = m.image ?? preDefaultCursor.image;
     final nativePixels = isWindows ? MediaQuery.devicePixelRatioOf(context) : 1.0;
+    // Show remote cursor follows the image scale, independently of Zoom cursor.
     double scale = c.scale;
     if (image != null && scale * nativePixels != 1.0) {
       final sx = kMinCursorSize / (image.width * nativePixels);
       final sy = kMinCursorSize / (image.height * nativePixels);
+      // Preserve Original's short-edge minimum; scaled views use the long edge.
       final minimumScale = c.viewStyle.style == kRemoteViewStyleOriginal
           ? (sx > sy ? sx : sy)
           : (sx < sy ? sx : sy);
       if (scale < minimumScale) scale = minimumScale;
     }
+    // Keep the hotspot at the remote position even when the minimum enlarges
+    // the cursor; fractional coordinates must survive painting below.
     final x = (m.x * c.scale + cx) / scale - hotx;
     final y = (m.y * c.scale + cy) / scale - hoty;
 

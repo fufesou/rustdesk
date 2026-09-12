@@ -211,7 +211,8 @@ Future<void> _checkPolicy(
 
 Future<void> _checkDprChange(
     TestFlutterView view, List<Map<dynamic, dynamic>> registrations) async {
-  final data = await _data(1, 'dpr-cache');
+  // Keep the scale above the minimum so only DPR invalidates the cache.
+  final data = await _data(2, 'dpr-cache');
   final canvas = _Canvas(1, style: kRemoteViewStyleAdaptive, scale: 1);
   final cursor = _Cursor(data, _FFI(canvas));
   for (final dpr in [2.0, 1.0]) {
