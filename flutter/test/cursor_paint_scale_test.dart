@@ -118,16 +118,18 @@ class _CanvasModel extends ChangeNotifier implements CanvasModel {
 }
 
 class _ScrollbarCanvasModel extends _CanvasModel {
-  _ScrollbarCanvasModel(String style) : super(style, 2, true) {
+  _ScrollbarCanvasModel(String style, {Size? frame, double scale = 2})
+      : super(style, scale, true) {
     imageOverflow.value = true;
+    if (frame != null) _ffi.ffiModel.rect = Offset.zero & frame;
   }
 
   @override
   ScrollStyle get scrollStyle => ScrollStyle.scrollbar;
   @override
-  double get scrollX => 0.1;
+  double get scrollX => _ffi.ffiModel.rect.width * scale > size.width ? 0.1 : 0;
   @override
-  double get scrollY => 0.2;
+  double get scrollY => _ffi.ffiModel.rect.height * scale > size.height ? 0.2 : 0;
 }
 
 class _Canvas extends Fake implements Canvas {
@@ -249,12 +251,20 @@ void main() {
     });
   }
   for (final style in [kRemoteViewStyleOriginal, kRemoteViewStyleCustom]) {
-    testWidgets('$style painted cursor follows scrollbar position',
-        (tester) async {
-      final painter = await _paintCursor(tester, _ScrollbarCanvasModel(style));
-      final target = _remotePosition * 2 -
-          Offset(_viewport.width * 2 * 0.1, _viewport.height * 2 * 0.2);
-      expect((Offset(painter.x, painter.y) + _hotspot) * painter.scale, target);
-    });
+    for (final (frame, scale, offset) in [
+      (_viewport, 2.0, const Offset(-40, -64)),
+      (const Size(199, 320), 1.0, const Offset(0, -64)),
+      (const Size(198, 320), 1.0, const Offset(1, -64)),
+      (const Size(400, 159), 1.0, const Offset(-40, 0)),
+      (const Size(400, 158), 1.0, const Offset(-40, 1)),
+    ]) {
+      testWidgets('$style frame=$frame painted cursor follows scrollbar layout',
+          (tester) async {
+        final painter = await _paintCursor(
+            tester, _ScrollbarCanvasModel(style, frame: frame, scale: scale));
+        final target = _remotePosition * scale + offset;
+        expect((Offset(painter.x, painter.y) + _hotspot) * painter.scale, target);
+      });
+    }
   }
 }

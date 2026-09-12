@@ -1113,7 +1113,11 @@ class _ImagePaintState extends State<ImagePaint> {
     mouseRegion({child}) => Obx(() {
           double getCursorScale() {
             final cursor = Provider.of<CursorModel>(context);
-            final peerDpr = cursor.cache?.pixelRatio ?? 0;
+            // Predefined artwork must not inherit the cached remote bitmap's DPI.
+            final cache = keyboardEnabled.isTrue
+                ? cursor.cache ?? preDefaultCursor.cache
+                : preForbiddenCursor.cache;
+            final peerDpr = cache?.pixelRatio ?? 0;
             if (!isWeb && isViewScaled() && !zoomCursor.value && peerDpr > 0) {
               return (isWindows ? dpr : 1.0) / peerDpr;
             }
@@ -1417,9 +1421,10 @@ class CursorPaint extends StatelessWidget {
       // Pan offsets can be stale after leaving the image; scrollbars do not use them.
       final imageWidth = rect.width * c.scale;
       final imageHeight = rect.height * c.scale;
-      cx = (c.size.width > imageWidth ? (c.size.width - imageWidth) / 2 : 0) -
+      // Match the integer centering in _buildCrossScrollbarFromLayout.
+      cx = (c.size.width > imageWidth ? (c.size.width - imageWidth) ~/ 2 : 0) -
           imageWidth * c.scrollX;
-      cy = (c.size.height > imageHeight ? (c.size.height - imageHeight) / 2 : 0) -
+      cy = (c.size.height > imageHeight ? (c.size.height - imageHeight) ~/ 2 : 0) -
           imageHeight * c.scrollY;
     }
 
