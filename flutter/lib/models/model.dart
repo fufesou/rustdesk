@@ -3463,8 +3463,12 @@ class CursorModel with ChangeNotifier {
         pixelRatio > 0 &&
         parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
       // macOS cursors with density metadata use premultiplied alpha; older
-      // hosts send straight alpha. Keep native decoding and old hosts unchanged.
+      // hosts send straight alpha. Web needs a straight-alpha resize source.
       (rgba, image) = await _decodeWebMacCursor(rgba, width, height);
+    } else if (!isWeb &&
+        pixelRatio == 0 &&
+        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
+      image = await _decodeLegacyMacCursor(rgba, width, height);
     } else {
       image = await img.decodeImageFromPixels(
           rgba, width, height, ui.PixelFormat.rgba8888);
@@ -3483,6 +3487,22 @@ class CursorModel with ChangeNotifier {
     // Update last cursor data.
     // Do not use the previous `image` and `id`, because `_id` may be changed.
     _updateCurData();
+  }
+
+  Future<ui.Image?> _decodeLegacyMacCursor(
+      Uint8List rgba, int width, int height) async {
+    // Old macOS packets are straight alpha. Premultiply a copy for native
+    // ui.Image, retaining the original colors for the separate byte cache.
+    final source = img2.Image.fromBytes(
+        width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
+    for (final pixel in source) {
+      final opacity = pixel.a / pixel.maxChannelValue;
+      pixel.r = (pixel.r * opacity).round();
+      pixel.g = (pixel.g * opacity).round();
+      pixel.b = (pixel.b * opacity).round();
+    }
+    return img.decodeImageFromPixels(
+        source.getBytes(), width, height, ui.PixelFormat.rgba8888);
   }
 
   Future<(Uint8List, ui.Image)> _decodeWebMacCursor(
