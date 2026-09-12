@@ -995,7 +995,8 @@ pub fn drm_cursor_snapshot<T>(
         None
     } else {
         display_info_of(display).and_then(|display| {
-            let wayland = scrap::wayland::display::get_displays();
+            // Display discovery runs outside the cursor service; missing metadata means unknown DPI.
+            let wayland = scrap::wayland::display::get_cached_displays()?;
             let index = identity_matches(&[display], &wayland.displays)
                 .into_iter()
                 .next()
