@@ -3461,9 +3461,10 @@ class CursorModel with ChangeNotifier {
     List<dynamic> colors = json.decode(evt['colors']);
     final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
     final ui.Image? image;
+    final platform = parent.target?.ffiModel.pi.platform;
     if (!isWeb &&
-        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
-      image = await _decodeMacCursor(rgba, width, height);
+        (platform == kPeerPlatformMacOS || platform == kPeerPlatformWindows)) {
+      image = await _decodeStraightAlphaCursor(rgba, width, height);
     } else {
       image = await img.decodeImageFromPixels(
           rgba, width, height, ui.PixelFormat.rgba8888);
@@ -3484,10 +3485,10 @@ class CursorModel with ChangeNotifier {
     _updateCurData();
   }
 
-  Future<ui.Image?> _decodeMacCursor(
+  Future<ui.Image?> _decodeStraightAlphaCursor(
       Uint8List rgba, int width, int height) async {
-    // macOS packets keep straight alpha, regardless of density metadata.
-    // Premultiply only for native ui.Image; the PNG cache needs straight colors.
+    // macOS and Win32 capture send straight alpha; XFixes/DRM are premultiplied.
+    // Convert a copy for native ui.Image, preserving the wire and PNG cache colors.
     final source = img2.Image.fromBytes(
         width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
     for (final pixel in source) {
