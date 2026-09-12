@@ -1,0 +1,57 @@
+name: Test rust-toolchain non-host input
+
+on:
+  push:
+    branches: [test/CI]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  non-host:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      TEST_TOOLCHAIN: nightly-2023-10-13-i686-pc-windows-msvc
+    steps:
+      - run: rustup --version
+      - name: Allow the non-host toolchain
+        id: enabled
+        uses: fufesou/rust-toolchain@06b350f08c8596edaf3d95d38686ba934fc4a6a7
+        with:
+          toolchain: ${{ env.TEST_TOOLCHAIN }}
+          targets: i686-pc-windows-msvc
+          components: rustfmt
+          force-non-host: true
+      - name: Verify the active default toolchain and compiler host
+        run: |
+          test "$(rustup show active-toolchain)" = "$TEST_TOOLCHAIN (default)"
+          rustc --version --verbose | grep -Fx 'host: i686-pc-windows-msvc'
+          rustfmt --version
+      - name: Reject the non-host toolchain when explicitly disabled
+        id: disabled
+        continue-on-error: true
+        uses: fufesou/rust-toolchain@06b350f08c8596edaf3d95d38686ba934fc4a6a7
+        with:
+          toolchain: ${{ env.TEST_TOOLCHAIN }}
+          force-non-host: "false"
+      - name: Reject the non-host toolchain when the input is omitted
+        id: omitted
+        continue-on-error: true
+        uses: fufesou/rust-toolchain@06b350f08c8596edaf3d95d38686ba934fc4a6a7
+        with:
+          toolchain: ${{ env.TEST_TOOLCHAIN }}
+      - name: Verify all input outcomes
+        if: always()
+        env:
+          ENABLED_OUTCOME: ${{ steps.enabled.outcome }}
+          DISABLED_OUTCOME: ${{ steps.disabled.outcome }}
+          OMITTED_OUTCOME: ${{ steps.omitted.outcome }}
+        run: |
+          test "$ENABLED_OUTCOME" = success
+          test "$DISABLED_OUTCOME" = failure
+          test "$OMITTED_OUTCOME" = failure
