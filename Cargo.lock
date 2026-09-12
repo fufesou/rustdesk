@@ -7446,6 +7446,7 @@ dependencies = [
  "tracing",
  "webm",
  "winapi 0.3.9",
+ "windows 0.61.1",
  "zbus",
 ]
 
