@@ -492,11 +492,13 @@ jobs:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        uses: fufesou/rust-toolchain@06b350f08c8596edaf3d95d38686ba934fc4a6a7 # feat/force-non-host
         with:
           toolchain: nightly-2023-10-13-${{ matrix.job.target }} # must use nightly here, because of abi_thiscall feature required
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
+          # Rustup 1.29.1+ requires explicit opt-in for an i686 host toolchain on x64 Windows.
+          force-non-host: true
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
