@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -142,6 +143,13 @@ void main() {
     view.resetDevicePixelRatio();
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
   });
+  for (final forbidden in [false, true]) {
+    test('predefined cursor forbidden=$forbidden preserves native RGBA', () {
+      view.devicePixelRatio = 1;
+      return _checkPredefinedCursor(
+          forbidden ? preForbiddenCursor : preDefaultCursor, registrations);
+    });
+  }
   for (final testCase in [
     (kRemoteViewStyleAdaptive, false, 0, 0.25, windows ? 1.0 : 4 / 3),
     (kRemoteViewStyleCustom, false, 0, 0.25, windows ? 1.0 : 4 / 3),
@@ -225,4 +233,50 @@ Future<void> _checkDprChange(
   data.nativeImage.dispose();
   cursor.dispose();
   canvas.dispose();
+}
+
+Future<void> _checkPredefinedCursor(PredefinedCursor predefined,
+    List<Map<dynamic, dynamic>> registrations) async {
+  await Future.doWhile(() async {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    return predefined.cache == null;
+  }).timeout(const Duration(seconds: 5));
+  final cache = predefined.cache!;
+  final original = img
+      .decodePng(base64Decode(predefined.png))!
+      .convert(format: img.Format.uint8, numChannels: 4);
+  final canvas = _Canvas(1, style: kRemoteViewStyleAdaptive, scale: 1);
+  final cursor = _Cursor(cache, _FFI(canvas));
+  buildCursorOfCache(cursor, 1, cache);
+  await deleteCustomCursor(cursor.cachedKeys.single);
+  cursor.dispose();
+  canvas.dispose();
+
+  final args = registrations.single;
+  final bytes = args['buffer'] as Uint8List;
+  final decoded = Platform.isWindows
+      ? img.Image.fromBytes(
+          width: args['width'] as int,
+          height: args['height'] as int,
+          bytes: bytes.buffer,
+          bytesOffset: bytes.offsetInBytes,
+          order: img.ChannelOrder.bgra)
+      : img.decodePng(bytes)!;
+  expect((decoded.width, decoded.height), (original.width, original.height));
+  expect(args['imagePixelRatio'], 1.0);
+  expect((args['hotX'], args['hotY']), (cache.hotxOrigin, cache.hotyOrigin));
+  expect(cache.image.getBytes(), original.getBytes());
+  // Actual bundled pixels cover transparent, opaque and translucent colors.
+  for (final (x, y) in [(0, 0), (1, 8), (13, 22), (16, 16)]) {
+    final expected = original.getPixel(x, y);
+    final actual = decoded.getPixel(x, y);
+    expect(actual.a, expected.a);
+    for (final (got, want) in [
+      (actual.r, expected.r),
+      (actual.g, expected.g),
+      (actual.b, expected.b)
+    ]) {
+      expect(got, closeTo(want, 1), reason: '${predefined.id} at ($x, $y)');
+    }
+  }
 }

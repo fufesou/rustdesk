@@ -2985,7 +2985,8 @@ class PredefinedCursor {
   CursorData? get cache => _cache;
 
   init() {
-    _image2 = img2.decodePng(base64Decode(png));
+    final pngBytes = base64Decode(png);
+    _image2 = img2.decodePng(pngBytes);
     if (_image2 != null) {
       // The png type of forbidden cursor image is `PngColorType.indexed`.
       if (id == kPreForbiddenCursorId) {
@@ -2993,18 +2994,18 @@ class PredefinedCursor {
       }
 
       () async {
-        final defaultImg = _image2!;
-        // This function is called only one time, no need to care about the performance.
-        Uint8List data = defaultImg.getBytes(order: img2.ChannelOrder.rgba);
         _image?.dispose();
-        final nativeImage = await img.decodeImageFromPixels(
-            data, defaultImg.width, defaultImg.height, ui.PixelFormat.rgba8888);
-        _image = nativeImage;
-        if (nativeImage == null) {
-          print("decodeImageFromPixels failed, pre-defined cursor $id");
-          return;
+        // PNG stores straight alpha; let the codec prepare the pixels for ui.Image.
+        final codec = await ui.instantiateImageCodec(pngBytes);
+        final ui.Image nativeImage;
+        try {
+          nativeImage = (await codec.getNextFrame()).image;
+        } finally {
+          codec.dispose();
         }
+        _image = nativeImage;
         double scale = 1.0;
+        final Uint8List data;
         if (isWindows) {
           data = _image2!.getBytes(order: img2.ChannelOrder.bgra);
         } else {
