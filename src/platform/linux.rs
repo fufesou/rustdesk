@@ -35,6 +35,10 @@ use std::{
 use terminfo::{capability as cap, Database};
 use wallpaper;
 
+// Scope density lookup to Flutter host builds to preserve legacy capture
+// behavior. These builds include density in cursor IDs to refresh on DPI
+// changes; non-Flutter builds retain original IDs and unknown density.
+// This gate describes the host binary, not the connected controller's UI.
 #[cfg(feature = "flutter")]
 mod cursor;
 
