@@ -102,7 +102,9 @@ class _FFI extends Fake implements FFI {
 }
 
 Future<CursorData> _data(int density, String id) async {
-  final image = await createTestImage(width: 9 * density, height: 18 * density);
+  final bitmapDensity = density == 0 ? 1 : density;
+  final image = await createTestImage(
+      width: 9 * bitmapDensity, height: 18 * bitmapDensity);
   return CursorData(
     peerId: 'dpi-policy',
     id: id,
@@ -110,8 +112,8 @@ Future<CursorData> _data(int density, String id) async {
     nativeImage: image,
     scale: 1,
     data: null,
-    hotxOrigin: 4.0 * density,
-    hotyOrigin: 9.0 * density,
+    hotxOrigin: 4.0 * bitmapDensity,
+    hotyOrigin: 9.0 * bitmapDensity,
     width: image.width,
     height: image.height,
     pixelRatio: density.toDouble(),
@@ -120,6 +122,8 @@ Future<CursorData> _data(int density, String id) async {
 
 void main() {
   for (final (style, zoom, density, viewScale, expectedScale) in [
+    (kRemoteViewStyleAdaptive, false, 0, 0.25, Platform.isWindows ? 1.0 : 4 / 3),
+    (kRemoteViewStyleCustom, false, 0, 0.25, Platform.isWindows ? 1.0 : 4 / 3),
     (kRemoteViewStyleAdaptive, false, 1, 0.25, Platform.isWindows ? 2.0 : 1.0),
     (kRemoteViewStyleAdaptive, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
     (kRemoteViewStyleCustom, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
@@ -173,8 +177,8 @@ void main() {
               tester.binding.defaultBinaryMessenger
                   .setMockMethodCallHandler(channel, null);
               expect(data.scale, closeTo(expectedScale, 1e-9));
-              expect(data.hotx, closeTo(4 * density * expectedScale, 1e-9));
-              expect(data.hoty, closeTo(9 * density * expectedScale, 1e-9));
+              expect(data.hotx, closeTo(data.hotxOrigin * expectedScale, 1e-9));
+              expect(data.hoty, closeTo(data.hotyOrigin * expectedScale, 1e-9));
             }));
   }
 }

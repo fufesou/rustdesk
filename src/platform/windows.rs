@@ -97,8 +97,6 @@ use windows_service::{
 use winreg::{enums::*, RegKey};
 
 mod acl;
-#[cfg(feature = "flutter")]
-mod cursor;
 mod installer_handoff;
 mod installer_shell;
 mod msi_registry;
@@ -217,14 +215,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         if ci.flags & CURSOR_SHOWING == 0 {
             Ok(None)
         } else {
-            #[cfg(feature = "flutter")]
-            {
-                cursor::current(&ci)
-            }
-            #[cfg(not(feature = "flutter"))]
-            {
-                Ok(Some(ci.hCursor as _))
-            }
+            Ok(Some(ci.hCursor as _))
         }
     }
 }
@@ -269,10 +260,6 @@ impl Drop for IconInfo {
 // https://github.com/TurboVNC/tightvnc/blob/a235bae328c12fd1c3aed6f3f034a37a6ffbbd22/vnc_winsrc/winvnc/vncEncoder.cpp
 // https://github.com/TigerVNC/tigervnc/blob/master/win/rfb_win32/DeviceFrameBuffer.cxx
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
-    #[cfg(feature = "flutter")]
-    if let Some(data) = cursor::data(hcursor)? {
-        return Ok(data);
-    }
     unsafe {
         let mut ii = IconInfo::new(hcursor as _)?;
         let bm_mask = get_bitmap(ii.0.hbmMask)?;
