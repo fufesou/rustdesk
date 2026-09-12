@@ -522,9 +522,9 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: db63b785c38153603e9fb84b50d3ec46f0d7e05e
-      resolved-ref: db63b785c38153603e9fb84b50d3ec46f0d7e05e
-      url: "https://github.com/rustdesk-org/flutter_custom_cursor"
+      ref: "403f9d3b4aac4277f35f761ba3d703468004d029"
+      resolved-ref: "403f9d3b4aac4277f35f761ba3d703468004d029"
+      url: "https://github.com/fufesou/flutter_custom_cursor"
     source: git
     version: "0.0.3"
   flutter_gpu_texture_renderer:

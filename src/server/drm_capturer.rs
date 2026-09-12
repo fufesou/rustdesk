@@ -974,6 +974,55 @@ pub fn drm_cursor() -> Option<DrmCursorData> {
     with_drm_cursor(|c| c.clone())
 }
 
+#[cfg(feature = "flutter")]
+pub fn drm_cursor_snapshot<T>(
+    f: impl Fn(&DrmCursorData) -> T,
+) -> Option<(T, Option<base::platform::linux::WaylandDisplayInfo>)> {
+    // Keep cursor identity and output together, then release the map before DRM_STATE.
+    let (value, display, hidden) = {
+        let map = DRM_CURSOR.lock().unwrap();
+        let (display, (_, cursor)) = map
+            .iter()
+            .find(|(_, (_, cursor))| cursor.id != scrap::drm_reader::HIDDEN_CURSOR_ID)
+            .or_else(|| map.iter().next())?;
+        (
+            f(cursor),
+            *display,
+            cursor.id == scrap::drm_reader::HIDDEN_CURSOR_ID,
+        )
+    };
+    let monitor = if hidden {
+        None
+    } else {
+        // Display discovery runs outside the cursor service; missing metadata means unknown DPI.
+        scrap::wayland::display::get_cached_displays().and_then(|wayland| {
+            cursor_monitor(
+                display.max(0) as usize,
+                &DRM_STATE.lock().unwrap(),
+                &wayland.displays,
+            )
+        })
+    };
+    Some((value, monitor))
+}
+
+#[cfg(feature = "flutter")]
+fn cursor_monitor(
+    display: usize,
+    state: &ProbeState,
+    monitors: &[base::platform::linux::WaylandDisplayInfo],
+) -> Option<base::platform::linux::WaylandDisplayInfo> {
+    let ProbeState::Available(_, displays) = state else {
+        return None;
+    };
+    // Reserve every connector's name match before guessing this cursor's density.
+    let index = identity_matches(displays, monitors)
+        .get(display)
+        .copied()
+        .flatten()?;
+    monitors.get(index).cloned()
+}
+
 enum ProbeState {
     Unknown,
     Unavailable(Instant),
@@ -2268,6 +2317,36 @@ mod drm_capturer_tests {
         let wl2 = vec![wl_display("HDMI-1", 0, 0, 1920, 1080)];
         let m2 = identity_matches(&drm2, &wl2);
         assert!(m2[0].is_none() && m2[1].is_none());
+    }
+
+    #[cfg(feature = "flutter")]
+    #[test]
+    fn cursor_monitor_reserves_other_displays_before_guessing_density() {
+        let state = ProbeState::Available(
+            Instant::now(),
+            vec![
+                drm_display("DSI-1", 1920, 1080),
+                drm_display("HDMI-A-1", 1920, 1080),
+            ],
+        );
+        for other_width in [2560, 1920] {
+            let mut monitors = vec![
+                wl_display("HDMI-1", 0, 0, 1920, 1080),
+                wl_display("Unknown-9", 960, 0, other_width, 1080),
+            ];
+            monitors[0].logical_size = Some((960, 540));
+            let selected = cursor_monitor(0, &state, &monitors);
+            if other_width == 2560 {
+                assert!(selected.is_none(), "DSI must not inherit HDMI's 2x density");
+            } else {
+                let selected = selected.unwrap();
+                assert_eq!(selected.name, "Unknown-9");
+                assert_eq!(selected.logical_size, Some((1920, 1080)));
+            }
+            let hdmi = cursor_monitor(1, &state, &monitors).unwrap();
+            assert_eq!(hdmi.name, "HDMI-1");
+            assert_eq!(hdmi.logical_size, Some((960, 540)));
+        }
     }
 
     #[test]
