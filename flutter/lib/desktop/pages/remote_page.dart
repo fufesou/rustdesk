@@ -1127,7 +1127,7 @@ class _ImagePaintState extends State<ImagePaint> {
             } else {
               if (zoomCursor.value || isViewOriginal()) {
                 cursorScale = s;
-              } else {
+              } else if (!isWeb) {
                 // NSCursor and GdkCursor treat the bitmap size as logical
                 // pixels, so an unzoomed cursor must be shrunk by the DPR to
                 // keep 1 remote px == 1 physical px, the size Original view
