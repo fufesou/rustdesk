@@ -22,40 +22,27 @@ MouseCursor buildCursorOfCache(
   if (cache == null) {
     return MouseCursor.defer;
   } else {
-    // Include the live DPR so moving between monitors rebuilds the native
-    // bitmap even when the remote view scale has not changed.
-    final dpr = WidgetsBinding
-        .instance.platformDispatcher.views.single.devicePixelRatio;
-    // Keep Original and older peers unchanged. A long-edge minimum preserves
-    // the proportions of thin remote cursors when normalizing their DPI.
-    final legacyMinimum = cache.pixelRatio == 0 ||
-        cursor.parent.target?.canvasModel.viewStyle.style == kRemoteViewStyleOriginal;
-    // The minimum is logical, while Windows callers pass a physical scale.
-    final effectiveScale = !legacyMinimum && isWindows
-        ? math.max(scale, kMinCursorSize * dpr / math.max(cache.width, cache.height))
-        : scale;
-    final key = '${cache.updateGetKey(effectiveScale, resizeImage: false, useLegacyMinimum: legacyMinimum)}_$dpr';
+    final key = cache.updateGetKey(scale);
     if (!cursor.cachedKeys.contains(key)) {
+      // data should be checked here, because it may be changed after `updateGetKey()`
+      final data = cache.data;
+      if (data == null) {
+        return MouseCursor.defer;
+      }
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
-      unawaited(custom_cursor_manager.CursorManager.instance
-          .registerCursorImage(
-        name: key,
-        image: cache.nativeImage,
-        hotSpot: Offset(cache.hotxOrigin, cache.hotyOrigin),
-        // Windows callers already express scale in physical pixels.
-        // The plugin takes logical scale and applies DPR during rasterization.
-        scale: isWindows ? cache.scale / dpr : cache.scale,
-        devicePixelRatio: dpr,
-      )
-          .then<void>((_) {}, onError: (Object error, StackTrace stack) {
-        cursor.cachedKeys.remove(key);
-        FlutterError.reportError(FlutterErrorDetails(
-            exception: error,
-            stack: stack,
-            library: 'native cursor',
-            context: ErrorDescription('registering cursor $key')));
-      }));
+      // [Safety]
+      // It's ok to call async registerCursor in current synchronous context,
+      // because activating the cursor is also an async call and will always
+      // be executed after this.
+      custom_cursor_manager.CursorManager.instance
+          .registerCursor(custom_cursor_manager.CursorData()
+            ..name = key
+            ..buffer = data
+            ..width = (cache.width * cache.scale).toInt()
+            ..height = (cache.height * cache.scale).toInt()
+            ..hotX = cache.hotx
+            ..hotY = cache.hoty);
       cursor.addKey(key);
     }
     return FlutterCustomMemoryImageCursor(key: key);
