@@ -7,7 +7,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
 import 'package:flutter_hbb/models/input_model.dart';
 import 'package:flutter_hbb/models/model.dart';
-import 'package:flutter_hbb/native/custom_cursor.dart' show deleteCustomCursor;
+import 'package:flutter_hbb/native/custom_cursor.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get/get.dart';
 import 'package:image/image.dart' as img;
@@ -111,7 +111,7 @@ Future<CursorData> _data(int density, String id) async {
     image: img.Image(width: image.width, height: image.height, numChannels: 4),
     nativeImage: image,
     scale: 1,
-    data: null,
+    data: Uint8List.fromList([1, 2]),
     hotxOrigin: 4.0 * bitmapDensity,
     hotyOrigin: 9.0 * bitmapDensity,
     width: image.width,
@@ -121,64 +121,107 @@ Future<CursorData> _data(int density, String id) async {
 }
 
 void main() {
-  for (final (style, zoom, density, viewScale, expectedScale) in [
-    (kRemoteViewStyleAdaptive, false, 0, 0.25, Platform.isWindows ? 1.0 : 4 / 3),
-    (kRemoteViewStyleCustom, false, 0, 0.25, Platform.isWindows ? 1.0 : 4 / 3),
-    (kRemoteViewStyleAdaptive, false, 1, 0.25, Platform.isWindows ? 2.0 : 1.0),
-    (kRemoteViewStyleAdaptive, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
-    (kRemoteViewStyleCustom, false, 2, 0.25, Platform.isWindows ? 1.0 : 0.5),
-    (kRemoteViewStyleAdaptive, true, 2, 0.25, Platform.isWindows ? 2 / 3 : 1 / 3),
-    (kRemoteViewStyleCustom, true, 2, 0.25, Platform.isWindows ? 2 / 3 : 1 / 3),
-    (kRemoteViewStyleOriginal, false, 2, 0.5, Platform.isWindows ? 1.0 : 2 / 3),
+  final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  final view = binding.platformDispatcher.views.single;
+  final channel = Platform.isWindows
+      ? SystemChannels.mouseCursor
+      : const MethodChannel('flutter_custom_cursor');
+  final windows = Platform.isWindows;
+  final registrations = <Map<dynamic, dynamic>>[];
+  setUp(() {
+    registrations.clear();
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
+        (call) async {
+      if (!call.method.startsWith('createCustomCursor')) return null;
+      final args = call.arguments as Map<dynamic, dynamic>;
+      registrations.add(args);
+      return args['name'];
+    });
+  });
+  tearDown(() {
+    view.resetDevicePixelRatio();
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
+  });
+  for (final testCase in [
+    (kRemoteViewStyleAdaptive, false, 0, 0.25, windows ? 1.0 : 4 / 3),
+    (kRemoteViewStyleCustom, false, 0, 0.25, windows ? 1.0 : 4 / 3),
+    (kRemoteViewStyleAdaptive, false, 1, 0.25, windows ? 2.0 : 1.0),
+    (kRemoteViewStyleAdaptive, false, 2, 0.25, windows ? 1.0 : 0.5),
+    (kRemoteViewStyleCustom, false, 2, 0.25, windows ? 1.0 : 0.5),
+    (kRemoteViewStyleAdaptive, true, 2, 0.25, windows ? 2 / 3 : 1 / 3),
+    (kRemoteViewStyleCustom, true, 2, 0.25, windows ? 2 / 3 : 1 / 3),
+    (kRemoteViewStyleOriginal, false, 2, 0.5, windows ? 1.0 : 2 / 3),
   ]) {
     testWidgets(
-        '$style zoom=$zoom peerDPR=$density keeps cursor units',
-        (tester) => tester.runAsync(() async {
-              tester.view.devicePixelRatio = 2;
-              addTearDown(tester.view.resetDevicePixelRatio);
-              final channel = Platform.isWindows
-                  ? SystemChannels.mouseCursor
-                  : const MethodChannel('flutter_custom_cursor');
-              tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-                  channel,
-                  (call) async => call.method.startsWith('createCustomCursor')
-                      ? (call.arguments as Map<dynamic, dynamic>)['name']
-                      : null);
-              final data = await _data(density, '$style-$zoom-$density');
-              // A stale cached DPR must not affect the cursor when the window moves.
-              final canvas = _Canvas(1, style: style, scale: viewScale);
-              final ffi = _FFI(canvas);
-              final cursor = _Cursor(data, ffi);
-              await tester.pumpWidget(MediaQuery(
-                data: const MediaQueryData(devicePixelRatio: 2),
-                child: MultiProvider(
-                    providers: [
-                      ChangeNotifierProvider<ImageModel>(
-                          create: (_) => _Image()),
-                      ChangeNotifierProvider<CanvasModel>.value(value: canvas),
-                      ChangeNotifierProvider<CursorModel>.value(value: cursor),
-                    ],
-                    child: ImagePaint(
-                      ffi: ffi,
-                      id: 'dpi-policy',
-                      zoomCursor: zoom.obs,
-                      cursorOverImage: true.obs,
-                      keyboardEnabled: true.obs,
-                      remoteCursorMoved: false.obs,
-                    )),
-              ));
-              await tester.pumpWidget(const SizedBox.shrink());
-              await Future.wait(cursor.cachedKeys.map((key) async {
-                await deleteCustomCursor(key);
-              }));
-              data.nativeImage.dispose();
-              cursor.dispose();
-              canvas.dispose();
-              tester.binding.defaultBinaryMessenger
-                  .setMockMethodCallHandler(channel, null);
-              expect(data.scale, closeTo(expectedScale, 1e-9));
-              expect(data.hotx, closeTo(data.hotxOrigin * expectedScale, 1e-9));
-              expect(data.hoty, closeTo(data.hotyOrigin * expectedScale, 1e-9));
-            }));
+        '${testCase.$1} zoom=${testCase.$2} peerDPR=${testCase.$3}',
+        (tester) => tester
+            .runAsync(() => _checkPolicy(tester, testCase, registrations)));
   }
+  test('live DPR changes invalidate a cached native cursor',
+      () => _checkDprChange(view, registrations));
+}
+
+Future<void> _checkPolicy(
+    WidgetTester tester,
+    (String, bool, int, double, double) testCase,
+    List<Map<dynamic, dynamic>> registrations) async {
+  final (style, zoom, density, viewScale, expectedScale) = testCase;
+  tester.view.devicePixelRatio = 2;
+  final data = await _data(density, '$style-$zoom-$density');
+  final originalBytes = data.data;
+  // A stale cached DPR must not affect the cursor when the window moves.
+  final canvas = _Canvas(1, style: style, scale: viewScale);
+  final ffi = _FFI(canvas);
+  final cursor = _Cursor(data, ffi);
+  await tester.pumpWidget(MediaQuery(
+    data: const MediaQueryData(devicePixelRatio: 2),
+    child: MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ImageModel>(create: (_) => _Image()),
+          ChangeNotifierProvider<CanvasModel>.value(value: canvas),
+          ChangeNotifierProvider<CursorModel>.value(value: cursor),
+        ],
+        child: ImagePaint(
+          ffi: ffi,
+          id: 'dpi-policy',
+          zoomCursor: zoom.obs,
+          cursorOverImage: true.obs,
+          keyboardEnabled: true.obs,
+          remoteCursorMoved: false.obs,
+        )),
+  ));
+  await tester.pumpWidget(const SizedBox.shrink());
+  for (final key in cursor.cachedKeys) {
+    await deleteCustomCursor(key);
+  }
+  data.nativeImage.dispose();
+  cursor.dispose();
+  canvas.dispose();
+  expect(data.scale, closeTo(expectedScale, 1e-9));
+  expect(data.hotx, closeTo(data.hotxOrigin * expectedScale, 1e-9));
+  expect(data.hoty, closeTo(data.hotyOrigin * expectedScale, 1e-9));
+  expect(data.data, same(originalBytes));
+  if (style == kRemoteViewStyleAdaptive && !zoom && density > 0) {
+    final args = registrations.single;
+    expect((args['width'], args['height']), (Platform.isLinux ? 36 : 18, 36));
+    expect((args['hotX'], args['hotY']), (8.0, 18.0));
+    expect(args['imagePixelRatio'], 2.0);
+  }
+}
+
+Future<void> _checkDprChange(
+    TestFlutterView view, List<Map<dynamic, dynamic>> registrations) async {
+  final data = await _data(1, 'dpr-cache');
+  final canvas = _Canvas(1, style: kRemoteViewStyleAdaptive, scale: 1);
+  final cursor = _Cursor(data, _FFI(canvas));
+  for (final dpr in [2.0, 1.0]) {
+    view.devicePixelRatio = dpr;
+    buildCursorOfCache(cursor, 1, data);
+    await deleteCustomCursor(cursor.cachedKeys.last);
+  }
+  expect(registrations, hasLength(2));
+  expect(registrations[0]['name'], isNot(registrations[1]['name']));
+  data.nativeImage.dispose();
+  cursor.dispose();
+  canvas.dispose();
 }
