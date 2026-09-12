@@ -3456,9 +3456,18 @@ class CursorModel with ChangeNotifier {
       throw FormatException('Invalid cursor pixel ratio: $pixelRatio');
     }
     List<dynamic> colors = json.decode(evt['colors']);
-    final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
-    final image = await img.decodeImageFromPixels(
-        rgba, width, height, ui.PixelFormat.rgba8888);
+    var rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
+    final ui.Image? image;
+    if (isWeb &&
+        pixelRatio > 0 &&
+        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
+      // macOS cursors with density metadata use premultiplied alpha; older
+      // hosts send straight alpha. Keep native decoding and old hosts unchanged.
+      (rgba, image) = await _decodeWebMacCursor(rgba, width, height);
+    } else {
+      image = await img.decodeImageFromPixels(
+          rgba, width, height, ui.PixelFormat.rgba8888);
+    }
     if (image == null) {
       return;
     }
@@ -3473,6 +3482,30 @@ class CursorModel with ChangeNotifier {
     // Update last cursor data.
     // Do not use the previous `image` and `id`, because `_id` may be changed.
     _updateCurData();
+  }
+
+  Future<(Uint8List, ui.Image)> _decodeWebMacCursor(
+      Uint8List rgba, int width, int height) async {
+    final source = img2.Image.fromBytes(
+        width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
+    for (final pixel in source) {
+      final alpha = pixel.a;
+      if (alpha == 0) continue;
+      final maxChannel = pixel.maxChannelValue;
+      // RGB and alpha rounding in capture can differ by one channel value.
+      pixel.r = min(maxChannel, (pixel.r * maxChannel / alpha).round());
+      pixel.g = min(maxChannel, (pixel.g * maxChannel / alpha).round());
+      pixel.b = min(maxChannel, (pixel.b * maxChannel / alpha).round());
+    }
+    // Web ImageDescriptor.raw treats RGBA as straight alpha. Decode a PNG so
+    // both the painted cursor and the resize source use the correct colors.
+    final codec = await ui.instantiateImageCodec(
+        Uint8List.fromList(img2.encodePng(source)));
+    try {
+      return (source.getBytes(), (await codec.getNextFrame()).image);
+    } finally {
+      codec.dispose();
+    }
   }
 
   Future<bool> _updateCache(

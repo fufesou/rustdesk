@@ -29,6 +29,7 @@ class _CursorModel extends Fake implements model.CursorModel {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  _alphaTests();
   for (final style in [kRemoteViewStyleAdaptive, kRemoteViewStyleCustom]) {
     for (final dpr in [1.0, 2.0]) {
       testWidgets('ImagePaint Web $style zoom off DPR $dpr keeps source size',
@@ -141,7 +142,9 @@ class _FFI extends Fake implements model.FFI {
   final ffiModel = _Peer();
 }
 
-Future<model.CursorModel> _loadCursor(model.FFI ffi, String id) async {
+Future<model.CursorModel> _loadCursor(model.FFI ffi, String id,
+    {List<int> pixel = const [255, 255, 255, 255],
+    double? pixelRatio = 1}) async {
   final cursor = model.CursorModel(WeakReference(ffi))..id = id;
   await cursor.updateCursorData({
     'id': id,
@@ -149,8 +152,8 @@ Future<model.CursorModel> _loadCursor(model.FFI ffi, String id) async {
     'height': '48',
     'hotx': '7',
     'hoty': '9',
-    'scale': '1',
-    'colors': jsonEncode(List.filled(48 * 48 * 4, 255)),
+    if (pixelRatio != null) 'scale': '$pixelRatio',
+    'colors': jsonEncode([for (var i = 0; i < 48 * 48; i++) ...pixel]),
   });
   addTearDown(() async {
     for (final key in cursor.cachedKeys) {
@@ -162,22 +165,31 @@ Future<model.CursorModel> _loadCursor(model.FFI ffi, String id) async {
   return cursor;
 }
 
-Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
+Map<String, dynamic> _captureCursor() {
   final originals = {
     for (final key in ['isMobile', 'getByName', 'setByName'])
       key: js.context[key]
   };
   js.context['isMobile'] = js.allowInterop(() => false);
   js.context['getByName'] = js.allowInterop((String name, String value) => '');
-  Map<String, dynamic>? registered;
+  final registered = <String, dynamic>{};
   js.context['setByName'] = js.allowInterop((String name, String value) {
-    if (name == 'cursor') registered = jsonDecode(value);
+    if (name == 'cursor') {
+      registered
+        ..clear()
+        ..addAll(jsonDecode(value));
+    }
   });
   addTearDown(() {
     for (final entry in originals.entries) {
       js.context[entry.key] = entry.value;
     }
   });
+  return registered;
+}
+
+Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
+  final registered = _captureCursor();
   final canvas = _Canvas(style);
   addTearDown(canvas.dispose);
   final ffi = _FFI(canvas);
@@ -206,7 +218,47 @@ Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
   session.dispose();
   await tester.pumpWidget(const SizedBox.shrink());
   final png =
-      img.decodePng(Uri.parse(registered!['url']).data!.contentAsBytes())!;
+      img.decodePng(Uri.parse(registered['url']).data!.contentAsBytes())!;
   expect((png.width, png.height), (48, 48));
-  expect((registered!['hotx'], registered!['hoty']), (7, 9));
+  expect((registered['hotx'], registered['hoty']), (7, 9));
+}
+
+void _alphaTests() {
+  for (final (density, pixel, expected) in [
+    (1.0, [128, 128, 128, 128], [255, 255, 255, 128]),
+    (2.0, [128, 64, 32, 128], [255, 128, 64, 128]),
+    (1.0, [113, 56, 28, 112], [255, 128, 64, 112]),
+    (1.0, [0, 0, 0, 0], [0, 0, 0, 0]),
+    (1.0, [255, 255, 255, 255], [255, 255, 255, 255]),
+    // Old macOS hosts send straight alpha without density metadata.
+    (0.0, [255, 128, 64, 128], [255, 128, 64, 128]),
+    (null, [80, 40, 20, 128], [80, 40, 20, 128]),
+  ]) {
+    test('Web macOS cursor density $density preserves RGBA $expected',
+        () => _checkAlpha(density, pixel, expected));
+  }
+}
+
+Future<void> _checkAlpha(
+    double? density, List<int> pixel, List<int> expected) async {
+  final registered = _captureCursor();
+  final canvas = _Canvas(kRemoteViewStyleAdaptive);
+  addTearDown(canvas.dispose);
+  final ffi = _FFI(canvas)..ffiModel.pi.platform = kPeerPlatformMacOS;
+  final cursor = await _loadCursor(ffi, 'alpha-$density-$pixel',
+      pixel: pixel, pixelRatio: density);
+  // Cover both the painted remote cursor and the initial CSS cursor PNG.
+  final straight = await cursor.image!
+      .toByteData(format: ui.ImageByteFormat.rawStraightRgba);
+  expect(straight!.buffer.asUint8List(0, 4), expected);
+  for (final scale in [1.0, 0.5, 1.0]) {
+    final session =
+        buildCursorOfCache(cursor, scale, cursor.cache).createSession(1);
+    await session.activate();
+    session.dispose();
+    final png =
+        img.decodePng(Uri.parse(registered['url']).data!.contentAsBytes())!;
+    final color = png.getPixel(png.width ~/ 2, png.height ~/ 2);
+    expect([color.r, color.g, color.b, color.a], expected);
+  }
 }
