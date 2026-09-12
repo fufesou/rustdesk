@@ -117,52 +117,49 @@ class _Canvas extends Fake implements Canvas {
   }
 }
 
+Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
+    {double dpr = 2, bool zoom = true, (int, int) source = (48, 64)}) async {
+  final image = (await tester
+      .runAsync(() => createTestImage(width: source.$1, height: source.$2)))!;
+  addTearDown(image.dispose);
+  await tester.pumpWidget(MediaQuery(
+    data: MediaQueryData(devicePixelRatio: dpr),
+    child: MultiProvider(
+      providers: [
+        ChangeNotifierProvider<CursorModel>(create: (_) => _CursorModel(image)),
+        ChangeNotifierProvider<CanvasModel>(create: (_) => canvas),
+      ],
+      child: CursorPaint(id: 'cursor-test', zoomCursor: zoom.obs),
+    ),
+  ));
+  final painter = tester.widget<CustomPaint>(find.byType(CustomPaint)).painter!
+      as ImagePainter;
+  expect(painter.image, same(image));
+  return painter;
+}
+
 void main() {
+  final minimumScale = Platform.isWindows ? 1 / 3 : 2 / 3;
   for (final (style, zoom, dpr, source, canvasScale, scale, texture) in [
     (kRemoteViewStyleAdaptive, false, 2.0, (48, 64), 0.375, 0.375, true),
     (kRemoteViewStyleOriginal, false, 2.0, (48, 64), 0.5, 0.5, true),
     (kRemoteViewStyleCustom, false, 2.0, (48, 64), 0.25, 0.25, false),
     (kRemoteViewStyleCustom, true, 2.0, (48, 64), 2.0, 2.0, false),
     (kRemoteViewStyleAdaptive, false, 2.25, (48, 48), 0.375, 0.375, false),
-    (
-      kRemoteViewStyleAdaptive,
-      true,
-      2.0,
-      (9, 18),
-      0.1,
-      Platform.isWindows ? 1 / 3 : 2 / 3,
-      true
-    ),
+    (kRemoteViewStyleAdaptive, true, 2.0, (9, 18), 0.1, minimumScale, true),
   ]) {
     testWidgets(
         '$style zoom=$zoom dpr=$dpr source=$source texture=$texture keeps remote geometry',
         (tester) async {
-      final image = (await tester.runAsync(
-          () => createTestImage(width: source.$1, height: source.$2)))!;
-      addTearDown(image.dispose);
-      await tester.pumpWidget(MediaQuery(
-        data: MediaQueryData(devicePixelRatio: dpr),
-        child: MultiProvider(
-          providers: [
-            ChangeNotifierProvider<CursorModel>(
-                create: (_) => _CursorModel(image)),
-            ChangeNotifierProvider<CanvasModel>(
-                create: (_) => _CanvasModel(style, canvasScale, texture)),
-          ],
-          child: CursorPaint(id: 'cursor-test', zoomCursor: zoom.obs),
-        ),
-      ));
-      final painter = tester
-          .widget<CustomPaint>(find.byType(CustomPaint))
-          .painter! as ImagePainter;
-
-      expect(painter.image, same(image));
+      final painter = await _paintCursor(
+          tester, _CanvasModel(style, canvasScale, texture),
+          dpr: dpr, zoom: zoom, source: source);
       expect(painter.scale, scale);
       var imageOrigin = _canvasOffset;
       if (!texture) {
         final background = _Canvas();
         ImagePainter(
-          image: image,
+          image: painter.image,
           x: _canvasOffset.dx / canvasScale,
           y: _canvasOffset.dy / canvasScale,
           scale: canvasScale,
@@ -181,28 +178,10 @@ void main() {
   for (final style in [kRemoteViewStyleOriginal, kRemoteViewStyleCustom]) {
     testWidgets('$style painted cursor follows scrollbar position',
         (tester) async {
-      final image = (await tester.runAsync(
-          () => createTestImage(width: 48, height: 64)))!;
-      addTearDown(image.dispose);
-      await tester.pumpWidget(MediaQuery(
-        data: const MediaQueryData(devicePixelRatio: 2),
-        child: MultiProvider(
-          providers: [
-            ChangeNotifierProvider<CursorModel>(
-                create: (_) => _CursorModel(image)),
-            ChangeNotifierProvider<CanvasModel>(
-                create: (_) => _ScrollbarCanvasModel(style)),
-          ],
-          child: CursorPaint(id: 'cursor-test', zoomCursor: true.obs),
-        ),
-      ));
-      final painter = tester
-          .widget<CustomPaint>(find.byType(CustomPaint))
-          .painter! as ImagePainter;
+      final painter = await _paintCursor(tester, _ScrollbarCanvasModel(style));
       final target = _remotePosition * 2 -
           Offset(_viewport.width * 2 * 0.1, _viewport.height * 2 * 0.2);
-      expect(
-          (Offset(painter.x, painter.y) + _hotspot) * painter.scale, target);
+      expect((Offset(painter.x, painter.y) + _hotspot) * painter.scale, target);
     });
   }
 }

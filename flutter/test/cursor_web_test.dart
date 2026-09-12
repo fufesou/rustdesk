@@ -28,11 +28,7 @@ void main() {
       registered = jsonDecode(value) as Map<String, dynamic>;
     });
     addTearDown(() => js.context['setByName'] = original);
-    final recorder = ui.PictureRecorder();
-    ui.Canvas(recorder).drawColor(const ui.Color(0xffffffff), ui.BlendMode.src);
-    final picture = recorder.endRecording();
-    final nativeImage = await picture.toImage(48, 48);
-    picture.dispose();
+    final nativeImage = await createTestImage(width: 48, height: 48);
     addTearDown(nativeImage.dispose);
     for (final (hotspot, scale, side, expected) in [
       ((7.0, 7.0), 633 / 1600, 19, (3, 3)),
