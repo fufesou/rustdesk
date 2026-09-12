@@ -2850,7 +2850,8 @@ class CanvasModel with ChangeNotifier {
   }
 }
 
-// data for cursor
+// Scale the host's bitmap and hotspot together. Incorrect source geometry
+// must be fixed in host capture, independently of the client's sizing policy.
 class CursorData {
   final String peerId;
   final String id;
@@ -2858,7 +2859,7 @@ class CursorData {
   // Borrowed from CursorModel/PredefinedCursor, which own its lifetime.
   // The plugin clones the handle before starting asynchronous encoding.
   final ui.Image nativeImage;
-  // Zero preserves sizing for peers that predate cursor density metadata.
+  // Zero preserves legacy sizing for capture backends without density metadata.
   final double pixelRatio;
   double scale;
   Uint8List? data;

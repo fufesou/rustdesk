@@ -316,7 +316,7 @@ message CursorData {
   int32 width = 4;
   int32 height = 5;
   bytes colors = 6;
-  // Physical bitmap pixels per remote logical pixel; 0 means an older sender.
+  // Physical bitmap pixels per remote logical pixel; 0 means unknown density.
   double scale = 7;
 }
 

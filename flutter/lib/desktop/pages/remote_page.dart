@@ -1116,6 +1116,8 @@ class _ImagePaintState extends State<ImagePaint> {
             if (!isWeb && isViewScaled() && !zoomCursor.value && peerDpr > 0) {
               return (isWindows ? dpr : 1.0) / peerDpr;
             }
+            // Density metadata is optional. Keep the legacy path for hosts that
+            // omit it so capture-backend upgrades are not a client prerequisite.
             var cursorScale = 1.0;
             if (isWindows) {
               // debug win10
