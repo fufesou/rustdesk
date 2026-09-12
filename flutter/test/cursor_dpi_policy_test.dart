@@ -45,6 +45,8 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   @override
   bool get cursorEmbedded => false;
   @override
+  ScrollStyle get scrollStyle => ScrollStyle.scrollauto;
+  @override
   Size get size => _viewport;
   @override
   final double scale;
@@ -88,7 +90,12 @@ class _Peer extends Fake implements FfiModel {
   @override
   final pi = PeerInfo();
   @override
-  bool get isPeerLinux => false;
+  bool isPeerLinux = false;
+}
+
+class _LinuxDisplay extends Display {
+  @override
+  double get scale => 2;
 }
 
 class _FFI extends Fake implements FFI {
@@ -99,7 +106,7 @@ class _FFI extends Fake implements FFI {
   @override
   final inputModel = _Input();
   @override
-  final ffiModel = _Peer();
+  final _Peer ffiModel = _Peer();
 }
 
 Future<CursorData> _data(int density, String id) async {
@@ -167,12 +174,17 @@ void main() {
   }
   test('live DPR changes invalidate a cached native cursor',
       () => _checkDprChange(view, registrations));
+  for (final style in [kRemoteViewStyleAdaptive, kRemoteViewStyleCustom]) {
+    testWidgets('Linux $style zoom follows video pixels', (tester) => tester.runAsync(
+        () => _checkPolicy(tester, (style, true, 2, 1.0, windows ? 1.0 : 0.5),
+            registrations, linux: true)));
+  }
 }
 
 Future<void> _checkPolicy(
     WidgetTester tester,
     (String, bool, int, double, double) testCase,
-    List<Map<dynamic, dynamic>> registrations) async {
+    List<Map<dynamic, dynamic>> registrations, {bool linux = false}) async {
   final (style, zoom, density, viewScale, expectedScale) = testCase;
   tester.view.devicePixelRatio = 2;
   final data = await _data(density, '$style-$zoom-$density');
@@ -180,6 +192,8 @@ Future<void> _checkPolicy(
   // A stale cached DPR must not affect the cursor when the window moves.
   final canvas = _Canvas(1, style: style, scale: viewScale);
   final ffi = _FFI(canvas);
+  ffi.ffiModel.isPeerLinux = linux;
+  if (linux) ffi.ffiModel.pi.displays.add(_LinuxDisplay());
   final cursor = _Cursor(data, ffi);
   await tester.pumpWidget(MediaQuery(
     data: const MediaQueryData(devicePixelRatio: 2),

@@ -1112,21 +1112,24 @@ class _ImagePaintState extends State<ImagePaint> {
 
     mouseRegion({child}) => Obx(() {
           double getCursorScale() {
-            final peerDpr = Provider.of<CursorModel>(context).cache?.pixelRatio ?? 0;
+            final cursor = Provider.of<CursorModel>(context);
+            final peerDpr = cursor.cache?.pixelRatio ?? 0;
             if (!isWeb && isViewScaled() && !zoomCursor.value && peerDpr > 0) {
               return (isWindows ? dpr : 1.0) / peerDpr;
             }
             // Density metadata is optional. Keep the legacy path for hosts that
             // omit it so capture-backend upgrades are not a client prerequisite.
+            final imageScale = isViewScaled() && zoomCursor.value
+                ? _cursorImageScale(widget.ffi, cursor) : s;
             var cursorScale = 1.0;
             if (isWindows) {
               // debug win10
               if (zoomCursor.value && isViewScaled()) {
-                cursorScale = s * dpr;
+                cursorScale = imageScale * dpr;
               }
             } else {
               if (zoomCursor.value || isViewOriginal()) {
-                cursorScale = s;
+                cursorScale = imageScale;
               } else if (!isWeb) {
                 // NSCursor and GdkCursor treat the bitmap size as logical
                 // pixels, so an unzoomed cursor must be shrunk by the DPR to
@@ -1422,7 +1425,7 @@ class CursorPaint extends StatelessWidget {
     final image = m.image ?? preDefaultCursor.image;
     final nativePixels = isWindows ? MediaQuery.devicePixelRatioOf(context) : 1.0;
     // Show remote cursor follows the image scale, independently of Zoom cursor.
-    double scale = c.scale;
+    double scale = _cursorImageScale(c.parent.target!, m);
     if (image != null && scale * nativePixels != 1.0) {
       final sx = kMinCursorSize / (image.width * nativePixels);
       final sy = kMinCursorSize / (image.height * nativePixels);
@@ -1465,4 +1468,32 @@ class CursorPaint extends StatelessWidget {
     return Offset(
         (canvas.x / scale).toInt() * scale, (canvas.y / scale).toInt() * scale);
   }
+
+}
+
+// Match physical video pixels, independently of the cursor's density metadata:
+// a single DRM output keeps physical desktop coordinates even at high DPI.
+double _cursorImageScale(FFI ffi, CursorModel cursor) {
+  final canvas = ffi.canvasModel;
+  final peer = ffi.ffiModel;
+  if (!peer.isPeerLinux) return canvas.scale;
+  if (canvas.imageOverflow.isTrue &&
+      canvas.scrollStyle != ScrollStyle.scrollauto &&
+      !ffi.imageModel.useTextureRender &&
+      !peer.pi.forceTextureRender) {
+    return canvas.scale; // The nontexture scrollbar also paints physical pixels.
+  }
+  final displays = peer.pi.getCurDisplays();
+  if (displays.length == 1) return canvas.scale / displays.first.scale;
+  final rect = peer.rect;
+  if (rect != null) {
+    final position = Offset(cursor.x + rect.left, cursor.y + rect.top);
+    for (final display in displays) {
+      if (Rect.fromLTWH(display.x, display.y, display.width / display.scale,
+              display.height / display.scale).contains(position)) {
+        return canvas.scale / display.scale;
+      }
+    }
+  }
+  return canvas.scale;
 }

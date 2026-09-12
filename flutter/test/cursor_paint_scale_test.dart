@@ -16,7 +16,9 @@ const _canvasOffset = Offset(15.125, 10.25);
 const _viewport = Size(200, 160);
 
 class _CursorModel extends ChangeNotifier implements CursorModel {
-  _CursorModel(this.image);
+  _CursorModel(this.image, this.position);
+
+  final Offset position;
 
   @override
   final ui.Image image;
@@ -25,9 +27,9 @@ class _CursorModel extends ChangeNotifier implements CursorModel {
   @override
   double get hoty => _hotspot.dy;
   @override
-  double get x => _remotePosition.dx;
+  double get x => position.dx;
   @override
-  double get y => _remotePosition.dy;
+  double get y => position.dy;
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
@@ -40,13 +42,24 @@ class _ImageModel extends Fake implements ImageModel {
   final bool useTextureRender;
 }
 
+class _Display extends Display {
+  _Display(this.scale, double left) {
+    x = left;
+    width = 3840;
+    height = 2160;
+  }
+
+  @override
+  final double scale;
+}
+
 class _Peer extends Fake implements FfiModel {
   @override
   final pi = PeerInfo();
   @override
-  bool get isPeerLinux => false;
+  bool isPeerLinux = false;
   @override
-  Rect get rect => Offset.zero & _viewport;
+  Rect rect = Offset.zero & _viewport;
 }
 
 class _FFI extends Fake implements FFI {
@@ -55,7 +68,9 @@ class _FFI extends Fake implements FFI {
   @override
   final ImageModel imageModel;
   @override
-  final ffiModel = _Peer();
+  final _Peer ffiModel = _Peer();
+  @override
+  late CanvasModel canvasModel;
 }
 
 class _CanvasModel extends ChangeNotifier implements CanvasModel {
@@ -67,9 +82,11 @@ class _CanvasModel extends ChangeNotifier implements CanvasModel {
           height: _viewport.height,
           displayWidth: _viewport.width.toInt(),
           displayHeight: _viewport.height.toInt(),
-        );
+        ) {
+    _ffi.canvasModel = this;
+  }
 
-  final FFI _ffi;
+  final _FFI _ffi;
   @override
   WeakReference<FFI> get parent => WeakReference(_ffi);
   @override
@@ -118,7 +135,8 @@ class _Canvas extends Fake implements Canvas {
 }
 
 Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
-    {double dpr = 2, bool zoom = true, (int, int) source = (48, 64)}) async {
+    {double dpr = 2, bool zoom = true, (int, int) source = (48, 64),
+    Offset position = _remotePosition}) async {
   final image = (await tester
       .runAsync(() => createTestImage(width: source.$1, height: source.$2)))!;
   addTearDown(image.dispose);
@@ -126,7 +144,7 @@ Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
     data: MediaQueryData(devicePixelRatio: dpr),
     child: MultiProvider(
       providers: [
-        ChangeNotifierProvider<CursorModel>(create: (_) => _CursorModel(image)),
+        ChangeNotifierProvider<CursorModel>(create: (_) => _CursorModel(image, position)),
         ChangeNotifierProvider<CanvasModel>(create: (_) => canvas),
       ],
       child: CursorPaint(id: 'cursor-test', zoomCursor: zoom.obs),
@@ -139,6 +157,38 @@ Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
 }
 
 void main() {
+  for (final (texture, displayScale, allDisplays) in [
+    (false, 2.0, false), (true, 2.0, false), (true, 2.0, true),
+    (false, 1.0, false), (true, 1.0, false),
+  ]) {
+    testWidgets('Linux scale=$displayScale texture=$texture all=$allDisplays',
+        (tester) async {
+      final canvas = _CanvasModel(kRemoteViewStyleCustom, 2, texture);
+      final peer = canvas._ffi.ffiModel;
+      peer.isPeerLinux = true;
+      // The first output's physical extent overlaps the second in logical
+      // coordinates. Selection must use logical extents and the union origin.
+      peer.pi.displays.assignAll([
+        if (displayScale > 1) _Display(4, -960), _Display(displayScale, 0),
+      ]);
+      peer.pi.currentDisplay = allDisplays ? kAllDisplayValue
+          : peer.pi.displays.length - 1;
+      peer.rect = Rect.fromLTWH(allDisplays ? -960 : 0, 0, 3840, 2160);
+      final painter = await _paintCursor(tester, canvas,
+          dpr: 1, zoom: false, source: (64, 64),
+          position: allDisplays ? _remotePosition + const Offset(960, 0)
+              : _remotePosition);
+      final pixelScale = 2 / displayScale;
+      expect(painter.scale, pixelScale);
+      final origin = texture ? _canvasOffset
+          : Offset((_canvasOffset.dx / pixelScale).toInt() * pixelScale,
+              (_canvasOffset.dy / pixelScale).toInt() * pixelScale);
+      final position = allDisplays
+          ? _remotePosition + const Offset(960, 0) : _remotePosition;
+      expect((Offset(painter.x, painter.y) + _hotspot) * painter.scale,
+          position * 2 + origin);
+    });
+  }
   final minimumScale = Platform.isWindows ? 1 / 3 : 2 / 3;
   for (final (style, zoom, dpr, source, canvasScale, scale, texture) in [
     (kRemoteViewStyleAdaptive, false, 2.0, (48, 64), 0.375, 0.375, true),
