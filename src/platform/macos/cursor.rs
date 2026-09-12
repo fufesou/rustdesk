@@ -40,9 +40,11 @@ pub(super) fn scale() -> ResultType<f64> {
 }
 
 pub(super) fn cache_id(cursor: u64, scale: f64) -> u64 {
+    // Legacy Web decoders require JS-safe integers; zero is the service's initial ID.
+    const MAX_CURSOR_ID: u64 = (1 << 53) - 1;
     let mut hash = DefaultHasher::new();
     (cursor, scale.to_bits()).hash(&mut hash);
-    hash.finish()
+    hash.finish() % MAX_CURSOR_ID + 1
 }
 
 unsafe fn bitmap(size: NSSize) -> ResultType<StrongPtr> {
@@ -238,5 +240,14 @@ mod tests {
     #[test]
     fn cursor_cache_changes_with_display_scale() {
         assert_ne!(cache_id(123, 1.0), cache_id(123, 2.0));
+    }
+
+    #[test]
+    fn cursor_cache_ids_fit_legacy_web_numbers() {
+        for cursor in [1, 123, u64::MAX] {
+            for scale in [1.0, 1.25, 2.0] {
+                assert!((1..=9_007_199_254_740_991).contains(&cache_id(cursor, scale)));
+            }
+        }
     }
 }
