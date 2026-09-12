@@ -225,9 +225,9 @@ Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
 
 void _alphaTests() {
   for (final (density, pixel, expected) in [
-    (1.0, [128, 128, 128, 128], [255, 255, 255, 128]),
-    (2.0, [128, 64, 32, 128], [255, 128, 64, 128]),
-    (1.0, [113, 56, 28, 112], [255, 128, 64, 112]),
+    (1.0, [255, 255, 255, 128], [255, 255, 255, 128]),
+    (2.0, [255, 128, 64, 128], [255, 128, 64, 128]),
+    (1.0, [255, 128, 64, 112], [255, 128, 64, 112]),
     (1.0, [0, 0, 0, 0], [0, 0, 0, 0]),
     (1.0, [255, 255, 255, 255], [255, 255, 255, 255]),
     // Old macOS hosts send straight alpha without density metadata.

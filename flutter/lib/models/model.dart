@@ -3459,18 +3459,11 @@ class CursorModel with ChangeNotifier {
       throw FormatException('Invalid cursor pixel ratio: $pixelRatio');
     }
     List<dynamic> colors = json.decode(evt['colors']);
-    var rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
+    final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
     final ui.Image? image;
-    if (isWeb &&
-        pixelRatio > 0 &&
+    if (!isWeb &&
         parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
-      // macOS cursors with density metadata use premultiplied alpha; older
-      // hosts send straight alpha. Web needs a straight-alpha resize source.
-      (rgba, image) = await _decodeWebMacCursor(rgba, width, height);
-    } else if (!isWeb &&
-        pixelRatio == 0 &&
-        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
-      image = await _decodeLegacyMacCursor(rgba, width, height);
+      image = await _decodeMacCursor(rgba, width, height);
     } else {
       image = await img.decodeImageFromPixels(
           rgba, width, height, ui.PixelFormat.rgba8888);
@@ -3491,10 +3484,10 @@ class CursorModel with ChangeNotifier {
     _updateCurData();
   }
 
-  Future<ui.Image?> _decodeLegacyMacCursor(
+  Future<ui.Image?> _decodeMacCursor(
       Uint8List rgba, int width, int height) async {
-    // Old macOS packets are straight alpha. Premultiply a copy for native
-    // ui.Image, retaining the original colors for the separate byte cache.
+    // macOS packets keep straight alpha, regardless of density metadata.
+    // Premultiply only for native ui.Image; the PNG cache needs straight colors.
     final source = img2.Image.fromBytes(
         width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
     for (final pixel in source) {
@@ -3505,30 +3498,6 @@ class CursorModel with ChangeNotifier {
     }
     return img.decodeImageFromPixels(
         source.getBytes(), width, height, ui.PixelFormat.rgba8888);
-  }
-
-  Future<(Uint8List, ui.Image)> _decodeWebMacCursor(
-      Uint8List rgba, int width, int height) async {
-    final source = img2.Image.fromBytes(
-        width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
-    for (final pixel in source) {
-      final alpha = pixel.a;
-      if (alpha == 0) continue;
-      final maxChannel = pixel.maxChannelValue;
-      // RGB and alpha rounding in capture can differ by one channel value.
-      pixel.r = min(maxChannel, (pixel.r * maxChannel / alpha).round());
-      pixel.g = min(maxChannel, (pixel.g * maxChannel / alpha).round());
-      pixel.b = min(maxChannel, (pixel.b * maxChannel / alpha).round());
-    }
-    // Web ImageDescriptor.raw treats RGBA as straight alpha. Decode a PNG so
-    // both the painted cursor and the resize source use the correct colors.
-    final codec = await ui.instantiateImageCodec(
-        Uint8List.fromList(img2.encodePng(source)));
-    try {
-      return (source.getBytes(), (await codec.getNextFrame()).image);
-    } finally {
-      codec.dispose();
-    }
   }
 
   Future<bool> _updateCache(

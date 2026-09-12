@@ -677,9 +677,10 @@ fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                 let g: f64 = msg_send![color, greenComponent];
                 let b: f64 = msg_send![color, blueComponent];
                 let a: f64 = msg_send![color, alphaComponent];
-                colors.push((r * a * 255.).round() as _);
-                colors.push((g * a * 255.).round() as _);
-                colors.push((b * a * 255.).round() as _);
+                // Keep straight RGBA on the wire for older Web/Sciter receivers.
+                colors.push((r * 255.) as _);
+                colors.push((g * 255.) as _);
+                colors.push((b * 255.) as _);
                 colors.push((a * 255.) as _);
             }
         }
