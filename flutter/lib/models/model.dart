@@ -2995,7 +2995,9 @@ class PredefinedCursor {
 
       () async {
         _image?.dispose();
-        // PNG stores straight alpha; let the codec prepare the pixels for ui.Image.
+        // Native registration uses this ui.Image. The RGBA bytes from img2 are
+        // straight alpha, but PixelFormat.rgba8888 requires premultiplied alpha.
+        // Decode the PNG directly to preserve translucent cursor colors.
         final codec = await ui.instantiateImageCodec(pngBytes);
         final ui.Image nativeImage;
         try {

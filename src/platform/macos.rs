@@ -638,6 +638,9 @@ fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
         if hcursor != hcursor2 {
             bail!("cursor changed");
         }
+        // NSImage.size is in points; using it as bitmap dimensions can crop Retina
+        // artwork. Render the full image and convert its hotspot to pixels;
+        // keep the existing 1x sampling path below.
         if scale > 1.0 {
             return cursor::data(c, hcursor, scale);
         }
