@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
-    sync::{atomic::AtomicUsize, Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use sciter::{
@@ -28,6 +31,8 @@ use crate::{
 
 type Video = AssetPtr<video_destination>;
 
+mod cursor;
+
 lazy_static::lazy_static! {
     static ref VIDEO: Arc<Mutex<Option<Video>>> = Default::default();
 }
@@ -39,6 +44,8 @@ lazy_static::lazy_static! {
 pub struct SciterHandler {
     element: Arc<Mutex<Option<Element>>>,
     close_state: HashMap<String, String>,
+    // The I/O session clones its UI handler, so share the peer's pixel format.
+    peer_is_macos: Arc<AtomicBool>,
 }
 
 impl SciterHandler {
@@ -122,7 +129,7 @@ impl SciterHandler {
 
 impl InvokeUiSession for SciterHandler {
     fn set_cursor_data(&self, cd: CursorData) {
-        let mut colors = hbb_common::compress::decompress(&cd.colors);
+        let mut colors = cursor::png_colors(&cd, self.peer_is_macos.load(Ordering::Relaxed));
         if colors.iter().filter(|x| **x != 0).next().is_none() {
             log::info!("Fix transparent");
             // somehow all 0 images shows black rect, here is a workaround
@@ -301,6 +308,8 @@ impl InvokeUiSession for SciterHandler {
     }
 
     fn set_peer_info(&self, pi: &PeerInfo) {
+        self.peer_is_macos
+            .store(pi.platform == "Mac OS", Ordering::Relaxed);
         let mut pi_sciter = Value::map();
         pi_sciter.set_item("username", pi.username.clone());
         pi_sciter.set_item("hostname", pi.hostname.clone());
