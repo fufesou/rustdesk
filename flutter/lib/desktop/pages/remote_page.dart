@@ -1423,10 +1423,14 @@ class CursorPaint extends StatelessWidget {
     }
 
     final image = m.image ?? preDefaultCursor.image;
-    final nativePixels = isWindows ? MediaQuery.devicePixelRatioOf(context) : 1.0;
+    // Match native registration's logical minimum for density-aware scaled views.
+    final logicalMinimum = (m.cache?.pixelRatio ?? 0) > 0 &&
+        c.viewStyle.style != kRemoteViewStyleOriginal;
+    final nativePixels = isWindows && !logicalMinimum
+        ? MediaQuery.devicePixelRatioOf(context) : 1.0;
     // Show remote cursor follows the image scale, independently of Zoom cursor.
     double scale = _cursorImageScale(c.parent.target!, m);
-    if (image != null && scale * nativePixels != 1.0) {
+    if (image != null && (logicalMinimum || scale * nativePixels != 1.0)) {
       final sx = kMinCursorSize / (image.width * nativePixels);
       final sy = kMinCursorSize / (image.height * nativePixels);
       // Preserve Original's short-edge minimum; scaled views use the long edge.

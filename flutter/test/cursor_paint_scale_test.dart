@@ -16,9 +16,12 @@ const _canvasOffset = Offset(15.125, 10.25);
 const _viewport = Size(200, 160);
 
 class _CursorModel extends ChangeNotifier implements CursorModel {
-  _CursorModel(this.image, this.position);
+  _CursorModel(this.image, this.position, this.density);
 
   final Offset position;
+  final double density;
+  @override
+  CursorData get cache => _Density(density);
 
   @override
   final ui.Image image;
@@ -33,6 +36,12 @@ class _CursorModel extends ChangeNotifier implements CursorModel {
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _Density extends Fake implements CursorData {
+  _Density(this.pixelRatio);
+  @override
+  final double pixelRatio;
 }
 
 class _ImageModel extends Fake implements ImageModel {
@@ -136,7 +145,7 @@ class _Canvas extends Fake implements Canvas {
 
 Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
     {double dpr = 2, bool zoom = true, (int, int) source = (48, 64),
-    Offset position = _remotePosition}) async {
+    Offset position = _remotePosition, double density = 0}) async {
   final image = (await tester
       .runAsync(() => createTestImage(width: source.$1, height: source.$2)))!;
   addTearDown(image.dispose);
@@ -144,7 +153,7 @@ Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
     data: MediaQueryData(devicePixelRatio: dpr),
     child: MultiProvider(
       providers: [
-        ChangeNotifierProvider<CursorModel>(create: (_) => _CursorModel(image, position)),
+        ChangeNotifierProvider<CursorModel>(create: (_) => _CursorModel(image, position, density)),
         ChangeNotifierProvider<CanvasModel>(create: (_) => canvas),
       ],
       child: CursorPaint(id: 'cursor-test', zoomCursor: zoom.obs),
@@ -156,7 +165,7 @@ Future<ImagePainter> _paintCursor(WidgetTester tester, CanvasModel canvas,
   return painter;
 }
 
-void main() {
+void _linuxDisplayTests() {
   for (final (texture, displayScale, allDisplays) in [
     (false, 2.0, false), (true, 2.0, false), (true, 2.0, true),
     (false, 1.0, false), (true, 1.0, false),
@@ -175,7 +184,7 @@ void main() {
           : peer.pi.displays.length - 1;
       peer.rect = Rect.fromLTWH(allDisplays ? -960 : 0, 0, 3840, 2160);
       final painter = await _paintCursor(tester, canvas,
-          dpr: 1, zoom: false, source: (64, 64),
+          dpr: 1, zoom: false, source: (64, 64), density: 2,
           position: allDisplays ? _remotePosition + const Offset(960, 0)
               : _remotePosition);
       final pixelScale = 2 / displayScale;
@@ -189,6 +198,35 @@ void main() {
           position * 2 + origin);
     });
   }
+}
+
+void _minimumTests() {
+  for (final (style, dpr, source, viewScale, expected) in [
+    (kRemoteViewStyleAdaptive, 1.0, (48, 64), 0.05, 0.1875),
+    (kRemoteViewStyleAdaptive, 2.0, (48, 64), 0.05, 0.1875),
+    (kRemoteViewStyleCustom, 1.0, (48, 64), 0.05, 0.1875),
+    (kRemoteViewStyleCustom, 2.0, (48, 64), 0.05, 0.1875),
+    (kRemoteViewStyleCustom, 2.0, (8, 10), 1.0, 1.2),
+    (kRemoteViewStyleOriginal, 1.0, (48, 64), 0.05, 0.25),
+    (kRemoteViewStyleOriginal, 2.0, (48, 64), 0.05, Platform.isWindows ? 0.125 : 0.25),
+  ]) {
+    testWidgets('density-aware $style DPR=$dpr source=$source minimum',
+        (tester) async {
+      final painter = await _paintCursor(tester,
+          _CanvasModel(style, viewScale, true),
+          dpr: dpr, source: source, density: 2);
+      expect(painter.scale, expected);
+      final hotspot = (Offset(painter.x, painter.y) + _hotspot) * painter.scale;
+      final target = _remotePosition * viewScale + _canvasOffset;
+      expect(hotspot.dx, closeTo(target.dx, 1e-9));
+      expect(hotspot.dy, closeTo(target.dy, 1e-9));
+    });
+  }
+}
+
+void main() {
+  _linuxDisplayTests();
+  _minimumTests();
   final minimumScale = Platform.isWindows ? 1 / 3 : 2 / 3;
   for (final (style, zoom, dpr, source, canvasScale, scale, texture) in [
     (kRemoteViewStyleAdaptive, false, 2.0, (48, 64), 0.375, 0.375, true),
