@@ -607,9 +607,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         }
     });
     #[cfg(feature = "flutter")]
-    let res = res
-        .map(|id| cursor::x11_scale().map(|scale| cursor::cache_id(id, scale)))
-        .transpose()?;
+    let res = res.map(cursor::x11_cursor_id);
     Ok(res)
 }
 
@@ -652,7 +650,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
         }
     }
     #[cfg(feature = "flutter")]
-    let scale = cursor::x11_scale()?;
+    let scale = cursor::x11_cursor_scale();
     #[cfg(feature = "flutter")]
     let matches = |id| cursor::cache_id(id, scale) == hcursor;
     #[cfg(not(feature = "flutter"))]

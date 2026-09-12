@@ -1,6 +1,6 @@
-use hbb_common::{anyhow::Context, bail, ResultType};
+use hbb_common::{anyhow::Context, bail, log, ResultType};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
@@ -8,8 +8,12 @@ use x11rb::{protocol::xproto::ConnectionExt, rust_connection::RustConnection, NO
 
 mod xsettings;
 
+#[cfg(test)]
+mod x11_tests;
+
 thread_local! {
     static SETTINGS: RefCell<Option<(RustConnection, usize)>> = const { RefCell::new(None) };
+    static X11_SCALE: Cell<Option<f64>> = const { Cell::new(Some(0.0)) };
 }
 
 pub(super) fn cache_id(id: u64, scale: f64) -> u64 {
@@ -19,6 +23,30 @@ pub(super) fn cache_id(id: u64, scale: f64) -> u64 {
     let mut hash = DefaultHasher::new();
     (id, scale.to_bits()).hash(&mut hash);
     hash.finish()
+}
+
+pub(super) fn x11_cursor_id(id: u64) -> u64 {
+    let scale = X11_SCALE.with(|last| match x11_scale() {
+        Ok(scale) => {
+            last.set(Some(scale));
+            scale
+        }
+        Err(err) => {
+            // XSETTINGS is optional; warn once per failure streak without
+            // turning valid XFixes cursor updates into service errors.
+            if last.replace(None).is_some() {
+                log::warn!("Failed to read XSETTINGS cursor density; using unknown density: {err}");
+            }
+            0.0
+        }
+    });
+    cache_id(id, scale)
+}
+
+pub(super) fn x11_cursor_scale() -> f64 {
+    // The cursor service reads the ID and bitmap on the same thread. Reuse
+    // that poll's density even if the settings manager changes between them.
+    X11_SCALE.with(|last| last.get().unwrap_or(0.0))
 }
 
 pub(super) fn x11_scale() -> ResultType<f64> {
