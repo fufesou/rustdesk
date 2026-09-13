@@ -40,9 +40,11 @@ pub(super) fn scale() -> ResultType<f64> {
 }
 
 pub(super) fn cache_id(cursor: u64, scale: f64) -> u64 {
+    // Legacy Web decoders require JS-safe integers; zero is the service's initial ID.
+    const MAX_CURSOR_ID: u64 = (1 << 53) - 1;
     let mut hash = DefaultHasher::new();
     (cursor, scale.to_bits()).hash(&mut hash);
-    hash.finish()
+    hash.finish() % MAX_CURSOR_ID + 1
 }
 
 unsafe fn bitmap(size: NSSize) -> ResultType<StrongPtr> {
@@ -107,14 +109,37 @@ pub(super) unsafe fn data(cursor: id, id: u64, scale: f64) -> ResultType<CursorD
     let hotspot: NSPoint = msg_send![cursor, hotSpot];
     Ok(CursorData {
         id,
-        colors: slice::from_raw_parts(pixels, length).to_vec().into(),
-        hotx: (hotspot.x * size.width / logical.width).round() as _,
-        hoty: (hotspot.y * size.height / logical.height).round() as _,
+        colors: straight_rgba(slice::from_raw_parts(pixels, length)).into(),
+        // A valid fractional hotspot near an edge can round past the last pixel.
+        hotx: (hotspot.x * size.width / logical.width)
+            .round()
+            .min(size.width - 1.0) as _,
+        hoty: (hotspot.y * size.height / logical.height)
+            .round()
+            .min(size.height - 1.0) as _,
         width: size.width as _,
         height: size.height as _,
         scale,
         ..Default::default()
     })
+}
+
+fn straight_rgba(pixels: &[u8]) -> Vec<u8> {
+    // AppKit renders premultiplied pixels, but macOS cursor packets have always
+    // used straight alpha. Density metadata does not negotiate a new format.
+    const MAX_CHANNEL: u16 = u8::MAX as u16;
+    let mut colors = pixels.to_vec();
+    for pixel in colors.chunks_exact_mut(CHANNELS) {
+        let alpha = u16::from(pixel[CHANNELS - 1]);
+        if alpha == 0 {
+            continue;
+        }
+        for channel in &mut pixel[..CHANNELS - 1] {
+            *channel =
+                ((u16::from(*channel) * MAX_CHANNEL + alpha / 2) / alpha).min(MAX_CHANNEL) as u8;
+        }
+    }
+    colors
 }
 
 #[cfg(test)]
@@ -165,11 +190,88 @@ mod tests {
                 (18, 36, 8, 18)
             );
             assert_eq!(result.colors.as_ref(), expected.as_slice());
+            assert_retina_hotspots(*image, &expected);
+        });
+    }
+
+    unsafe fn assert_retina_hotspots(image: id, expected: &[u8]) {
+        for (point, pixels) in [
+            ((8.8, 17.8), (17, 35)),
+            ((8.8, 9.0), (17, 18)),
+            ((4.0, 17.8), (8, 35)),
+            ((0.0, 0.0), (0, 0)),
+        ] {
+            let c: id = msg_send![class!(NSCursor), alloc];
+            let c = StrongPtr::new(msg_send![c,
+                initWithImage: image hotSpot: NSPoint::new(point.0, point.1)]);
+            let actual: NSPoint = msg_send![*c, hotSpot];
+            assert_eq!((actual.x, actual.y), point);
+            let result = data(*c, 1, 2.0).unwrap();
+            assert_eq!((result.hotx, result.hoty), pixels);
+            assert_eq!(result.colors.as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn retina_cursor_keeps_straight_alpha_for_legacy_receivers() {
+        const SIDE: usize = 4;
+        const SCALE: f64 = 2.0;
+        const PREMULTIPLIED: [[u8; CHANNELS]; SIDE] = [
+            [128, 128, 128, 128],
+            [64, 32, 16, 128],
+            [240, 100, 20, 255],
+            [0, 0, 0, 0],
+        ];
+        const STRAIGHT: [[u8; CHANNELS]; SIDE] = [
+            [255, 255, 255, 128],
+            [128, 64, 32, 128],
+            [240, 100, 20, 255],
+            [0, 0, 0, 0],
+        ];
+        autoreleasepool(|| unsafe {
+            let logical = NSSize::new(SIDE as f64 / SCALE, SIDE as f64 / SCALE);
+            let image: id = msg_send![class!(NSImage), alloc];
+            let image = StrongPtr::new(msg_send![image, initWithSize: logical]);
+            let rep = bitmap(NSSize::new(SIDE as f64, SIDE as f64)).unwrap();
+            let pixels: Vec<u8> = (0..SIDE * SIDE)
+                .flat_map(|index| PREMULTIPLIED[index % SIDE])
+                .collect();
+            let buffer: *mut u8 = msg_send![*rep, bitmapData];
+            ptr::copy_nonoverlapping(pixels.as_ptr(), buffer, pixels.len());
+            let (): () = msg_send![*rep, setSize: logical];
+            let (): () = msg_send![*image, addRepresentation: *rep];
+            let cursor: id = msg_send![class!(NSCursor), alloc];
+            let cursor = StrongPtr::new(
+                msg_send![cursor, initWithImage: *image hotSpot: NSPoint::new(1.0, 1.0)],
+            );
+            let result = data(*cursor, 1, SCALE).unwrap();
+            // Older Sciter receivers encode the received bytes directly as PNG.
+            let mut png = Vec::new();
+            repng::encode(
+                &mut png,
+                result.width as _,
+                result.height as _,
+                &result.colors,
+            )
+            .unwrap();
+            let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+            for (index, pixel) in decoded.pixels().enumerate() {
+                assert_eq!(pixel.0, STRAIGHT[index % SIDE]);
+            }
         });
     }
 
     #[test]
     fn cursor_cache_changes_with_display_scale() {
         assert_ne!(cache_id(123, 1.0), cache_id(123, 2.0));
+    }
+
+    #[test]
+    fn cursor_cache_ids_fit_legacy_web_numbers() {
+        for cursor in [1, 123, u64::MAX] {
+            for scale in [1.0, 1.25, 2.0] {
+                assert!((1..=9_007_199_254_740_991).contains(&cache_id(cursor, scale)));
+            }
+        }
     }
 }

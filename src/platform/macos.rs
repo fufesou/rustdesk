@@ -37,6 +37,9 @@ use std::{
 
 mod cursor;
 
+#[cfg(test)]
+mod cursor_poll_tests;
+
 // macOS boolean_t is defined as `int` in <mach/boolean.h>
 type BooleanT = hbb_common::libc::c_int;
 
@@ -567,10 +570,10 @@ fn unsafe_get_cursor() -> ResultType<Option<u64>> {
         if seed == LATEST_SEED {
             return Ok(None);
         }
+        let c = get_cursor_id(seed.1)?;
         LATEST_SEED = seed;
+        Ok(Some(c.1))
     }
-    let c = get_cursor_id()?;
-    Ok(Some(c.1))
 }
 
 pub fn reset_input_cache() {
@@ -579,7 +582,7 @@ pub fn reset_input_cache() {
     }
 }
 
-fn get_cursor_id() -> ResultType<(id, u64, f64)> {
+fn get_cursor_id(scale: f64) -> ResultType<(id, u64)> {
     unsafe {
         let c: id = msg_send![class!(NSCursor), currentSystemCursor];
         if c == nil {
@@ -622,22 +625,31 @@ fn get_cursor_id() -> ResultType<(id, u64, f64)> {
                 hcursor += (r + g + b + a) * (255 << i) as f64;
             }
         }
-        let scale = cursor::scale()?;
-        Ok((c, cursor::cache_id(hcursor as _, scale), scale))
+        Ok((c, cursor::cache_id(hcursor as _, scale)))
     }
 }
 
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
-    autoreleasepool(|| unsafe_get_cursor_data(hcursor))
+    let result = autoreleasepool(|| unsafe_get_cursor_data(hcursor));
+    if result.is_err() {
+        // A failed capture must be retried even if the seed and density stay unchanged.
+        reset_input_cache();
+    }
+    result
 }
 
 // https://github.com/stweil/OSXvnc/blob/master/OSXvnc-server/mousecursor.c
 fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     unsafe {
-        let (c, hcursor2, scale) = get_cursor_id()?;
+        // Keep the poll's density if the pointer crosses displays before capture.
+        let scale = LATEST_SEED.1;
+        let (c, hcursor2) = get_cursor_id(scale)?;
         if hcursor != hcursor2 {
             bail!("cursor changed");
         }
+        // NSImage.size is in points; using it as bitmap dimensions can crop Retina
+        // artwork. Render the full image and convert its hotspot to pixels;
+        // keep the existing 1x sampling path below.
         if scale > 1.0 {
             return cursor::data(c, hcursor, scale);
         }
@@ -674,9 +686,10 @@ fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                 let g: f64 = msg_send![color, greenComponent];
                 let b: f64 = msg_send![color, blueComponent];
                 let a: f64 = msg_send![color, alphaComponent];
-                colors.push((r * a * 255.).round() as _);
-                colors.push((g * a * 255.).round() as _);
-                colors.push((b * a * 255.).round() as _);
+                // Keep straight RGBA on the wire for older Web/Sciter receivers.
+                colors.push((r * 255.) as _);
+                colors.push((g * 255.) as _);
+                colors.push((b * 255.) as _);
                 colors.push((a * 255.) as _);
             }
         }

@@ -17,12 +17,14 @@ thread_local! {
 }
 
 pub(super) fn cache_id(id: u64, scale: f64) -> u64 {
+    // Legacy Web decoders require JS-safe integers; zero is the service's initial ID.
+    const MAX_CURSOR_ID: u64 = (1 << 53) - 1;
     if scale == 0.0 {
         return id;
     }
     let mut hash = DefaultHasher::new();
     (id, scale.to_bits()).hash(&mut hash);
-    hash.finish()
+    hash.finish() % MAX_CURSOR_ID + 1
 }
 
 pub(super) fn x11_cursor_id(id: u64) -> u64 {
@@ -129,10 +131,21 @@ fn wayland_scale(display: &base::platform::linux::WaylandDisplayInfo) -> ResultT
     Ok(f64::from(width) / f64::from(logical_width))
 }
 
-#[cfg(all(test, feature = "drm"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn cursor_cache_ids_fit_legacy_web_numbers() {
+        for cursor in [1, 123, u64::MAX] {
+            assert_eq!(cache_id(cursor, 0.0), cursor);
+            for scale in [1.0, 1.25, 2.0] {
+                assert!((1..=9_007_199_254_740_991).contains(&cache_id(cursor, scale)));
+            }
+        }
+    }
+
+    #[cfg(feature = "drm")]
     #[test]
     fn cursor_density_tracks_fractional_rotation_and_cache_identity() {
         let display = base::platform::linux::WaylandDisplayInfo {

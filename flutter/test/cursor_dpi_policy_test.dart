@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:flutter_custom_cursor/cursor_manager.dart' show CursorManager;
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
 import 'package:flutter_hbb/models/input_model.dart';
@@ -45,6 +46,8 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   @override
   bool get cursorEmbedded => false;
   @override
+  ScrollStyle get scrollStyle => ScrollStyle.scrollauto;
+  @override
   Size get size => _viewport;
   @override
   final double scale;
@@ -56,8 +59,8 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-class _Cursor extends ChangeNotifier implements CursorModel {
-  _Cursor(this.cache, this._ffi);
+class _Cursor extends CursorModel {
+  _Cursor(this.cache, this._ffi) : super(WeakReference(_ffi));
 
   final FFI _ffi;
   @override
@@ -66,17 +69,9 @@ class _Cursor extends ChangeNotifier implements CursorModel {
   @override
   CursorData cache;
   @override
-  ui.Image? get image => null;
-  @override
   double get hotx => cache.hotxOrigin;
   @override
   double get hoty => cache.hotyOrigin;
-  @override
-  final Set<String> cachedKeys = {};
-  @override
-  void addKey(String key) => cachedKeys.add(key);
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _Input extends Fake implements InputModel {
@@ -88,7 +83,12 @@ class _Peer extends Fake implements FfiModel {
   @override
   final pi = PeerInfo();
   @override
-  bool get isPeerLinux => false;
+  bool isPeerLinux = false;
+}
+
+class _LinuxDisplay extends Display {
+  @override
+  double get scale => 2;
 }
 
 class _FFI extends Fake implements FFI {
@@ -99,7 +99,7 @@ class _FFI extends Fake implements FFI {
   @override
   final inputModel = _Input();
   @override
-  final ffiModel = _Peer();
+  final _Peer ffiModel = _Peer();
 }
 
 Future<CursorData> _data(int density, String id) async {
@@ -167,22 +167,34 @@ void main() {
   }
   test('live DPR changes invalidate a cached native cursor',
       () => _checkDprChange(view, registrations));
+  for (final style in [kRemoteViewStyleAdaptive, kRemoteViewStyleCustom]) {
+    testWidgets('$style forbidden cursor ignores remote DPR', (tester) =>
+        tester.runAsync(() => _checkPolicy(tester,
+            (style, false, 2, 0.25, 0.5), registrations, dpr: 1)));
+    testWidgets('Linux $style zoom follows video pixels', (tester) => tester.runAsync(
+        () => _checkPolicy(tester, (style, true, 2, 1.0, windows ? 1.0 : 0.5),
+            registrations, linux: true)));
+  }
 }
 
 Future<void> _checkPolicy(
     WidgetTester tester,
     (String, bool, int, double, double) testCase,
-    List<Map<dynamic, dynamic>> registrations) async {
+    List<Map<dynamic, dynamic>> registrations,
+    {bool linux = false, double dpr = 2}) async {
   final (style, zoom, density, viewScale, expectedScale) = testCase;
-  tester.view.devicePixelRatio = 2;
+  tester.view.devicePixelRatio = dpr;
   final data = await _data(density, '$style-$zoom-$density');
   final originalBytes = data.data;
   // A stale cached DPR must not affect the cursor when the window moves.
   final canvas = _Canvas(1, style: style, scale: viewScale);
   final ffi = _FFI(canvas);
+  ffi.ffiModel.isPeerLinux = linux;
+  if (linux) ffi.ffiModel.pi.displays.add(_LinuxDisplay());
   final cursor = _Cursor(data, ffi);
+  final keyboardEnabled = true.obs;
   await tester.pumpWidget(MediaQuery(
-    data: const MediaQueryData(devicePixelRatio: 2),
+    data: MediaQueryData(devicePixelRatio: dpr),
     child: MultiProvider(
         providers: [
           ChangeNotifierProvider<ImageModel>(create: (_) => _Image()),
@@ -194,10 +206,17 @@ Future<void> _checkPolicy(
           id: 'dpi-policy',
           zoomCursor: zoom.obs,
           cursorOverImage: true.obs,
-          keyboardEnabled: true.obs,
+          keyboardEnabled: keyboardEnabled,
           remoteCursorMoved: false.obs,
         )),
   ));
+  final revoke = !zoom && style != kRemoteViewStyleOriginal;
+  if (revoke) {
+    await Future.wait(cursor.cachedKeys
+        .map(CursorManager.instance.ensureCursorRegistered));
+    keyboardEnabled.value = false;
+    await tester.pump();
+  }
   await tester.pumpWidget(const SizedBox.shrink());
   for (final key in cursor.cachedKeys) {
     await deleteCustomCursor(key);
@@ -209,11 +228,17 @@ Future<void> _checkPolicy(
   expect(data.hotx, closeTo(data.hotxOrigin * expectedScale, 1e-9));
   expect(data.hoty, closeTo(data.hotyOrigin * expectedScale, 1e-9));
   expect(data.data, same(originalBytes));
+  if (revoke) {
+    final args = registrations.last;
+    expect(args['name'], contains('_${kPreForbiddenCursorId}_'));
+    expect((args['width'], args['height']), (32, 32));
+    expect((args['hotX'], args['hotY']), (0.0, 0.0));
+  }
   if (style == kRemoteViewStyleAdaptive && !zoom && density > 0) {
-    final args = registrations.single;
-    expect((args['width'], args['height']), (Platform.isLinux ? 36 : 18, 36));
-    expect((args['hotX'], args['hotY']), (8.0, 18.0));
-    expect(args['imagePixelRatio'], 2.0);
+    final args = registrations.first;
+    expect((args['width'], args['height']), ((Platform.isLinux ? 18 : 9) * dpr, 18 * dpr));
+    expect((args['hotX'], args['hotY']), (4 * dpr, 9 * dpr));
+    expect(args['imagePixelRatio'], dpr);
   }
 }
 

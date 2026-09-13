@@ -6,7 +6,6 @@ library;
 
 import 'dart:convert';
 import 'dart:js' as js;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
@@ -20,16 +19,10 @@ import 'package:get/get.dart';
 import 'package:image/image.dart' as img;
 import 'package:provider/provider.dart';
 
-class _CursorModel extends Fake implements model.CursorModel {
-  @override
-  final Set<String> cachedKeys = {};
-  @override
-  void addKey(String key) => cachedKeys.add(key);
-}
-
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   _alphaTests();
+  _thinCursorTests();
   for (final style in [kRemoteViewStyleAdaptive, kRemoteViewStyleCustom]) {
     for (final dpr in [1.0, 2.0]) {
       testWidgets('ImagePaint Web $style zoom off DPR $dpr keeps source size',
@@ -37,15 +30,10 @@ void main() {
     }
   }
   test('Web cursor aligns CSS hotspots with rounded PNG dimensions', () async {
-    Map<String, dynamic>? registered;
-    final original = js.context['setByName'];
-    js.context['setByName'] = js.allowInterop((String name, String value) {
-      expect(name, 'cursor');
-      registered = jsonDecode(value) as Map<String, dynamic>;
-    });
-    addTearDown(() => js.context['setByName'] = original);
-    final nativeImage = await createTestImage(width: 48, height: 48);
-    addTearDown(nativeImage.dispose);
+    final registered = _captureCursor();
+    final canvas = _Canvas(kRemoteViewStyleAdaptive);
+    addTearDown(canvas.dispose);
+    final ffi = _FFI(canvas);
     for (final (hotspot, scale, side, expected) in [
       ((7.0, 7.0), 633 / 1600, 19, (3, 3)),
       ((21.0, 23.0), 633 / 1600, 19, (8, 9)),
@@ -54,35 +42,54 @@ void main() {
       ((21.0, 23.0), 0.5, 24, (11, 12)),
       ((7.0, 7.0), 1.0, 48, (7, 7)),
     ]) {
-      final cache = _data(nativeImage, hotspot);
+      final cursor = await _loadCursor(ffi, '$hotspot-$scale',
+          hotspot: hotspot, pixelRatio: null);
       final session =
-          buildCursorOfCache(_CursorModel(), scale, cache).createSession(1);
+          buildCursorOfCache(cursor, scale, cursor.cache).createSession(1);
       await session.activate();
-      final uri = Uri.parse(registered!['url'] as String);
+      final uri = Uri.parse(registered['url'] as String);
       final bitmap = img.decodePng(uri.data!.contentAsBytes())!;
       expect((bitmap.width, bitmap.height), (side, side));
-      expect((registered!['hotx'], registered!['hoty']), expected);
+      expect((registered['hotx'], registered['hoty']), expected);
       session.dispose();
-      await deleteCustomCursor(cache.updateGetKey(scale));
     }
   });
 }
 
-model.CursorData _data(ui.Image nativeImage, (double, double) hotspot) {
-  final image = img.Image(width: 48, height: 48, numChannels: 4);
-  img.fill(image, color: img.ColorRgba8(255, 255, 255, 255));
-  return model.CursorData(
-    peerId: 'web-cursor-test',
-    id: '$hotspot',
-    image: image,
-    nativeImage: nativeImage,
-    scale: 1,
-    data: Uint8List.fromList(img.encodePng(image)),
-    hotxOrigin: hotspot.$1,
-    hotyOrigin: hotspot.$2,
-    width: 48,
-    height: 48,
-  );
+void _thinCursorTests() {
+  for (final style in [kRemoteViewStyleAdaptive, kRemoteViewStyleCustom]) {
+    for (final zoom in [false, true]) {
+      testWidgets('ImagePaint Web $style thin cursor zoom=$zoom', (tester) =>
+          tester.runAsync(() => _checkPolicy(tester, style, 1,
+              zoom: zoom, source: (64, 4), hotspot: (32, 2),
+              expectedSize: zoom ? (32, 2) : (64, 4),
+              expectedHotspot: zoom ? (16, 1) : (32, 2))));
+    }
+  }
+  test('Web thin cursors keep a raster pixel and an in-bounds hotspot', () async {
+    final registered = _captureCursor();
+    final canvas = _Canvas(kRemoteViewStyleAdaptive);
+    addTearDown(canvas.dispose);
+    final ffi = _FFI(canvas);
+    for (final (source, hotspot, scale, size, expected) in [
+      ((4, 64), (2.0, 32.0), 0.5, (2, 32), (1, 16)),
+      ((2, 128), (1.0, 64.0), 0.01, (1, 12), (0, 6)),
+      ((128, 2), (64.0, 1.0), 0.01, (12, 1), (6, 0)),
+    ]) {
+      final cursor = await _loadCursor(ffi, '$source',
+          source: source, hotspot: hotspot);
+      for (final factor in [1.0, scale, 1.0]) {
+        final session =
+            buildCursorOfCache(cursor, factor, cursor.cache).createSession(1);
+        await session.activate();
+        session.dispose();
+        final png = img.decodePng(Uri.parse(registered['url']).data!.contentAsBytes())!;
+        expect((png.width, png.height), factor == 1 ? source : size);
+        expect((registered['hotx'], registered['hoty']),
+            factor == 1 ? (hotspot.$1, hotspot.$2) : expected);
+      }
+    }
+  });
 }
 
 class _Image extends ChangeNotifier implements model.ImageModel {
@@ -144,18 +151,22 @@ class _FFI extends Fake implements model.FFI {
 
 Future<model.CursorModel> _loadCursor(model.FFI ffi, String id,
     {List<int> pixel = const [255, 255, 255, 255],
+    (int, int) source = (48, 48),
+    (double, double) hotspot = (7, 9),
     double? pixelRatio = 1}) async {
   final cursor = model.CursorModel(WeakReference(ffi))..id = id;
   await cursor.updateCursorData({
     'id': id,
-    'width': '48',
-    'height': '48',
-    'hotx': '7',
-    'hoty': '9',
+    'width': '${source.$1}',
+    'height': '${source.$2}',
+    'hotx': '${hotspot.$1}',
+    'hoty': '${hotspot.$2}',
     if (pixelRatio != null) 'scale': '$pixelRatio',
-    'colors': jsonEncode([for (var i = 0; i < 48 * 48; i++) ...pixel]),
+    'colors': jsonEncode([for (var i = 0; i < source.$1 * source.$2; i++) ...pixel]),
   });
   addTearDown(() async {
+    // Keep the session owner alive across asynchronous image decoding.
+    expect(cursor.parent.target, same(ffi));
     for (final key in cursor.cachedKeys) {
       await deleteCustomCursor(key);
     }
@@ -188,12 +199,16 @@ Map<String, dynamic> _captureCursor() {
   return registered;
 }
 
-Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
+Future<void> _checkPolicy(WidgetTester tester, String style, double dpr,
+    {bool zoom = false, (int, int) source = (48, 48),
+    (double, double) hotspot = (7, 9), (int, int) expectedSize = (48, 48),
+    (int, int) expectedHotspot = (7, 9)}) async {
   final registered = _captureCursor();
   final canvas = _Canvas(style);
   addTearDown(canvas.dispose);
   final ffi = _FFI(canvas);
-  final cursor = await _loadCursor(ffi, '$style-$dpr');
+  final cursor = await _loadCursor(ffi, '$style-$dpr-$zoom-$source',
+      source: source, hotspot: hotspot);
   await tester.pumpWidget(MediaQuery(
     data: MediaQueryData(devicePixelRatio: dpr),
     child: MultiProvider(
@@ -205,7 +220,7 @@ Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
         child: ImagePaint(
             ffi: ffi,
             id: 'web-cursor-test',
-            zoomCursor: false.obs,
+            zoomCursor: zoom.obs,
             cursorOverImage: true.obs,
             keyboardEnabled: true.obs,
             remoteCursorMoved: false.obs)),
@@ -219,28 +234,27 @@ Future<void> _checkPolicy(WidgetTester tester, String style, double dpr) async {
   await tester.pumpWidget(const SizedBox.shrink());
   final png =
       img.decodePng(Uri.parse(registered['url']).data!.contentAsBytes())!;
-  expect((png.width, png.height), (48, 48));
-  expect((registered['hotx'], registered['hoty']), (7, 9));
+  expect((png.width, png.height), expectedSize);
+  expect((registered['hotx'], registered['hoty']), expectedHotspot);
 }
 
 void _alphaTests() {
-  for (final (density, pixel, expected) in [
-    (1.0, [128, 128, 128, 128], [255, 255, 255, 128]),
-    (2.0, [128, 64, 32, 128], [255, 128, 64, 128]),
-    (1.0, [113, 56, 28, 112], [255, 128, 64, 112]),
-    (1.0, [0, 0, 0, 0], [0, 0, 0, 0]),
-    (1.0, [255, 255, 255, 255], [255, 255, 255, 255]),
+  for (final (density, pixel) in [
+    (1.0, [255, 255, 255, 128]),
+    (2.0, [255, 128, 64, 128]),
+    (1.0, [255, 128, 64, 112]),
+    (1.0, [0, 0, 0, 0]),
+    (1.0, [255, 255, 255, 255]),
     // Old macOS hosts send straight alpha without density metadata.
-    (0.0, [255, 128, 64, 128], [255, 128, 64, 128]),
-    (null, [80, 40, 20, 128], [80, 40, 20, 128]),
+    (0.0, [255, 128, 64, 128]),
+    (null, [80, 40, 20, 128]),
   ]) {
-    test('Web macOS cursor density $density preserves RGBA $expected',
-        () => _checkAlpha(density, pixel, expected));
+    test('Web macOS cursor density $density preserves RGBA $pixel',
+        () => _checkAlpha(density, pixel));
   }
 }
 
-Future<void> _checkAlpha(
-    double? density, List<int> pixel, List<int> expected) async {
+Future<void> _checkAlpha(double? density, List<int> pixel) async {
   final registered = _captureCursor();
   final canvas = _Canvas(kRemoteViewStyleAdaptive);
   addTearDown(canvas.dispose);
@@ -250,7 +264,7 @@ Future<void> _checkAlpha(
   // Cover both the painted remote cursor and the initial CSS cursor PNG.
   final straight = await cursor.image!
       .toByteData(format: ui.ImageByteFormat.rawStraightRgba);
-  expect(straight!.buffer.asUint8List(0, 4), expected);
+  expect(straight!.buffer.asUint8List(0, 4), pixel);
   for (final scale in [1.0, 0.5, 1.0]) {
     final session =
         buildCursorOfCache(cursor, scale, cursor.cache).createSession(1);
@@ -259,6 +273,6 @@ Future<void> _checkAlpha(
     final png =
         img.decodePng(Uri.parse(registered['url']).data!.contentAsBytes())!;
     final color = png.getPixel(png.width ~/ 2, png.height ~/ 2);
-    expect([color.r, color.g, color.b, color.a], expected);
+    expect([color.r, color.g, color.b, color.a], pixel);
   }
 }

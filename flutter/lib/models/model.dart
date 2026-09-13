@@ -2696,8 +2696,18 @@ class CanvasModel with ChangeNotifier {
 
     setScrollPercent(scrollPixelPercent.x, scrollPixelPercent.y);
     pushScrollPositionToUI(scrollPixel.x, scrollPixel.y);
+    // A no-op jump emits no notification to refresh the actual scroll fractions.
+    updateScrollPercent();
 
     notifyListeners();
+  }
+
+  void updateScrollAfterLayout((double, double) renderedScroll) {
+    updateScrollPercent();
+    // A delayed refresh may already have changed the model without repainting.
+    if (renderedScroll != (_scrollX, _scrollY)) {
+      notifyListeners();
+    }
   }
 
   panX(double dx) {
@@ -2906,6 +2916,9 @@ class CursorData {
       }
     }
 
+    // Web's long-edge minimum can round a thin axis below one raster pixel.
+    final webWidth = max(1, (width * scale).round());
+    final webHeight = max(1, (height * scale).round());
     if (resizeImage && _doubleToInt(oldScale) != _doubleToInt(scale)) {
       if (isWindows) {
         data = img2
@@ -2921,8 +2934,8 @@ class CursorData {
           img2.encodePng(
             img2.copyResize(
               image,
-              width: isWeb ? (width * scale).round() : (width * scale).toInt(),
-              height: isWeb ? (height * scale).round() : (height * scale).toInt(),
+              width: isWeb ? webWidth : (width * scale).toInt(),
+              height: isWeb ? webHeight : (height * scale).toInt(),
               interpolation: img2.Interpolation.average,
             ),
           ),
@@ -2935,8 +2948,8 @@ class CursorData {
     hoty = hotyOrigin * scale;
     if (isWeb) {
       // CSS hotspots must follow the actual rounded PNG dimensions.
-      hotx = hotxOrigin * (width * scale).round() / width;
-      hoty = hotyOrigin * (height * scale).round() / height;
+      hotx = hotxOrigin * webWidth / width;
+      hoty = hotyOrigin * webHeight / height;
     }
     return scale;
   }
@@ -2995,7 +3008,9 @@ class PredefinedCursor {
 
       () async {
         _image?.dispose();
-        // PNG stores straight alpha; let the codec prepare the pixels for ui.Image.
+        // Native registration uses this ui.Image. The RGBA bytes from img2 are
+        // straight alpha, but PixelFormat.rgba8888 requires premultiplied alpha.
+        // Decode the PNG directly to preserve translucent cursor colors.
         final codec = await ui.instantiateImageCodec(pngBytes);
         final ui.Image nativeImage;
         try {
@@ -3457,18 +3472,12 @@ class CursorModel with ChangeNotifier {
       throw FormatException('Invalid cursor pixel ratio: $pixelRatio');
     }
     List<dynamic> colors = json.decode(evt['colors']);
-    var rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
+    final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
     final ui.Image? image;
-    if (isWeb &&
-        pixelRatio > 0 &&
-        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
-      // macOS cursors with density metadata use premultiplied alpha; older
-      // hosts send straight alpha. Web needs a straight-alpha resize source.
-      (rgba, image) = await _decodeWebMacCursor(rgba, width, height);
-    } else if (!isWeb &&
-        pixelRatio == 0 &&
-        parent.target?.ffiModel.pi.platform == kPeerPlatformMacOS) {
-      image = await _decodeLegacyMacCursor(rgba, width, height);
+    final platform = parent.target?.ffiModel.pi.platform;
+    if (!isWeb &&
+        (platform == kPeerPlatformMacOS || platform == kPeerPlatformWindows)) {
+      image = await _decodeStraightAlphaCursor(rgba, width, height);
     } else {
       image = await img.decodeImageFromPixels(
           rgba, width, height, ui.PixelFormat.rgba8888);
@@ -3489,10 +3498,10 @@ class CursorModel with ChangeNotifier {
     _updateCurData();
   }
 
-  Future<ui.Image?> _decodeLegacyMacCursor(
+  Future<ui.Image?> _decodeStraightAlphaCursor(
       Uint8List rgba, int width, int height) async {
-    // Old macOS packets are straight alpha. Premultiply a copy for native
-    // ui.Image, retaining the original colors for the separate byte cache.
+    // macOS and Win32 capture send straight alpha; XFixes/DRM are premultiplied.
+    // Convert a copy for native ui.Image, preserving the wire and PNG cache colors.
     final source = img2.Image.fromBytes(
         width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
     for (final pixel in source) {
@@ -3503,30 +3512,6 @@ class CursorModel with ChangeNotifier {
     }
     return img.decodeImageFromPixels(
         source.getBytes(), width, height, ui.PixelFormat.rgba8888);
-  }
-
-  Future<(Uint8List, ui.Image)> _decodeWebMacCursor(
-      Uint8List rgba, int width, int height) async {
-    final source = img2.Image.fromBytes(
-        width: width, height: height, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
-    for (final pixel in source) {
-      final alpha = pixel.a;
-      if (alpha == 0) continue;
-      final maxChannel = pixel.maxChannelValue;
-      // RGB and alpha rounding in capture can differ by one channel value.
-      pixel.r = min(maxChannel, (pixel.r * maxChannel / alpha).round());
-      pixel.g = min(maxChannel, (pixel.g * maxChannel / alpha).round());
-      pixel.b = min(maxChannel, (pixel.b * maxChannel / alpha).round());
-    }
-    // Web ImageDescriptor.raw treats RGBA as straight alpha. Decode a PNG so
-    // both the painted cursor and the resize source use the correct colors.
-    final codec = await ui.instantiateImageCodec(
-        Uint8List.fromList(img2.encodePng(source)));
-    try {
-      return (source.getBytes(), (await codec.getNextFrame()).image);
-    } finally {
-      codec.dispose();
-    }
   }
 
   Future<bool> _updateCache(

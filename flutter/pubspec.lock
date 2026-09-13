@@ -530,8 +530,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: "db63b785c38153603e9fb84b50d3ec46f0d7e05e"
-      resolved-ref: "db63b785c38153603e9fb84b50d3ec46f0d7e05e"
+      ref: db63b785c38153603e9fb84b50d3ec46f0d7e05e
+      resolved-ref: db63b785c38153603e9fb84b50d3ec46f0d7e05e
       url: "https://github.com/rustdesk-org/flutter_custom_cursor"
     source: git
     version: "0.0.3"

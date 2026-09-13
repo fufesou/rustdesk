@@ -67,8 +67,10 @@ void main() {
   for (final testCase in <(String, String?, List<int>)>[
     (kPeerPlatformMacOS, null, [64, 32, 16, 128]),
     (kPeerPlatformMacOS, '0', [64, 32, 16, 128]),
-    (kPeerPlatformMacOS, '1', [32, 16, 8, 128]),
-    (kPeerPlatformMacOS, '2', [32, 16, 8, 128]),
+    (kPeerPlatformMacOS, '1', [64, 32, 16, 128]),
+    (kPeerPlatformMacOS, '2', [64, 32, 16, 128]),
+    (kPeerPlatformWindows, null, [64, 32, 16, 128]),
+    (kPeerPlatformWindows, '0', [64, 32, 16, 128]),
     (kPeerPlatformLinux, '0', [32, 16, 8, 128]),
   ]) {
     for (final dpr in [1.0, 2.0]) {
@@ -119,6 +121,8 @@ Future<void> _checkCursor((String, String?, List<int>) testCase, double dpr,
       bytes: straight!.buffer,
       bytesOffset: straight.offsetInBytes,
       order: img.ChannelOrder.rgba));
+  // Real sessions own FFI strongly throughout asynchronous cursor decoding.
+  expect(cursor.parent.target, same(ffi));
 }
 
 void _checkRegistration(Map<dynamic, dynamic> args, double dpr) {
