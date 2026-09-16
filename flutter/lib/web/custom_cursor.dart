@@ -104,7 +104,7 @@ MouseCursor buildCursorOfCache(
   if (cache == null) {
     return MouseCursor.defer;
   } else {
-    final key = cache.updateGetKey(scale);
+    final key = cursor.getCursorKey(cache, scale);
     if (!cursor.cachedKeys.contains(key)) {
       // data should be checked here, because it may be changed after `updateGetKey()`
       final data = cache.data;

@@ -398,8 +398,7 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
             // On the DRM path get_cursor_data() may return a snapshot whose id has advanced past the
             // requested `hcursor` (it returns the latest hardware cursor); file it in the cache AND
             // record state.hcursor under the id ACTUALLY served, so a later reappearance of that exact
-            // shape dedupes correctly instead of being suppressed. Everything below is fully
-            // gated on the drm feature, so the drm-off build stays byte-identical to upstream.
+            // shape dedupes correctly instead of being suppressed.
             #[cfg(all(target_os = "linux", feature = "drm"))]
             let mut drm_served_id = hcursor;
             if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
@@ -425,20 +424,10 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);
                 msg = Arc::new(tmp);
-                // A DRM cursor id is derived from the shape's pixels plus geometry, so an animated
-                // pointer mints a new id on every shape change and this map would grow for the life
-                // of the service, each entry pinning a compressed cursor message. (Upstream's X11
-                // ids come from a small set of XFixes serials, so the map is effectively bounded
-                // there -- which is why the ceiling is gated and the stock build stays untouched.)
-                // Past the ceiling, drop the map and start over: the next request for any evicted
-                // shape just recompresses it, and the ceiling comfortably covers every static shape
-                // plus a generous animation window.
-                #[cfg(all(target_os = "linux", feature = "drm"))]
-                {
-                    const CURSOR_CACHE_MAX: usize = 64;
-                    if state.cached_cursor_data.len() >= CURSOR_CACHE_MAX {
-                        state.cached_cursor_data.clear();
-                    }
+                // Evicted shapes can be captured and compressed again on demand.
+                const CURSOR_CACHE_MAX: usize = 64;
+                if state.cached_cursor_data.len() >= CURSOR_CACHE_MAX {
+                    state.cached_cursor_data.clear();
                 }
                 state.cached_cursor_data.insert(cache_key, msg.clone());
                 super::log::trace!("Cursor data updated, hcursor: {}", cache_key);

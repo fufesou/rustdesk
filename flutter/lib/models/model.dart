@@ -349,6 +349,7 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'sync_platform_additions') {
         handlePlatformAdditions(evt, sessionId, peerId);
       } else if (name == 'connection_ready') {
+        _resetCursorData();
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
         resetRestartReconnectState();
@@ -1662,8 +1663,31 @@ class FfiModel with ChangeNotifier {
   }
 
   handleCursorData(Map<String, dynamic> evt) async {
-    cachedPeerData.cursorDataList.add(evt);
-    await parent.target?.cursorModel.updateCursorData(evt);
+    final data = cachedPeerData.cursorDataList;
+    data.add(evt);
+    final bool cached;
+    try {
+      cached = await parent.target?.cursorModel.updateCursorData(evt) ?? false;
+    } catch (_) {
+      data.remove(evt);
+      rethrow;
+    }
+    if (!cached) {
+      data.remove(evt);
+      return;
+    }
+    // Preserve newer events and do not restore entries removed by a reconnect.
+    for (var i = data.indexOf(evt) - 1; i >= 0; i--) {
+      if (data[i]['id'] == evt['id']) {
+        data.removeAt(i);
+      }
+    }
+  }
+
+  void _resetCursorData() {
+    cachedPeerData.cursorDataList.clear();
+    cachedPeerData.lastCursorId = {};
+    parent.target?.cursorModel.resetCursorData();
   }
 
   /// Handle the peer info synchronization event based on [evt].
@@ -3013,6 +3037,8 @@ class CursorModel with ChangeNotifier {
   CursorData? _cache;
   final _cacheMap = <String, CursorData>{};
   final _cacheKeys = <String>{};
+  final _predefinedCursorKeyPrefix = Uuid().v4();
+  int _cacheGeneration = 0;
   double _x = -10000;
   double _y = -10000;
   // int.parse(evt['id']) may cause FormatException
@@ -3127,6 +3153,12 @@ class CursorModel with ChangeNotifier {
 
   Set<String> get cachedKeys => _cacheKeys;
   addKey(String key) => _cacheKeys.add(key);
+
+  String getCursorKey(CursorData cache, double scale) {
+    final key = cache.updateGetKey(scale);
+    // Shared predefined images need registrations owned by this model.
+    return cache.peerId.isEmpty ? '${_predefinedCursorKeyPrefix}_$key' : key;
+  }
 
   // remote physical display coordinate
   // For update pan (mobile), onOneFingerPanStart, onOneFingerPanUpdate, onHoldDragUpdate
@@ -3422,7 +3454,8 @@ class CursorModel with ChangeNotifier {
     _images.clear();
   }
 
-  updateCursorData(Map<String, dynamic> evt) async {
+  Future<bool> updateCursorData(Map<String, dynamic> evt) async {
+    final generation = _cacheGeneration;
     final id = evt['id'];
     final hotx = double.parse(evt['hotx']);
     final hoty = double.parse(evt['hoty']);
@@ -3433,9 +3466,18 @@ class CursorModel with ChangeNotifier {
     final image = await img.decodeImageFromPixels(
         rgba, width, height, ui.PixelFormat.rgba8888);
     if (image == null) {
-      return;
+      return false;
     }
-    if (await _updateCache(rgba, image, id, hotx, hoty, width, height)) {
+    if (generation != _cacheGeneration) {
+      image.dispose();
+      return false;
+    }
+    final cached = await _updateCache(rgba, image, id, hotx, hoty, width, height);
+    if (generation != _cacheGeneration) {
+      image.dispose();
+      return false;
+    }
+    if (cached) {
       _images[id]?.item1.dispose();
       _images[id] = Tuple3(image, hotx, hoty);
     }
@@ -3443,6 +3485,7 @@ class CursorModel with ChangeNotifier {
     // Update last cursor data.
     // Do not use the previous `image` and `id`, because `_id` may be changed.
     _updateCurData();
+    return cached;
   }
 
   Future<bool> _updateCache(
@@ -3454,6 +3497,7 @@ class CursorModel with ChangeNotifier {
     int w,
     int h,
   ) async {
+    final generation = _cacheGeneration;
     Uint8List? data;
     img2.Image imgOrigin = img2.Image.fromBytes(
         width: w, height: h, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
@@ -3466,6 +3510,9 @@ class CursorModel with ChangeNotifier {
         return false;
       }
       data = imgBytes.buffer.asUint8List();
+    }
+    if (generation != _cacheGeneration) {
+      return false;
     }
     final cache = CursorData(
       peerId: peerId,
@@ -3544,6 +3591,19 @@ class CursorModel with ChangeNotifier {
     _x = xCursor;
     _y = yCursor;
     parent.target?.inputModel.moveMouse(x, y);
+    notifyListeners();
+  }
+
+  void resetCursorData() {
+    // Decoding and PNG encoding may finish after the connection has changed.
+    _cacheGeneration++;
+    _id = '-1';
+    _image = null;
+    _cache = null;
+    disposeImages();
+    _cacheMap.clear();
+    _clearCache();
+    _cacheKeys.clear();
     notifyListeners();
   }
 

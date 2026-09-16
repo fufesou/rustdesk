@@ -96,6 +96,7 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    cursor_data_limit: CursorDataLimit,
 }
 
 #[derive(Default)]
@@ -121,6 +122,10 @@ impl<T: InvokeUiSession> Remote<T> {
         receiver: mpsc::UnboundedReceiver<Data>,
         sender: mpsc::UnboundedSender<Data>,
     ) -> Self {
+        let cursor_data_limit = CursorDataLimit::new(
+            &handler.get_option(keys::OPTION_CURSOR_DATA_LIMIT.to_owned()),
+            &handler.get_option(keys::OPTION_CURSOR_DATA_UPDATE_LIMIT.to_owned()),
+        );
         Self {
             handler,
             audio_sender: crate::client::start_audio_thread(),
@@ -145,6 +150,7 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            cursor_data_limit,
         }
     }
 
@@ -1511,10 +1517,17 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::CursorData(cd)) => {
-                    self.handler.set_cursor_data(cd);
+                    let id = cd.id;
+                    if self.cursor_data_limit.allow_data(id) {
+                        self.handler.set_cursor_data(cd);
+                    } else if self.cursor_data_limit.allow_id(id) {
+                        self.handler.set_cursor_id(id.to_string());
+                    }
                 }
                 Some(message::Union::CursorId(id)) => {
-                    self.handler.set_cursor_id(id.to_string());
+                    if self.cursor_data_limit.allow_id(id) {
+                        self.handler.set_cursor_id(id.to_string());
+                    }
                 }
                 Some(message::Union::CursorPosition(cp)) => {
                     self.handler.set_cursor_position(cp);
@@ -2542,6 +2555,79 @@ impl<T: InvokeUiSession> Remote<T> {
         let mut msg = Message::new();
         msg.set_misc(misc);
         self.sender.send(Data::Message(msg)).ok();
+    }
+}
+
+struct CursorDataLimit {
+    limit: usize,
+    update_limit: usize,
+    warned: bool,
+    updates: HashMap<u64, usize>,
+}
+
+impl CursorDataLimit {
+    fn new(option: &str, update_option: &str) -> Self {
+        const DEFAULT_CURSOR_DATA_LIMIT: usize = 64;
+        const DEFAULT_CURSOR_DATA_UPDATE_LIMIT: usize = 16;
+        Self {
+            limit: Self::parse_limit(
+                option,
+                keys::OPTION_CURSOR_DATA_LIMIT,
+                DEFAULT_CURSOR_DATA_LIMIT,
+            ),
+            update_limit: Self::parse_limit(
+                update_option,
+                keys::OPTION_CURSOR_DATA_UPDATE_LIMIT,
+                DEFAULT_CURSOR_DATA_UPDATE_LIMIT,
+            ),
+            warned: false,
+            updates: HashMap::new(),
+        }
+    }
+
+    fn parse_limit(option: &str, key: &str, default: usize) -> usize {
+        if option.is_empty() {
+            return default;
+        }
+        match option.parse() {
+            Ok(limit) => limit,
+            Err(err) => {
+                log::warn!("Invalid {key}: {err}; using {default}");
+                default
+            }
+        }
+    }
+
+    fn allow_data(&mut self, id: u64) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        if self.updates.len() >= self.limit && !self.updates.contains_key(&id) {
+            self.warn_limit(keys::OPTION_CURSOR_DATA_LIMIT, self.limit);
+            return false;
+        }
+        let updates = self.updates.entry(id).or_default();
+        if self.update_limit != 0 && *updates >= self.update_limit {
+            self.warn_limit(keys::OPTION_CURSOR_DATA_UPDATE_LIMIT, self.update_limit);
+            return false;
+        }
+        if self.update_limit != 0 {
+            *updates += 1;
+        }
+        true
+    }
+
+    fn allow_id(&self, id: u64) -> bool {
+        self.limit == 0 || self.updates.contains_key(&id)
+    }
+
+    fn warn_limit(&mut self, key: &str, limit: usize) {
+        if !self.warned {
+            log::warn!(
+                "Cursor data limit ({key}={limit}) reached; ignoring excess cursor images. Configure this peer option to change the limit."
+            );
+            self.warned = true;
+        }
     }
 }
 
