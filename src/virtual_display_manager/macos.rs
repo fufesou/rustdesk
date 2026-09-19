@@ -67,6 +67,30 @@ fn start_worker() -> Result<mpsc::Sender<Command>, String> {
     Ok(sender)
 }
 
+fn log_command(command: &Command, connections: &HashSet<i32>) {
+    match command {
+        Command::Connected(conn_id) => log::info!(
+            "[macos-virtual-display] source=connection_lifecycle command=connected conn_id={conn_id} connections_before={} registered={}",
+            connections.len(),
+            connections.contains(conn_id),
+        ),
+        Command::Disconnected(conn_id) => log::info!(
+            "[macos-virtual-display] source=connection_lifecycle command=disconnected conn_id={conn_id} connections_before={} registered={} remove_all={}",
+            connections.len(),
+            connections.contains(conn_id),
+            connections.len() == 1 && connections.contains(conn_id),
+        ),
+        Command::Toggle {
+            conn_id, index, on, ..
+        } => log::info!(
+            "[macos-virtual-display] source=peer_request command=toggle conn_id={conn_id} index={index} on={on} connections_before={} registered={}",
+            connections.len(),
+            connections.contains(conn_id),
+        ),
+        Command::Resize { .. } => {}
+    }
+}
+
 // Serialize connection lifetimes with native operations: a delayed disconnect
 // must not remove displays created by a new connection, or leave an in-flight
 // creation alive after the last connection closes.
@@ -77,6 +101,7 @@ fn run_worker(
 ) {
     let mut connections = HashSet::new();
     for command in receiver {
+        log_command(&command, &connections);
         match command {
             Command::Resize {
                 conn_id,

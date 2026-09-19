@@ -1678,6 +1678,7 @@ class FfiModel with ChangeNotifier {
   handleSyncPeerInfo(
       Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     if (evt['displays'] != null) {
+      final previousDisplayCount = _pi.displays.length;
       cachedPeerData.peerInfo['displays'] = evt['displays'];
       List<dynamic> displays = json.decode(evt['displays']);
       List<Display> newDisplays = [];
@@ -1695,7 +1696,10 @@ class FfiModel with ChangeNotifier {
 
       if (_pi.currentDisplay == kAllDisplayValue) {
         updateCurDisplay(sessionId);
-        // to-do: What if the displays are changed?
+        if (previousDisplayCount != _pi.displays.length) {
+          await requestDisplayCapture(sessionId,
+              Int32List.fromList(List.generate(_pi.displays.length, (i) => i)));
+        }
       } else {
         if (_pi.currentDisplay >= 0 &&
             _pi.currentDisplay < _pi.displays.length) {
@@ -1731,6 +1735,12 @@ class FfiModel with ChangeNotifier {
     parent.target!.canvasModel
         .tryUpdateScrollStyle(Duration(milliseconds: 300), null);
     notifyListeners();
+  }
+
+  @protected
+  Future<void> requestDisplayCapture(SessionID sessionId, Int32List displays) {
+    return bind.sessionSwitchDisplay(
+        isDesktop: isDesktop, sessionId: sessionId, value: displays);
   }
 
   handlePlatformAdditions(

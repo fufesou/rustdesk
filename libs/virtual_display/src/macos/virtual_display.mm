@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <os/log.h>
 #include <atomic>
 #include <mutex>
 #include <chrono>
@@ -33,23 +34,42 @@ extern "C" unsigned int RustDeskVirtualDisplayMask() {
     return displayMask.load();
 }
 
+static void logRemoval(int index, bool begin) {
+    NSMutableDictionary<NSNumber *, NSNumber *> *ids = [NSMutableDictionary new];
+    for (NSNumber *slot in displays) {
+        ids[slot] = @(displayIDs[slot.unsignedIntegerValue].load());
+    }
+    os_log(OS_LOG_DEFAULT, "[macos-virtual-display] removal=%{public}s index=%d mask=%u retained_ids=%{public}@",
+        begin ? "begin" : "end", index, displayMask.load(), ids);
+    if (begin) {
+        for (NSString *frame in [NSThread callStackSymbols]) {
+            os_log(OS_LOG_DEFAULT, "[macos-virtual-display] removal_stack index=%d frame=%{public}@",
+                index, frame);
+        }
+    }
+}
+
 extern "C" bool RustDeskToggleVirtualDisplay(int index, bool on) {
     std::lock_guard<std::mutex> lock(displayMutex);
     @autoreleasepool {
         @try {
             if (!on && index == -1) {
+                logRemoval(index, true);
                 for (int i = 1; i <= 4; ++i) displayIDs[i].store(0);
                 [displays removeAllObjects];
                 [displaySettings removeAllObjects];
                 displayMask.store(0);
+                logRemoval(index, false);
                 return true;
             }
             if (index < 1 || index > 4) return false;
             if (!on) {
+                logRemoval(index, true);
                 displayIDs[index].store(0);
                 [displays removeObjectForKey:@(index)];
                 [displaySettings removeObjectForKey:@(index)];
                 displayMask.fetch_and(~(1u << index));
+                logRemoval(index, false);
                 return true;
             }
             if (!RustDeskVirtualDisplaySupported()) return false;
