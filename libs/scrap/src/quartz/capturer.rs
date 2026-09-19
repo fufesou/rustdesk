@@ -1,7 +1,7 @@
 use std::ptr;
 
 use block::{Block, ConcreteBlock};
-use hbb_common::libc::c_void;
+use hbb_common::{libc::c_void, log};
 use std::sync::{Arc, Mutex};
 
 use super::config::Config;
@@ -17,7 +17,33 @@ pub struct Capturer {
     height: usize,
     format: PixelFormat,
     display: Display,
-    stopped: Arc<Mutex<bool>>,
+    stopped: Arc<Mutex<StopState>>,
+}
+
+#[derive(Default)]
+struct StopState {
+    stopped: bool,
+    retired: Option<(CGDisplayStreamRef, DispatchQueue)>,
+}
+
+impl StopState {
+    fn release_if_stopped(&mut self) {
+        if !self.stopped {
+            return;
+        }
+        if let Some((stream, queue)) = self.retired.take() {
+            // Release on the serial queue after the current callback has returned.
+            let context = Box::into_raw(Box::new((stream, queue)));
+            unsafe { dispatch_async_f(queue, context.cast(), release_stream) };
+        }
+    }
+}
+
+unsafe extern "C" fn release_stream(context: *mut c_void) {
+    let (stream, queue) = *Box::from_raw(context as *mut (CGDisplayStreamRef, DispatchQueue));
+    CFRelease(stream);
+    dispatch_release(queue);
+    log::info!("Released stopped display stream {:p}", stream);
 }
 
 impl Capturer {
@@ -29,13 +55,14 @@ impl Capturer {
         config: Config,
         handler: F,
     ) -> Result<Capturer, CGError> {
-        let stopped = Arc::new(Mutex::new(false));
+        let stopped = Arc::new(Mutex::new(StopState::default()));
         let cloned_stopped = stopped.clone();
         let handler: FrameAvailableHandler = ConcreteBlock::new(move |status, _, surface, _| {
             use self::CGDisplayStreamFrameStatus::*;
             if status == Stopped {
                 let mut lock = cloned_stopped.lock().unwrap();
-                *lock = true;
+                lock.stopped = true;
+                lock.release_if_stopped();
                 return;
             }
             if status == FrameComplete {
@@ -96,16 +123,24 @@ impl Capturer {
 
 impl Drop for Capturer {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CGDisplayStreamStop(self.stream);
-            loop {
-                if *self.stopped.lock().unwrap() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
-            CFRelease(self.stream);
-            dispatch_release(self.queue);
+        let result = unsafe { CGDisplayStreamStop(self.stream) };
+        if result != CGError::Success {
+            log::error!(
+                "Failed to stop display {} stream {:p}: {:?}",
+                self.display.id(),
+                self.stream,
+                result
+            );
         }
+        let mut state = self.stopped.lock().unwrap();
+        log::info!(
+            "Retiring display {} stream {:p}; awaiting stop notification: {}",
+            self.display.id(),
+            self.stream,
+            !state.stopped
+        );
+        // Stop may return before or after its callback. Both must finish before release.
+        state.retired = Some((self.stream, self.queue));
+        state.release_if_stopped();
     }
 }
