@@ -1133,11 +1133,13 @@ fn get_api_server_(api: String, custom: String) -> String {
     }
     let s0 = get_custom_rendezvous_server(custom);
     if !s0.is_empty() {
-        let s = crate::increase_port(&s0, -2);
-        if s == s0 {
-            return format!("http://{}:{}", s, config::RENDEZVOUS_PORT - 2);
+        let host = socket_client::split_host_port(&s0)
+            .map(|(host, _)| host)
+            .unwrap_or(s0);
+        if hbb_common::is_ipv6_str(&host) {
+            return format!("https://[{host}]");
         } else {
-            return format!("http://{}", s);
+            return format!("https://{host}");
         }
     }
     "https://admin.rustdesk.com".to_owned()
@@ -1269,7 +1271,7 @@ fn get_tcp_proxy_addr() -> String {
 }
 
 /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
-/// Connects with `connect_tcp` + `secure_tcp`, sends `HttpProxyRequest`,
+/// Connects with `connect_tcp`, completes the authenticated key exchange, sends `HttpProxyRequest`,
 /// receives `HttpProxyResponse`.
 ///
 /// The entire operation (connect + handshake + send + receive) is wrapped in
@@ -1304,8 +1306,6 @@ async fn tcp_proxy_request(
     timeout(overall_timeout, async {
         let mut conn = socket_client::connect_tcp(&*tcp_addr, CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
-        secure_tcp_silent(&mut conn, &key).await?;
-
         let mut req = HttpProxyRequest::new();
         req.method = method.to_uppercase();
         req.path = path;
@@ -1314,21 +1314,31 @@ async fn tcp_proxy_request(
 
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_http_proxy_request(req);
-        conn.send(&msg_out).await?;
-
-        match conn.next().await {
-            Some(Ok(bytes)) => {
-                let msg_in = RendezvousMessage::parse_from_bytes(&bytes)?;
-                match msg_in.union {
-                    Some(rendezvous_message::Union::HttpProxyResponse(resp)) => Ok(resp),
-                    _ => bail!("Unexpected response from TCP proxy"),
-                }
-            }
-            Some(Err(e)) => bail!("TCP proxy read error: {}", e),
-            None => bail!("TCP proxy connection closed without response"),
-        }
+        exchange_tcp_proxy_request(&mut conn, &key, &msg_out).await
     })
     .await?
+}
+
+async fn exchange_tcp_proxy_request(
+    conn: &mut Stream,
+    key: &str,
+    request: &RendezvousMessage,
+) -> ResultType<HttpProxyResponse> {
+    if !key_exchange(conn, key, false).await? {
+        bail!("the rendezvous server did not complete the key exchange");
+    }
+    conn.send(request).await?;
+    match conn.next().await {
+        Some(Ok(bytes)) => {
+            let response = RendezvousMessage::parse_from_bytes(&bytes)?;
+            match response.union {
+                Some(rendezvous_message::Union::HttpProxyResponse(response)) => Ok(response),
+                _ => bail!("Unexpected response from TCP proxy"),
+            }
+        }
+        Some(Err(err)) => bail!("TCP proxy read error: {}", err),
+        None => bail!("TCP proxy connection closed without response"),
+    }
 }
 
 /// Build HeaderEntry list from "Key: Value" style header string (used by post_request).
@@ -2129,10 +2139,6 @@ pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
     secure_tcp_impl(conn, key, true).await
 }
 
-async fn secure_tcp_silent(conn: &mut Stream, key: &str) -> ResultType<()> {
-    secure_tcp_impl(conn, key, false).await
-}
-
 /// Like [`secure_tcp`], but returns only once the server's key exchange has actually encrypted
 /// the stream; a server that answers with anything else, or with nothing, is an error, so the
 /// caller can withhold what it was about to send instead of sending it in the clear.
@@ -2854,6 +2860,30 @@ mod tests {
     };
     use std::collections::HashSet;
 
+    #[test]
+    fn implicit_api_server_uses_https() {
+        for (rendezvous_server, expected) in [
+            ("hbbs.example.com", "https://hbbs.example.com"),
+            ("hbbs.example.com:21116", "https://hbbs.example.com"),
+            ("hbbs.example.com:30000", "https://hbbs.example.com"),
+            ("[2001:db8::1]:21116", "https://[2001:db8::1]"),
+            ("2001:db8::1", "https://[2001:db8::1]"),
+        ] {
+            assert_eq!(
+                get_api_server_(String::new(), rendezvous_server.to_owned()),
+                expected
+            );
+        }
+
+        assert_eq!(
+            get_api_server_(
+                "http://hbbs.example.com:21114".to_owned(),
+                "ignored.example.com".to_owned(),
+            ),
+            "http://hbbs.example.com:21114"
+        );
+    }
+
     #[inline]
     fn get_timestamp_secs() -> u128 {
         (std::time::SystemTime::UNIX_EPOCH
@@ -3324,6 +3354,12 @@ mod tests {
             .unwrap()
     }
 
+    async fn connect_raw_tcp(host: &str) -> Stream {
+        socket_client::connect_tcp_local(host, None, CONNECT_TIMEOUT)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_secure_tcp_required_refuses_a_server_without_the_exchange() {
         let (key, _) = server_key();
@@ -3343,6 +3379,38 @@ mod tests {
         let mut conn = connect(&host).await;
         secure_tcp(&mut conn, &key).await.unwrap();
         assert!(!conn.is_secured());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_proxy_does_not_send_before_key_exchange() {
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let host = rendezvous_stub(move |mut stream| async move {
+            let mut msg = RendezvousMessage::new();
+            msg.set_register_peer_response(RegisterPeerResponse::new());
+            stream.send(&msg).await.unwrap();
+            let received_frame = stream.next_timeout(1_000).await.is_some();
+            if received_frame {
+                let mut response = RendezvousMessage::new();
+                response.set_http_proxy_response(HttpProxyResponse::default());
+                stream.send(&response).await.unwrap();
+            }
+            request_tx.send(received_frame).ok();
+        })
+        .await;
+        let (key, _) = server_key();
+        let mut conn = connect_raw_tcp(&host).await;
+        let mut proxy_request = HttpProxyRequest::new();
+        proxy_request.method = "POST".to_owned();
+        proxy_request.path = "/api/sysinfo".to_owned();
+        proxy_request.body = Bytes::from(b"sensitive".to_vec());
+        let mut request = RendezvousMessage::new();
+        request.set_http_proxy_request(proxy_request);
+
+        let result = exchange_tcp_proxy_request(&mut conn, &key, &request).await;
+        drop(conn);
+
+        assert!(result.is_err());
+        assert!(!request_rx.await.unwrap());
     }
 
     #[tokio::test]
