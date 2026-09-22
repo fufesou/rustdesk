@@ -42,6 +42,7 @@ const double _kContentFontSize = 15;
 const Color _accentColor = MyTheme.accent;
 const String _kSettingPageControllerTag = 'settingPageController';
 const String _kSettingPageTabKeyTag = 'settingPageTabKey';
+const String _kMainIpcAuthorizationRequired = 'main_ipc_authorization_required';
 
 class _TabInfo {
   late final SettingsTabKey key;
@@ -1018,10 +1019,33 @@ class _Safety extends StatefulWidget {
 }
 
 class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
+  static const _authorizationHandler = 'security-settings';
+
   @override
   bool get wantKeepAlive => true;
   bool locked = bind.mainIsInstalled();
   final scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    if (isLinux || isMacOS) {
+      platformFFI.registerEventHandler(
+          _kMainIpcAuthorizationRequired, _authorizationHandler, (_) async {
+        if (!mounted) return;
+        setState(() => locked = true);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    if (isLinux || isMacOS) {
+      platformFFI.unregisterEventHandler(
+          _kMainIpcAuthorizationRequired, _authorizationHandler);
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1243,8 +1267,12 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             enabled: enabled && !isOptionFixed(kOptionAccessMode),
             initialKey: initialKey,
             onChanged: (mode) async {
-              await bind.mainSetOption(key: kOptionAccessMode, value: mode);
-              setState(() {});
+              try {
+                await bind.mainSetOption(key: kOptionAccessMode, value: mode);
+              } catch (error) {
+                showToast(error.toString());
+              }
+              if (mounted) setState(() {});
             }).marginOnly(left: _kContentHMargin),
         Column(
           children: [
@@ -1545,9 +1573,14 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                               !isOptFixed
                           ? () async {
                               applyEnabled.value = false;
-                              await bind.mainSetOption(
-                                  key: kOptionDirectAccessPort,
-                                  value: controller.text);
+                              try {
+                                await bind.mainSetOption(
+                                    key: kOptionDirectAccessPort,
+                                    value: controller.text);
+                              } catch (error) {
+                                applyEnabled.value = true;
+                                showToast(error.toString());
+                              }
                             }
                           : null,
                       child: Text(
@@ -1746,9 +1779,14 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                         applyEnabled.value && enabled && !locked && !isOptFixed
                             ? () async {
                                 applyEnabled.value = false;
-                                await bind.mainSetOption(
-                                    key: kOptionAutoDisconnectTimeout,
-                                    value: controller.text);
+                                try {
+                                  await bind.mainSetOption(
+                                      key: kOptionAutoDisconnectTimeout,
+                                      value: controller.text);
+                                } catch (error) {
+                                  applyEnabled.value = true;
+                                  showToast(error.toString());
+                                }
                               }
                             : null,
                     child: Text(
@@ -1764,14 +1802,24 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   }
 
   Widget unlockPin() {
+    final serverVerifiedPin = isLinux || isMacOS;
     bool enabled = !locked;
-    RxString unlockPin = bind.mainGetUnlockPin().obs;
+    RxString unlockPin = (serverVerifiedPin ? '' : bind.mainGetUnlockPin()).obs;
+    RxBool unlockPinSet = unlockPin.value.isNotEmpty.obs;
     update() async {
-      unlockPin.value = bind.mainGetUnlockPin();
+      if (serverVerifiedPin) {
+        unlockPinSet.value =
+            await bind.mainGetCommon(key: 'unlock-pin-set') == 'true';
+      } else {
+        unlockPin.value = bind.mainGetUnlockPin();
+        unlockPinSet.value = unlockPin.value.isNotEmpty;
+      }
     }
 
+    update();
+
     onChanged(bool? checked) async {
-      changeUnlockPinDialog(unlockPin.value, update);
+      changeUnlockPinDialog(serverVerifiedPin ? '' : unlockPin.value, update);
     }
 
     final isOptFixed = isOptionFixed(kOptionWhitelist);
@@ -1779,7 +1827,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       child: Obx(() => Row(
             children: [
               Checkbox(
-                      value: unlockPin.isNotEmpty,
+                      value: unlockPinSet.value,
                       onChanged: enabled && !isOptFixed ? onChanged : null)
                   .marginOnly(right: 5),
               Expanded(
@@ -1791,7 +1839,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           )),
       onTap: enabled
           ? () {
-              onChanged(!unlockPin.isNotEmpty);
+              onChanged(!unlockPinSet.value);
             }
           : null,
     ).marginOnly(left: _kCheckBoxLeftMargin);
@@ -1806,11 +1854,34 @@ class _Network extends StatefulWidget {
 }
 
 class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
+  static const _authorizationHandler = 'network-settings';
+
   @override
   bool get wantKeepAlive => true;
   bool locked = !isWeb && bind.mainIsInstalled();
 
   final scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    if (isLinux || isMacOS) {
+      platformFFI.registerEventHandler(
+          _kMainIpcAuthorizationRequired, _authorizationHandler, (_) async {
+        if (!mounted) return;
+        setState(() => locked = true);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    if (isLinux || isMacOS) {
+      platformFFI.unregisterEventHandler(
+          _kMainIpcAuthorizationRequired, _authorizationHandler);
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1908,9 +1979,14 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
             value: mainGetBoolOptionSync(optionKey),
             onChanged: locked || isOptionFixed(optionKey)
                 ? null
-                : (value) {
-                    mainSetBoolOption(optionKey, value);
-                    setState(() {});
+                : (value) async {
+                    try {
+                      await mainSetBoolOption(optionKey, value);
+                    } catch (error) {
+                      showToast(error.toString());
+                      return;
+                    }
+                    if (mounted) setState(() {});
                   },
           ),
         );
@@ -1977,10 +2053,15 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
                                     locked || isOptionFixed(kOptionDisableUdp)
                                         ? null
                                         : (value) async {
-                                            await bind.mainSetOption(
-                                                key: kOptionDisableUdp,
-                                                value: value ? 'Y' : 'N');
-                                            setState(() {});
+                                            try {
+                                              await bind.mainSetOption(
+                                                  key: kOptionDisableUdp,
+                                                  value: value ? 'Y' : 'N');
+                                            } catch (error) {
+                                              showToast(error.toString());
+                                              return;
+                                            }
+                                            if (mounted) setState(() {});
                                           },
                               ),
                             ),
@@ -2737,7 +2818,12 @@ Widget _OptionCheckBox(
       if (reverse) option = !option;
       final setter =
           optSetter ?? (isServer ? mainSetBoolOption : mainSetLocalBoolOption);
-      await setter(key, option);
+      try {
+        await setter(key, option);
+      } catch (error) {
+        showToast(error.toString());
+        return;
+      }
       final readOption = getOpt();
       if (reverse) {
         ref.value = !readOption;
@@ -3062,15 +3148,36 @@ Widget _lock(
                             Text(translate(label)).marginOnly(left: 5),
                           ]).marginSymmetric(vertical: 2)),
                   onPressed: () async {
-                    final unlockPin = bind.mainGetUnlockPin();
-                    if (unlockPin.isEmpty || isUnlockPinDisabled()) {
+                    unlockWithAdmin() async {
                       bool checked = await callMainCheckSuperUserPermission();
                       if (checked) {
                         onUnlock();
                       }
-                    } else {
-                      checkUnlockPinDialog(unlockPin, onUnlock);
                     }
+
+                    if (isLinux || isMacOS) {
+                      final unlockPinSet =
+                          await bind.mainGetCommon(key: 'unlock-pin-set') ==
+                              'true';
+                      if (!unlockPinSet || isUnlockPinDisabled()) {
+                        await unlockWithAdmin();
+                        return;
+                      }
+                      checkUnlockPinDialog((pin) async {
+                        return await bind.mainGetCommon(
+                                key: 'verify-unlock-pin:$pin') ==
+                            'true';
+                      }, onUnlock);
+                      return;
+                    }
+
+                    final unlockPin = bind.mainGetUnlockPin();
+                    if (unlockPin.isEmpty || isUnlockPinDisabled()) {
+                      await unlockWithAdmin();
+                      return;
+                    }
+                    checkUnlockPinDialog(
+                        (pin) async => unlockPin == pin, onUnlock);
                   },
                 ).marginSymmetric(horizontal: 2, vertical: 4),
               ).marginOnly(left: _kCardLeftMargin),
@@ -3276,8 +3383,14 @@ void changeSocks5Proxy() async {
           return;
         }
       }
-      await bind.mainSetSocks(
-          proxy: proxy, username: username, password: password);
+      try {
+        await bind.mainSetSocks(
+            proxy: proxy, username: username, password: password);
+      } catch (error) {
+        proxyMsg = translate(error.toString());
+        cancel();
+        return;
+      }
       close();
     }
 

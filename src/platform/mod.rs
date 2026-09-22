@@ -14,6 +14,10 @@ pub mod win_device;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/elevation.rs"]
+mod macos_elevation;
+
 #[cfg(target_os = "macos")]
 pub mod delegate;
 

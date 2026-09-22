@@ -2040,6 +2040,18 @@ pub fn check_super_user_permission() -> ResultType<bool> {
     Ok(true)
 }
 
+pub fn approve_main_ipc_authorization(request_id: &str) -> ResultType<bool> {
+    if !crate::ipc::is_valid_main_ipc_token(request_id) {
+        bail!("Invalid main IPC approval request");
+    }
+    let exe = std::env::current_exe()?;
+    let exe = exe
+        .to_str()
+        .ok_or_else(|| anyhow!("Current executable path is not valid UTF-8"))?;
+    gtk_sudo::run(vec![exe, "--approve-main-ipc", request_id])?;
+    Ok(true)
+}
+
 /*
 pub fn elevate(args: Vec<&str>) -> ResultType<bool> {
     let cmd = std::env::current_exe()?;

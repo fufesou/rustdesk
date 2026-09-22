@@ -57,7 +57,13 @@ pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
 #[cfg(windows)]
 pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use ipc_auth::{active_uid, authorize_service_scoped_ipc_connection};
+use ipc_auth::{
+    active_uid, approve_main_ipc_request, approve_main_ipc_token,
+    authorize_service_scoped_ipc_connection, authorize_unix_main_ipc_connection,
+    begin_main_ipc_pin_attempt, clear_main_ipc_client_token_if_matches,
+    create_main_ipc_approval_request, is_main_ipc_token_approved, main_ipc_client_token,
+    set_main_ipc_client_token,
+};
 #[cfg(target_os = "macos")]
 use ipc_auth::authorize_user_server_process;
 #[cfg(windows)]
@@ -97,12 +103,14 @@ use std::{
 pub const IPC_ACTION_CLOSE: &str = "close";
 #[cfg(target_os = "windows")]
 const PORTABLE_SERVICE_IPC_HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub(crate) const IPC_TOKEN_LEN: usize = 64;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_AUTH_TIMEOUT_MS: u64 = 1_000;
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -329,6 +337,25 @@ pub enum DataPortableService {
     CmShowElevation(bool),
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum DataMainIpcAuth {
+    Request { token: String, pin: Option<String> },
+    Pending(String),
+    Approve(String),
+    Authenticate(String),
+    Result(bool),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MainIpcAuthorization {
+    Approved,
+    Pending { request_id: String, token: String },
+    Rejected,
+}
+
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +434,8 @@ pub enum Data {
     Empty,
     Disconnected,
     DataPortableService(DataPortableService),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    MainIpcAuth(DataMainIpcAuth),
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     SwitchSidesRequest(String),
@@ -612,6 +641,195 @@ fn legacy_hot_measured() -> bool {
     true
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const ADMIN_PROTECTED_OPTION_KEYS: &[&str] = &[
+    "stop-service",
+    keys::OPTION_ACCESS_MODE,
+    keys::OPTION_ENABLE_KEYBOARD,
+    keys::OPTION_ENABLE_CLIPBOARD,
+    keys::OPTION_ENABLE_FILE_TRANSFER,
+    keys::OPTION_ENABLE_CAMERA,
+    keys::OPTION_ENABLE_TERMINAL,
+    keys::OPTION_ENABLE_REMOTE_PRINTER,
+    keys::OPTION_ENABLE_AUDIO,
+    keys::OPTION_ENABLE_TUNNEL,
+    keys::OPTION_ENABLE_REMOTE_RESTART,
+    keys::OPTION_ENABLE_RECORD_SESSION,
+    keys::OPTION_ENABLE_BLOCK_INPUT,
+    keys::OPTION_ENABLE_PRIVACY_MODE,
+    keys::OPTION_ALLOW_SCOPE_VIOLATION_CLOSE,
+    keys::OPTION_ALLOW_SCOPE_VIOLATION_ALARM,
+    keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
+    keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD,
+    keys::OPTION_ENABLE_LAN_DISCOVERY,
+    keys::OPTION_DIRECT_SERVER,
+    keys::OPTION_DIRECT_ACCESS_PORT,
+    keys::OPTION_WHITELIST,
+    keys::OPTION_ID_WHITELIST,
+    keys::OPTION_ALLOW_AUTO_DISCONNECT,
+    keys::OPTION_AUTO_DISCONNECT_TIMEOUT,
+    keys::OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN,
+    keys::OPTION_APPROVE_MODE,
+    keys::OPTION_VERIFICATION_METHOD,
+    keys::OPTION_TEMPORARY_PASSWORD_LENGTH,
+    keys::OPTION_ENABLE_TRUSTED_DEVICES,
+    keys::OPTION_TRUSTED_DEVICE_EXPIRATION,
+    keys::OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
+    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+    "rendezvous-servers",
+    keys::OPTION_API_SERVER,
+    keys::OPTION_RELAY_SERVER,
+    keys::OPTION_ICE_SERVERS,
+    keys::OPTION_KEY,
+    keys::OPTION_PROXY_URL,
+    keys::OPTION_PROXY_USERNAME,
+    keys::OPTION_PROXY_PASSWORD,
+    keys::OPTION_ALLOW_WEBSOCKET,
+    keys::OPTION_DISABLE_UDP,
+    keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+    "2fa",
+    "bot",
+    "allow-hide-cm",
+];
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) fn protected_options_changed(
+    current: &HashMap<String, String>,
+    proposed: &HashMap<String, String>,
+) -> bool {
+    ADMIN_PROTECTED_OPTION_KEYS
+        .iter()
+        .any(|key| current.get(*key) != proposed.get(*key))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn unprotected_option_changes(
+    current: &HashMap<String, String>,
+    proposed: &HashMap<String, String>,
+) -> ResultType<HashMap<String, String>> {
+    if protected_options_changed(current, proposed) {
+        bail!("Authentication Required");
+    }
+    // Only these checked differences may be written. Replacing the full map
+    // could revert a protected setting changed after this snapshot was read.
+    Ok(current
+        .keys()
+        .chain(proposed.keys())
+        .filter(|key| current.get(*key) != proposed.get(*key))
+        .map(|key| (key.clone(), proposed.get(key).cloned().unwrap_or_default()))
+        .collect())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn handle_unprotected_options(value: HashMap<String, String>, stream: &mut Connection) {
+    let _chk = CheckIfRestart::new();
+    let _nat = CheckTestNatType::new();
+    let result = crate::trusted_devices::config::update(move || {
+        let changes = unprotected_option_changes(&Config::get_options(), &value)?;
+        if let Some(implementation) = changes.get("privacy-mode-impl-key") {
+            crate::privacy_mode::switch(implementation);
+        }
+        for (key, value) in changes {
+            Config::set_option(key, value);
+        }
+        Ok(())
+    })
+    .await;
+    let response = match result {
+        Ok(()) => Data::Options(None),
+        Err(error) => Data::SecurityConfigError(error.to_string()),
+    };
+    allow_err!(stream.send(&response).await);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn unix_main_ipc_data_requires_authorization(data: &Data) -> bool {
+    // Accepted UID/executable-checked peers still read Options/Socks/SocksWs for
+    // normal client operation. The separately authorized _service channel also
+    // syncs full configs, so this is not a secrecy boundary against every
+    // accepted user-side RustDesk process.
+    match data {
+        Data::ConfirmedKey(_) | Data::SyncConfig(_) | Data::Socks(Some(_)) => true,
+        Data::TrustedDeviceManagement(request) => {
+            !matches!(request.as_ref(), authority::Request::List)
+        }
+        Data::Config((name, value)) => match value {
+            None => matches!(
+                name.as_str(),
+                "permanent-password-storage-and-salt" | "unlock-pin"
+            ),
+            Some(_) => matches!(
+                name.as_str(),
+                "id" | "permanent-password" | "salt" | "unlock-pin"
+            ),
+        },
+        Data::Options(Some(proposed)) => {
+            protected_options_changed(&Config::get_options(), proposed)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+#[inline]
+fn is_allowed_unix_main_ipc_data(data: &Data) -> bool {
+    !unix_main_ipc_data_requires_authorization(data)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_main_ipc_data_can_request_authorization(data: &Data) -> bool {
+    unix_main_ipc_data_requires_authorization(data)
+        && !matches!(
+            data,
+            Data::ConfirmedKey(_) | Data::SyncConfig(None) | Data::Config((_, None))
+        )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn handle_unix_main_ipc_auth(
+    data: &Data,
+    stream: &mut Connection,
+    peer_uid: Option<u32>,
+    authorized: &mut bool,
+) -> bool {
+    let response = match data {
+        Data::MainIpcAuth(DataMainIpcAuth::Request {
+            token,
+            pin: Some(pin),
+        }) => {
+            let expected = Config::get_unlock_pin();
+            let pin_matches = begin_main_ipc_pin_attempt()
+                && !expected.is_empty()
+                && constant_time_main_ipc_secret_eq(&expected, pin);
+            let approved = pin_matches && approve_main_ipc_token(token);
+            *authorized |= approved;
+            DataMainIpcAuth::Result(approved)
+        }
+        Data::MainIpcAuth(DataMainIpcAuth::Request { token, pin: None }) => {
+            match create_main_ipc_approval_request(token) {
+                Ok(request_id) => DataMainIpcAuth::Pending(request_id),
+                Err(err) => {
+                    log::warn!("Failed to create main IPC approval request: {err}");
+                    DataMainIpcAuth::Result(false)
+                }
+            }
+        }
+        Data::MainIpcAuth(DataMainIpcAuth::Approve(request_id)) => {
+            DataMainIpcAuth::Result(peer_uid == Some(0) && approve_main_ipc_request(request_id))
+        }
+        Data::MainIpcAuth(DataMainIpcAuth::Authenticate(token)) => {
+            *authorized |= is_main_ipc_token_approved(token);
+            DataMainIpcAuth::Result(*authorized)
+        }
+        Data::MainIpcAuth(_) => DataMainIpcAuth::Result(false),
+        _ => return false,
+    };
+    allow_err!(stream.send(&Data::MainIpcAuth(response)).await);
+    true
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn start(postfix: &str) -> ResultType<()> {
     let incoming = new_listener(postfix).await?;
@@ -627,10 +845,16 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                     let mut stream = Connection::new(stream);
                     let postfix = postfix.to_owned();
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    let peer_uid = stream.peer_uid();
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if config::is_service_ipc_postfix(&postfix) {
                         if !authorize_service_scoped_ipc_connection(&stream, &postfix) {
                             continue;
                         }
+                    } else if postfix.is_empty()
+                        && !authorize_unix_main_ipc_connection(&stream, &postfix)
+                    {
+                        continue;
                     }
                     #[cfg(windows)]
                     if postfix.is_empty() {
@@ -643,6 +867,11 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                         }
                     }
                     tokio::spawn(async move {
+                        // Authorization lasts until this connection closes. Expiring
+                        // a cached capability does not revoke an authenticated socket.
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        let mut main_ipc_authorized = postfix.is_empty()
+                            && (!crate::platform::is_installed() || peer_uid == Some(0));
                         loop {
                             match stream.next().await {
                                 Err(err) => {
@@ -650,6 +879,36 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                     break;
                                 }
                                 Ok(Some(data)) => {
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    if postfix.is_empty() {
+                                        if handle_unix_main_ipc_auth(
+                                            &data,
+                                            &mut stream,
+                                            peer_uid,
+                                            &mut main_ipc_authorized,
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
+                                        if !main_ipc_authorized
+                                            && unix_main_ipc_data_requires_authorization(&data)
+                                        {
+                                            log::warn!(
+                                                "Rejected unauthorized data on Unix main IPC channel: data_kind={:?}, peer_uid={:?}",
+                                                std::mem::discriminant(&data),
+                                                peer_uid
+                                            );
+                                            break;
+                                        }
+                                        if !main_ipc_authorized {
+                                            if let Data::Options(Some(value)) = data {
+                                                handle_unprotected_options(value, &mut stream)
+                                                    .await;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     // On Linux/macOS, the protected `_service` channel is used only for
                                     // syncing config between root service and the active user process.
                                     //
@@ -1008,6 +1267,12 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = crate::audio_service::get_voice_call_input_device();
                 } else if name == "unlock-pin" {
                     value = Some(Config::get_unlock_pin());
+                } else if name == "unlock-pin-set" {
+                    value = Some(if Config::get_unlock_pin().is_empty() {
+                        "N".to_owned()
+                    } else {
+                        "Y".to_owned()
+                    });
                 } else {
                     value = None;
                 }
@@ -1069,6 +1334,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                 } else if name == "voice-call-input" {
                     crate::audio_service::set_voice_call_input_device(Some(value), true);
                 } else if name == "unlock-pin" {
+                    // On Unix, PIN changes affect future PIN checks; existing capabilities,
+                    // pending OS approvals and authenticated connections keep their lifetimes.
                     Config::set_unlock_pin(&value);
                 } else {
                     return;
@@ -1369,7 +1636,7 @@ async fn handle(data: Data, stream: &mut Connection) {
     };
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
     use hbb_common::rand::{rngs::OsRng, RngCore as _};
     use std::fmt::Write as _;
@@ -1377,10 +1644,7 @@ pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
     let mut random_bytes = [0u8; IPC_TOKEN_RANDOM_BYTES];
     let mut rng = OsRng;
     rng.try_fill_bytes(&mut random_bytes).map_err(|err| {
-        hbb_common::anyhow::anyhow!(
-            "failed to generate portable service ipc token from OsRng: {}",
-            err
-        )
+        hbb_common::anyhow::anyhow!("failed to generate IPC token from OsRng: {}", err)
     })?;
 
     let mut token = String::with_capacity(IPC_TOKEN_LEN);
@@ -1390,7 +1654,7 @@ pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
     Ok(token)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub(crate) fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> bool {
     if expected.len() != IPC_TOKEN_LEN || candidate.len() != IPC_TOKEN_LEN {
         return false;
@@ -1401,6 +1665,25 @@ pub(crate) fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> boo
         .zip(candidate.as_bytes().iter())
         .fold(0u8, |diff, (left, right)| diff | (*left ^ *right))
         == 0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn constant_time_main_ipc_secret_eq(expected: &str, candidate: &str) -> bool {
+    use hbb_common::sha2::{Digest as _, Sha256};
+
+    let expected_hash = Sha256::digest(expected.as_bytes());
+    let candidate_hash = Sha256::digest(candidate.as_bytes());
+    expected_hash
+        .iter()
+        .zip(candidate_hash.iter())
+        .fold(0u8, |diff, (left, right)| diff | (*left ^ *right))
+        == 0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+pub(crate) fn is_valid_main_ipc_token(token: &str) -> bool {
+    token.len() == IPC_TOKEN_LEN && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(target_os = "windows")]
@@ -1573,6 +1856,189 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn authenticate_main_ipc_connection(
+    conn: &mut ConnectionTmpl<ConnClient>,
+    token: &str,
+) -> ResultType<bool> {
+    conn.send(&Data::MainIpcAuth(DataMainIpcAuth::Authenticate(
+        token.to_owned(),
+    )))
+    .await?;
+    match conn.next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS).await? {
+        Some(Data::MainIpcAuth(DataMainIpcAuth::Result(authorized))) => {
+            if !authorized {
+                clear_main_ipc_client_token_if_matches(token);
+            }
+            Ok(authorized)
+        }
+        _ => bail!("Main IPC capability handshake returned an unexpected response"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn authorize_main_ipc_connection(
+    conn: &mut ConnectionTmpl<ConnClient>,
+    allow_prompt: bool,
+) -> ResultType<bool> {
+    if !crate::platform::is_installed() || unsafe { hbb_common::libc::geteuid() == 0 } {
+        return Ok(true);
+    }
+    if let Some(token) = main_ipc_client_token() {
+        if authenticate_main_ipc_connection(conn, &token).await? {
+            return Ok(true);
+        }
+    }
+    if !allow_prompt {
+        return Ok(false);
+    }
+    #[cfg(feature = "flutter")]
+    {
+        let event = serde_json::json!({"name": "main_ipc_authorization_required"});
+        if crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, event.to_string())
+            != Some(true)
+        {
+            bail!("Failed to notify settings that authorization is required");
+        }
+        Ok(false)
+    }
+    #[cfg(not(feature = "flutter"))]
+    {
+        request_main_ipc_os_authorization(conn).await?;
+        Ok(true)
+    }
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "flutter")
+))]
+async fn request_main_ipc_os_authorization(
+    conn: &mut ConnectionTmpl<ConnClient>,
+) -> ResultType<()> {
+    let MainIpcAuthorization::Pending { request_id, token } =
+        request_main_ipc_authorization_on_connection(conn, None).await?
+    else {
+        bail!("Main IPC authorization did not return an approval request");
+    };
+    let approved = tokio::task::spawn_blocking(move || {
+        crate::platform::approve_main_ipc_authorization(&request_id)
+    })
+    .await??;
+    if !approved || !confirm_main_ipc_approval_on_connection(conn, token).await? {
+        bail!("Main IPC authorization was not approved");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn connect_authorized_main_ipc(
+    ms_timeout: u64,
+    allow_prompt: bool,
+) -> ResultType<ConnectionTmpl<ConnClient>> {
+    let mut conn = connect(ms_timeout, "").await?;
+    if !authorize_main_ipc_connection(&mut conn, allow_prompt).await? {
+        bail!("Authentication Required");
+    }
+    Ok(conn)
+}
+
+async fn connect_for_main_ipc_data(
+    ms_timeout: u64,
+    data: &Data,
+) -> ResultType<ConnectionTmpl<ConnClient>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if unix_main_ipc_data_requires_authorization(data) {
+        return connect_authorized_main_ipc(
+            ms_timeout,
+            unix_main_ipc_data_can_request_authorization(data),
+        )
+        .await;
+    }
+    connect(ms_timeout, "").await
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "flutter"))]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn request_main_ipc_authorization(
+    pin: Option<String>,
+) -> ResultType<MainIpcAuthorization> {
+    let mut conn = connect(MAIN_IPC_AUTH_TIMEOUT_MS, "").await?;
+    request_main_ipc_authorization_on_connection(&mut conn, pin).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn request_main_ipc_authorization_on_connection(
+    conn: &mut ConnectionTmpl<ConnClient>,
+    pin: Option<String>,
+) -> ResultType<MainIpcAuthorization> {
+    let token = generate_one_time_ipc_token()?;
+    conn.send(&Data::MainIpcAuth(DataMainIpcAuth::Request {
+        token: token.clone(),
+        pin,
+    }))
+    .await?;
+    match conn.next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS).await? {
+        Some(Data::MainIpcAuth(DataMainIpcAuth::Result(true))) => {
+            if !set_main_ipc_client_token(Some(token)) {
+                bail!("Generated an invalid main IPC capability");
+            }
+            Ok(MainIpcAuthorization::Approved)
+        }
+        Some(Data::MainIpcAuth(DataMainIpcAuth::Pending(request_id))) => {
+            Ok(MainIpcAuthorization::Pending { request_id, token })
+        }
+        Some(Data::MainIpcAuth(DataMainIpcAuth::Result(false))) => {
+            Ok(MainIpcAuthorization::Rejected)
+        }
+        _ => bail!("Main IPC authorization request returned an unexpected response"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn confirm_main_ipc_approval_on_connection(
+    conn: &mut ConnectionTmpl<ConnClient>,
+    token: String,
+) -> ResultType<bool> {
+    let authorized = authenticate_main_ipc_connection(conn, &token).await?;
+    if authorized && !set_main_ipc_client_token(Some(token)) {
+        bail!("Generated an invalid main IPC capability");
+    }
+    Ok(authorized)
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "flutter"))]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn confirm_main_ipc_approval(token: String) -> ResultType<bool> {
+    let mut conn = connect(MAIN_IPC_AUTH_TIMEOUT_MS, "").await?;
+    confirm_main_ipc_approval_on_connection(&mut conn, token).await
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "flutter"))]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn confirm_main_ipc_authorization() -> ResultType<bool> {
+    let Some(token) = main_ipc_client_token() else {
+        return Ok(false);
+    };
+    let mut conn = connect(MAIN_IPC_AUTH_TIMEOUT_MS, "").await?;
+    authenticate_main_ipc_connection(&mut conn, &token).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn approve_main_ipc_authorization(request_id: String) -> ResultType<bool> {
+    if unsafe { hbb_common::libc::geteuid() != 0 } {
+        bail!("Main IPC approval requires root");
+    }
+    let mut conn = connect(MAIN_IPC_AUTH_TIMEOUT_MS, "").await?;
+    conn.send(&Data::MainIpcAuth(DataMainIpcAuth::Approve(request_id)))
+        .await?;
+    match conn.next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS).await? {
+        Some(Data::MainIpcAuth(DataMainIpcAuth::Result(approved))) => Ok(approved),
+        _ => bail!("Main IPC approval returned an unexpected response"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn connect_for_uid(
     ms_timeout: u64,
     uid: u32,
@@ -1694,11 +2160,6 @@ where
         Ok(())
     }
 
-    async fn send_config(&mut self, name: &str, value: String) -> ResultType<()> {
-        self.send(&Data::Config((name.to_owned(), Some(value))))
-            .await
-    }
-
     pub async fn next_timeout(&mut self, ms_timeout: u64) -> ResultType<Option<Data>> {
         Ok(timeout(ms_timeout, self.next()).await??)
     }
@@ -1749,8 +2210,9 @@ pub async fn get_config(name: &str) -> ResultType<Option<String>> {
 }
 
 async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<String>> {
-    let mut c = connect(ms_timeout, "").await?;
-    c.send(&Data::Config((name.to_owned(), None))).await?;
+    let data = Data::Config((name.to_owned(), None));
+    let mut c = connect_for_main_ipc_data(ms_timeout, &data).await?;
+    c.send(&data).await?;
     if let Some(Data::Config((name2, value))) = c.next_timeout(ms_timeout).await? {
         if name == name2 {
             return Ok(value);
@@ -1760,9 +2222,28 @@ async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<Stri
 }
 
 pub async fn set_config_async(name: &str, value: String) -> ResultType<()> {
-    let mut c = connect(1000, "").await?;
-    c.send_config(name, value).await?;
+    const TIMEOUT_MS: u64 = 1_000;
+    let data = Data::Config((name.to_owned(), Some(value)));
+    let mut c = connect_for_main_ipc_data(TIMEOUT_MS, &data).await?;
+    c.send(&data).await?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Data::Config((name, Some(id))) = &data {
+        if name == "id" {
+            // Read on the same connection so the host processes the write first.
+            c.send(&Data::Config((name.to_owned(), None))).await?;
+            confirm_id_update(id, c.next_timeout(TIMEOUT_MS).await?)?;
+        }
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn confirm_id_update(expected: &str, response: Option<Data>) -> ResultType<()> {
+    match response {
+        Some(Data::Config((name, Some(id)))) if name == "id" && id == expected => Ok(()),
+        Some(Data::SecurityConfigError(error)) => bail!(error),
+        _ => bail!("The host did not confirm the ID change"),
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1771,7 +2252,7 @@ pub async fn set_data(data: &Data) -> ResultType<()> {
 }
 
 async fn set_data_async(data: &Data) -> ResultType<()> {
-    let mut c = connect(1000, "").await?;
+    let mut c = connect_for_main_ipc_data(1_000, data).await?;
     c.send(data).await?;
     Ok(())
 }
@@ -1859,8 +2340,9 @@ pub async fn set_permanent_password_with_ack(v: String) -> ResultType<bool> {
 async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
     // The daemon ACK/NACK is expected quickly since it applies the config in-process.
     let ms_timeout = 1_000;
-    let mut c = connect(ms_timeout, "").await?;
-    c.send_config("permanent-password", v).await?;
+    let data = Data::Config(("permanent-password".to_owned(), Some(v)));
+    let mut c = connect_for_main_ipc_data(ms_timeout, &data).await?;
+    c.send(&data).await?;
     if let Some(Data::Config((name2, Some(v)))) = c.next_timeout(ms_timeout).await? {
         if name2 == "permanent-password" {
             let v = v.trim();
@@ -1904,6 +2386,10 @@ pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
             bail!("No more than {max_len} characters");
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return set_config("unlock-pin", v);
+    }
     Config::set_unlock_pin(&v);
     set_config("unlock-pin", v)
 }
@@ -1912,11 +2398,19 @@ pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_unlock_pin() -> String {
     if let Ok(Some(v)) = get_config("unlock-pin") {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if !crate::platform::is_installed() {
+            Config::set_unlock_pin(&v);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         Config::set_unlock_pin(&v);
-        v
-    } else {
-        Config::get_unlock_pin()
+        return v;
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return String::new();
+    }
+    Config::get_unlock_pin()
 }
 
 #[cfg(feature = "flutter")]
@@ -1924,10 +2418,9 @@ pub fn get_unlock_pin() -> String {
 pub async fn trusted_devices(request: authority::Request) -> ResultType<String> {
     const TIMEOUT_MS: u64 = 1000;
     let list = matches!(request, authority::Request::List);
-    let mut connection = connect(TIMEOUT_MS, "").await?;
-    connection
-        .send(&Data::TrustedDeviceManagement(Box::new(request)))
-        .await?;
+    let data = Data::TrustedDeviceManagement(Box::new(request));
+    let mut connection = connect_for_main_ipc_data(TIMEOUT_MS, &data).await?;
+    connection.send(&data).await?;
     let response = match connection.next_timeout(TIMEOUT_MS).await? {
         Some(Data::TrustedDeviceResponse(result)) => {
             match result.map_err(|error| hbb_common::anyhow::anyhow!(error))? {
@@ -2048,6 +2541,23 @@ pub fn set_option(key: &str, value: &str) {
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
     let _nat = CheckTestNatType::new();
     let affected = crate::trusted_devices::config::changes_authentication(&value);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let installed = crate::platform::is_installed();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let affected = affected || installed;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let connection = if installed {
+        let mut connection = connect(1_000, "").await?;
+        if host_options_require_authorization(&mut connection, &value).await?
+            && !authorize_main_ipc_connection(&mut connection, true).await?
+        {
+            bail!("Authentication Required");
+        }
+        Ok(connection)
+    } else {
+        connect(1000, "").await
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let connection = connect(1000, "").await;
     if affected && connection.is_err() {
         bail!("The host is unavailable; authentication settings were not changed");
@@ -2069,6 +2579,23 @@ pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
     }
     Config::set_options(value);
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+async fn host_options_require_authorization<T>(
+    connection: &mut ConnectionTmpl<T>,
+    proposed: &HashMap<String, String>,
+) -> ResultType<bool>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    const TIMEOUT_MS: u64 = 1_000;
+    connection.send(&Data::Options(None)).await?;
+    match connection.next_timeout(TIMEOUT_MS).await? {
+        Some(Data::Options(Some(current))) => Ok(protected_options_changed(&current, proposed)),
+        Some(Data::SecurityConfigError(error)) => bail!(error),
+        _ => bail!("The host did not provide its current options"),
+    }
 }
 
 #[inline]
@@ -2120,6 +2647,17 @@ pub async fn get_socks() -> Option<config::Socks5Server> {
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
     let _nat = CheckTestNatType::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        let mut conn = connect_authorized_main_ipc(1_000, true).await?;
+        conn.send(&Data::Socks(Some(value.clone()))).await?;
+        Config::set_socks(if value.proxy.is_empty() {
+            None
+        } else {
+            Some(value)
+        });
+        return Ok(());
+    }
     Config::set_socks(if value.proxy.is_empty() {
         None
     } else {
@@ -2419,6 +2957,371 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 mod test {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::*;
+    use hbb_common::tokio;
+
+    #[test]
+    fn ordinary_update_cannot_restore_a_concurrent_protected_change() {
+        use super::*;
+
+        let protected = keys::OPTION_ENABLE_FILE_TRANSFER.to_owned();
+        let recording = keys::OPTION_ALLOW_AUTO_RECORD_INCOMING.to_owned();
+        let original = HashMap::from([(protected.clone(), "Y".to_owned())]);
+        let mut proposed = original.clone();
+        proposed.insert(recording.clone(), "Y".to_owned());
+        let changes = unprotected_option_changes(&original, &proposed).unwrap();
+
+        let mut restricted = original;
+        restricted.insert(protected.clone(), "N".to_owned());
+        assert_eq!(changes, HashMap::from([(recording, "Y".to_owned())]));
+        restricted.extend(changes);
+        assert_eq!(restricted.get(&protected).map(String::as_str), Some("N"));
+        assert_eq!(
+            unprotected_option_changes(&restricted, &proposed)
+                .unwrap_err()
+                .to_string(),
+            "Authentication Required"
+        );
+    }
+
+    #[test]
+    fn ordinary_option_removal_preserves_protected_options() {
+        use super::*;
+
+        let protected = keys::OPTION_ENABLE_FILE_TRANSFER.to_owned();
+        let recording = keys::OPTION_ALLOW_AUTO_RECORD_INCOMING.to_owned();
+        let proposed = HashMap::from([(protected, "N".to_owned())]);
+        let mut current = proposed.clone();
+        current.insert(recording.clone(), "Y".to_owned());
+        assert_eq!(
+            unprotected_option_changes(&current, &proposed).unwrap(),
+            HashMap::from([(recording, String::new())])
+        );
+        assert!(unprotected_option_changes(&proposed, &proposed)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_stale_local_options_do_not_require_authorization() {
+        use super::*;
+
+        const BUFFER_SIZE: usize = 16_384;
+        const TIMEOUT_MS: u64 = 1_000;
+        let keyboard_key = keys::OPTION_ENABLE_KEYBOARD;
+        let recording_key = keys::OPTION_ALLOW_AUTO_RECORD_INCOMING;
+        let mut host_options = Config::get_options();
+        let keyboard = if host_options.get(keyboard_key).map(String::as_str) == Some("N") {
+            "Y"
+        } else {
+            "N"
+        };
+        host_options.insert(keyboard_key.to_owned(), keyboard.to_owned());
+        host_options.remove(recording_key);
+        let mut proposed = host_options.clone();
+        proposed.insert(recording_key.to_owned(), "Y".to_owned());
+        let (client, server) = tokio::io::duplex(BUFFER_SIZE);
+        let mut client = ConnectionTmpl::new(client);
+        let peer = tokio::spawn(async move {
+            let mut server = ConnectionTmpl::new(server);
+            for response in [
+                Data::Options(Some(host_options.clone())),
+                Data::Options(Some(host_options)),
+                Data::Test,
+            ] {
+                let request = server.next_timeout(TIMEOUT_MS).await.unwrap();
+                assert!(matches!(request, Some(Data::Options(None))));
+                server.send(&response).await.unwrap();
+            }
+        });
+        let ordinary = host_options_require_authorization(&mut client, &proposed)
+            .await
+            .unwrap();
+        assert!(!ordinary);
+        proposed.remove(keyboard_key);
+        let protected = host_options_require_authorization(&mut client, &proposed)
+            .await
+            .unwrap();
+        assert!(protected);
+        assert!(host_options_require_authorization(&mut client, &proposed)
+            .await
+            .is_err());
+        peer.await.unwrap();
+    }
+
+    #[test]
+    fn test_id_update_requires_confirmation() {
+        use super::{confirm_id_update, Data};
+
+        let expected = "NewClient";
+        assert!(confirm_id_update(
+            expected,
+            Some(Data::Config(("id".to_owned(), Some(expected.to_owned()))))
+        )
+        .is_ok());
+        for response in [
+            None,
+            Some(Data::Config(("id".to_owned(), None))),
+            Some(Data::Config((
+                "id".to_owned(),
+                Some("OldClient".to_owned()),
+            ))),
+            Some(Data::Config((
+                "other".to_owned(),
+                Some(expected.to_owned()),
+            ))),
+        ] {
+            assert!(confirm_id_update(expected, response).is_err());
+        }
+        let error = "Authentication Required";
+        assert_eq!(
+            confirm_id_update(expected, Some(Data::SecurityConfigError(error.to_owned())))
+                .unwrap_err()
+                .to_string(),
+            error
+        );
+    }
+
+    #[test]
+    fn test_stop_service_option_requires_authorization() {
+        use super::{protected_options_changed, HashMap};
+
+        let running = HashMap::new();
+        let stopped = HashMap::from([("stop-service".to_owned(), "Y".to_owned())]);
+        assert!(protected_options_changed(&running, &stopped));
+        assert!(protected_options_changed(&stopped, &running));
+        assert!(!protected_options_changed(&stopped, &stopped));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_unix_main_ipc_data_policy() {
+        let mut options = Config::get_options();
+        let changed_api_server = if options.get(keys::OPTION_API_SERVER).map(String::as_str)
+            == Some("attacker.example")
+        {
+            "other-attacker.example"
+        } else {
+            "attacker.example"
+        };
+        options.insert(
+            keys::OPTION_API_SERVER.to_owned(),
+            changed_api_server.to_owned(),
+        );
+        let mut ordinary_options = Config::get_options();
+        let changed_abr = match ordinary_options
+            .get(keys::OPTION_ENABLE_ABR)
+            .map(String::as_str)
+        {
+            Some("Y") => "N",
+            _ => "Y",
+        };
+        ordinary_options.insert(keys::OPTION_ENABLE_ABR.to_owned(), changed_abr.to_owned());
+
+        assert!(!is_allowed_unix_main_ipc_data(&Data::SyncConfig(None)));
+        assert!(!is_allowed_unix_main_ipc_data(&Data::SyncConfig(Some(
+            (Config::default(), Config2::default()).into()
+        ))));
+        assert!(!is_allowed_unix_main_ipc_data(&Data::Config((
+            "permanent-password".to_owned(),
+            Some("attacker-password".to_owned())
+        ))));
+        assert!(is_allowed_unix_main_ipc_data(&Data::Options(Some(
+            ordinary_options
+        ))));
+        assert!(!is_allowed_unix_main_ipc_data(&Data::Options(Some(
+            options
+        ))));
+        let mut service_options = Config::get_options();
+        if service_options.remove("stop-service").is_none() {
+            service_options.insert("stop-service".to_owned(), "Y".to_owned());
+        }
+        assert!(!is_allowed_unix_main_ipc_data(&Data::Options(Some(
+            service_options
+        ))));
+        assert!(!is_allowed_unix_main_ipc_data(&Data::ConfirmedKey(None)));
+        assert!(is_allowed_unix_main_ipc_data(&Data::Config((
+            "unlock-pin-set".to_owned(),
+            None
+        ))));
+        assert!(!is_allowed_unix_main_ipc_data(&Data::Config((
+            "unlock-pin".to_owned(),
+            None
+        ))));
+        assert!(is_allowed_unix_main_ipc_data(&Data::Config((
+            "temporary-password".to_owned(),
+            Some(String::new())
+        ))));
+        assert!(is_allowed_unix_main_ipc_data(&Data::Test));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_unix_main_ipc_trusted_device_management_policy() {
+        for (request, allowed) in [
+            (authority::Request::List, true),
+            (authority::Request::Clear, false),
+            (authority::Request::Remove(Vec::new()), false),
+            (authority::Request::Renew(Vec::new()), false),
+        ] {
+            assert_eq!(
+                is_allowed_unix_main_ipc_data(&Data::TrustedDeviceManagement(Box::new(request))),
+                allowed
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_unix_main_ipc_only_protected_writes_request_authorization() {
+        for data in [
+            Data::Config(("permanent-password".to_owned(), Some("password".to_owned()))),
+            Data::Config(("unlock-pin".to_owned(), Some("1234".to_owned()))),
+            Data::TrustedDeviceManagement(Box::new(authority::Request::Clear)),
+        ] {
+            assert!(unix_main_ipc_data_can_request_authorization(&data));
+        }
+        for data in [
+            Data::SyncConfig(None),
+            Data::Config(("unlock-pin".to_owned(), None)),
+            Data::Config(("permanent-password-storage-and-salt".to_owned(), None)),
+            Data::ConfirmedKey(None),
+            Data::Options(None),
+            Data::TrustedDeviceManagement(Box::new(authority::Request::List)),
+            Data::Test,
+        ] {
+            assert!(!unix_main_ipc_data_can_request_authorization(&data));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_unix_main_ipc_rendezvous_servers_requires_authorization() {
+        let mut options = Config::get_options();
+        let value = if options
+            .get("rendezvous-servers")
+            .map(String::as_str)
+            == Some("attacker.example")
+        {
+            "other-attacker.example"
+        } else {
+            "attacker.example"
+        };
+        options.insert("rendezvous-servers".to_owned(), value.to_owned());
+        assert!(!is_allowed_unix_main_ipc_data(&Data::Options(Some(options))));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_unix_main_ipc_authorization_over_real_transport() {
+        let suffix = generate_one_time_ipc_token().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("rustdesk-main-ipc-auth-{}.sock", &suffix[..16]));
+        let path = path.to_string_lossy().into_owned();
+        let mut endpoint = Endpoint::new(path.clone());
+        let mut incoming = endpoint.incoming().unwrap();
+        let token = generate_one_time_ipc_token().unwrap();
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            let raw = Endpoint::connect(&client_path).await.unwrap();
+            let mut conn = ConnectionTmpl::new(raw);
+            conn.send(&Data::MainIpcAuth(DataMainIpcAuth::Authenticate(token)))
+                .await
+                .unwrap();
+            matches!(
+                conn.next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS).await.unwrap(),
+                Some(Data::MainIpcAuth(DataMainIpcAuth::Result(false)))
+            )
+        });
+
+        let raw = incoming.next().await.unwrap().unwrap();
+        let mut server = Connection::new(raw);
+        assert!(authorize_unix_main_ipc_connection(&server, ""));
+        let peer_uid = server.peer_uid();
+        let data = server
+            .next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut authorized = false;
+        assert!(handle_unix_main_ipc_auth(&data, &mut server, peer_uid, &mut authorized).await);
+        assert!(!authorized);
+        assert!(client.await.unwrap());
+
+        drop(server);
+        drop(incoming);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_unix_main_ipc_overlapping_approvals() {
+        for reverse_completion in [false, true] {
+            check_overlapping_main_ipc_approvals(reverse_completion).await;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn serve_main_ipc_auth_test_requests(mut incoming: Incoming) {
+        // Two requests, two confirmations, and one rejected stale capability.
+        for _ in 0..5 {
+            let raw = incoming.next().await.unwrap().unwrap();
+            let mut conn = Connection::new(raw);
+            assert!(authorize_unix_main_ipc_connection(&conn, ""));
+            let data = conn
+                .next_timeout(MAIN_IPC_AUTH_TIMEOUT_MS)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut authorized = false;
+            let peer_uid = conn.peer_uid();
+            assert!(handle_unix_main_ipc_auth(&data, &mut conn, peer_uid, &mut authorized).await);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn check_overlapping_main_ipc_approvals(reverse_completion: bool) {
+        let suffix = generate_one_time_ipc_token().unwrap();
+        let path = std::env::temp_dir().join(format!("rustdesk-overlap-{}.sock", &suffix[..16]));
+        let path = path.to_string_lossy().into_owned();
+        let mut endpoint = Endpoint::new(path.clone());
+        let server = tokio::spawn(serve_main_ipc_auth_test_requests(
+            endpoint.incoming().unwrap(),
+        ));
+        let active_token = main_ipc_client_token();
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let mut conn = ConnectionTmpl::new(Endpoint::connect(&path).await.unwrap());
+            requests.push(
+                request_main_ipc_authorization_on_connection(&mut conn, None)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(main_ipc_client_token(), active_token);
+        }
+        if reverse_completion {
+            requests.reverse();
+        }
+        let mut confirmed_token = None;
+        for request in requests {
+            let MainIpcAuthorization::Pending { request_id, token } = request else {
+                panic!("Expected a pending approval");
+            };
+            assert!(approve_main_ipc_request(&request_id));
+            let mut conn = ConnectionTmpl::new(Endpoint::connect(&path).await.unwrap());
+            confirmed_token = Some(token.clone());
+            assert!(confirm_main_ipc_approval_on_connection(&mut conn, token)
+                .await
+                .unwrap());
+        }
+        let mut conn = ConnectionTmpl::new(Endpoint::connect(&path).await.unwrap());
+        assert!(!authenticate_main_ipc_connection(&mut conn, &suffix)
+            .await
+            .unwrap());
+        assert_eq!(main_ipc_client_token(), confirmed_token);
+        server.await.unwrap();
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

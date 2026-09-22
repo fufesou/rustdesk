@@ -2061,18 +2061,21 @@ pub fn check_super_user_permission() -> ResultType<bool> {
     unsafe { Ok(MacCheckAdminAuthorization() == YES) }
 }
 
+pub fn approve_main_ipc_authorization(request_id: &str) -> ResultType<bool> {
+    if !crate::ipc::is_valid_main_ipc_token(request_id) {
+        bail!("Invalid main IPC approval request");
+    }
+    elevate(
+        vec!["--approve-main-ipc", request_id],
+        "Unlock RustDesk settings",
+    )
+}
+
 pub fn elevate(args: Vec<&str>, prompt: &str) -> ResultType<bool> {
     let cmd = std::env::current_exe()?;
     match cmd.to_str() {
         Some(cmd) => {
-            let mut cmd_with_args = cmd.to_string();
-            for arg in args {
-                cmd_with_args = format!("{} {}", cmd_with_args, arg);
-            }
-            let script = format!(
-                r#"do shell script "{}" with prompt "{}" with administrator privileges"#,
-                cmd_with_args, prompt
-            );
+            let script = super::macos_elevation::elevation_script(cmd, &args, prompt);
             match std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(script)

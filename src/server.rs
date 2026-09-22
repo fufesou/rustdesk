@@ -741,7 +741,25 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     } else {
         match crate::ipc::connect(1000, "").await {
             Ok(mut conn) => {
-                if conn.send(&Data::SyncConfig(None)).await.is_ok() {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let sync_authorized =
+                    match crate::ipc::authorize_main_ipc_connection(&mut conn, false).await {
+                        Ok(authorized) => {
+                            if !authorized {
+                                log::debug!(
+                                    "Skipping full config sync: main IPC authorization is required"
+                                );
+                            }
+                            authorized
+                        }
+                        Err(err) => {
+                            log::warn!("Failed to authorize full config sync: {err}");
+                            false
+                        }
+                    };
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let sync_authorized = true;
+                if sync_authorized && conn.send(&Data::SyncConfig(None)).await.is_ok() {
                     if let Ok(Some(data)) = conn.next_timeout(1000).await {
                         match data {
                             Data::SyncConfig(Some(configs)) => {

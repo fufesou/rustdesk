@@ -1,3 +1,7 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::ipc::{
+    constant_time_ipc_token_eq, generate_one_time_ipc_token, is_valid_main_ipc_token,
+};
 use crate::ipc::{Connection, ConnectionTmpl};
 #[cfg(all(windows, not(feature = "flutter")))]
 use hbb_common::sha2::{Digest, Sha256};
@@ -20,6 +24,12 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use std::{
     fs,
@@ -27,6 +37,192 @@ use std::{
 };
 #[cfg(windows)]
 use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProcessId};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_PENDING_CAPABILITY_TTL: Duration = Duration::from_secs(60);
+// Idle lifetime for capability reuse, refreshed by successful token checks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_APPROVED_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_PIN_ATTEMPT_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_MAX_PENDING_CAPABILITIES: usize = 32;
+// Full capacity rejects new tokens without evicting unexpired approvals.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAIN_IPC_MAX_APPROVED_CAPABILITIES: usize = 16;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PendingMainIpcCapability {
+    token: String,
+    expires_at: Instant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+struct MainIpcCapabilityState {
+    pending: HashMap<String, PendingMainIpcCapability>,
+    approved: HashMap<String, Instant>,
+    next_pin_attempt: Option<Instant>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl MainIpcCapabilityState {
+    fn prune(&mut self, now: Instant) {
+        self.pending.retain(|_, entry| entry.expires_at > now);
+        self.approved.retain(|_, expires_at| *expires_at > now);
+    }
+
+    fn request(&mut self, token: String, request_id: String, now: Instant) -> ResultType<()> {
+        if !is_valid_main_ipc_token(&token) || !is_valid_main_ipc_token(&request_id) {
+            bail!("Invalid main IPC capability value");
+        }
+        self.prune(now);
+        self.pending.retain(|_, entry| entry.token != token);
+        if self.pending.len() >= MAIN_IPC_MAX_PENDING_CAPABILITIES {
+            bail!("Too many pending main IPC capability requests");
+        }
+        if self.pending.contains_key(&request_id) {
+            bail!("Duplicate main IPC capability request");
+        }
+        self.pending.insert(
+            request_id,
+            PendingMainIpcCapability {
+                token,
+                expires_at: now + MAIN_IPC_PENDING_CAPABILITY_TTL,
+            },
+        );
+        Ok(())
+    }
+
+    fn approve_pending(&mut self, request_id: &str, now: Instant) -> bool {
+        self.prune(now);
+        let Some(entry) = self.pending.remove(request_id) else {
+            return false;
+        };
+        self.approve_token(entry.token, now)
+    }
+
+    fn approve_token(&mut self, token: String, now: Instant) -> bool {
+        if !is_valid_main_ipc_token(&token) {
+            return false;
+        }
+        self.prune(now);
+        if self.approved.len() >= MAIN_IPC_MAX_APPROVED_CAPABILITIES
+            && !self.approved.contains_key(&token)
+        {
+            return false;
+        }
+        self.approved
+            .insert(token, now + MAIN_IPC_APPROVED_CAPABILITY_TTL);
+        true
+    }
+
+    fn is_approved(&mut self, token: &str, now: Instant) -> bool {
+        self.prune(now);
+        let approved_token = self
+            .approved
+            .keys()
+            .find(|approved| constant_time_ipc_token_eq(approved, token))
+            .cloned();
+        let Some(approved_token) = approved_token else {
+            return false;
+        };
+        self.approved
+            .insert(approved_token, now + MAIN_IPC_APPROVED_CAPABILITY_TTL);
+        true
+    }
+
+    fn begin_pin_attempt(&mut self, now: Instant) -> bool {
+        if self.next_pin_attempt.is_some_and(|next| next > now) {
+            return false;
+        }
+        self.next_pin_attempt = Some(now + MAIN_IPC_PIN_ATTEMPT_INTERVAL);
+        true
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn main_ipc_capability_state() -> &'static Mutex<MainIpcCapabilityState> {
+    static STATE: OnceLock<Mutex<MainIpcCapabilityState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(MainIpcCapabilityState::default()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn main_ipc_client_token_state() -> &'static Mutex<Option<String>> {
+    static TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    TOKEN.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn create_main_ipc_approval_request(token: &str) -> ResultType<String> {
+    let request_id = generate_one_time_ipc_token()?;
+    main_ipc_capability_state().lock().unwrap().request(
+        token.to_owned(),
+        request_id.clone(),
+        Instant::now(),
+    )?;
+    Ok(request_id)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn approve_main_ipc_request(request_id: &str) -> bool {
+    main_ipc_capability_state()
+        .lock()
+        .unwrap()
+        .approve_pending(request_id, Instant::now())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn approve_main_ipc_token(token: &str) -> bool {
+    main_ipc_capability_state()
+        .lock()
+        .unwrap()
+        .approve_token(token.to_owned(), Instant::now())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn is_main_ipc_token_approved(token: &str) -> bool {
+    main_ipc_capability_state()
+        .lock()
+        .unwrap()
+        .is_approved(token, Instant::now())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn begin_main_ipc_pin_attempt() -> bool {
+    main_ipc_capability_state()
+        .lock()
+        .unwrap()
+        .begin_pin_attempt(Instant::now())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn set_main_ipc_client_token(token: Option<String>) -> bool {
+    if token
+        .as_deref()
+        .is_some_and(|value| !is_valid_main_ipc_token(value))
+    {
+        return false;
+    }
+    *main_ipc_client_token_state().lock().unwrap() = token;
+    true
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn main_ipc_client_token() -> Option<String> {
+    main_ipc_client_token_state().lock().unwrap().clone()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn clear_main_ipc_client_token_if_matches(token: &str) {
+    let mut current = main_ipc_client_token_state().lock().unwrap();
+    if current
+        .as_deref()
+        .is_some_and(|value| constant_time_ipc_token_eq(value, token))
+    {
+        *current = None;
+    }
+}
 
 #[cfg(windows)]
 #[inline]
@@ -168,6 +364,12 @@ pub(crate) fn is_allowed_service_peer_uid(peer_uid: u32, active_uid: Option<u32>
     // Root is allowed at the UID gate because the service side may run as root.
     // Callers still enforce executable matching before accepting service-scoped peers.
     peer_uid == 0 || active_uid.is_some_and(|uid| uid == peer_uid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[inline]
+fn is_allowed_unix_main_peer_uid(peer_uid: u32, server_uid: u32) -> bool {
+    peer_uid == 0 || peer_uid == server_uid
 }
 
 #[cfg(target_os = "macos")]
@@ -573,6 +775,41 @@ pub(crate) fn log_rejected_windows_ipc_connection(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn authorize_unix_main_ipc_connection(stream: &Connection, postfix: &str) -> bool {
+    let peer_uid = stream.peer_uid();
+    let peer_pid = stream.peer_pid();
+    let server_uid = unsafe { libc::geteuid() as u32 };
+    if !peer_uid.is_some_and(|uid| is_allowed_unix_main_peer_uid(uid, server_uid)) {
+        hbb_common::throttled_log!(
+            UNAUTHORIZED_IPC_LOG_INTERVAL,
+            warn,
+            "Rejected unauthorized connection on Unix main IPC channel: postfix={}, peer_uid={:?}, server_uid={}, peer_pid={:?}",
+            postfix,
+            peer_uid,
+            server_uid,
+            peer_pid
+        );
+        return false;
+    }
+    if peer_uid == Some(0) {
+        return true;
+    }
+    if let Err(err) = ensure_peer_executable_matches_current_by_pid_opt(peer_pid, postfix) {
+        hbb_common::throttled_log!(
+            UNAUTHORIZED_IPC_LOG_INTERVAL,
+            warn,
+            "Rejected unauthorized connection on Unix main IPC channel due to executable mismatch: postfix={}, peer_uid={:?}, peer_pid={:?}, err={}",
+            postfix,
+            peer_uid,
+            peer_pid,
+            err
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn authorize_service_scoped_ipc_connection(stream: &Connection, postfix: &str) -> bool {
     let peer_pid = stream.peer_pid();
     let (authorized, peer_uid, active_uid) = stream.service_authorization_status();
@@ -871,6 +1108,13 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::{Connection, ConnectionTmpl};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::ipc::{self, Data, DataMainIpcAuth};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use hbb_common::{futures::StreamExt as _, tokio};
+
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn test_service_peer_uid_policy() {
@@ -878,6 +1122,132 @@ mod tests {
         assert!(super::is_allowed_service_peer_uid(501, Some(501)));
         assert!(!super::is_allowed_service_peer_uid(502, Some(501)));
         assert!(!super::is_allowed_service_peer_uid(501, None));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_unix_main_peer_uid_policy() {
+        assert!(super::is_allowed_unix_main_peer_uid(0, 501));
+        assert!(super::is_allowed_unix_main_peer_uid(501, 501));
+        assert!(!super::is_allowed_unix_main_peer_uid(502, 501));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_main_ipc_capability_lifecycle() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let token = "a".repeat(crate::ipc::IPC_TOKEN_LEN);
+        let request_id = "b".repeat(crate::ipc::IPC_TOKEN_LEN);
+        let mut state = super::MainIpcCapabilityState::default();
+
+        state
+            .request(token.clone(), request_id.clone(), now)
+            .unwrap();
+        assert!(!state.is_approved(&token, now));
+        assert!(state.approve_pending(&request_id, now));
+        assert!(state.is_approved(&token, now));
+        assert!(!state.is_approved(
+            &token,
+            now + super::MAIN_IPC_APPROVED_CAPABILITY_TTL + Duration::from_secs(1)
+        ));
+
+        let expired_request = "c".repeat(crate::ipc::IPC_TOKEN_LEN);
+        state.request(token, expired_request.clone(), now).unwrap();
+        assert!(!state.approve_pending(
+            &expired_request,
+            now + super::MAIN_IPC_PENDING_CAPABILITY_TTL + Duration::from_secs(1)
+        ));
+
+        assert!(state.begin_pin_attempt(now));
+        assert!(!state.begin_pin_attempt(now));
+        assert!(state.begin_pin_attempt(now + super::MAIN_IPC_PIN_ATTEMPT_INTERVAL));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_main_ipc_capability_capacity_recovers_after_expiry() {
+        let now = std::time::Instant::now();
+        let mut state = super::MainIpcCapabilityState::default();
+        let tokens: Vec<_> = (0..=super::MAIN_IPC_MAX_APPROVED_CAPABILITIES)
+            .map(|index| format!("{index:0width$x}", width = crate::ipc::IPC_TOKEN_LEN))
+            .collect();
+        for token in &tokens[..super::MAIN_IPC_MAX_APPROVED_CAPABILITIES] {
+            assert!(state.approve_token(token.clone(), now));
+        }
+        let next_token = tokens.last().unwrap();
+        assert!(!state.approve_token(next_token.clone(), now));
+        assert!(state.approve_token(tokens[0].clone(), now));
+        assert!(state.is_approved(&tokens[0], now));
+
+        let after_expiry = now + super::MAIN_IPC_APPROVED_CAPABILITY_TTL;
+        assert!(state.approve_token(next_token.clone(), after_expiry));
+        assert!(state.is_approved(next_token, after_expiry));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_main_ipc_capability_expiry_preserves_authenticated_connection() {
+        let token = ipc::generate_one_time_ipc_token().unwrap();
+        let path = std::env::temp_dir().join(format!("rustdesk-ipc-ttl-{}.sock", &token[..16]));
+        let path = path.to_string_lossy().into_owned();
+        let mut endpoint = ipc::Endpoint::new(path.clone());
+        let mut incoming = endpoint.incoming().unwrap();
+        let pair = tokio::join!(ipc::Endpoint::connect(&path), incoming.next());
+        let mut client = ConnectionTmpl::new(pair.0.unwrap());
+        let mut server = (Connection::new(pair.1.unwrap().unwrap()), false);
+        assert!(super::approve_main_ipc_token(&token));
+        assert!(connection_accepts_token(&mut client, &mut server, &token).await);
+
+        // Expire only this test's token, leaving concurrent tests' approvals intact.
+        super::main_ipc_capability_state()
+            .lock()
+            .unwrap()
+            .approved
+            .insert(token.clone(), std::time::Instant::now());
+        assert!(!super::is_main_ipc_token_approved(&token));
+        assert!(connection_accepts_token(&mut client, &mut server, &token).await);
+
+        let pair = tokio::join!(ipc::Endpoint::connect(&path), incoming.next());
+        let mut new_client = ConnectionTmpl::new(pair.0.unwrap());
+        let mut new_server = (Connection::new(pair.1.unwrap().unwrap()), false);
+        assert!(!connection_accepts_token(&mut new_client, &mut new_server, &token).await);
+        drop((client, server, new_client, new_server, incoming));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn connection_accepts_token(
+        client: &mut ConnectionTmpl<parity_tokio_ipc::ConnClient>,
+        server: &mut (Connection, bool),
+        token: &str,
+    ) -> bool {
+        client
+            .send(&Data::MainIpcAuth(DataMainIpcAuth::Authenticate(
+                token.to_owned(),
+            )))
+            .await
+            .unwrap();
+        let data = server
+            .0
+            .next_timeout(ipc::MAIN_IPC_AUTH_TIMEOUT_MS)
+            .await
+            .unwrap()
+            .unwrap();
+        let peer_uid = server.0.peer_uid();
+        assert!(super::authorize_unix_main_ipc_connection(&server.0, ""));
+        assert!(
+            ipc::handle_unix_main_ipc_auth(&data, &mut server.0, peer_uid, &mut server.1).await
+        );
+        match client
+            .next_timeout(ipc::MAIN_IPC_AUTH_TIMEOUT_MS)
+            .await
+            .unwrap()
+        {
+            Some(Data::MainIpcAuth(DataMainIpcAuth::Result(accepted))) => accepted,
+            _ => panic!("Expected an authorization result"),
+        }
     }
 
     #[test]

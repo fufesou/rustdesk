@@ -2767,13 +2767,14 @@ void changeUnlockPinDialog(String oldPin, Function() callback) {
   });
 }
 
-void checkUnlockPinDialog(String correctPin, Function() passCallback) {
+void checkUnlockPinDialog(
+    Future<bool> Function(String) verifyPin, Function() passCallback) {
   final controller = TextEditingController();
   String? errorText;
   gFFI.dialogManager.show((setState, close, context) {
     submit() async {
       final pin = controller.text.trim();
-      if (correctPin != pin) {
+      if (!await verifyPin(pin)) {
         setState(() {
           errorText = translate('Wrong PIN');
         });

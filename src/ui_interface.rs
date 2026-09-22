@@ -423,6 +423,12 @@ pub fn set_options(m: HashMap<String, String>) {
 }
 
 pub fn try_set_options(m: HashMap<String, String>) -> hbb_common::ResultType<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        ipc::set_options(m.clone())?;
+        *OPTIONS.lock().unwrap() = m;
+        return Ok(());
+    }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if !crate::trusted_devices::config::changes_authentication(&m) {
@@ -454,6 +460,24 @@ pub fn set_auth_option(key: String, value: String) -> hbb_common::ResultType<()>
         options.insert(key, value);
     }
     try_set_options(options)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn try_set_unix_option(key: &str, value: &str) -> Option<hbb_common::ResultType<()>> {
+    if !crate::platform::is_installed() {
+        return None;
+    }
+    let mut options = OPTIONS.lock().unwrap().clone();
+    if value.is_empty() {
+        options.remove(key);
+    } else {
+        options.insert(key.to_owned(), value.to_owned());
+    }
+    let result = try_set_options(options);
+    if result.is_ok() && key == "audio-input" {
+        crate::audio_service::restart();
+    }
+    Some(result)
 }
 
 #[inline]
@@ -488,7 +512,13 @@ pub fn set_option(key: String, value: String) {
                 return;
             }
         }
-    } else if &key == "audio-input" {
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(result) = try_set_unix_option(&key, &value) {
+        hbb_common::allow_err!(result);
+        return;
+    }
+    if &key == "audio-input" {
         #[cfg(not(target_os = "ios"))]
         crate::audio_service::restart();
     }
@@ -1245,10 +1275,55 @@ pub fn is_root() -> bool {
     false
 }
 
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "flutter"))]
+fn authorize_unix_main_ipc() -> bool {
+    match ipc::confirm_main_ipc_authorization() {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(err) => {
+            log::warn!("Failed to confirm existing main IPC authorization: {err}");
+        }
+    }
+    let request = match ipc::request_main_ipc_authorization(None) {
+        Ok(request) => request,
+        Err(err) => {
+            log::error!("Failed to request main IPC authorization: {err}");
+            return false;
+        }
+    };
+    let ipc::MainIpcAuthorization::Pending { request_id, token } = request else {
+        return matches!(request, ipc::MainIpcAuthorization::Approved);
+    };
+    match crate::platform::approve_main_ipc_authorization(&request_id) {
+        Ok(true) => match ipc::confirm_main_ipc_approval(token) {
+            Ok(authorized) => authorized,
+            Err(err) => {
+                log::error!("Failed to confirm main IPC authorization: {err}");
+                false
+            }
+        },
+        Ok(false) => false,
+        Err(err) => {
+            log::error!("Failed to elevate main IPC approval: {err}");
+            false
+        }
+    }
+}
+
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 #[inline]
 pub fn check_super_user_permission() -> bool {
-    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if is_root() {
+            return true;
+        }
+        if crate::platform::is_installed() {
+            return authorize_unix_main_ipc();
+        }
+        return crate::platform::check_super_user_permission().unwrap_or(false);
+    }
+    #[cfg(windows)]
     return crate::platform::check_super_user_permission().unwrap_or(false);
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     return true;
@@ -1544,12 +1619,12 @@ const UNKNOWN_ERROR: &'static str = "Unknown error";
 #[inline]
 #[tokio::main(flavor = "current_thread")]
 pub async fn change_id_shared(id: String, old_id: String) -> String {
-    let res = change_id_shared_(id, old_id).await.to_owned();
+    let res = change_id_shared_(id, old_id).await;
     *ASYNC_JOB_STATUS.lock().unwrap() = res.clone();
     res
 }
 
-pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
+pub async fn change_id_shared_(id: String, old_id: String) -> String {
     if !hbb_common::is_valid_custom_id(&id) {
         log::debug!(
             "debugging invalid id: \"{id}\", len: {}, base64: \"{}\"",
@@ -1558,7 +1633,7 @@ pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
         );
         let bom = id.trim_start_matches('\u{FEFF}');
         log::debug!("bom: {}", hbb_common::is_valid_custom_id(&bom));
-        return INVALID_FORMAT;
+        return INVALID_FORMAT.to_owned();
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1573,7 +1648,7 @@ pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
 
     if uuid.is_empty() {
         log::error!("Failed to change id, uuid is_empty");
-        return UNKNOWN_ERROR;
+        return UNKNOWN_ERROR.to_owned();
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1599,14 +1674,22 @@ pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
     let err = *err.lock().unwrap();
     if err.is_empty() {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::ipc::set_config_async("id", id.to_owned()).await.ok();
+        return change_id_write_status(crate::ipc::set_config_async("id", id.to_owned()).await);
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             Config::set_key_confirmed(false);
             Config::set_id(&id);
         }
     }
-    err
+    err.to_owned()
+}
+
+#[cfg(any(not(any(target_os = "android", target_os = "ios")), test))]
+fn change_id_write_status(result: hbb_common::ResultType<()>) -> String {
+    match result {
+        Ok(()) => String::new(),
+        Err(error) => error.to_string(),
+    }
 }
 
 async fn check_id(
@@ -1768,6 +1851,19 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::validate_windows_service_video_save_directory;
+
+    #[test]
+    fn change_id_reports_ipc_failures() {
+        use super::change_id_write_status;
+
+        assert_eq!(change_id_write_status(Ok(())), "");
+        for error in ["Authentication Required", "reset by the peer"] {
+            assert_eq!(
+                change_id_write_status(Err(hbb_common::anyhow::anyhow!(error))),
+                error
+            );
+        }
+    }
 
     #[test]
     fn validate_service_video_save_directory() {

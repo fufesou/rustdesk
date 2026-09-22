@@ -95,13 +95,17 @@ void showServerSettingsWithValue(
         isInProgress = true;
       });
       bool ret = await setServerConfig(
-          null,
-          errMsgs,
-          ServerConfig(
-              idServer: idCtrl.text.trim(),
-              relayServer: relayCtrl.text.trim(),
-              apiServer: apiCtrl.text.trim(),
-              key: keyCtrl.text.trim()));
+              null,
+              errMsgs,
+              ServerConfig(
+                  idServer: idCtrl.text.trim(),
+                  relayServer: relayCtrl.text.trim(),
+                  apiServer: apiCtrl.text.trim(),
+                  key: keyCtrl.text.trim()))
+          .catchError((Object error) {
+        idServerMsg.value = translate(error.toString());
+        return false;
+      }, test: (_) => isLinux || isMacOS);
       setState(() {
         isInProgress = false;
       });

@@ -1079,12 +1079,23 @@ pub fn main_set_option(key: String, value: String) -> hbb_common::anyhow::Result
         if is_allow_tls_fallback {
             hbb_common::tls::reset_tls_cache();
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(result) = try_set_unix_option(&key, &value) {
+            return result;
+        }
         set_option(key, value.clone());
         #[cfg(target_os = "android")]
         crate::rendezvous_mediator::RendezvousMediator::restart();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::common::test_rendezvous_server();
     } else {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if key != "stop-service" {
+            // Let set_option run its native service-management path first.
+            if let Some(result) = try_set_unix_option(&key, &value) {
+                return result;
+            }
+        }
         set_option(key, value.clone());
     }
     Ok(())
@@ -1132,8 +1143,17 @@ pub fn main_test_if_valid_server(server: String, test_with_proxy: bool) -> Strin
     test_if_valid_server(server, test_with_proxy)
 }
 
-pub fn main_set_socks(proxy: String, username: String, password: String) {
-    set_socks(proxy, username, password)
+pub fn main_set_socks(proxy: String, username: String, password: String) -> ResultType<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return crate::ipc::set_socks(config::Socks5Server {
+            proxy,
+            username,
+            password,
+        });
+    }
+    set_socks(proxy, username, password);
+    Ok(())
 }
 
 pub fn main_get_proxy_status() -> bool {
@@ -2806,6 +2826,24 @@ pub fn main_get_common(key: String) -> String {
         return ui_interface::is_permanent_password_set().to_string();
     } else if key == "local-permanent-password-set" {
         return ui_interface::is_local_permanent_password_set().to_string();
+    } else if key == "unlock-pin-set" {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return matches!(
+            crate::ipc::get_config("unlock-pin-set"),
+            Ok(Some(value)) if value == "Y"
+        )
+        .to_string();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return (!get_unlock_pin().is_empty()).to_string();
+    } else if let Some(pin) = key.strip_prefix("verify-unlock-pin:") {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return matches!(
+            crate::ipc::request_main_ipc_authorization(Some(pin.to_owned())),
+            Ok(crate::ipc::MainIpcAuthorization::Approved)
+        )
+        .to_string();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return (get_unlock_pin() == pin).to_string();
     } else {
         if key.starts_with("download-data-") {
             let id = key.replace("download-data-", "");

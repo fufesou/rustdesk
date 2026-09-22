@@ -232,6 +232,24 @@ pub fn core_main() -> Option<CoreMainAction> {
             None
         };
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if args[0] == "--approve-main-ipc" {
+            if args.len() != 2 || !crate::ipc::is_valid_main_ipc_token(&args[1]) {
+                println!("Invalid main IPC approval request!");
+                return None;
+            }
+            if !crate::platform::is_installed() || !is_root() {
+                println!("Installation and administrative privileges required!");
+                return None;
+            }
+            match crate::ipc::approve_main_ipc_authorization(args[1].to_owned()) {
+                Ok(true) => println!("Done!"),
+                Ok(false) => println!("Main IPC approval request was rejected!"),
+                Err(err) => println!("{err}"),
+            }
+            return None;
+        }
+
         #[cfg(windows)]
         {
             use crate::platform;
@@ -876,6 +894,7 @@ fn is_user_main_ipc_scope_cli_command(args: &[String]) -> bool {
             | Some("--option")
             | Some("--assign")
             | Some("--deploy")
+            | Some("--approve-main-ipc")
     )
 }
 
