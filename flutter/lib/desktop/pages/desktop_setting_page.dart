@@ -1765,13 +1765,23 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
 
   Widget unlockPin() {
     bool enabled = !locked;
-    RxString unlockPin = bind.mainGetUnlockPin().obs;
+    final hasPin = RxnBool();
     update() async {
-      unlockPin.value = bind.mainGetUnlockPin();
+      try {
+        hasPin.value = usesUnixCredentialAuthorization
+            ? await unixCredentialRequest('pin-set')
+            : bind.mainGetUnlockPin().isNotEmpty;
+      } catch (error) {
+        debugPrint('Failed to query unlock PIN state: $error');
+      }
     }
+    update();
 
     onChanged(bool? checked) async {
-      changeUnlockPinDialog(unlockPin.value, update);
+      if (hasPin.value == null) return;
+      changeUnlockPinDialog(
+          usesUnixCredentialAuthorization ? '' : bind.mainGetUnlockPin(), update,
+          hasHiddenPin: usesUnixCredentialAuthorization && hasPin.value == true);
     }
 
     final isOptFixed = isOptionFixed(kOptionWhitelist);
@@ -1779,8 +1789,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       child: Obx(() => Row(
             children: [
               Checkbox(
-                      value: unlockPin.isNotEmpty,
-                      onChanged: enabled && !isOptFixed ? onChanged : null)
+                      tristate: hasPin.value == null,
+                      value: hasPin.value,
+                      onChanged: enabled && !isOptFixed && hasPin.value != null
+                          ? onChanged
+                          : null)
                   .marginOnly(right: 5),
               Expanded(
                   child: Text(
@@ -1791,7 +1804,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           )),
       onTap: enabled
           ? () {
-              onChanged(!unlockPin.isNotEmpty);
+              onChanged(null);
             }
           : null,
     ).marginOnly(left: _kCheckBoxLeftMargin);
@@ -1819,7 +1832,7 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
       _lock(locked, 'Unlock Network Settings', () {
         locked = false;
         setState(() => {});
-      }),
+      }, networkSettings: true),
       preventMouseKeyBuilder(
         block: locked,
         child: Column(children: [
@@ -3039,8 +3052,9 @@ Widget _SubLabeledWidget(BuildContext context, String label, Widget child,
 Widget _lock(
   bool locked,
   String label,
-  Function() onUnlock,
-) {
+  Function() onUnlock, {
+  bool networkSettings = false,
+}) {
   return Offstage(
       offstage: !locked,
       child: Row(
@@ -3062,6 +3076,13 @@ Widget _lock(
                             Text(translate(label)).marginOnly(left: 5),
                           ]).marginSymmetric(vertical: 2)),
                   onPressed: () async {
+                    if (usesUnixCredentialAuthorization) {
+                      if (await ensureCredentialAuthorization(
+                          networkSettings: networkSettings)) {
+                        onUnlock();
+                      }
+                      return;
+                    }
                     final unlockPin = bind.mainGetUnlockPin();
                     if (unlockPin.isEmpty || isUnlockPinDisabled()) {
                       bool checked = await callMainCheckSuperUserPermission();
@@ -3069,7 +3090,9 @@ Widget _lock(
                         onUnlock();
                       }
                     } else {
-                      checkUnlockPinDialog(unlockPin, onUnlock);
+                      if (await checkUnlockPinDialog((pin) => pin == unlockPin)) {
+                        onUnlock();
+                      }
                     }
                   },
                 ).marginSymmetric(horizontal: 2, vertical: 4),

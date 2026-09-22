@@ -219,6 +219,16 @@ pub fn core_main() -> Option<CoreMainAction> {
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if args[0] == "--approve-credential" {
+            let result = match args.as_slice() {
+                [_, uid, grant] => crate::ipc::unix_credentials::approve(uid, grant),
+                _ => Err(hbb_common::anyhow::anyhow!(
+                    "Expected a target UID and approval digest"
+                )),
+            };
+            return result.err().map(CoreMainAction::ExitFailure);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         // Root CLI management commands must talk to the user `--server` main IPC.
         // Example: `sudo rustdesk --option custom-rendezvous-server` should query the
         // user's IPC instead of root's `/tmp/<app>-0/ipc`; `connect()` still limits this

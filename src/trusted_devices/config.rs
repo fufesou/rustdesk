@@ -256,10 +256,14 @@ pub fn changes_password(value: &str) -> bool {
 
 pub fn set_salt(salt: &str) -> ResultType<()> {
     let affected = Config::get_local_permanent_password_storage_and_salt().1 != salt;
-    change(affected, || {
+    let applied = change(affected, || {
         Config::set_salt(salt);
-        Ok(())
-    })
+        Ok(Config::get_local_permanent_password_storage_and_salt().1 == salt)
+    })?;
+    if !applied {
+        bail!("The host rejected the salt change");
+    }
+    Ok(())
 }
 
 pub fn set_config(value: Config) -> ResultType<bool> {

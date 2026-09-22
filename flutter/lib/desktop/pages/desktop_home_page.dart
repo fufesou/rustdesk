@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/animated_rotation_widget.dart';
 import 'package:flutter_hbb/common/widgets/custom_password.dart';
+import 'package:flutter_hbb/common/widgets/dialog.dart' show ensureCredentialAuthorization;
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
@@ -947,6 +948,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
         });
         return;
       }
+      if (!await ensureCredentialAuthorization()) return;
       final ok = await bind.mainSetPermanentPasswordWithResult(password: pass);
       if (!ok) {
         setState(() {
@@ -1077,6 +1079,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
               errMsg0 = "";
               errMsg1 = "";
             });
+            if (!await ensureCredentialAuthorization()) return;
             final ok =
                 await bind.mainSetPermanentPasswordWithResult(password: "");
             if (!ok) {

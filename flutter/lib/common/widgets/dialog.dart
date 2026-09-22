@@ -2707,18 +2707,23 @@ void CommonConfirmDialog(OverlayDialogManager dialogManager, String content,
   });
 }
 
-void changeUnlockPinDialog(String oldPin, Function() callback) {
+void changeUnlockPinDialog(String oldPin, Function() callback,
+    {bool hasHiddenPin = false}) {
   final pinController = TextEditingController(text: oldPin);
   final confirmController = TextEditingController(text: oldPin);
   String? pinErrorText;
   String? confirmationErrorText;
   final maxLength = bind.mainMaxEncryptLen();
   gFFI.dialogManager.show((setState, close, context) {
-    submit() async {
+    submit([bool remove = false]) async {
       pinErrorText = null;
       confirmationErrorText = null;
-      final pin = pinController.text.trim();
-      final confirm = confirmController.text.trim();
+      final pin = remove ? '' : pinController.text.trim();
+      final confirm = remove ? '' : confirmController.text.trim();
+      if (hasHiddenPin && !remove && pin.isEmpty && confirm.isEmpty) {
+        close();
+        return;
+      }
       if (pin != confirm) {
         setState(() {
           confirmationErrorText =
@@ -2726,6 +2731,7 @@ void changeUnlockPinDialog(String oldPin, Function() callback) {
         });
         return;
       }
+      if (!await ensureCredentialAuthorization()) return;
       final errorMsg = bind.mainSetUnlockPin(pin: pin);
       if (errorMsg != '') {
         setState(() {
@@ -2759,6 +2765,8 @@ void changeUnlockPinDialog(String oldPin, Function() callback) {
       ).marginOnly(bottom: 12),
       actions: [
         dialogButton(translate("Cancel"), onPressed: close, isOutline: true),
+        if (hasHiddenPin)
+          dialogButton(translate("Remove"), onPressed: () => submit(true)),
         dialogButton(translate("OK"), onPressed: submit),
       ],
       onSubmit: submit,
@@ -2767,20 +2775,58 @@ void changeUnlockPinDialog(String oldPin, Function() callback) {
   });
 }
 
-void checkUnlockPinDialog(String correctPin, Function() passCallback) {
+bool get usesUnixCredentialAuthorization =>
+    !isWeb && (isLinux || isMacOS) && bind.mainIsInstalled();
+
+Future<bool> unixCredentialRequest(String action) async {
+  return _credentialResult(
+      await bind.mainGetCommon(key: 'credential-auth:$action'));
+}
+
+bool _credentialResult(String result) {
+  if (result == 'true') return true;
+  if (result == 'false') return false;
+  throw StateError(result.startsWith('error:') ? result.substring(6) : 'Failed');
+}
+
+Future<bool> ensureCredentialAuthorization(
+    {bool networkSettings = false}) async {
+  if (!usesUnixCredentialAuthorization) return true;
+  try {
+    final action = networkSettings ? 'network-status' : 'status';
+    final status = await bind.mainGetCommon(key: 'credential-auth:$action');
+    if (networkSettings && status == 'offline') {
+      // Local approval unlocks this page without issuing a credential grant.
+      return await callMainCheckSuperUserPermission();
+    }
+    if (_credentialResult(status)) return true;
+    if (!isUnlockPinDisabled() && await unixCredentialRequest('pin-set')) {
+      return await checkUnlockPinDialog((pin) => unixCredentialRequest('pin:$pin'));
+    }
+    return await unixCredentialRequest('admin');
+  } catch (error) {
+    showToast(translate(error.toString()));
+    return false;
+  }
+}
+
+Future<bool> checkUnlockPinDialog(FutureOr<bool> Function(String) verify) async {
   final controller = TextEditingController();
   String? errorText;
-  gFFI.dialogManager.show((setState, close, context) {
+  final accepted = await gFFI.dialogManager.show<bool>((setState, close, context) {
     submit() async {
       final pin = controller.text.trim();
-      if (correctPin != pin) {
+      try {
+        if (await verify(pin)) {
+          close(true);
+          return;
+        }
         setState(() {
           errorText = translate('Wrong PIN');
         });
-        return;
+      } catch (error) {
+        setState(() => errorText = translate(error.toString()));
       }
-      passCallback.call();
-      close();
     }
 
     return CustomAlertDialog(
@@ -2803,6 +2849,7 @@ void checkUnlockPinDialog(String correctPin, Function() passCallback) {
       onCancel: close,
     );
   });
+  return accepted == true;
 }
 
 void confrimDeleteTrustedDevicesDialog(

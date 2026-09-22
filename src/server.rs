@@ -741,10 +741,27 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     } else {
         match crate::ipc::connect(1000, "").await {
             Ok(mut conn) => {
-                if conn.send(&Data::SyncConfig(None)).await.is_ok() {
+                let request = Data::SyncConfig(None);
+                // Installed GUIs bootstrap options and the HTTP proxy without requesting full config.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let request = if crate::platform::is_installed()
+                    && unsafe { hbb_common::libc::geteuid() } != 0
+                {
+                    Data::Options(None)
+                } else {
+                    request
+                };
+                if conn.send(&request).await.is_ok() {
                     if let Ok(Some(data)) = conn.next_timeout(1000).await {
-                        match data {
-                            Data::SyncConfig(Some(configs)) => {
+                        match (request, data) {
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            (Data::Options(None), Data::Options(Some(options))) => {
+                                if let Err(err) = refresh_gui_proxy(&mut conn).await {
+                                    log::warn!("Could not refresh the GUI proxy: {err}");
+                                }
+                                crate::ui_interface::cache_host_options(options);
+                            }
+                            (Data::SyncConfig(None), Data::SyncConfig(Some(configs))) => {
                                 let (config, config2) = *configs;
                                 #[cfg(target_os = "windows")]
                                 allow_err!(
@@ -783,6 +800,17 @@ pub async fn start_server(is_server: bool, no_server: bool) {
             }
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn refresh_gui_proxy(conn: &mut crate::ipc::Connection) -> ResultType<()> {
+    const TIMEOUT_MS: u64 = 1_000;
+    conn.send(&Data::Socks(None)).await?;
+    let Some(Data::Socks(proxy)) = conn.next_timeout(TIMEOUT_MS).await? else {
+        bail!("The host did not return its proxy configuration");
+    };
+    Config::cache_host_socks(proxy);
+    Ok(())
 }
 
 #[cfg(windows)]

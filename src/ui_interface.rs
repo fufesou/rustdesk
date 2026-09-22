@@ -88,6 +88,12 @@ lazy_static::lazy_static! {
 
 const INIT_ASYNC_JOB_STATUS: &str = " ";
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn cache_host_options(options: HashMap<String, String>) {
+    *OPTIONS.lock().unwrap() = options;
+    *OPTION_SYNCED.lock().unwrap() = true;
+}
+
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 #[inline]
 pub fn get_id() -> String {
@@ -660,6 +666,10 @@ pub fn is_permanent_password_set() -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let daemon_is_set = ipc::is_permanent_password_set();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if crate::platform::is_installed() {
+            return daemon_is_set;
+        }
         // `daemon_is_set` is authoritative for the return value. Local storage is only used to
         // decide whether we should attempt a sync to clear stale user-side state.
         let local_storage_is_empty = if daemon_is_set {
@@ -677,6 +687,16 @@ pub fn is_permanent_password_set() -> bool {
 
 #[inline]
 pub fn is_local_permanent_password_set() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return match ipc::get_config("local-permanent-password-set") {
+            Ok(Some(value)) => value == "Y",
+            result => {
+                log::warn!("Failed to query local permanent password state: {result:?}");
+                false
+            }
+        };
+    }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     return Config::has_local_permanent_password();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1425,8 +1445,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                 UI_STATUS.lock().unwrap().mouse_time = v;
                             }
                             Ok(Some(ipc::Data::Options(Some(v)))) => {
-                                *OPTIONS.lock().unwrap() = v;
-                                *OPTION_SYNCED.lock().unwrap() = true;
+                                cache_host_options(v);
                             }
                             Ok(Some(ipc::Data::Config((name, Some(value))))) => {
                                 if name == "id" {
