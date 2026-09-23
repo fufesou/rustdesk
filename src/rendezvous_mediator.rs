@@ -39,6 +39,10 @@ use crate::{
 
 type Message = RendezvousMessage;
 
+#[cfg(test)]
+#[path = "rendezvous_mediator/relay_tests.rs"]
+mod relay_tests;
+
 fn connection_meta(
     control_permissions: Option<ControlPermissions>,
     controlled_context: Option<ControlledContext>,
@@ -262,6 +266,7 @@ pub struct RendezvousMediator {
     host: String,
     host_prefix: String,
     keep_alive: i32,
+    relay_requests: Arc<Mutex<base::relay::RelayRequests>>,
 }
 
 impl RendezvousMediator {
@@ -373,6 +378,7 @@ impl RendezvousMediator {
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            relay_requests: Default::default(),
         };
 
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
@@ -419,7 +425,11 @@ impl RendezvousMediator {
             select! {
                 n = socket.next() => {
                     match n {
-                        Some(Ok((bytes, _))) => {
+                        Some(Ok((bytes, source))) => {
+                            if !base::relay::is_rendezvous_source(&source, &addr) {
+                                log::debug!("Ignored rendezvous packet from unexpected source {source:?}");
+                                continue;
+                            }
                             if let Ok(msg) = Message::parse_from_bytes(&bytes) {
                                 rz.handle_resp(msg.union, Sink::Framed(&mut socket, &addr), &server, &mut update_latency).await?;
                             } else {
@@ -608,6 +618,7 @@ impl RendezvousMediator {
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            relay_requests: Default::default(),
         };
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
@@ -671,6 +682,16 @@ impl RendezvousMediator {
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&rr.socket_addr);
+        base::relay::validate_uuid(&rr.uuid).map_err(anyhow::Error::msg)?;
+        let relay_server = self
+            .relay_requests
+            .lock()
+            .await
+            .select(addr, &rr.relay_server, Instant::now())
+            .map_err(anyhow::Error::msg)?;
+        if relay_server != rr.relay_server {
+            log::info!("Using the selected relay; hbbs advertised a different address");
+        }
         let last = *LAST_RELAY_MSG.lock().await;
         *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
         // skip duplicate relay request messages
@@ -683,8 +704,12 @@ impl RendezvousMediator {
         );
 
         self.create_relay(
-            rr.socket_addr.into(),
-            rr.relay_server,
+            RelayResponse {
+                socket_addr: rr.socket_addr,
+                relay_reply_token: rr.relay_reply_token,
+                ..Default::default()
+            },
+            relay_server,
             rr.uuid,
             server,
             rr.secure,
@@ -698,7 +723,7 @@ impl RendezvousMediator {
 
     async fn create_relay(
         &self,
-        socket_addr: Vec<u8>,
+        mut rr: RelayResponse,
         relay_server: String,
         uuid: String,
         server: ServerPtr,
@@ -708,7 +733,8 @@ impl RendezvousMediator {
         webrtc_sdp_answer: String,
         meta: ConnectionMeta,
     ) -> ResultType<()> {
-        let peer_addr = AddrMangle::decode(&socket_addr);
+        base::relay::validate_uuid(&uuid).map_err(anyhow::Error::msg)?;
+        let peer_addr = AddrMangle::decode(&rr.socket_addr);
         log::info!(
             "create_relay requested from {:?}, relay_server: {}, uuid: {}, secure: {}",
             peer_addr,
@@ -734,13 +760,9 @@ impl RendezvousMediator {
         }
 
         let mut msg_out = Message::new();
-        let mut rr = RelayResponse {
-            socket_addr: socket_addr.into(),
-            version: crate::VERSION.to_owned(),
-            socket_addr_v6,
-            webrtc_sdp_answer,
-            ..Default::default()
-        };
+        rr.version = crate::VERSION.to_owned();
+        rr.socket_addr_v6 = socket_addr_v6;
+        rr.webrtc_sdp_answer = webrtc_sdp_answer;
         if initiate {
             rr.uuid = uuid.clone();
             rr.relay_server = relay_server.clone();
@@ -771,6 +793,10 @@ impl RendezvousMediator {
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
+        self.relay_requests
+            .lock()
+            .await
+            .remember(addr, &relay_server, Instant::now());
         let relay = use_ws() || Config::is_proxy();
         let mut socket_addr_v6 = Default::default();
         let meta = connection_meta(
@@ -805,7 +831,11 @@ impl RendezvousMediator {
         }
         let uuid = Uuid::new_v4().to_string();
         self.create_relay(
-            fla.socket_addr.into(),
+            RelayResponse {
+                socket_addr: fla.socket_addr,
+                relay_reply_token: fla.relay_reply_token,
+                ..Default::default()
+            },
             relay_server,
             uuid,
             server,
@@ -852,6 +882,7 @@ impl RendezvousMediator {
             relay_server,
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
+            relay_reply_token: fla.relay_reply_token,
             ..Default::default()
         });
         let bytes = msg_out.write_to_bytes()?;
@@ -1119,6 +1150,10 @@ impl RendezvousMediator {
             .await;
         }
         let relay_server = self.get_relay_server(ph.relay_server);
+        self.relay_requests
+            .lock()
+            .await
+            .remember(peer_addr, &relay_server, Instant::now());
         // for ensure, websocket go relay directly
         // A symmetric NAT relays the legacy transports but deliberately not WebRTC: the answer
         // built above rides along on the relay request, and ICE probes the candidate pairs rather
@@ -1129,7 +1164,11 @@ impl RendezvousMediator {
             let uuid = Uuid::new_v4().to_string();
             return self
                 .create_relay(
-                    ph.socket_addr.into(),
+                    RelayResponse {
+                        socket_addr: ph.socket_addr,
+                        relay_reply_token: ph.relay_reply_token,
+                        ..Default::default()
+                    },
                     relay_server,
                     uuid,
                     server,
@@ -1151,6 +1190,7 @@ impl RendezvousMediator {
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
             webrtc_sdp_answer,
+            relay_reply_token: ph.relay_reply_token,
             ..Default::default()
         };
         if ph.udp_port > 0 {
@@ -1800,6 +1840,7 @@ mod tests {
             host: host.to_string(),
             host_prefix: String::new(),
             keep_alive: 0,
+            relay_requests: Default::default(),
         };
         let msg_punch = PunchHoleSent {
             webrtc_sdp_answer: "answer".to_owned(),

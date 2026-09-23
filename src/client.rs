@@ -104,6 +104,8 @@ mod audio_state_tests;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
+mod relay;
+use relay::RelaySetup;
 pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
@@ -356,6 +358,10 @@ fn tcp_punch_allowed() -> bool {
             || crate::get_ipv6_punch_enabled()
             || crate::get_webrtc_enabled())
 }
+
+#[cfg(test)]
+#[path = "client/relay_tests.rs"]
+mod relay_tests;
 
 impl Client {
     const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
@@ -1112,10 +1118,6 @@ impl Client {
                         // An offerer not adopted into the relay race (empty answer) is closed by
                         // the guard's drop here.
                         drop(webrtc_offerer.take());
-                        // Keep relay_server for a WebRTC secure-failure fallback: request_relay
-                        // coordinates a FRESH uuid via the rendezvous server, so it works even if
-                        // the raced create_relay already consumed the original uuid pairing.
-                        let relay_server_rr = rr.relay_server.clone();
                         let fut = Self::create_relay(
                             &peer,
                             rr.uuid,
@@ -1198,7 +1200,7 @@ impl Client {
                             Ok(pk) => pk,
                             Err(e) if typ == "WebRTC" => {
                                 // WebRTC won the race but identity/DTLS binding failed. Fall back
-                                // to a freshly-coordinated relay (request_relay negotiates a new
+                                // to a freshly-coordinated relay (the new punch negotiates a new
                                 // uuid, immune to the raced create_relay having consumed the
                                 // original pairing) so a bad WebRTC handshake does not kill the
                                 // whole session when relay is available.
@@ -1207,16 +1209,14 @@ impl Client {
                                     e
                                 );
                                 drop(webrtc_guard.take());
-                                let mut relay_conn = Self::request_relay(
-                                    &peer,
-                                    relay_server_rr,
-                                    &rendezvous_server,
-                                    !signed_id_pk.is_empty(),
-                                    &key,
-                                    &token,
+                                let mut relay_conn = Self::request_relay_with_punch(RelaySetup {
+                                    peer: &peer,
+                                    rendezvous_server: &rendezvous_server,
+                                    key: &key,
+                                    token: &token,
                                     conn_type,
-                                    &interface.get_switch_code(),
-                                )
+                                    switch_code: &interface.get_switch_code(),
+                                })
                                 .await
                                 .map_err(|relay_e| {
                                     anyhow!(
@@ -1542,16 +1542,14 @@ impl Client {
         if (interface.is_force_relay() && typ != "WebRTC") || conn.is_err() {
             if !relay_server.is_empty() {
                 let switch_code = interface.get_switch_code();
-                conn = Self::request_relay(
-                    peer_id,
-                    relay_server.to_owned(),
+                conn = Self::request_relay_with_punch(RelaySetup {
+                    peer: peer_id,
                     rendezvous_server,
-                    !signed_id_pk.is_empty(),
                     key,
                     token,
                     conn_type,
-                    &switch_code,
-                )
+                    switch_code: &switch_code,
+                })
                 .await;
                 if let Err(e) = conn {
                     // this direct is mainly used by on_establish_connection_error, so we update it here before bail
@@ -1579,16 +1577,14 @@ impl Client {
                 // first so the bad pc is closed promptly.
                 log::warn!("WebRTC secure handshake failed ({}), falling back to relay", e);
                 drop(webrtc_guard.take());
-                match Self::request_relay(
-                    peer_id,
-                    relay_server.to_owned(),
+                match Self::request_relay_with_punch(RelaySetup {
+                    peer: peer_id,
                     rendezvous_server,
-                    !signed_id_pk.is_empty(),
                     key,
                     token,
                     conn_type,
-                    &interface.get_switch_code(),
-                )
+                    switch_code: &interface.get_switch_code(),
+                })
                 .await
                 {
                     Ok(mut relay_conn) => {
@@ -1850,6 +1846,7 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        base::relay::validate_uuid(&uuid).map_err(hbb_common::anyhow::Error::msg)?;
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
