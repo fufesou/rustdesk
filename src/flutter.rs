@@ -260,6 +260,7 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
+    refresh_on_ack: bool,
 }
 
 pub type FlutterRgbaRendererPluginOnRgba = unsafe extern "C" fn(
@@ -1721,7 +1722,8 @@ pub extern "C" fn session_get_rgba(session_uuid_str: *const char, display: usize
 
 pub fn session_next_rgba(session_id: SessionID, display: usize) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        return s.ui_handler.next_rgba(display);
+        s.ui_handler.next_rgba(display);
+        display::refresh_after_rgba(&s, display);
     }
 }
 
