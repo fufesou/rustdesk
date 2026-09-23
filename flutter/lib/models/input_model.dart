@@ -448,6 +448,7 @@ class InputModel {
   // mouse
   final isPhysicalMouse = false.obs;
   int _lastButtons = 0;
+  int _pressedMouseButtons = 0;
   Offset lastMousePos = Offset.zero;
   int _lastWheelTsUs = 0;
 
@@ -1076,10 +1077,22 @@ class InputModel {
       }
     }
     _lastButtons = hasStaleButtonsOnMouseUp ? 0 : evt.buttons;
+    if (_relativeMouse.enabled.value && keyboardPerm) {
+      _trackMouseButton(buttons, type);
+    }
 
     out['buttons'] = buttons;
     out['type'] = type;
     return out;
+  }
+
+  void _trackMouseButton(int buttons, String type) {
+    if (mouseButtonsToPeer(buttons).isEmpty) return;
+    if (type == _kMouseEventDown) {
+      _pressedMouseButtons |= buttons;
+    } else if (type == _kMouseEventUp) {
+      _pressedMouseButtons &= ~buttons;
+    }
   }
 
   /// Send a mouse tap event(down and up).
@@ -1578,6 +1591,30 @@ class InputModel {
     }
   }
 
+  void onPointCancelImage(PointerCancelEvent e) {
+    if (e.kind != ui.PointerDeviceKind.mouse) return;
+    if (isDesktop) _queryOtherWindowCoords = false;
+    if (isViewOnly && !showMyCursor) return;
+    if (isViewCamera) return;
+
+    final pressed = _pressedMouseButtons;
+    _pressedMouseButtons = 0;
+    _lastButtons = 0;
+    const buttons = {
+      kPrimaryMouseButton: MouseButtons.left,
+      kSecondaryMouseButton: MouseButtons.right,
+      kMiddleMouseButton: MouseButtons.wheel,
+      kBackMouseButton: MouseButtons.back,
+      kForwardMouseButton: MouseButtons.forward,
+    };
+    // Releases need no position and must not re-engage relative pointer lock.
+    for (final button in buttons.entries) {
+      if (pressed & button.key != 0) {
+        unawaited(sendMouse(kMouseEventTypeUp, button.value));
+      }
+    }
+  }
+
   void onPointMoveImage(PointerMoveEvent e) {
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
@@ -1821,6 +1858,8 @@ class InputModel {
     bool edgeScroll = false,
   }) {
     if (isViewCamera) return null;
+    final release = _takePendingMouseRelease(evt);
+    if (release != null) return release;
     double x = offset.dx;
     double y = max(0.0, offset.dy);
     if (_checkPeerControlProtected(x, y)) {
@@ -1876,6 +1915,9 @@ class InputModel {
     final buttons = evt['buttons'];
     if (buttons is int) {
       evt['buttons'] = mouseButtonsToPeer(buttons);
+      if (type == kMouseEventTypeDown) {
+        _trackMouseButton(buttons, _kMouseEventDown);
+      }
     } else {
       // Log warning if buttons exists but is not an int (unexpected caller).
       // Keep empty string fallback for missing buttons to preserve move/hover behavior.
@@ -1886,6 +1928,24 @@ class InputModel {
       evt['buttons'] = '';
     }
     return evt;
+  }
+
+  Map<String, dynamic>? _takePendingMouseRelease(Map<String, dynamic> evt) {
+    if (evt['type'] != _kMouseEventUp) return null;
+    final buttons = evt['buttons'];
+    if (buttons is! int || _pressedMouseButtons & buttons == 0) return null;
+    final button = mouseButtonsToPeer(buttons);
+    if (button.isEmpty) return null;
+
+    // A matching release must survive cursor ownership and image bounds checks.
+    _pressedMouseButtons &= ~buttons;
+    return {
+      ...evt,
+      'type': kMouseEventTypeUp,
+      'buttons': button,
+      'x': '0',
+      'y': '0',
+    };
   }
 
   Map<String, dynamic>? handleMouse(
