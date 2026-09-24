@@ -47,7 +47,7 @@ class _Peer extends Fake implements FfiModel {
   @override
   bool get showMyCursor => false;
   @override
-  bool get keyboard => true;
+  bool keyboard = true;
   @override
   Rect get rect => Offset.zero & _size;
 }
@@ -96,6 +96,7 @@ class _Input extends InputModel {
 
   @override
   Future<void> sendMouse(String type, MouseButtons button) async {
+    if (!keyboardPerm) return;
     messages.add({'type': type, 'buttons': button.value});
   }
 }
@@ -202,6 +203,26 @@ void _testCancellation(_FFI Function() fixture) {
 }
 
 void _testTrackedCancellation(_FFI Function() fixture) {
+  testWidgets('permission revocation does not lose a canceled release',
+      (tester) async {
+    final ffi = fixture();
+    final input = ffi.inputModel;
+    final listener = await _mountRegion(tester, input);
+    listener.onPointerDown!(_down(kPrimaryMouseButton));
+    ffi.ffiModel.keyboard = false;
+    listener.onPointerCancel?.call(_cancel);
+    expect(input.buttonEvents, [('down', 'left'), ('up', 'left')]);
+  });
+  testWidgets('view-only transition does not lose a canceled release',
+      (tester) async {
+    final ffi = fixture();
+    final input = ffi.inputModel;
+    final listener = await _mountRegion(tester, input);
+    listener.onPointerDown!(_down(kPrimaryMouseButton));
+    ffi.ffiModel.viewOnly = true;
+    listener.onPointerCancel?.call(_cancel);
+    expect(input.buttonEvents, [('down', 'left'), ('up', 'left')]);
+  });
   testWidgets('a blocked press does not release another controller button',
       (tester) async {
     final ffi = fixture();

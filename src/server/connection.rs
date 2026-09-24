@@ -253,6 +253,58 @@ struct InputMouse {
     show_cursor: bool,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MOUSE_BUTTON_SHIFT: u32 = 3;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Default)]
+struct PressedMouseButtons(i32);
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl PressedMouseButtons {
+    fn record(&mut self, event: &MouseEvent) {
+        use crate::input::*;
+
+        let button = event.mask >> MOUSE_BUTTON_SHIFT;
+        if !matches!(
+            button,
+            MOUSE_BUTTON_LEFT
+                | MOUSE_BUTTON_RIGHT
+                | MOUSE_BUTTON_WHEEL
+                | MOUSE_BUTTON_BACK
+                | MOUSE_BUTTON_FORWARD
+        ) {
+            return;
+        }
+        match event.mask & MOUSE_TYPE_MASK {
+            MOUSE_TYPE_DOWN => self.0 |= button,
+            MOUSE_TYPE_UP => self.0 &= !button,
+            _ => {}
+        }
+    }
+
+    fn take_releases(&mut self) -> Vec<MouseEvent> {
+        use crate::input::*;
+
+        let pressed = std::mem::take(&mut self.0);
+        [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_WHEEL,
+            MOUSE_BUTTON_BACK,
+            MOUSE_BUTTON_FORWARD,
+        ]
+        .iter()
+        .copied()
+        .filter(|button| pressed & button != 0)
+        .map(|button| MouseEvent {
+            mask: (button << MOUSE_BUTTON_SHIFT) | MOUSE_TYPE_UP,
+            ..Default::default()
+        })
+        .collect()
+    }
+}
+
 enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Mouse(InputMouse),
@@ -375,6 +427,8 @@ pub struct Connection {
     require_2fa: Option<totp_rs::TOTP>,
     awaiting_2fa: bool,
     keyboard: bool,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pressed_mouse_buttons: PressedMouseButtons,
     clipboard: bool,
     audio: bool,
     file: bool,
@@ -588,6 +642,8 @@ impl Connection {
             authorized: false,
             unauthorized_id: Some(unauthorized),
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            pressed_mouse_buttons: PressedMouseButtons::default(),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
             audio: Self::permission(keys::OPTION_ENABLE_AUDIO, &control_permissions),
             // to-do: make sure is the option correct here
@@ -798,6 +854,10 @@ impl Connection {
                         ipc::Data::SwitchPermission{name, enabled} => {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                if !enabled {
+                                    conn.release_pressed_mouse_buttons();
+                                }
                                 conn.keyboard = enabled;
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 if let Some(s) = conn.server.upgrade() {
@@ -2430,6 +2490,26 @@ impl Connection {
             .ok();
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn release_pressed_mouse_buttons(&mut self) {
+        for msg in self.pressed_mouse_buttons.take_releases() {
+            let input = InputMouse {
+                msg,
+                conn_id: self.inner.id(),
+                username: self.lr.my_name.clone(),
+                argb: self.peer_argb,
+                simulate: true,
+                show_cursor: self.show_my_cursor,
+            };
+            if let Err(err) = self.tx_input.send(MessageInput::Mouse(input)) {
+                log::warn!(
+                    "Failed to release mouse button after permission change: {}",
+                    err
+                );
+            }
+        }
+    }
+
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn input_pointer(&self, msg: PointerDeviceEvent, conn_id: i32) {
@@ -3152,6 +3232,7 @@ impl Connection {
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
+                        self.pressed_mouse_buttons.record(&me);
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
@@ -4959,6 +5040,10 @@ impl Connection {
         }
         if let Ok(q) = o.disable_keyboard.enum_value() {
             if q != BoolOption::NotSet {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if q == BoolOption::Yes && !self.disable_keyboard {
+                    self.release_pressed_mouse_buttons();
+                }
                 self.disable_keyboard = q == BoolOption::Yes;
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
@@ -7090,6 +7175,41 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn permission_revocation_releases_only_buttons_held_by_this_connection() {
+        use crate::input::{
+            MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_WHEEL, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP,
+        };
+
+        let event = |button, kind| MouseEvent {
+            mask: (button << MOUSE_BUTTON_SHIFT) | kind,
+            ..Default::default()
+        };
+        let mut pressed = PressedMouseButtons::default();
+        let buttons = [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_WHEEL,
+            MOUSE_BUTTON_BACK,
+            MOUSE_BUTTON_FORWARD,
+        ];
+        for button in buttons {
+            pressed.record(&event(button, MOUSE_TYPE_DOWN));
+        }
+        pressed.record(&event(MOUSE_BUTTON_LEFT, MOUSE_TYPE_UP));
+
+        let releases = pressed.take_releases();
+        let actual: Vec<_> = releases.iter().map(|event| event.mask).collect();
+        let expected: Vec<_> = buttons[1..]
+            .iter()
+            .map(|button| event(*button, MOUSE_TYPE_UP).mask)
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(pressed.take_releases().is_empty());
+    }
 
     // The registry is process-global and the harness runs tests in parallel threads, so every
     // test that admits connections holds this first; a poisoned lock is still a lock.

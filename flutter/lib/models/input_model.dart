@@ -1594,23 +1594,22 @@ class InputModel {
   void onPointCancelImage(PointerCancelEvent e) {
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isDesktop) _queryOtherWindowCoords = false;
-    if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
 
     final pressed = _pressedMouseButtons;
-    _pressedMouseButtons = 0;
     _lastButtons = 0;
-    const buttons = {
-      kPrimaryMouseButton: MouseButtons.left,
-      kSecondaryMouseButton: MouseButtons.right,
-      kMiddleMouseButton: MouseButtons.wheel,
-      kBackMouseButton: MouseButtons.back,
-      kForwardMouseButton: MouseButtons.forward,
-    };
-    // Releases need no position and must not re-engage relative pointer lock.
-    for (final button in buttons.entries) {
-      if (pressed & button.key != 0) {
-        unawaited(sendMouse(kMouseEventTypeUp, button.value));
+    const buttons = [
+      kPrimaryMouseButton,
+      kSecondaryMouseButton,
+      kMiddleMouseButton,
+      kBackMouseButton,
+      kForwardMouseButton,
+    ];
+    // Tracked releases bypass cursor protection and bounds checks without pointer lock.
+    for (final button in buttons) {
+      if (pressed & button != 0) {
+        handleMouse(
+            {'type': _kMouseEventUp, 'buttons': button}, Offset.zero);
       }
     }
   }
