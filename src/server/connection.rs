@@ -284,6 +284,8 @@ impl PressedMouseButtons {
                 self.force_released &= !button;
                 self.pressed |= button;
             }
+            // A rejected down must not leave an unpaired up after control returns.
+            MOUSE_TYPE_DOWN => self.force_released |= button,
             MOUSE_TYPE_UP if self.force_released & button != 0 => {
                 self.force_released &= !button;
                 return false;
