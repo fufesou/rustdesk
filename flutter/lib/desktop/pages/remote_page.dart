@@ -25,7 +25,8 @@ import '../widgets/tabbar_widget.dart';
 import 'macos_full_screen_focus_recovery.dart';
 
 import 'package:flutter_hbb/native/custom_cursor.dart'
-    if (dart.library.html) 'package:flutter_hbb/web/custom_cursor.dart';
+    if (dart.library.html) 'package:flutter_hbb/web/custom_cursor.dart'
+    show buildCursorOfCache;
 
 final SimpleWrapper<bool> _firstEnterImage = SimpleWrapper(false);
 
@@ -1091,7 +1092,6 @@ class ImagePaint extends StatefulWidget {
 
 class _ImagePaintState extends State<ImagePaint> {
   bool _lastRemoteCursorMoved = false;
-  final _cursorDisplayScale = 1.0.obs;
 
   String get id => widget.id;
   RxBool get zoomCursor => widget.zoomCursor;
@@ -1105,19 +1105,60 @@ class _ImagePaintState extends State<ImagePaint> {
     final m = Provider.of<ImageModel>(context);
     var c = Provider.of<CanvasModel>(context);
     final s = c.scale;
-    // Read the live DPR while the canvas's post-frame update is pending.
+    // CanvasModel caches the DPR and only refreshes it when the view style
+    // changes, so read it live to follow the window across monitors.
     final dpr = MediaQuery.devicePixelRatioOf(context);
 
+    bool isViewScaled() =>
+        c.viewStyle.style == kRemoteViewStyleAdaptive ||
+        c.viewStyle.style == kRemoteViewStyleCustom;
     bool isViewOriginal() => c.viewStyle.style == kRemoteViewStyleOriginal;
 
     mouseRegion({child}) => Obx(() {
           double getCursorScale() {
-            var c = Provider.of<CanvasModel>(context);
-            if (isDesktop) {
-              return _getDesktopCursorScale(c, dpr);
-            } else {
-              return zoomCursor.value || isViewOriginal() ? s : 1.0;
+            final cursor = Provider.of<CursorModel>(context);
+            // Predefined artwork must not inherit the cached remote bitmap's DPI.
+            final cache = keyboardEnabled.isTrue
+                ? cursor.cache ?? preDefaultCursor.cache
+                : preForbiddenCursor.cache;
+            final legacyScale = _legacyMacCursorScale(widget.ffi, cache,
+                zoom: zoomCursor.isTrue, dpr: dpr);
+            if (legacyScale != null) return legacyScale;
+            final peerDpr = cache?.pixelRatio ?? 0;
+            if (isViewScaled() &&
+                zoomCursor.isFalse &&
+                peerDpr > 0 &&
+                (!isWeb ||
+                    widget.ffi.ffiModel.pi.platform == kPeerPlatformMacOS)) {
+              // Normalize to logical size; Windows takes physical pixels here.
+              // Web normalizes only macOS's optional Retina image, preserving
+              // the existing unzoomed sizing policy for other hosts.
+              return (isWindows ? dpr : 1.0) / peerDpr;
             }
+            if (isDesktop &&
+                isViewOriginal() &&
+                widget.ffi.ffiModel.isPeerLinux) {
+              return _cursorImageScale(widget.ffi, cursor,
+                      useLocalPointer: true) *
+                  (isWindows ? dpr : 1.0);
+            }
+            // Without density, preserve the legacy unzoomed size. Controller
+            // DPR alone cannot determine the remote bitmap's logical size.
+            final imageScale = isViewScaled() && zoomCursor.isTrue
+                ? _cursorImageScale(widget.ffi, cursor, useLocalPointer: true)
+                : s;
+            var cursorScale = 1.0;
+            if (isWindows) {
+              // debug win10
+              if (zoomCursor.value && isViewScaled()) {
+                cursorScale = imageScale * dpr;
+              }
+            } else {
+              if (zoomCursor.value || isViewOriginal()) {
+                cursorScale = imageScale;
+              }
+            }
+            return cursorScale;
           }
 
           return MouseRegion(
@@ -1147,6 +1188,7 @@ class _ImagePaintState extends State<ImagePaint> {
               child: child);
         });
     if (c.imageOverflow.isTrue && c.scrollStyle != ScrollStyle.scrollauto) {
+      _syncScrollAfterLayout(c);
       final paintWidth = c.getDisplayWidth() * s;
       final paintHeight = c.getDisplayHeight() * s;
       final paintSize = Size(paintWidth, paintHeight);
@@ -1191,56 +1233,18 @@ class _ImagePaintState extends State<ImagePaint> {
     }
   }
 
-  /// Matches desktop cursors to the rendered image and native pixel units.
-  ///
-  /// Windows cursor pixels are physical; NSCursor/GdkCursor use logical pixels.
-  /// Unzoomed Adaptive/Custom views preserve macOS cursors' point dimensions.
-  double _getDesktopCursorScale(CanvasModel c, double dpr) {
-    final peer = widget.ffi.ffiModel;
-    if (!zoomCursor.value &&
-        peer.pi.platform == kPeerPlatformMacOS &&
-        (c.viewStyle.style == kRemoteViewStyleAdaptive ||
-            c.viewStyle.style == kRemoteViewStyleCustom)) {
-      return isWindows ? dpr : 1.0;
-    }
-    if (peer.isPeerLinux && peer.pi.currentDisplay == kAllDisplayValue) {
-      if (!zoomCursor.value || c.viewStyle.style == kRemoteViewStyleOriginal) {
-        // Remove the host output's density without applying canvas zoom.
-        final scale = 1.0 / _cursorDisplayScale.value;
-        return isWindows ? scale : scale / dpr;
-      }
-      final scale = c.scale / _cursorDisplayScale.value;
-      return isWindows ? scale * dpr : scale;
-    }
-    if (!zoomCursor.value || c.viewStyle.style == kRemoteViewStyleOriginal) {
-      // Original and unzoomed views do not apply canvas zoom.
-      final scale = _getCursorScaleForDisplay(1.0);
-      return isWindows ? scale : scale / dpr;
-    }
-    final scale = _getCursorScaleForDisplay(c.scale);
-    return isWindows ? scale * dpr : scale;
-  }
-
-  double _getCursorScaleForDisplay(double scale) {
-    final peer = widget.ffi.ffiModel;
-    // All Displays can mix densities; no single display scale applies.
-    if (peer.pi.currentDisplay == kAllDisplayValue) return scale;
-    final displays = peer.pi.getCurDisplays();
-    if (displays.isEmpty) return scale;
-    if (peer.pi.platform == kPeerPlatformMacOS) {
-      // macOS sends NSImage.size in points (src/platform/macos.rs:640,682),
-      // while HiDPI screen frames use backing pixels (libs/scrap/src/quartz/display.rs:37).
-      return scale * displays.first.scale;
-    }
-    if (!peer.isPeerLinux) return scale;
-    // Match rendering when a Wayland host
-    // with multiple outputs reports a display scale > 1.
-    // A single-output host keeps scale at 1.0 to preserve physical uinput
-    // coordinates, even with OS scaling enabled. This counts host outputs,
-    // not the selected displays.length.
-    // See src/server/display_service.rs:650 (update_sync_displays) and
-    // src/server/drm_capturer.rs:1523 (DRM's matching convention).
-    return scale / displays.first.scale;
+  // Layout can change scroll metrics without notification. Compare against this
+  // build's fractions: a delayed refresh may already have changed the model.
+  void _syncScrollAfterLayout(CanvasModel canvas) {
+    // Both supported scrollbar view styles also paint from scroll fractions.
+    if (canvas.scrollStyle != ScrollStyle.scrolledge &&
+        canvas.viewStyle.style != kRemoteViewStyleCustom &&
+        canvas.viewStyle.style != kRemoteViewStyleOriginal) return;
+    final renderedScroll = (canvas.scrollX, canvas.scrollY);
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      canvas.updateScrollAfterLayout(renderedScroll);
+    });
   }
 
   Widget _buildScrollbarNonTextureRender(
@@ -1299,14 +1303,11 @@ class _ImagePaintState extends State<ImagePaint> {
           top: (displays[i].y - rect.top) * s + offset.dy,
           width: displays[i].width * sizeScale,
           height: displays[i].height * sizeScale,
-          child: _trackCursorDisplay(
-            Obx(() => Texture(
-                  textureId: textureId.value,
-                  filterQuality:
-                      isViewOriginal ? FilterQuality.none : FilterQuality.low,
-                )),
-            displays[i],
-          ),
+          child: Obx(() => Texture(
+                textureId: textureId.value,
+                filterQuality:
+                    isViewOriginal ? FilterQuality.none : FilterQuality.low,
+              )),
         ));
       }
     }
@@ -1314,20 +1315,6 @@ class _ImagePaintState extends State<ImagePaint> {
       width: size.width,
       height: size.height,
       child: Stack(children: children),
-    );
-  }
-
-  Widget _trackCursorDisplay(Widget child, Display display) {
-    final peer = widget.ffi.ffiModel;
-    if (!isDesktop ||
-        !peer.isPeerLinux ||
-        peer.pi.currentDisplay != kAllDisplayValue) {
-      return child;
-    }
-    return MouseRegion(
-      onEnter: (_) => _cursorDisplayScale.value = display.scale,
-      onHover: (_) => _cursorDisplayScale.value = display.scale,
-      child: child,
     );
   }
 
@@ -1458,43 +1445,137 @@ class CursorPaint extends StatelessWidget {
       }
     }
 
-    double cx = c.x;
-    double cy = c.y;
-    if (c.viewStyle.style == kRemoteViewStyleOriginal &&
-        c.scrollStyle == ScrollStyle.scrollbar) {
+    final imageOffset = _softwareImageOffset(c);
+    double cx = imageOffset?.dx ?? c.x;
+    double cy = imageOffset?.dy ?? c.y;
+    if (c.imageOverflow.isTrue && c.scrollStyle != ScrollStyle.scrollauto) {
       final rect = c.parent.target!.ffiModel.rect;
       if (rect == null) {
         // unreachable!
         debugPrint('unreachable! The displays rect is null.');
         return Container();
       }
-      if (cx < 0) {
-        final imageWidth = rect.width * c.scale;
-        cx = -imageWidth * c.scrollX;
-      }
-      if (cy < 0) {
-        final imageHeight = rect.height * c.scale;
-        cy = -imageHeight * c.scrollY;
-      }
+      // Scrollbar and edge scrolling share a layout that ignores canvas pan offsets.
+      final imageWidth = rect.width * c.scale;
+      final imageHeight = rect.height * c.scale;
+      // Match the video's integer centering on each fitting axis, even if a
+      // detached scroll controller left a stale fraction before layout sync.
+      cx = c.size.width < imageWidth
+          ? -imageWidth * c.scrollX
+          : ((c.size.width - imageWidth) ~/ 2).toDouble();
+      cy = c.size.height < imageHeight
+          ? -imageHeight * c.scrollY
+          : ((c.size.height - imageHeight) ~/ 2).toDouble();
     }
 
-    double x = (m.x - hotx) * c.scale + cx;
-    double y = (m.y - hoty) * c.scale + cy;
-    double scale = 1.0;
-    final isViewOriginal = c.viewStyle.style == kRemoteViewStyleOriginal;
-    if (zoomCursor.value || isViewOriginal) {
-      x = m.x - hotx + cx / c.scale;
-      y = m.y - hoty + cy / c.scale;
-      scale = c.scale;
+    final image = m.image ?? preDefaultCursor.image;
+    // Match native registration's logical minimum for density-aware scaled views.
+    final logicalMinimum = (m.cache?.pixelRatio ?? 0) > 0 &&
+        c.viewStyle.style != kRemoteViewStyleOriginal;
+    final nativePixels = isWindows && !logicalMinimum
+        ? MediaQuery.devicePixelRatioOf(context)
+        : 1.0;
+    // Show remote cursor follows the image scale, independently of Zoom cursor.
+    double scale = _cursorImageScale(c.parent.target!, m);
+    if (image != null && (logicalMinimum || scale * nativePixels != 1.0)) {
+      final sx = kMinCursorSize / (image.width * nativePixels);
+      final sy = kMinCursorSize / (image.height * nativePixels);
+      // Match native resizing: a thin axis must not enlarge the whole cursor.
+      final minimumScale = sx < sy ? sx : sy;
+      if (scale < minimumScale) scale = minimumScale;
     }
+    // Anchor the hotspot to the video position even when the minimum size
+    // makes the artwork scale differ from the video scale.
+    final x = (m.x * c.scale + cx) / scale - hotx;
+    final y = (m.y * c.scale + cy) / scale - hoty;
 
     return CustomPaint(
       painter: ImagePainter(
-        image: m.image ?? preDefaultCursor.image,
+        image: image,
         x: x,
         y: y,
         scale: scale,
+        useIntegerPosition: false,
       ),
     );
   }
+
+  /// Match video-origin rounding: source pixels for software, logical pixels
+  /// for Linux textures. The caller handles scrolling and unrounded origins.
+  /// Keep cursor positions and hotspots fractional.
+  Offset? _softwareImageOffset(CanvasModel canvas) {
+    if (canvas.imageOverflow.isTrue &&
+        canvas.scrollStyle != ScrollStyle.scrollauto) {
+      return null;
+    }
+    final ffi = canvas.parent.target!;
+    final peer = ffi.ffiModel;
+    if (ffi.imageModel.useTextureRender || peer.pi.forceTextureRender) {
+      // Match Linux's texture origin without rounding the cursor or hotspot.
+      return isLinux
+          ? Offset(canvas.x.toInt().toDouble(), canvas.y.toInt().toDouble())
+          : null;
+    }
+    var scale = canvas.scale;
+    final displays = peer.pi.getCurDisplays();
+    if (peer.isPeerLinux && displays.isNotEmpty) scale /= displays[0].scale;
+    // Match the origin used by _buildScrollAutoNonTextureRender's ImagePainter.
+    return Offset(
+        (canvas.x / scale).toInt() * scale, (canvas.y / scale).toInt() * scale);
+  }
+}
+
+double? _legacyMacCursorScale(FFI ffi, CursorData? cache,
+    {required bool zoom, required double dpr}) {
+  final pi = ffi.ffiModel.pi;
+  if (isWeb ||
+      cache == null ||
+      cache.pixelRatio > 0 ||
+      const {kPreDefaultCursorId, kPreForbiddenCursorId}.contains(cache.id) ||
+      pi.platform != kPeerPlatformMacOS ||
+      pi.currentDisplay == kAllDisplayValue) {
+    return null;
+  }
+  final displays = pi.getCurDisplays();
+  if (displays.isEmpty) return null;
+  // Legacy macOS cursors use points while captured frames use backing pixels.
+  // Preserve the desktop policy only until the peer supplies bitmap density.
+  final canvas = ffi.canvasModel;
+  if (canvas.viewStyle.style == kRemoteViewStyleOriginal) {
+    return displays.first.scale / (isWindows ? 1 : dpr);
+  }
+  if (!zoom) return isWindows ? dpr : 1.0;
+  return canvas.scale * displays.first.scale * (isWindows ? dpr : 1);
+}
+
+/// Logical pixels per cursor bitmap pixel, matching the video renderer.
+/// Linux display geometry, not cursor density, determines this ratio.
+/// Native mixed-display cursors use mapped local input; overlays use the host
+/// position. Callers apply minimum size, controller DPR and hotspot offsets.
+double _cursorImageScale(FFI ffi, CursorModel cursor,
+    {bool useLocalPointer = false}) {
+  final canvas = ffi.canvasModel;
+  final peer = ffi.ffiModel;
+  if (!peer.isPeerLinux) return canvas.scale;
+  final displays = peer.pi.getCurDisplays();
+  if (displays.length == 1) return canvas.scale / displays.first.scale;
+  final rect = peer.rect;
+  if (rect != null) {
+    // Mapped local input is already in host desktop coordinates. CursorModel's
+    // position is relative to rect, so restore its origin for display lookup.
+    // Before the first local movement, both paths use the host position.
+    final position =
+        (useLocalPointer ? ffi.inputModel.remotePointerPosition.value : null) ??
+            Offset(cursor.x + rect.left, cursor.y + rect.top);
+    for (final display in displays) {
+      // Display origins are desktop coordinates; dimensions are physical pixels.
+      // Convert the dimensions so these bounds use the same units as position.
+      if (Rect.fromLTWH(display.x, display.y, display.width / display.scale,
+              display.height / display.scale)
+          .contains(position)) {
+        return canvas.scale / display.scale;
+      }
+    }
+  }
+  return canvas.scale;
 }
