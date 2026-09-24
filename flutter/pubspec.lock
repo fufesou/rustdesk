@@ -522,8 +522,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: ad940aaac3aada70958df2de761adda1a71aa2c4
-      resolved-ref: ad940aaac3aada70958df2de761adda1a71aa2c4
+      ref: d8dd084a6156d95f288e09ac546b7ad5353e77d3
+      resolved-ref: d8dd084a6156d95f288e09ac546b7ad5353e77d3
       url: "https://github.com/fufesou/flutter_custom_cursor"
     source: git
     version: "0.0.3"
