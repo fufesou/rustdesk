@@ -2516,10 +2516,7 @@ impl Connection {
                 show_cursor: self.show_my_cursor,
             };
             if let Err(err) = self.tx_input.send(MessageInput::Mouse(input)) {
-                log::warn!(
-                    "Failed to release mouse button after permission change: {}",
-                    err
-                );
+                log::warn!("Failed to release held mouse button: {}", err);
             }
         }
     }
@@ -5315,6 +5312,8 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.release_pressed_mouse_buttons();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //

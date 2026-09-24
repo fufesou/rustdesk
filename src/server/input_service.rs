@@ -19,6 +19,7 @@ use scrap::wayland::pipewire::RDP_SESSION_INFO;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc;
 use std::{
+    collections::HashSet,
     convert::TryFrom,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
@@ -487,10 +488,38 @@ enum KeysDown {
     EnigoKey(u64),
 }
 
+#[derive(Default)]
+struct MouseButtonOwners(HashMap<i32, HashSet<i32>>);
+
+impl MouseButtonOwners {
+    fn press(&mut self, conn: i32, button: i32) {
+        self.0.entry(button).or_default().insert(conn);
+    }
+
+    fn release(&mut self, conn: i32, button: i32) -> bool {
+        if let Some(owners) = self.0.get_mut(&button) {
+            owners.remove(&conn);
+            if !owners.is_empty() {
+                return false;
+            }
+            self.0.remove(&button);
+        }
+        true
+    }
+}
+
+fn record_mouse_down(result: enigo::ResultType, conn: i32, button: i32) -> enigo::ResultType {
+    result?;
+    MOUSE_BUTTON_OWNERS.lock().unwrap().press(conn, button);
+    Ok(())
+}
+
 lazy_static::lazy_static! {
     static ref ENIGO: Arc<Mutex<Enigo>> = {
         Arc::new(Mutex::new(Enigo::new()))
     };
+    // Access while holding ENIGO so ownership follows the actual injection order.
+    static ref MOUSE_BUTTON_OWNERS: Mutex<MouseButtonOwners> = Default::default();
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
@@ -1119,6 +1148,9 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
+    if evt_type == MOUSE_TYPE_UP && !MOUSE_BUTTON_OWNERS.lock().unwrap().release(conn, buttons) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
@@ -1194,19 +1226,39 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
-                allow_err!(en.mouse_down(MouseButton::Left));
+                allow_err!(record_mouse_down(
+                    en.mouse_down(MouseButton::Left),
+                    conn,
+                    buttons
+                ));
             }
             MOUSE_BUTTON_RIGHT => {
-                allow_err!(en.mouse_down(MouseButton::Right));
+                allow_err!(record_mouse_down(
+                    en.mouse_down(MouseButton::Right),
+                    conn,
+                    buttons
+                ));
             }
             MOUSE_BUTTON_WHEEL => {
-                allow_err!(en.mouse_down(MouseButton::Middle));
+                allow_err!(record_mouse_down(
+                    en.mouse_down(MouseButton::Middle),
+                    conn,
+                    buttons
+                ));
             }
             MOUSE_BUTTON_BACK => {
-                allow_err!(en.mouse_down(MouseButton::Back));
+                allow_err!(record_mouse_down(
+                    en.mouse_down(MouseButton::Back),
+                    conn,
+                    buttons
+                ));
             }
             MOUSE_BUTTON_FORWARD => {
-                allow_err!(en.mouse_down(MouseButton::Forward));
+                allow_err!(record_mouse_down(
+                    en.mouse_down(MouseButton::Forward),
+                    conn,
+                    buttons
+                ));
             }
             _ => {}
         },
