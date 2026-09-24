@@ -258,11 +258,14 @@ const MOUSE_BUTTON_SHIFT: u32 = 3;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Default)]
-struct PressedMouseButtons(i32);
+struct PressedMouseButtons {
+    pressed: i32,
+    force_released: i32,
+}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl PressedMouseButtons {
-    fn record(&mut self, event: &MouseEvent) {
+    fn record(&mut self, event: &MouseEvent, keyboard_enabled: bool) -> bool {
         use crate::input::*;
 
         let button = event.mask >> MOUSE_BUTTON_SHIFT;
@@ -274,19 +277,28 @@ impl PressedMouseButtons {
                 | MOUSE_BUTTON_BACK
                 | MOUSE_BUTTON_FORWARD
         ) {
-            return;
+            return true;
         }
         match event.mask & MOUSE_TYPE_MASK {
-            MOUSE_TYPE_DOWN => self.0 |= button,
-            MOUSE_TYPE_UP => self.0 &= !button,
+            MOUSE_TYPE_DOWN if keyboard_enabled => {
+                self.force_released &= !button;
+                self.pressed |= button;
+            }
+            MOUSE_TYPE_UP if self.force_released & button != 0 => {
+                self.force_released &= !button;
+                return false;
+            }
+            MOUSE_TYPE_UP if keyboard_enabled => self.pressed &= !button,
             _ => {}
         }
+        true
     }
 
     fn take_releases(&mut self) -> Vec<MouseEvent> {
         use crate::input::*;
 
-        let pressed = std::mem::take(&mut self.0);
+        let pressed = std::mem::take(&mut self.pressed);
+        self.force_released |= pressed;
         [
             MOUSE_BUTTON_LEFT,
             MOUSE_BUTTON_RIGHT,
@@ -3231,8 +3243,10 @@ impl Connection {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if self.peer_keyboard_enabled() {
-                        self.pressed_mouse_buttons.record(&me);
+                    let keyboard_enabled = self.peer_keyboard_enabled();
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if self.pressed_mouse_buttons.record(&me, keyboard_enabled) && keyboard_enabled
+                    {
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
