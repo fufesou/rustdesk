@@ -438,6 +438,11 @@ Future<void> _checkView(WidgetTester tester, (String, bool) mode,
           : !mode.$2
               ? (Platform.isWindows ? dpr : 1.0)
               : expectedScale * peerScale;
+    } else if (density == 0 &&
+        peer == kPeerPlatformLinux &&
+        !mode.$2 &&
+        mode.$1 != kRemoteViewStyleOriginal) {
+      expectedScale = 1.0 / peerScale / (Platform.isWindows ? 1 : dpr);
     } else if (density > 0 && !mode.$2 && mode.$1 != kRemoteViewStyleOriginal) {
       expectedScale = (Platform.isWindows ? dpr : 1.0) / density;
     }

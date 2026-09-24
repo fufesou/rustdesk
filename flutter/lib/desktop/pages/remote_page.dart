@@ -1142,6 +1142,16 @@ class _ImagePaintState extends State<ImagePaint> {
                       useLocalPointer: true) *
                   (isWindows ? dpr : 1.0);
             }
+            if (isDesktop &&
+                widget.ffi.ffiModel.isPeerLinux &&
+                isViewScaled() &&
+                zoomCursor.isFalse &&
+                peerDpr == 0) {
+              // Keep the baseline output-scale policy when capture has no density.
+              return _cursorImageScale(widget.ffi, cursor,
+                      useLocalPointer: true, unzoomed: true) /
+                  (isWindows ? 1 : dpr);
+            }
             // Without density, preserve the legacy unzoomed size. Controller
             // DPR alone cannot determine the remote bitmap's logical size.
             final imageScale = isViewScaled() && zoomCursor.isTrue
@@ -1548,17 +1558,17 @@ double? _legacyMacCursorScale(FFI ffi, CursorData? cache,
   return canvas.scale * displays.first.scale * (isWindows ? dpr : 1);
 }
 
-/// Logical pixels per cursor bitmap pixel, matching the video renderer.
+/// Match video geometry, using unit zoom for legacy unzoomed cursors.
 /// Linux display geometry, not cursor density, determines this ratio.
 /// Native mixed-display cursors use mapped local input; overlays use the host
 /// position. Callers apply minimum size, controller DPR and hotspot offsets.
 double _cursorImageScale(FFI ffi, CursorModel cursor,
-    {bool useLocalPointer = false}) {
-  final canvas = ffi.canvasModel;
+    {bool useLocalPointer = false, bool unzoomed = false}) {
+  final scale = unzoomed ? 1.0 : ffi.canvasModel.scale;
   final peer = ffi.ffiModel;
-  if (!peer.isPeerLinux) return canvas.scale;
+  if (!peer.isPeerLinux) return scale;
   final displays = peer.pi.getCurDisplays();
-  if (displays.length == 1) return canvas.scale / displays.first.scale;
+  if (displays.length == 1) return scale / displays.first.scale;
   final rect = peer.rect;
   if (rect != null) {
     // Mapped local input is already in host desktop coordinates. CursorModel's
@@ -1573,9 +1583,9 @@ double _cursorImageScale(FFI ffi, CursorModel cursor,
       if (Rect.fromLTWH(display.x, display.y, display.width / display.scale,
               display.height / display.scale)
           .contains(position)) {
-        return canvas.scale / display.scale;
+        return scale / display.scale;
       }
     }
   }
-  return canvas.scale;
+  return scale;
 }
