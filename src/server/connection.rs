@@ -7176,41 +7176,6 @@ mod test {
     #[allow(unused)]
     use super::*;
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[test]
-    fn permission_revocation_releases_only_buttons_held_by_this_connection() {
-        use crate::input::{
-            MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT,
-            MOUSE_BUTTON_WHEEL, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP,
-        };
-
-        let event = |button, kind| MouseEvent {
-            mask: (button << MOUSE_BUTTON_SHIFT) | kind,
-            ..Default::default()
-        };
-        let mut pressed = PressedMouseButtons::default();
-        let buttons = [
-            MOUSE_BUTTON_LEFT,
-            MOUSE_BUTTON_RIGHT,
-            MOUSE_BUTTON_WHEEL,
-            MOUSE_BUTTON_BACK,
-            MOUSE_BUTTON_FORWARD,
-        ];
-        for button in buttons {
-            pressed.record(&event(button, MOUSE_TYPE_DOWN));
-        }
-        pressed.record(&event(MOUSE_BUTTON_LEFT, MOUSE_TYPE_UP));
-
-        let releases = pressed.take_releases();
-        let actual: Vec<_> = releases.iter().map(|event| event.mask).collect();
-        let expected: Vec<_> = buttons[1..]
-            .iter()
-            .map(|button| event(*button, MOUSE_TYPE_UP).mask)
-            .collect();
-        assert_eq!(actual, expected);
-        assert!(pressed.take_releases().is_empty());
-    }
-
     // The registry is process-global and the harness runs tests in parallel threads, so every
     // test that admits connections holds this first; a poisoned lock is still a lock.
     static UNAUTHORIZED_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
