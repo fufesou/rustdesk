@@ -508,9 +508,43 @@ impl MouseButtonOwners {
     }
 }
 
-fn record_mouse_down(result: enigo::ResultType, conn: i32, button: i32) -> enigo::ResultType {
+fn record_mouse_down(result: enigo::ResultType, _conn: i32, _button: i32) -> enigo::ResultType {
     result?;
-    MOUSE_BUTTON_OWNERS.lock().unwrap().press(conn, button);
+    #[cfg(not(windows))]
+    MOUSE_BUTTON_OWNERS.lock().unwrap().press(_conn, _button);
+    Ok(())
+}
+
+#[cfg(windows)]
+const MOUSE_BUTTON_SHIFT: u32 = 3;
+
+#[cfg(windows)]
+pub(super) fn dispatch_mouse(
+    evt: &MouseEvent,
+    conn: i32,
+    dispatch: impl FnOnce(bool) -> enigo::ResultType,
+) -> enigo::ResultType {
+    let button = evt.mask >> MOUSE_BUTTON_SHIFT;
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
+    if !matches!(evt_type, MOUSE_TYPE_DOWN | MOUSE_TYPE_UP)
+        || !matches!(
+            button,
+            MOUSE_BUTTON_LEFT
+                | MOUSE_BUTTON_RIGHT
+                | MOUSE_BUTTON_WHEEL
+                | MOUSE_BUTTON_BACK
+                | MOUSE_BUTTON_FORWARD
+        )
+    {
+        return dispatch(true);
+    }
+    // Keep ownership in the originating process when the injection backend changes.
+    let mut owners = MOUSE_BUTTON_OWNERS.lock().unwrap();
+    let simulate = evt_type != MOUSE_TYPE_UP || owners.release(conn, button);
+    dispatch(simulate)?;
+    if evt_type == MOUSE_TYPE_DOWN {
+        owners.press(conn, button);
+    }
     Ok(())
 }
 
@@ -518,7 +552,7 @@ lazy_static::lazy_static! {
     static ref ENIGO: Arc<Mutex<Enigo>> = {
         Arc::new(Mutex::new(Enigo::new()))
     };
-    // Access while holding ENIGO so ownership follows the actual injection order.
+    // Windows locks across dispatch; other platforms lock while holding ENIGO.
     static ref MOUSE_BUTTON_OWNERS: Mutex<MouseButtonOwners> = Default::default();
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
@@ -833,13 +867,29 @@ pub fn handle_mouse(
     {
         // having GUI (--server has tray, it is GUI too), run main GUI thread, otherwise crash
         let evt = evt.clone();
-        QUEUE.exec_async(move || handle_mouse_(&evt, conn, username, argb, simulate, show_cursor));
+        QUEUE.exec_async(move || {
+            allow_err!(handle_mouse_(
+                &evt,
+                conn,
+                username,
+                argb,
+                simulate,
+                show_cursor
+            ));
+        });
         return;
     }
     #[cfg(windows)]
     crate::portable_service::client::handle_mouse(evt, conn, username, argb, simulate, show_cursor);
     #[cfg(not(windows))]
-    handle_mouse_(evt, conn, username, argb, simulate, show_cursor);
+    allow_err!(handle_mouse_(
+        evt,
+        conn,
+        username,
+        argb,
+        simulate,
+        show_cursor
+    ));
 }
 
 // to-do: merge handle_mouse and handle_pointer
@@ -1116,10 +1166,12 @@ pub fn handle_mouse_(
     _argb: u32,
     simulate: bool,
     _show_cursor: bool,
-) {
-    if simulate {
-        handle_mouse_simulation_(evt, conn);
-    }
+) -> enigo::ResultType {
+    let result = if simulate {
+        handle_mouse_simulation_(evt, conn)
+    } else {
+        Ok(())
+    };
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let evt_type = evt.mask & MOUSE_TYPE_MASK;
@@ -1132,15 +1184,16 @@ pub fn handle_mouse_(
             handle_mouse_show_cursor_(evt, conn, _username, _argb);
         }
     }
+    result
 }
 
-pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
+pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) -> enigo::ResultType {
     if !active_mouse_(conn) {
-        return;
+        return Ok(());
     }
 
     if EXITING.load(Ordering::SeqCst) {
-        return;
+        return Ok(());
     }
 
     #[cfg(windows)]
@@ -1148,9 +1201,11 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
+    #[cfg(not(windows))]
     if evt_type == MOUSE_TYPE_UP && !MOUSE_BUTTON_OWNERS.lock().unwrap().release(conn, buttons) {
-        return;
+        return Ok(());
     }
+    let mut result = Ok(());
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
@@ -1226,39 +1281,19 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
-                allow_err!(record_mouse_down(
-                    en.mouse_down(MouseButton::Left),
-                    conn,
-                    buttons
-                ));
+                result = record_mouse_down(en.mouse_down(MouseButton::Left), conn, buttons);
             }
             MOUSE_BUTTON_RIGHT => {
-                allow_err!(record_mouse_down(
-                    en.mouse_down(MouseButton::Right),
-                    conn,
-                    buttons
-                ));
+                result = record_mouse_down(en.mouse_down(MouseButton::Right), conn, buttons);
             }
             MOUSE_BUTTON_WHEEL => {
-                allow_err!(record_mouse_down(
-                    en.mouse_down(MouseButton::Middle),
-                    conn,
-                    buttons
-                ));
+                result = record_mouse_down(en.mouse_down(MouseButton::Middle), conn, buttons);
             }
             MOUSE_BUTTON_BACK => {
-                allow_err!(record_mouse_down(
-                    en.mouse_down(MouseButton::Back),
-                    conn,
-                    buttons
-                ));
+                result = record_mouse_down(en.mouse_down(MouseButton::Back), conn, buttons);
             }
             MOUSE_BUTTON_FORWARD => {
-                allow_err!(record_mouse_down(
-                    en.mouse_down(MouseButton::Forward),
-                    conn,
-                    buttons
-                ));
+                result = record_mouse_down(en.mouse_down(MouseButton::Forward), conn, buttons);
             }
             _ => {}
         },
@@ -1337,6 +1372,7 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     for key in to_release {
         en.key_up(key.clone());
     }
+    result
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
