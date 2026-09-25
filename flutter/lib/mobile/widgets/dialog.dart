@@ -107,7 +107,9 @@ void showServerSettingsWithValue(
 
     Widget buildField(
         String label, TextEditingController controller, String errorMsg,
-        {String? Function(String?)? validator, bool autofocus = false}) {
+        {String? Function(String?)? validator,
+        bool autofocus = false,
+        String? helperText}) {
       if (isDesktop || isWeb) {
         return Row(
           children: [
@@ -126,6 +128,7 @@ void showServerSettingsWithValue(
                 showLabelText: false,
                 validator: validator,
                 autofocus: autofocus,
+                helperText: helperText,
               ).workaroundFreezeLinuxMint(),
             ),
           ],
@@ -137,6 +140,7 @@ void showServerSettingsWithValue(
         controller: controller,
         errorMsg: errorMsg,
         validator: validator,
+        helperText: helperText,
       ).workaroundFreezeLinuxMint();
     }
 
@@ -174,6 +178,8 @@ void showServerSettingsWithValue(
                       }
                       return null;
                     },
+                    helperText:
+                        '${translate('Default')}: HTTPS · ${translate('Warning')}: ${translate('API Server')} = http://<server>:<api-port> · <api-port>=<ID-port>-2 (21116→21114)',
                   ),
                   SizedBox(height: 8),
                   buildField('Key', keyCtrl, ''),
@@ -215,6 +221,7 @@ TextFormField serverSettingsTextFormField({
   bool autofocus = false,
   bool showLabelText = true,
   EdgeInsetsGeometry? contentPadding,
+  String? helperText,
 }) {
   return TextFormField(
     controller: controller,
@@ -222,6 +229,9 @@ TextFormField serverSettingsTextFormField({
       labelText: showLabelText ? label : null,
       errorText: errorMsg.isEmpty ? null : errorMsg,
       contentPadding: contentPadding,
+      helper: helperText == null
+          ? null
+          : Text(helperText, overflow: TextOverflow.visible),
     ),
     validator: validator,
     autofocus: autofocus,
