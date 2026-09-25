@@ -3,7 +3,7 @@ use fsevent::{self, StreamFlags};
 use hbb_common::{bail, log, ResultType};
 use std::{
     sync::{
-        mpsc::{channel, Receiver, RecvTimeoutError, Sender},
+        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
     thread,
@@ -42,8 +42,6 @@ impl Drop for PasteObserver {
 }
 
 impl PasteObserver {
-    const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
-
     pub fn new() -> Self {
         Self {
             exit: Arc::new(Mutex::new(false)),
@@ -142,18 +140,18 @@ impl PasteObserver {
         thread::spawn(move || {
             let mut fsevent = None;
             loop {
-                match rx_control.recv_timeout(Self::OBSERVE_TIMEOUT) {
+                match rx_control.recv() {
                     Ok(FseventControl::Start) => {
                         if fsevent.is_none() {
                             fsevent =
                                 Some(Self::new_fsevent(home_dir.clone(), tx_observer.clone()));
                         }
                     }
-                    Ok(FseventControl::Stop) | Err(RecvTimeoutError::Timeout) => {
+                    Ok(FseventControl::Stop) => {
                         let _ = fsevent.as_mut().map(|e| e.shutdown_observe());
                         fsevent = None;
                     }
-                    Ok(FseventControl::Exit) | Err(RecvTimeoutError::Disconnected) => {
+                    Ok(FseventControl::Exit) | Err(_) => {
                         break;
                     }
                 }
@@ -172,7 +170,7 @@ impl PasteObserver {
 
     pub fn stop(&mut self) {
         if let Some(tx_handle_fsevent_thread) = &self.tx_handle_fsevent_thread {
-            self.observer_info = Default::default();
+            self.observer_info.lock().unwrap().take();
             tx_handle_fsevent_thread.tx.send(FseventControl::Stop).ok();
         }
     }

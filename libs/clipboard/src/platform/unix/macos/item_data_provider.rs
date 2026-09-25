@@ -63,7 +63,12 @@ declare_class!(
         // }
     }
 
-    unsafe impl PasteboardFileUrlProvider {}
+    unsafe impl PasteboardFileUrlProvider {
+        #[method(applicationWillTerminate:)]
+        fn application_will_terminate(_notification: &NSObject) {
+            crate::ContextSend::enable(false);
+        }
+    }
 );
 
 pub(super) fn create_pasteboard_file_url_provider(
