@@ -661,6 +661,7 @@ impl InvokeUiSession for FlutterHandler {
                 ("hoty", &cd.hoty.to_string()),
                 ("width", &cd.width.to_string()),
                 ("height", &cd.height.to_string()),
+                ("scale", &cd.scale.to_string()),
                 (
                     "colors",
                     &serde_json::ser::to_string(&colors).unwrap_or("".to_owned()),

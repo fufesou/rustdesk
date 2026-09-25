@@ -2,10 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart' show kPrimaryMouseButton;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:flutter_custom_cursor/cursor_manager.dart' show CursorManager;
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
+import 'package:flutter_hbb/main.dart' show kWindowId;
 import 'package:flutter_hbb/models/input_model.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/native/custom_cursor.dart';
@@ -14,6 +17,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:get/get.dart';
 import 'package:image/image.dart' as img;
 import 'package:provider/provider.dart';
+import 'package:uuid/uuid.dart';
 
 class _Canvas extends ChangeNotifier implements CanvasModel {
   _Canvas(String style)
@@ -40,6 +44,15 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   @override
   double get y => 0;
   @override
+  double get scrollX => 0;
+  @override
+  double get scrollY => 0;
+  @override
+  ScrollStyle get scrollStyle => ScrollStyle.scrollauto;
+  int localCursorUpdates = 0;
+  @override
+  void updateLocalCursor(double x, double y) => localCursorUpdates++;
+  @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
@@ -55,6 +68,8 @@ class _Image extends ChangeNotifier implements ImageModel {
 class _Input extends Fake implements InputModel {
   @override
   final relativeMouseMode = false.obs;
+  @override
+  final remotePointerPosition = Rxn<Offset>();
 }
 
 class _Display extends Display {
@@ -66,6 +81,8 @@ class _Peer extends Fake implements FfiModel {
   @override
   final pi = PeerInfo();
   @override
+  Rect? rect;
+  @override
   bool get isPeerLinux => pi.platform == kPeerPlatformLinux;
   @override
   bool get isPeerWindows => pi.platform == kPeerPlatformWindows;
@@ -74,11 +91,31 @@ class _Peer extends Fake implements FfiModel {
 class _FFI extends Fake implements FFI {
   _FFI(this.canvasModel);
   @override
+  final sessionId = UuidValue('00000000-0000-0000-0000-000000000000');
+  @override
   final CanvasModel canvasModel;
   @override
   final ffiModel = _Peer();
   @override
   final inputModel = _Input();
+  @override
+  late final cursorModel = CursorModel(WeakReference(this));
+}
+
+class _RoutingInput extends InputModel {
+  _RoutingInput(super.parent);
+  @override
+  bool get isViewOnly => false;
+  @override
+  bool get isViewCamera => false;
+  Map<String, dynamic>? lastEvent;
+  @override
+  Map<String, dynamic>? handleMouse(Map<String, dynamic> evt, Offset offset,
+          {bool onExit = false,
+          bool moveCanvas = true,
+          bool edgeScroll = false}) =>
+      lastEvent = processEventToPeer(evt, offset,
+          onExit: onExit, moveCanvas: false, edgeScroll: edgeScroll);
 }
 
 class _Cursor extends CursorModel {
@@ -89,11 +126,13 @@ class _Cursor extends CursorModel {
 
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  final view = binding.platformDispatcher.views.single;
   final channel = Platform.isWindows
       ? SystemChannels.mouseCursor
       : const MethodChannel('flutter_custom_cursor');
   final registrations = <Map<dynamic, dynamic>>[];
   setUp(() {
+    view.devicePixelRatio = 1;
     registrations.clear();
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
         (call) async {
@@ -103,15 +142,17 @@ void main() {
       return args['name'];
     });
   });
-  tearDown(() =>
-      binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null));
+  tearDown(() {
+    view.resetDevicePixelRatio();
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
+  });
   for (final scenario in [
     ((4, 64), 0.5, (2, 32)),
     ((64, 4), 0.5, (32, 2)),
     ((1, 64), 0.25, (1, 16)),
     ((8, 8), 0.5, (12, 12)),
     ((4, 64), 1.0, (4, 64)),
-    ((1, 512), 10.0, (2, 1024)),
+    ((1, 512), 2.0, (2, 1024)),
   ]) {
     test('native cursor size $scenario',
         () => _checkSize(scenario, registrations));
@@ -137,22 +178,120 @@ void main() {
     kRemoteViewStyleCustom
   ]) {
     for (final zoom in [false, true]) {
-      testWidgets('$style zoom=$zoom follows the live DPR and peer scale',
-          (tester) => _checkView(tester, (style, zoom), registrations));
+      for (final density
+          in style == kRemoteViewStyleAdaptive ? [0.0, 2.0] : [0.0]) {
+        testWidgets(
+            '$style zoom=$zoom density=$density uses live DPR and peer display scale',
+            (tester) => tester.runAsync(() => _checkView(
+                tester, (style, zoom), registrations,
+                density: density)));
+      }
     }
   }
+  test('display refresh discards the mapped pointer without a geometry update',
+      () async {
+    final canvas = _Canvas(kRemoteViewStyleOriginal);
+    final ffi = _FFI(canvas);
+    final peer = FfiModel(WeakReference(ffi));
+    addTearDown(canvas.dispose);
+    addTearDown(peer.dispose);
+    peer.pi.platform = kPeerPlatformLinux;
+    // Empty geometry exercises the early return without resizing a native session.
+    for (final display in [kAllDisplayValue, 0, kAllDisplayValue]) {
+      ffi.inputModel.remotePointerPosition.value = const Offset(10, 20);
+      peer.switchToNewDisplay(display, ffi.sessionId, 'size');
+      expect(ffi.inputModel.remotePointerPosition.value, isNull);
+    }
+    ffi.inputModel.remotePointerPosition.value = const Offset(10, 20);
+    await peer.updateCurDisplay(ffi.sessionId);
+    expect(ffi.inputModel.remotePointerPosition.value, isNull);
+  });
+  testWidgets(
+      'routed drag remembers the destination without moving the canvas',
+      (tester) => tester.runAsync(() async {
+            final canvas = _Canvas(kRemoteViewStyleAdaptive)..scale = 1;
+            final ffi = _FFI(canvas);
+            (ffi.ffiModel as _Peer).rect = const Rect.fromLTWH(0, 0, 800, 320);
+            ffi.ffiModel.pi
+              ..platform = kPeerPlatformLinux
+              ..currentDisplay = kAllDisplayValue;
+            final input = _RoutingInput(WeakReference(ffi));
+            // Relative mode never starts; close its observer without native teardown.
+            addTearDown(input.relativeMouseMode.close);
+            addTearDown(ffi.cursorModel.dispose);
+            addTearDown(canvas.dispose);
+            _mockRoutingWindow(tester);
+            final origin =
+                Offset(CanvasModel.leftToEdge, CanvasModel.topToEdge);
+            final start = origin + const Offset(10, 10);
+            input.onPointHoverImage(PointerHoverEvent(
+                kind: ui.PointerDeviceKind.mouse, position: start));
+            expect(input.remotePointerPosition.value, const Offset(10, 10));
+            input.onPointDownImage(PointerDownEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: start,
+                buttons: kPrimaryMouseButton));
+            input.onPointMoveImage(PointerMoveEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: start,
+                buttons: kPrimaryMouseButton));
+            await Future<void>.delayed(Duration.zero);
+            final localUpdates = canvas.localCursorUpdates;
+            input.onPointMoveImage(PointerMoveEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: origin + const Offset(325, 30),
+                buttons: kPrimaryMouseButton));
+            expect(
+                (input.lastEvent?['x'], input.lastEvent?['y']), ('450', '60'));
+            expect(input.remotePointerPosition.value, const Offset(450, 60));
+            expect(canvas.localCursorUpdates, localUpdates);
+          }));
 }
 
-CursorData _data((int, int) size, {Offset hotspot = Offset.zero}) {
+void _mockRoutingWindow(WidgetTester tester) {
+  const windows = MethodChannel('mixin.one/flutter_multi_window');
+  const events = MethodChannel('mixin.one/flutter_multi_window_channel');
+  final previousWindowId = kWindowId;
+  kWindowId = 1;
+  final destination = RemoteWindowCoords(
+      const Rect.fromLTWH(300, 0, 200, 160),
+      CanvasCoords()
+        ..scale = 0.5
+        ..size = const Size(200, 160),
+      CursorCoords(),
+      const Rect.fromLTWH(400, 0, 400, 320));
+  final messenger = tester.binding.defaultBinaryMessenger;
+  messenger.setMockMethodCallHandler(events, (call) async {
+    expect(call.method, kWindowEventRemoteWindowCoords);
+    return jsonEncode([jsonEncode(destination.toJson())]);
+  });
+  messenger.setMockMethodCallHandler(windows, (call) async {
+    expect(call.method, 'getFrame');
+    return {'x': 0.0, 'y': 0.0, 'width': 200.0, 'height': 160.0};
+  });
+  addTearDown(() {
+    kWindowId = previousWindowId;
+    messenger.setMockMethodCallHandler(windows, null);
+    messenger.setMockMethodCallHandler(events, null);
+  });
+}
+
+Future<CursorData> _data((int, int) size,
+    {Offset hotspot = Offset.zero, double density = 0}) async {
   final image = img.Image(width: size.$1, height: size.$2, numChannels: 4);
   for (final pixel in image) {
     pixel.setRgba(64, 32, 16, 255);
   }
   image.getPixel(0, 0).setRgba(255, 0, 0, 128);
+  final codec =
+      await ui.instantiateImageCodec(Uint8List.fromList(img.encodePng(image)));
+  final nativeImage = (await codec.getNextFrame()).image;
+  codec.dispose();
   return CursorData(
       peerId: 'size',
-      id: '$size',
+      id: '$size-$density',
       image: image,
+      nativeImage: nativeImage,
       scale: 1,
       data: Platform.isWindows
           ? image.getBytes(order: img.ChannelOrder.bgra)
@@ -160,7 +299,8 @@ CursorData _data((int, int) size, {Offset hotspot = Offset.zero}) {
       hotxOrigin: hotspot.dx,
       hotyOrigin: hotspot.dy,
       width: size.$1,
-      height: size.$2);
+      height: size.$2,
+      pixelRatio: density);
 }
 
 Future<void> _dispose(CursorModel cursor) async {
@@ -169,6 +309,9 @@ Future<void> _dispose(CursorModel cursor) async {
   }
   cursor.dispose();
 }
+
+Future<void> _ensureRegistered(CursorModel cursor) => Future.wait(
+    cursor.cachedKeys.map(CursorManager.instance.ensureCursorRegistered));
 
 Future<void> _checkWindowsPeerAlpha(
     (List<int>, int) pattern, List<Map<dynamic, dynamic>> registrations) async {
@@ -191,30 +334,38 @@ Future<void> _checkWindowsPeerAlpha(
         (i) => pattern.$1[i % pattern.$1.length])),
   });
   buildCursorOfCache(cursor, 1.0 / dpr, cursor.cache);
-  await Future<void>.delayed(Duration.zero);
+  await _ensureRegistered(cursor);
   final args = registrations.single;
   final targetSize = (sourceSize / dpr).ceil();
   _expectSize(args, (targetSize, targetSize));
   final bytes = args['buffer'] as Uint8List;
   if (Platform.isWindows) {
-    expect(bytes.sublist(0, channels), [0, 0, pattern.$2, pattern.$2]);
+    expect(bytes.sublist(0, channels), [0, 0, pattern.$1.first, pattern.$2]);
   } else {
     final pixel = img.decodePng(bytes)!.getPixel(0, 0);
-    expect([pixel.r, pixel.g, pixel.b, pixel.a], [255, 0, 0, pattern.$2]);
+    expect([pixel.r, pixel.g, pixel.b, pixel.a],
+        [pattern.$1.first, 0, 0, pattern.$2]);
   }
 }
 
 Future<void> _checkSize(((int, int), double, (int, int)) scenario,
     List<Map<dynamic, dynamic>> registrations) async {
   final ffi = _FFI(_Canvas(kRemoteViewStyleAdaptive));
-  final cursor = _Cursor(_data(scenario.$1), ffi);
+  final data = await _data(scenario.$1);
+  final cursor = _Cursor(data, ffi);
   addTearDown(() => _dispose(cursor));
+  addTearDown(data.nativeImage.dispose);
   addTearDown(ffi.canvasModel.dispose);
   buildCursorOfCache(cursor, scenario.$2, cursor.cache);
-  await Future<void>.delayed(Duration.zero);
+  await _ensureRegistered(cursor);
   final (width, height) = scenario.$3;
-  expect(
-      (cursor.cache.rasterWidth, cursor.cache.rasterHeight), (width, height));
+  expect((
+    (cursor.cache.width * cursor.cache.scale).ceil(),
+    (cursor.cache.height * cursor.cache.scale).ceil()
+  ), (
+    width,
+    height
+  ));
   final args = registrations.single;
   final padded = Platform.isLinux && width != height;
   final side = width > height ? width : height;
@@ -244,24 +395,29 @@ void _expectSize(Map<dynamic, dynamic> args, (int, int) expected) {
 Future<void> _checkRasterTransitions(
     List<Map<dynamic, dynamic>> registrations) async {
   const delta = 3e-8;
-  const scaleAboveOne = (2.25 / 1.75) / 2.25 * 1.75;
+  const scaleBelowHalfPixel = 32.5 / 64 - delta;
+  const scaleAboveHalfPixel = 32.5 / 64 + delta;
+  const scaleAboveOne = 64.5 / 64 + delta;
   final ffi = _FFI(_Canvas(kRemoteViewStyleAdaptive));
-  final cursor = _Cursor(_data((64, 64)), ffi);
+  final data = await _data((64, 64));
+  final cursor = _Cursor(data, ffi);
   addTearDown(() => _dispose(cursor));
+  addTearDown(data.nativeImage.dispose);
   addTearDown(ffi.canvasModel.dispose);
   for (final (scale, expected) in [
     (scaleAboveOne, (65, 65)),
-    (0.5 - delta, (32, 32)),
-    (0.5 + delta, (33, 33)),
+    (scaleBelowHalfPixel, (32, 32)),
+    (scaleAboveHalfPixel, (33, 33)),
     (1.0, (64, 64)),
     (scaleAboveOne, (65, 65)),
     (1.0, (64, 64)),
   ]) {
     buildCursorOfCache(cursor, scale, cursor.cache);
-    await Future<void>.delayed(Duration.zero);
+    await _ensureRegistered(cursor);
     final key = cursor.cache.updateGetKey(scale);
     _expectSize(
-        registrations.singleWhere((args) => args['name'] == key), expected);
+        registrations.singleWhere((args) => args['name'] == '${key}_1.0'),
+        expected);
   }
   expect(registrations.length, 4);
 }
@@ -273,18 +429,25 @@ Future<void> _checkResizeLimits(
   const validScale = maxSide / sourceLongEdge;
   final ffi = _FFI(_Canvas(kRemoteViewStyleAdaptive));
   const hotspot = Offset(4, 7);
-  final cursor = _Cursor(_data(size, hotspot: hotspot), ffi);
+  final data = await _data(size, hotspot: hotspot);
+  final cursor = _Cursor(data, ffi);
   addTearDown(() => _dispose(cursor));
+  addTearDown(data.nativeImage.dispose);
   addTearDown(ffi.canvasModel.dispose);
   buildCursorOfCache(cursor, validScale, cursor.cache);
-  await Future<void>.delayed(Duration.zero);
-  final raster = ((size.$1 * validScale).ceil(), (size.$2 * validScale).ceil());
-  final expectedHotspot =
+  await _ensureRegistered(cursor);
+  final raster =
+      ((size.$1 * validScale).round(), (size.$2 * validScale).round());
+  final cacheHotspot = (hotspot.dx * validScale, hotspot.dy * validScale);
+  final encodedHotspot =
       (hotspot.dx * raster.$1 / size.$1, hotspot.dy * raster.$2 / size.$2);
+  final nativeHotspot = Platform.isWindows || Platform.isLinux
+      ? (encodedHotspot.$1.roundToDouble(), encodedHotspot.$2.roundToDouble())
+      : encodedHotspot;
   _expectSize(
       registrations.single, Platform.isLinux ? (maxSide, maxSide) : raster);
   expect((registrations.single['hotX'], registrations.single['hotY']),
-      expectedHotspot);
+      nativeHotspot);
   // Fail on a small allocation before reaching unsafe sizes without the guard.
   for (final scale in [
     (maxSide + 1) / sourceLongEdge,
@@ -295,13 +458,16 @@ Future<void> _checkResizeLimits(
     -1.0,
   ]) {
     buildCursorOfCache(cursor, scale, cursor.cache);
-    await Future<void>.delayed(Duration.zero);
+    await _ensureRegistered(cursor);
     expect(cursor.cache.scale, validScale);
-    expect((cursor.cache.rasterWidth, cursor.cache.rasterHeight), raster);
-    expect((cursor.cache.hotx, cursor.cache.hoty), expectedHotspot);
+    expect((
+      (cursor.cache.width * cursor.cache.scale).ceil(),
+      (cursor.cache.height * cursor.cache.scale).ceil()
+    ), raster);
+    expect((cursor.cache.hotx, cursor.cache.hoty), cacheHotspot);
   }
   buildCursorOfCache(cursor, 1.0, cursor.cache);
-  await Future<void>.delayed(Duration.zero);
+  await _ensureRegistered(cursor);
   expect(cursor.cache.scale, 1.0);
   _expectSize(registrations.last,
       Platform.isLinux ? (sourceLongEdge, sourceLongEdge) : size);
@@ -314,15 +480,18 @@ const _viewCases = [
 ];
 
 Future<void> _checkView(WidgetTester tester, (String, bool) mode,
-    List<Map<dynamic, dynamic>> registrations) async {
+    List<Map<dynamic, dynamic>> registrations,
+    {required double density}) async {
   const sourceSize = 64, customScale = 4.0;
   final canvas = _Canvas(mode.$1);
   final ffi = _FFI(canvas);
   final display = _Display();
   ffi.ffiModel.pi.displays.addAll([Display(), display]);
   ffi.ffiModel.pi.currentDisplay = 1;
-  final cursor = _Cursor(_data((sourceSize, sourceSize)), ffi);
+  final data = await _data((sourceSize, sourceSize), density: density);
+  final cursor = _Cursor(data, ffi);
   addTearDown(() => _dispose(cursor));
+  addTearDown(data.nativeImage.dispose);
   addTearDown(canvas.dispose);
   addTearDown(tester.view.resetDevicePixelRatio);
   for (final (dpr, peer, peerScale) in _viewCases) {
@@ -352,17 +521,43 @@ Future<void> _checkView(WidgetTester tester, (String, bool) mode,
         ),
       ),
     ));
+    await _ensureRegistered(cursor);
     final video = tester.widget<CustomPaint>(find.byType(CustomPaint)).painter
         as ImagePainter;
-    final scale = video.scale * (mode.$2 ? 1.0 : 1.0 / (canvas.scale * dpr));
-    final size = sourceSize * (peer == kPeerPlatformMacOS ? peerScale : 1.0);
-    final w = peer == kPeerPlatformMacOS &&
-            !mode.$2 &&
-            mode.$1 != kRemoteViewStyleOriginal
-        ? (sourceSize * (Platform.isWindows ? dpr : 1.0)).ceil()
-        : (size * scale * (Platform.isWindows ? dpr : 1.0)).ceil();
+    var expectedScale = Platform.isWindows
+        ? mode.$2 || mode.$1 == kRemoteViewStyleOriginal
+            ? video.scale * dpr
+            : 1.0
+        : mode.$2 || mode.$1 == kRemoteViewStyleOriginal
+            ? video.scale
+            : 1.0;
+    if (density == 0 && peer == kPeerPlatformMacOS) {
+      expectedScale = mode.$1 == kRemoteViewStyleOriginal
+          ? peerScale / (Platform.isWindows ? 1 : dpr)
+          : !mode.$2
+              ? (Platform.isWindows ? dpr : 1.0)
+              : expectedScale * peerScale;
+    } else if (density == 0 &&
+        peer == kPeerPlatformLinux &&
+        !mode.$2 &&
+        mode.$1 != kRemoteViewStyleOriginal) {
+      expectedScale = 1.0 / peerScale / (Platform.isWindows ? 1 : dpr);
+    } else if (density > 0 && !mode.$2 && mode.$1 != kRemoteViewStyleOriginal) {
+      expectedScale = (Platform.isWindows ? dpr : 1.0) / density;
+    }
+    const minimumScale = kMinCursorSize / sourceSize;
+    if (expectedScale != 1 && expectedScale < minimumScale) {
+      expectedScale = minimumScale;
+    }
+    expect(cursor.cache.scale, closeTo(expectedScale, 1e-9));
+    final w = Platform.isWindows
+        ? (sourceSize * expectedScale).round()
+        : Platform.isLinux
+            ? (sourceSize * expectedScale).round() * dpr.ceil()
+            : (sourceSize * expectedScale * dpr).round();
     final key = cursor.cache.updateGetKey(cursor.cache.scale);
-    _expectSize(registrations.singleWhere((v) => v['name'] == key), (w, w));
+    _expectSize(
+        registrations.singleWhere((v) => v['name'] == '${key}_$dpr'), (w, w));
   }
   await tester.pumpWidget(const SizedBox.shrink());
 }

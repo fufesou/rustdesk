@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod cursor_metadata;
+
 const HANDSHAKE_TIMEOUT_MS: u64 = 3000;
 const DRM_CONNECT_TIMEOUT_MS: u64 = 1000;
 /// The service may hold the list back while it wakes sleeping displays: ~3.6s (DRM_WAKE_*).
@@ -1034,23 +1036,63 @@ fn fold_cursor_id(id: u64, t: i32) -> u64 {
     }
 }
 
-fn with_drm_cursor<T>(f: impl Fn(&DrmCursorData) -> T) -> Option<T> {
-    let map = DRM_CURSOR.lock().unwrap();
-    map.values()
-        .map(|(_, c)| c)
-        .find(|c| c.id != scrap::drm_reader::HIDDEN_CURSOR_ID)
-        .or_else(|| map.values().map(|(_, c)| c).next())
-        .map(f)
+/// Snapshot of the DRM hardware cursor and optional display metadata. Pixels retain the
+/// premultiplied format used by the XFixes path.
+pub fn drm_cursor_snapshot<T>(
+    f: impl Fn(&DrmCursorData) -> T,
+) -> Option<(T, Option<base::platform::linux::WaylandDisplayInfo>)> {
+    use scrap::wayland::display::{get_cached_displays, wayland_snapshot_generation};
+
+    // Keep cursor identity and output together, then release the map before DRM_STATE.
+    let (value, display, epoch, hidden) = {
+        let map = DRM_CURSOR.lock().unwrap();
+        let (display, (epoch, cursor)) = map
+            .iter()
+            .find(|(_, (_, cursor))| cursor.id != scrap::drm_reader::HIDDEN_CURSOR_ID)
+            .or_else(|| map.iter().next())?;
+        (
+            f(cursor),
+            *display,
+            *epoch,
+            cursor.id == scrap::drm_reader::HIDDEN_CURSOR_ID,
+        )
+    };
+    let monitor = if hidden {
+        None
+    } else {
+        cursor_metadata::monitor(
+            cursor_metadata::Context {
+                display,
+                epoch,
+                layout_generation: wayland_snapshot_generation(),
+            },
+            get_cached_displays(),
+            |wayland| {
+                cursor_monitor(
+                    display.max(0) as usize,
+                    &DRM_STATE.lock().unwrap(),
+                    &wayland.displays,
+                )
+            },
+        )
+    };
+    Some((value, monitor))
 }
 
-pub fn drm_cursor_id() -> Option<u64> {
-    with_drm_cursor(|c| c.id)
-}
-
-/// Snapshot of the DRM hardware cursor, or None. The pixels are premultiplied ARGB and are passed
-/// through as-is, like the XFixes path, so the client sees one cursor format from either backend.
-pub fn drm_cursor() -> Option<DrmCursorData> {
-    with_drm_cursor(|c| c.clone())
+fn cursor_monitor(
+    display: usize,
+    state: &ProbeState,
+    monitors: &[base::platform::linux::WaylandDisplayInfo],
+) -> Option<base::platform::linux::WaylandDisplayInfo> {
+    let ProbeState::Available(_, displays) = state else {
+        return None;
+    };
+    // Reserve every connector's name match before guessing this cursor's density.
+    let index = identity_matches(displays, monitors)
+        .get(display)
+        .copied()
+        .flatten()?;
+    monitors.get(index).cloned()
 }
 
 enum ProbeState {
@@ -2551,6 +2593,7 @@ mod drm_capturer_tests {
             width: w,
             height: h,
             logical_size: Some((w, h)),
+            scale_factor: 1,
             refresh_rate: 60,
             transform: 0,
         }

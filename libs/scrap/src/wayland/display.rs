@@ -248,6 +248,25 @@ pub fn wayland_failure_stamped() -> bool {
     LAST_FAILED_LOOKUP.lock().unwrap().is_some()
 }
 
+#[cfg(feature = "drm")]
+pub enum CachedDisplays {
+    Busy,
+    Ready(Option<Arc<Displays>>),
+}
+
+/// Cursor polls must neither wait for discovery nor mistake contention for missing metadata.
+#[cfg(feature = "drm")]
+pub fn get_cached_displays() -> CachedDisplays {
+    match DISPLAYS.try_lock() {
+        Ok(cache) => CachedDisplays::Ready(cache.clone()),
+        Err(std::sync::TryLockError::WouldBlock) => CachedDisplays::Busy,
+        Err(err) => {
+            warn!("Failed to read cached Wayland displays: {}", err);
+            CachedDisplays::Ready(None)
+        }
+    }
+}
+
 pub fn get_displays() -> Arc<Displays> {
     let mut lock = DISPLAYS.lock().unwrap();
     match lock.as_ref() {
@@ -337,6 +356,17 @@ pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<Display
     }
     match enumerate_displays() {
         Ok(displays) => {
+            #[cfg(feature = "drm")]
+            {
+                // Output density can change without moving any desktop-coordinate rectangle.
+                let mut cache = DISPLAYS.lock().unwrap();
+                if let Some(updated) = cache
+                    .as_deref()
+                    .and_then(|cached| updated_cursor_scales(cached, &displays))
+                {
+                    *cache = Some(Arc::new(updated));
+                }
+            }
             desktop_rect_of(&displays).map(|rect| (rect, logical_rects_of(&displays)))
         }
         Err(_err) => {
@@ -345,6 +375,30 @@ pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<Display
             None
         }
     }
+}
+
+#[cfg(feature = "drm")]
+fn updated_cursor_scales(cached: &Displays, live: &[WaylandDisplayInfo]) -> Option<Displays> {
+    let mut displays = cached.displays.clone();
+    let mut changed = false;
+    for output in &mut displays {
+        // Geometry changes retain the existing layout invalidation/rebuild path.
+        let Some(current) = live.iter().find(|d| {
+            d.name == output.name
+                && (d.x, d.y) == (output.x, output.y)
+                && (d.width, d.height) == (output.width, output.height)
+                && d.transform == output.transform
+                && d.logical_size == output.logical_size
+        }) else {
+            continue;
+        };
+        changed |= output.scale_factor != current.scale_factor;
+        output.scale_factor = current.scale_factor;
+    }
+    changed.then_some(Displays {
+        primary: cached.primary,
+        displays,
+    })
 }
 
 fn desktop_rect_of(displays: &[WaylandDisplayInfo]) -> Option<(i32, i32, i32, i32)> {
@@ -564,6 +618,7 @@ mod tests {
             width,
             height,
             logical_size,
+            scale_factor: 1,
             refresh_rate: 60,
             transform: 0,
         }
