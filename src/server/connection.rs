@@ -322,6 +322,8 @@ impl PressedMouseButtons {
 enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Mouse(InputMouse),
+    #[cfg(windows)]
+    RetryMouseReleases,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Key((KeyEvent, bool)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1328,6 +1330,10 @@ impl Connection {
                             mouse_input.simulate,
                             mouse_input.show_cursor,
                         );
+                    }
+                    #[cfg(windows)]
+                    MessageInput::RetryMouseReleases => {
+                        crate::portable_service::client::retry_mouse_releases();
                     }
                     MessageInput::Key((mut msg, press)) => {
                         // Set the press state to false, use `down` only in `handle_key()`.
@@ -2518,6 +2524,10 @@ impl Connection {
             if let Err(err) = self.tx_input.send(MessageInput::Mouse(input)) {
                 log::warn!("Failed to release held mouse button: {}", err);
             }
+        }
+        #[cfg(windows)]
+        if let Err(err) = self.tx_input.send(MessageInput::RetryMouseReleases) {
+            log::warn!("Failed to queue pending mouse releases: {}", err);
         }
     }
 

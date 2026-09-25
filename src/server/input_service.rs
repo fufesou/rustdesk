@@ -489,20 +489,26 @@ enum KeysDown {
 }
 
 #[derive(Default)]
-struct MouseButtonOwners(HashMap<i32, HashSet<i32>>);
+struct MouseButtonOwners {
+    owners: HashMap<i32, HashSet<i32>>,
+    #[cfg(windows)]
+    pending_releases: HashMap<i32, (i32, MouseEvent)>,
+}
 
 impl MouseButtonOwners {
     fn press(&mut self, conn: i32, button: i32) {
-        self.0.entry(button).or_default().insert(conn);
+        self.owners.entry(button).or_default().insert(conn);
+        #[cfg(windows)]
+        self.pending_releases.remove(&button);
     }
 
     fn release(&mut self, conn: i32, button: i32) -> bool {
-        if let Some(owners) = self.0.get_mut(&button) {
+        if let Some(owners) = self.owners.get_mut(&button) {
             owners.remove(&conn);
             if !owners.is_empty() {
                 return false;
             }
-            self.0.remove(&button);
+            self.owners.remove(&button);
         }
         true
     }
@@ -541,11 +547,35 @@ pub(super) fn dispatch_mouse(
     // Keep ownership in the originating process when the injection backend changes.
     let mut owners = MOUSE_BUTTON_OWNERS.lock().unwrap();
     let simulate = evt_type != MOUSE_TYPE_UP || owners.release(conn, button);
-    dispatch(simulate)?;
-    if evt_type == MOUSE_TYPE_DOWN {
+    let result = dispatch(simulate);
+    if evt_type == MOUSE_TYPE_DOWN && result.is_ok() {
         owners.press(conn, button);
+    } else if evt_type == MOUSE_TYPE_UP && simulate {
+        if result.is_ok() {
+            owners.pending_releases.remove(&button);
+        } else {
+            // The peer already released; retain delivery work without retaining a hold.
+            owners.pending_releases.insert(button, (conn, evt.clone()));
+        }
     }
-    Ok(())
+    result
+}
+
+#[cfg(windows)]
+pub(super) fn retry_mouse_releases(
+    mut dispatch: impl FnMut(&MouseEvent, i32) -> enigo::ResultType,
+) {
+    let mut owners = MOUSE_BUTTON_OWNERS.lock().unwrap();
+    owners.pending_releases.retain(|button, (conn, evt)| {
+        if let Err(err) = dispatch(evt, *conn) {
+            log::warn!(
+                "Failed to retry mouse release for connection {conn}, button {button}: {err}"
+            );
+            true
+        } else {
+            false
+        }
+    });
 }
 
 lazy_static::lazy_static! {
@@ -912,6 +942,8 @@ pub fn fix_key_down_timeout_loop() {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(10_000));
         fix_key_down_timeout(false);
+        #[cfg(windows)]
+        crate::portable_service::client::retry_mouse_releases();
     });
     if let Err(err) = ctrlc::set_handler(move || {
         fix_key_down_timeout_at_exit();

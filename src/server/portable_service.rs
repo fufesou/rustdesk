@@ -1571,6 +1571,24 @@ pub mod client {
         }
     }
 
+    pub fn retry_mouse_releases() {
+        crate::input_service::retry_mouse_releases(|evt, conn| {
+            if RUNNING.lock().unwrap().clone() {
+                handle_mouse_(evt, conn, String::new(), u32::default(), true, false)
+                    .map_err(|err| err.to_string().into())
+            } else {
+                crate::input_service::handle_mouse_(
+                    evt,
+                    conn,
+                    String::new(),
+                    u32::default(),
+                    true,
+                    false,
+                )
+            }
+        });
+    }
+
     pub fn handle_pointer(evt: &PointerDeviceEvent, conn: i32) {
         if RUNNING.lock().unwrap().clone() {
             crate::input_service::update_latest_input_cursor_time(conn);
