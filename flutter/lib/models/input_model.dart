@@ -1920,6 +1920,7 @@ class InputModel {
     bool moveCanvas = true,
     bool edgeScroll = false,
   }) {
+    final isMoveEvent = isMove;
     final ffiModel = parent.target!.ffiModel;
     CanvasCoords canvas =
         CanvasCoords.fromCanvasModel(parent.target!.canvasModel);
@@ -1970,7 +1971,7 @@ class InputModel {
       onExit: onExit,
       buttons: buttons,
     );
-    _rememberRemotePointer(point, isMove);
+    _rememberRemotePointer(point, isMoveEvent);
     return point;
   }
 

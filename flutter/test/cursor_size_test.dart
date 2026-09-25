@@ -2,11 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart' show kPrimaryMouseButton;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_custom_cursor/cursor_manager.dart' show CursorManager;
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
+import 'package:flutter_hbb/main.dart' show kWindowId;
 import 'package:flutter_hbb/models/input_model.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/native/custom_cursor.dart';
@@ -42,6 +44,15 @@ class _Canvas extends ChangeNotifier implements CanvasModel {
   @override
   double get y => 0;
   @override
+  double get scrollX => 0;
+  @override
+  double get scrollY => 0;
+  @override
+  ScrollStyle get scrollStyle => ScrollStyle.scrollauto;
+  int localCursorUpdates = 0;
+  @override
+  void updateLocalCursor(double x, double y) => localCursorUpdates++;
+  @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
@@ -70,6 +81,8 @@ class _Peer extends Fake implements FfiModel {
   @override
   final pi = PeerInfo();
   @override
+  Rect? rect;
+  @override
   bool get isPeerLinux => pi.platform == kPeerPlatformLinux;
   @override
   bool get isPeerWindows => pi.platform == kPeerPlatformWindows;
@@ -85,6 +98,24 @@ class _FFI extends Fake implements FFI {
   final ffiModel = _Peer();
   @override
   final inputModel = _Input();
+  @override
+  late final cursorModel = CursorModel(WeakReference(this));
+}
+
+class _RoutingInput extends InputModel {
+  _RoutingInput(super.parent);
+  @override
+  bool get isViewOnly => false;
+  @override
+  bool get isViewCamera => false;
+  Map<String, dynamic>? lastEvent;
+  @override
+  Map<String, dynamic>? handleMouse(Map<String, dynamic> evt, Offset offset,
+          {bool onExit = false,
+          bool moveCanvas = true,
+          bool edgeScroll = false}) =>
+      lastEvent = processEventToPeer(evt, offset,
+          onExit: onExit, moveCanvas: false, edgeScroll: edgeScroll);
 }
 
 class _Cursor extends CursorModel {
@@ -174,6 +205,74 @@ void main() {
     ffi.inputModel.remotePointerPosition.value = const Offset(10, 20);
     await peer.updateCurDisplay(ffi.sessionId);
     expect(ffi.inputModel.remotePointerPosition.value, isNull);
+  });
+  testWidgets(
+      'routed drag remembers the destination without moving the canvas',
+      (tester) => tester.runAsync(() async {
+            final canvas = _Canvas(kRemoteViewStyleAdaptive)..scale = 1;
+            final ffi = _FFI(canvas);
+            (ffi.ffiModel as _Peer).rect = const Rect.fromLTWH(0, 0, 800, 320);
+            ffi.ffiModel.pi
+              ..platform = kPeerPlatformLinux
+              ..currentDisplay = kAllDisplayValue;
+            final input = _RoutingInput(WeakReference(ffi));
+            // Relative mode never starts; close its observer without native teardown.
+            addTearDown(input.relativeMouseMode.close);
+            addTearDown(ffi.cursorModel.dispose);
+            addTearDown(canvas.dispose);
+            _mockRoutingWindow(tester);
+            final origin =
+                Offset(CanvasModel.leftToEdge, CanvasModel.topToEdge);
+            final start = origin + const Offset(10, 10);
+            input.onPointHoverImage(PointerHoverEvent(
+                kind: ui.PointerDeviceKind.mouse, position: start));
+            expect(input.remotePointerPosition.value, const Offset(10, 10));
+            input.onPointDownImage(PointerDownEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: start,
+                buttons: kPrimaryMouseButton));
+            input.onPointMoveImage(PointerMoveEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: start,
+                buttons: kPrimaryMouseButton));
+            await Future<void>.delayed(Duration.zero);
+            final localUpdates = canvas.localCursorUpdates;
+            input.onPointMoveImage(PointerMoveEvent(
+                kind: ui.PointerDeviceKind.mouse,
+                position: origin + const Offset(325, 30),
+                buttons: kPrimaryMouseButton));
+            expect(
+                (input.lastEvent?['x'], input.lastEvent?['y']), ('450', '60'));
+            expect(input.remotePointerPosition.value, const Offset(450, 60));
+            expect(canvas.localCursorUpdates, localUpdates);
+          }));
+}
+
+void _mockRoutingWindow(WidgetTester tester) {
+  const windows = MethodChannel('mixin.one/flutter_multi_window');
+  const events = MethodChannel('mixin.one/flutter_multi_window_channel');
+  final previousWindowId = kWindowId;
+  kWindowId = 1;
+  final destination = RemoteWindowCoords(
+      const Rect.fromLTWH(300, 0, 200, 160),
+      CanvasCoords()
+        ..scale = 0.5
+        ..size = const Size(200, 160),
+      CursorCoords(),
+      const Rect.fromLTWH(400, 0, 400, 320));
+  final messenger = tester.binding.defaultBinaryMessenger;
+  messenger.setMockMethodCallHandler(events, (call) async {
+    expect(call.method, kWindowEventRemoteWindowCoords);
+    return jsonEncode([jsonEncode(destination.toJson())]);
+  });
+  messenger.setMockMethodCallHandler(windows, (call) async {
+    expect(call.method, 'getFrame');
+    return {'x': 0.0, 'y': 0.0, 'width': 200.0, 'height': 160.0};
+  });
+  addTearDown(() {
+    kWindowId = previousWindowId;
+    messenger.setMockMethodCallHandler(windows, null);
+    messenger.setMockMethodCallHandler(events, null);
   });
 }
 
