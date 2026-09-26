@@ -253,9 +253,77 @@ struct InputMouse {
     show_cursor: bool,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MOUSE_BUTTON_SHIFT: u32 = 3;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Default)]
+struct PressedMouseButtons {
+    pressed: i32,
+    force_released: i32,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl PressedMouseButtons {
+    fn record(&mut self, event: &MouseEvent, keyboard_enabled: bool) -> bool {
+        use crate::input::*;
+
+        let button = event.mask >> MOUSE_BUTTON_SHIFT;
+        if !matches!(
+            button,
+            MOUSE_BUTTON_LEFT
+                | MOUSE_BUTTON_RIGHT
+                | MOUSE_BUTTON_WHEEL
+                | MOUSE_BUTTON_BACK
+                | MOUSE_BUTTON_FORWARD
+        ) {
+            return true;
+        }
+        match event.mask & MOUSE_TYPE_MASK {
+            MOUSE_TYPE_DOWN if keyboard_enabled => {
+                self.force_released &= !button;
+                self.pressed |= button;
+            }
+            // A rejected down must not leave an unpaired up after control returns.
+            MOUSE_TYPE_DOWN => self.force_released |= button,
+            MOUSE_TYPE_UP if self.force_released & button != 0 => {
+                self.force_released &= !button;
+                return false;
+            }
+            MOUSE_TYPE_UP if keyboard_enabled => self.pressed &= !button,
+            _ => {}
+        }
+        true
+    }
+
+    fn take_releases(&mut self) -> Vec<MouseEvent> {
+        use crate::input::*;
+
+        let pressed = std::mem::take(&mut self.pressed);
+        self.force_released |= pressed;
+        [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_WHEEL,
+            MOUSE_BUTTON_BACK,
+            MOUSE_BUTTON_FORWARD,
+        ]
+        .iter()
+        .copied()
+        .filter(|button| pressed & button != 0)
+        .map(|button| MouseEvent {
+            mask: (button << MOUSE_BUTTON_SHIFT) | MOUSE_TYPE_UP,
+            ..Default::default()
+        })
+        .collect()
+    }
+}
+
 enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Mouse(InputMouse),
+    #[cfg(windows)]
+    RetryMouseReleases,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Key((KeyEvent, bool)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -375,6 +443,8 @@ pub struct Connection {
     require_2fa: Option<totp_rs::TOTP>,
     awaiting_2fa: bool,
     keyboard: bool,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pressed_mouse_buttons: PressedMouseButtons,
     clipboard: bool,
     audio: bool,
     file: bool,
@@ -588,6 +658,8 @@ impl Connection {
             authorized: false,
             unauthorized_id: Some(unauthorized),
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            pressed_mouse_buttons: PressedMouseButtons::default(),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
             audio: Self::permission(keys::OPTION_ENABLE_AUDIO, &control_permissions),
             // to-do: make sure is the option correct here
@@ -798,6 +870,10 @@ impl Connection {
                         ipc::Data::SwitchPermission{name, enabled} => {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                if !enabled {
+                                    conn.release_pressed_mouse_buttons();
+                                }
                                 conn.keyboard = enabled;
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 if let Some(s) = conn.server.upgrade() {
@@ -1259,6 +1335,10 @@ impl Connection {
                             mouse_input.simulate,
                             mouse_input.show_cursor,
                         );
+                    }
+                    #[cfg(windows)]
+                    MessageInput::RetryMouseReleases => {
+                        crate::portable_service::client::retry_mouse_releases();
                     }
                     MessageInput::Key((mut msg, press)) => {
                         // Set the press state to false, use `down` only in `handle_key()`.
@@ -2435,6 +2515,27 @@ impl Connection {
             .ok();
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn release_pressed_mouse_buttons(&mut self) {
+        for msg in self.pressed_mouse_buttons.take_releases() {
+            let input = InputMouse {
+                msg,
+                conn_id: self.inner.id(),
+                username: self.lr.my_name.clone(),
+                argb: self.peer_argb,
+                simulate: true,
+                show_cursor: self.show_my_cursor,
+            };
+            if let Err(err) = self.tx_input.send(MessageInput::Mouse(input)) {
+                log::warn!("Failed to release held mouse button: {}", err);
+            }
+        }
+        #[cfg(windows)]
+        if let Err(err) = self.tx_input.send(MessageInput::RetryMouseReleases) {
+            log::warn!("Failed to queue pending mouse releases: {}", err);
+        }
+    }
+
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn input_pointer(&self, msg: PointerDeviceEvent, conn_id: i32) {
@@ -3156,7 +3257,10 @@ impl Connection {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if self.peer_keyboard_enabled() {
+                    let keyboard_enabled = self.peer_keyboard_enabled();
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if self.pressed_mouse_buttons.record(&me, keyboard_enabled) && keyboard_enabled
+                    {
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
@@ -4981,6 +5085,10 @@ impl Connection {
         }
         if let Ok(q) = o.disable_keyboard.enum_value() {
             if q != BoolOption::NotSet {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if q == BoolOption::Yes && !self.disable_keyboard {
+                    self.release_pressed_mouse_buttons();
+                }
                 self.disable_keyboard = q == BoolOption::Yes;
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
@@ -5236,6 +5344,8 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.release_pressed_mouse_buttons();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //

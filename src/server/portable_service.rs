@@ -783,7 +783,7 @@ pub mod server {
                                     }
                                     Mouse((v, conn, username, argb, simulate, show_cursor)) => {
                                         if let Ok(evt) = MouseEvent::parse_from_bytes(&v) {
-                                            crate::input_service::handle_mouse_(&evt, conn, username, argb, simulate, show_cursor);
+                                            allow_err!(crate::input_service::handle_mouse_(&evt, conn, username, argb, simulate, show_cursor));
                                         }
                                     }
                                     Pointer((v, conn)) => {
@@ -1548,12 +1548,45 @@ pub mod client {
         simulate: bool,
         show_cursor: bool,
     ) {
-        if RUNNING.lock().unwrap().clone() {
-            crate::input_service::update_latest_input_cursor_time(conn);
-            handle_mouse_(evt, conn, username, argb, simulate, show_cursor).ok();
+        let dispatch = |simulate| -> enigo::ResultType {
+            if RUNNING.lock().unwrap().clone() {
+                crate::input_service::update_latest_input_cursor_time(conn);
+                handle_mouse_(evt, conn, username, argb, simulate, show_cursor)
+                    .map_err(|err| err.to_string().into())
+            } else {
+                crate::input_service::handle_mouse_(
+                    evt,
+                    conn,
+                    username,
+                    argb,
+                    simulate,
+                    show_cursor,
+                )
+            }
+        };
+        if simulate {
+            allow_err!(crate::input_service::dispatch_mouse(evt, conn, dispatch));
         } else {
-            crate::input_service::handle_mouse_(evt, conn, username, argb, simulate, show_cursor);
+            allow_err!(dispatch(false));
         }
+    }
+
+    pub fn retry_mouse_releases() {
+        crate::input_service::retry_mouse_releases(|evt, conn| {
+            if RUNNING.lock().unwrap().clone() {
+                handle_mouse_(evt, conn, String::new(), u32::default(), true, false)
+                    .map_err(|err| err.to_string().into())
+            } else {
+                crate::input_service::handle_mouse_(
+                    evt,
+                    conn,
+                    String::new(),
+                    u32::default(),
+                    true,
+                    false,
+                )
+            }
+        });
     }
 
     pub fn handle_pointer(evt: &PointerDeviceEvent, conn: i32) {
