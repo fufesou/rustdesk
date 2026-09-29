@@ -104,17 +104,18 @@ resetSystemCursor() => CursorManager.instance.resetSystemCursor();
 MouseCursor buildCursorOfCache(
     model.CursorModel cursor, double scale, model.CursorData? cache) {
   if (cache == null) {
-    return MouseCursor.defer;
+    return _shownCursor(cursor);
   } else {
     // A short-edge minimum can enlarge thin artwork beyond CSS cursor limits.
     // Keep unzoomed images unchanged and use the long edge when resizing.
-    final key = cache.updateGetKey(scale, useLegacyMinimum: scale == 1.0);
+    final key = cursor.nativeKey(cache, scale, useLegacyMinimum: scale == 1.0);
     if (key == null) return MouseCursor.defer;
     if (!cursor.cachedKeys.contains(key)) {
       // data should be checked here, because it may be changed after `updateGetKey()`
       final data = cache.data;
       if (data == null) {
-        return MouseCursor.defer;
+        cursor.restorePixels(cache.id);
+        return _shownCursor(cursor);
       }
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
@@ -126,7 +127,17 @@ MouseCursor buildCursorOfCache(
           hotX: cache.hotx,
           hotY: cache.hoty));
       cursor.addKey(key);
+      cursor.registered(cache, key);
     }
+    cursor.shown(cache, key);
     return FlutterCustomMemoryImageCursor(key: key);
   }
+}
+
+// The last shape's cursor stays while the one in use is made, rather than the system one.
+MouseCursor _shownCursor(model.CursorModel cursor) {
+  final key = cursor.shownKey;
+  return key == null
+      ? MouseCursor.defer
+      : FlutterCustomMemoryImageCursor(key: key);
 }

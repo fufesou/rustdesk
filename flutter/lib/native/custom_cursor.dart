@@ -20,7 +20,7 @@ resetSystemCursor() {}
 MouseCursor buildCursorOfCache(
     CursorModel cursor, double scale, CursorData? cache) {
   if (cache == null) {
-    return MouseCursor.defer;
+    return _shownCursor(cursor);
   } else {
     // Include the live DPR so moving between monitors rebuilds the native
     // bitmap even when the remote view scale has not changed.
@@ -36,13 +36,17 @@ MouseCursor buildCursorOfCache(
         ? math.max(
             scale, kMinCursorSize * dpr / math.max(cache.width, cache.height))
         : scale;
-    final cacheKey = cache.updateGetKey(effectiveScale,
+    final key = cursor.nativeKey(cache, effectiveScale,
         resizeImage: false,
         useLegacyMinimum: legacyMinimum,
-        rasterScale: isWindows ? 1 : (isLinux ? dpr.ceilToDouble() : dpr));
-    if (cacheKey == null) return MouseCursor.defer;
-    final key = '${cacheKey}_$dpr';
+        rasterScale: isWindows ? 1 : (isLinux ? dpr.ceilToDouble() : dpr),
+        devicePixelRatio: dpr);
+    if (key == null) return MouseCursor.defer;
     if (!cursor.cachedKeys.contains(key)) {
+      if (!cache.hasPixels) {
+        cursor.restorePixels(cache.id);
+        return _shownCursor(cursor);
+      }
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
       unawaited(custom_cursor_manager.CursorManager.instance
@@ -55,8 +59,10 @@ MouseCursor buildCursorOfCache(
         scale: isWindows ? cache.scale / dpr : cache.scale,
         devicePixelRatio: dpr,
       )
-          .then<void>((_) {}, onError: (Object error, StackTrace stack) {
+          .then<void>((_) => cursor.registered(cache, key),
+              onError: (Object error, StackTrace stack) {
         cursor.cachedKeys.remove(key);
+        if (cursor.shownKey == key) cursor.shownKey = null;
         FlutterError.reportError(FlutterErrorDetails(
             exception: error,
             stack: stack,
@@ -65,9 +71,20 @@ MouseCursor buildCursorOfCache(
       }));
       cursor.addKey(key);
     }
+    cursor.shown(cache, key);
     return FlutterCustomMemoryImageCursor(
         key: key,
         registrationToken: custom_cursor_manager.CursorManager.instance
             .registrationTokenFor(key));
   }
+}
+
+MouseCursor _shownCursor(CursorModel cursor) {
+  final key = cursor.shownKey;
+  return key == null
+      ? MouseCursor.defer
+      : FlutterCustomMemoryImageCursor(
+          key: key,
+          registrationToken: custom_cursor_manager.CursorManager.instance
+              .registrationTokenFor(key));
 }

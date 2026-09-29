@@ -100,6 +100,8 @@ class _FFI extends Fake implements FFI {
   final inputModel = _Input();
   @override
   late final cursorModel = CursorModel(WeakReference(this));
+  @override
+  var id = '';
 }
 
 class _RoutingInput extends InputModel {
@@ -324,15 +326,14 @@ Future<void> _checkWindowsPeerAlpha(
   addTearDown(() => _dispose(cursor));
   addTearDown(cursor.disposeImages);
   addTearDown(ffi.canvasModel.dispose);
-  await cursor.updateCursorData({
-    'id': 'alpha',
-    'hotx': '0',
-    'hoty': '0',
-    'width': '$sourceSize',
-    'height': '$sourceSize',
-    'colors': jsonEncode(List.generate(sourceSize * sourceSize * channels,
-        (i) => pattern.$1[i % pattern.$1.length])),
-  });
+  await cursor.updateCursorData(
+      'alpha',
+      0,
+      0,
+      sourceSize,
+      sourceSize,
+      Uint8List.fromList(List.generate(sourceSize * sourceSize * channels,
+          (i) => pattern.$1[i % pattern.$1.length])));
   buildCursorOfCache(cursor, 1.0 / dpr, cursor.cache);
   await _ensureRegistered(cursor);
   final args = registrations.single;
@@ -414,10 +415,10 @@ Future<void> _checkRasterTransitions(
   ]) {
     buildCursorOfCache(cursor, scale, cursor.cache);
     await _ensureRegistered(cursor);
-    final key = cursor.cache.updateGetKey(scale);
+    final key = cursor.nativeKey(cursor.cache, scale,
+        resizeImage: false, devicePixelRatio: 1.0);
     _expectSize(
-        registrations.singleWhere((args) => args['name'] == '${key}_1.0'),
-        expected);
+        registrations.singleWhere((args) => args['name'] == key), expected);
   }
   expect(registrations.length, 4);
 }
@@ -555,9 +556,9 @@ Future<void> _checkView(WidgetTester tester, (String, bool) mode,
         : Platform.isLinux
             ? (sourceSize * expectedScale).round() * dpr.ceil()
             : (sourceSize * expectedScale * dpr).round();
-    final key = cursor.cache.updateGetKey(cursor.cache.scale);
-    _expectSize(
-        registrations.singleWhere((v) => v['name'] == '${key}_$dpr'), (w, w));
+    final key = cursor.nativeKey(cursor.cache, cursor.cache.scale,
+        resizeImage: false, devicePixelRatio: dpr);
+    _expectSize(registrations.singleWhere((v) => v['name'] == key), (w, w));
   }
   await tester.pumpWidget(const SizedBox.shrink());
 }
