@@ -97,6 +97,7 @@ use windows_service::{
 use winreg::{enums::*, RegKey};
 
 mod acl;
+mod cursor;
 mod installer_handoff;
 mod installer_shell;
 mod msi_registry;
@@ -215,7 +216,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         if ci.flags & CURSOR_SHOWING == 0 {
             Ok(None)
         } else {
-            Ok(Some(ci.hCursor as _))
+            cursor::capture(&ci).map(Some)
         }
     }
 }
@@ -260,8 +261,9 @@ impl Drop for IconInfo {
 // https://github.com/TurboVNC/tightvnc/blob/a235bae328c12fd1c3aed6f3f034a37a6ffbbd22/vnc_winsrc/winvnc/vncEncoder.cpp
 // https://github.com/TigerVNC/tigervnc/blob/master/win/rfb_win32/DeviceFrameBuffer.cxx
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
+    let (handle, scale) = cursor::captured(hcursor)?;
     unsafe {
-        let mut ii = IconInfo::new(hcursor as _)?;
+        let mut ii = IconInfo::new(handle as _)?;
         let bm_mask = get_bitmap(ii.0.hbmMask)?;
         let mut width = bm_mask.bmWidth;
         let mut height = if ii.is_color() {
@@ -332,6 +334,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             hoty: ii.0.yHotspot as _,
             width: width as _,
             height: height as _,
+            scale,
             ..Default::default()
         })
     }
