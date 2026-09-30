@@ -1125,14 +1125,8 @@ class _ImagePaintState extends State<ImagePaint> {
                 zoom: zoomCursor.isTrue, dpr: dpr);
             if (legacyScale != null) return legacyScale;
             final peerDpr = cache?.pixelRatio ?? 0;
-            if (isViewScaled() &&
-                zoomCursor.isFalse &&
-                peerDpr > 0 &&
-                (!isWeb ||
-                    widget.ffi.ffiModel.pi.platform == kPeerPlatformMacOS)) {
+            if (isViewScaled() && zoomCursor.isFalse && peerDpr > 0) {
               // Normalize to logical size; Windows takes physical pixels here.
-              // Web normalizes only macOS's optional Retina image, preserving
-              // the existing unzoomed sizing policy for other hosts.
               return (isWindows ? dpr : 1.0) / peerDpr;
             }
             if (isDesktop &&
