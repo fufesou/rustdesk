@@ -1,11 +1,11 @@
 import 'dart:convert';
 import 'dart:js' as js;
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'package:flutter_hbb/models/model.dart' as model;
+import 'cursor_image.dart';
 
 class CursorData {
   final String key;
@@ -117,13 +117,15 @@ MouseCursor buildCursorOfCache(
         cursor.restorePixels(cache.id);
         return _shownCursor(cursor);
       }
+      final webCursor = trimWebCursor(data,
+          hotX: cache.hotx.round(), hotY: cache.hoty.round());
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
       CursorManager.instance.registerCursor(CursorData(
           key: key,
-          url: 'data:image/rgba;base64,${base64Encode(data)}',
-          width: max(1, (cache.width * cache.scale).round()),
-          height: max(1, (cache.height * cache.scale).round()),
+          url: 'data:image/rgba;base64,${base64Encode(webCursor.png)}',
+          width: webCursor.width,
+          height: webCursor.height,
           hotX: cache.hotx,
           hotY: cache.hoty));
       cursor.addKey(key);
