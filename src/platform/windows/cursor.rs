@@ -26,9 +26,19 @@ thread_local! {
 pub(super) fn capture(info: &CURSORINFO) -> ResultType<u64> {
     let scale = monitor_scale(info.ptScreenPos)?;
     let handle = info.hCursor as u64;
-    // A shared OS handle can remain unchanged when the pointer crosses DPI boundaries.
+    let icon = super::IconInfo::new(info.hCursor)?;
+    let bitmap = super::get_bitmap(icon.0.hbmMask)?;
+    // Windows can keep a cursor handle while its DPI variant changes.
     let mut hash = DefaultHasher::new();
-    (handle, scale.to_bits()).hash(&mut hash);
+    (
+        handle,
+        scale.to_bits(),
+        bitmap.bmWidth,
+        bitmap.bmHeight,
+        icon.0.xHotspot,
+        icon.0.yHotspot,
+    )
+        .hash(&mut hash);
     const MAX_CURSOR_ID: u64 = (1 << 53) - 1;
     let id = hash.finish() % MAX_CURSOR_ID + 1;
     CAPTURE.with(|capture| capture.set(Some(Capture { id, handle, scale })));
