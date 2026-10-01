@@ -380,20 +380,23 @@ pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<Display
 #[cfg(feature = "drm")]
 fn updated_cursor_scales(cached: &Displays, live: &[WaylandDisplayInfo]) -> Option<Displays> {
     let mut displays = cached.displays.clone();
+    let single = matches!((displays.as_slice(), live), ([_], [_]));
     let mut changed = false;
     for output in &mut displays {
-        // Geometry changes retain the existing layout invalidation/rebuild path.
+        // Multi-display geometry changes retain the existing layout invalidation/rebuild path.
         let Some(current) = live.iter().find(|d| {
             d.name == output.name
                 && (d.x, d.y) == (output.x, output.y)
                 && (d.width, d.height) == (output.width, output.height)
                 && d.transform == output.transform
-                && d.logical_size == output.logical_size
+                && (single || d.logical_size == output.logical_size)
         }) else {
             continue;
         };
-        changed |= output.scale_factor != current.scale_factor;
+        changed |= output.scale_factor != current.scale_factor
+            || output.logical_size != current.logical_size;
         output.scale_factor = current.scale_factor;
+        output.logical_size = current.logical_size;
     }
     changed.then_some(Displays {
         primary: cached.primary,
@@ -807,6 +810,20 @@ mod tests {
             logical_rects_of(&displays),
             vec![rect("", 0, 0, 2560, 1440)]
         );
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn single_display_cursor_density_tracks_live_scale() {
+        let mut cached = Displays {
+            primary: 0,
+            displays: vec![display(0, 0, 2560, 1600, Some((1280, 800)))],
+        };
+        cached.displays[0].scale_factor = 2;
+        let live = [display(0, 0, 2560, 1600, Some((2560, 1600)))];
+        let updated = updated_cursor_scales(&cached, &live).unwrap();
+        assert_eq!(updated.displays[0].logical_size, live[0].logical_size);
+        assert_eq!(updated.displays[0].scale_factor, live[0].scale_factor);
     }
 
     // Multiple displays use logical size, falling back to physical when absent.
