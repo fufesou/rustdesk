@@ -541,6 +541,9 @@ impl CursorShapes {
             .entry(cd.id)
             .or_insert_with(|| {
                 *bytes += cd.colors.len();
+                if let Some(physical) = cd.high_resolution.as_ref() {
+                    *bytes += physical.colors.len();
+                }
                 msg.clone()
             })
             .clone()
@@ -553,13 +556,17 @@ impl CursorShapes {
 /// being compressed again.
 fn cursor_shape_message(
     mut data: CursorData,
-    compress: impl FnOnce(&[u8]) -> Vec<u8>,
+    mut compress: impl FnMut(&[u8]) -> Vec<u8>,
 ) -> Arc<Message> {
-    data.id = crate::cursor_content_id(data.width, data.height, data.hotx, data.hoty, &data.colors);
+    data.id = crate::cursor_data_content_id(&data);
     if let Some(msg) = cursor_data_message(data.id) {
         return msg;
     }
     data.colors = compress(&data.colors[..]).into();
+    if let Some(physical) = data.high_resolution.as_mut() {
+        physical.id = data.id;
+        physical.colors = compress(&physical.colors).into();
+    }
     let mut msg = Message::new();
     msg.set_cursor_data(data);
     shared_cursor_shape(Arc::new(msg))
@@ -2760,6 +2767,23 @@ mod cursor_shape_tests {
         let again = cursor_shape_message(raw(2), &mut compress);
         assert!(Arc::ptr_eq(&shown, &again), "a new handle, the same shape");
         assert_eq!(compressed, 1, "a shape sent before is not compressed again");
+
+        let mut retina = raw(3);
+        retina.scale = 1.0;
+        let mut physical = raw(3);
+        physical.scale = 2.0;
+        retina.high_resolution = Some(physical).into();
+        let retina_message = cursor_shape_message(retina, hbb_common::compress::compress);
+        assert!(!Arc::ptr_eq(&shown, &retina_message));
+        let Some(message::Union::CursorData(retina)) = &retina_message.union else {
+            panic!("a Retina cursor shape");
+        };
+        let physical = retina.high_resolution.as_ref().unwrap();
+        assert_eq!(physical.id, retina.id);
+        assert_eq!(
+            zstd::bulk::decompress(&physical.colors, 4 * 4 * 4).unwrap(),
+            vec![9u8; 4 * 4 * 4]
+        );
 
         let sending = shared_cursor_shape(shape(u64::MAX - 3));
         let mut few = HashMap::from([(1, shown.clone())]);

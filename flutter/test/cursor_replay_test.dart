@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_custom_cursor/flutter_custom_cursor.dart';
+import 'package:flutter_custom_cursor/cursor_manager.dart' show CursorManager;
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/generated_bridge.dart' show CursorShape;
 import 'package:flutter_hbb/models/model.dart';
@@ -61,18 +62,31 @@ class _FFI extends Fake implements FFI {
   late final FfiModel ffiModel;
   @override
   late final CursorModel cursorModel;
+  @override
+  final canvasModel = _Canvas();
   _Cursor get cursor => cursorModel as _Cursor;
+}
+
+class _Canvas extends Fake implements CanvasModel {
+  @override
+  final ViewStyle viewStyle = ViewStyle.defaultViewStyle();
 }
 
 Uint8List _pixels(int size, int seed) =>
     Uint8List.fromList(List.generate(size * size * 4, (i) => (i + seed) % 256));
 
 /// A shape as the core delivers it, and keeps it.
-Future<void> _feed(_FFI ffi, String id, {int size = 8, int seed = 0}) {
+Future<void> _feed(_FFI ffi, String id,
+    {int size = 8, int seed = 0, double scale = 0}) {
   final pixels = _pixels(size, seed);
-  ffi.cursor.core[id] =
-      CursorShape(hotx: 0, hoty: 0, width: size, height: size, colors: pixels);
-  return ffi.ffiModel.handleCursorData(id, 0, 0, size, size, pixels);
+  ffi.cursor.core[id] = CursorShape(
+      hotx: 0,
+      hoty: 0,
+      width: size,
+      height: size,
+      colors: pixels,
+      scale: scale);
+  return ffi.ffiModel.handleCursorData(id, 0, 0, size, size, pixels, scale);
 }
 
 void _select(_FFI ffi, String id) {
@@ -96,6 +110,7 @@ void main() {
   final deleted = <String>[];
   late _FFI ffi;
   setUp(() {
+    binding.platformDispatcher.views.single.devicePixelRatio = 1;
     registered.clear();
     deleted.clear();
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
@@ -113,8 +128,30 @@ void main() {
     ffi = _FFI();
   });
   tearDown(() {
+    binding.platformDispatcher.views.single.resetDevicePixelRatio();
     ffi.cursorModel.disposeImages();
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
+  });
+
+  test('a restored native cursor retains the physical image density', () async {
+    final cursor = ffi.cursorModel;
+    await _feed(ffi, 'retina', size: 32, scale: 2.0);
+    buildCursorOfCache(cursor, 1.0, cursor.cache);
+    await Future.wait(
+        cursor.cachedKeys.map(CursorManager.instance.ensureCursorRegistered));
+    await _feed(ffi, 'next');
+    _select(ffi, 'retina');
+    buildCursorOfCache(cursor, 0.5, cursor.cache);
+    await _settle();
+    expect(ffi.cursor.fetched, ['retina']);
+    expect(cursor.cache!.pixelRatio, 2.0);
+    expect(cursor.cache!.width, 32);
+    expect(
+        _key(buildCursorOfCache(cursor, 0.5, cursor.cache)),
+        cursor.nativeKey(cursor.cache!, 0.5,
+            resizeImage: false, devicePixelRatio: 1.0));
+    await Future.wait(
+        cursor.cachedKeys.map(CursorManager.instance.ensureCursorRegistered));
   });
 
   test(
@@ -148,7 +185,7 @@ void main() {
     await _settle();
     expect(ffi.cursor.fetched, isEmpty, reason: 'nothing had to be decoded');
     expect(registered.length, 2);
-    expect((cursor.cache!.rasterWidth, cursor.cache!.rasterHeight), (16, 16));
+    expect(cursor.cache!.scale, 0.5);
 
     await _feed(ffi, '2');
     expect(cursor.cachedShape('1')!.hasPixels, isFalse,
@@ -174,8 +211,10 @@ void main() {
     expect(cursor.cachedKeys.length, 100);
 
     _select(ffi, '0');
-    expect(_key(buildCursorOfCache(cursor, 1.0, cursor.cache)),
-        cursor.nativeKey(cursor.cache!, 1.0));
+    expect(
+        _key(buildCursorOfCache(cursor, 1.0, cursor.cache)),
+        cursor.nativeKey(cursor.cache!, 1.0,
+            resizeImage: false, devicePixelRatio: 1.0));
     await _settle();
     expect(ffi.cursor.fetched, isEmpty, reason: 'its cursor is still there');
     expect(registered.length, 100);
@@ -216,8 +255,10 @@ void main() {
     expect(_key(buildCursorOfCache(cursor, 0.5, cursor.cache)), shown);
     await _settle();
     expect(ffi.cursor.fetched, ['1']);
-    expect(_key(buildCursorOfCache(cursor, 0.5, cursor.cache)),
-        cursor.nativeKey(cursor.cache!, 0.5));
+    expect(
+        _key(buildCursorOfCache(cursor, 0.5, cursor.cache)),
+        cursor.nativeKey(cursor.cache!, 0.5,
+            resizeImage: false, devicePixelRatio: 1.0));
   });
 
   test('shapes that keep decoding late still get their native cursors',
@@ -229,8 +270,8 @@ void main() {
     // A and B arrive, each decoding only after the peer moved on.
     for (final (id, seed) in [('A', 1), ('B', 2)]) {
       final pixels = _pixels(8, seed);
-      ffi.cursor.core[id] =
-          CursorShape(hotx: 0, hoty: 0, width: 8, height: 8, colors: pixels);
+      ffi.cursor.core[id] = CursorShape(
+          hotx: 0, hoty: 0, width: 8, height: 8, scale: 0, colors: pixels);
       final decoding = ffi.ffiModel.handleCursorData(id, 0, 0, 8, 8, pixels);
       _select(ffi, 'arrow');
       await decoding;
@@ -267,12 +308,12 @@ void main() {
       await _settle();
     }
     expect(
-        registered
-            .where((key) => key.contains('_A_') && key.endsWith('_16_16')),
+        registered.where((key) =>
+            key.contains('_A_') && key.endsWith('_160000000_160000000_1.0')),
         isNotEmpty);
     expect(
-        registered
-            .where((key) => key.contains('_B_') && key.endsWith('_16_16')),
+        registered.where((key) =>
+            key.contains('_B_') && key.endsWith('_160000000_160000000_1.0')),
         isNotEmpty);
   });
 
@@ -302,8 +343,8 @@ void main() {
     expect(ffi.cursor.fetched, isEmpty,
         reason: 'its pixels waited for the cursor at 0.5');
     expect(
-        registered
-            .where((key) => key.contains('_A_') && key.endsWith('_16_16')),
+        registered.where((key) =>
+            key.contains('_A_') && key.endsWith('_160000000_160000000_1.0')),
         isNotEmpty);
   });
 
@@ -365,7 +406,7 @@ void main() {
     await _feed(ffi, '1');
     await _feed(ffi, '2');
     ffi.cursor.core['1'] = CursorShape(
-        hotx: 0, hoty: 0, width: 8, height: 8, colors: Uint8List(3));
+        hotx: 0, hoty: 0, width: 8, height: 8, scale: 0, colors: Uint8List(3));
     _select(ffi, '1');
     for (var i = 0; i < 5; i++) {
       ffi.cursorModel.image;
@@ -534,7 +575,12 @@ void main() {
       await _feed(ffi, '1');
       if (how == 'cannot decode') {
         ffi.cursor.core['2'] = CursorShape(
-            hotx: 0, hoty: 0, width: 8, height: 8, colors: Uint8List(3));
+            hotx: 0,
+            hoty: 0,
+            width: 8,
+            height: 8,
+            scale: 0,
+            colors: Uint8List(3));
       }
       _select(ffi, '2');
       expect(cursor.cache?.id, '1', reason: 'kept while the shape may come');
@@ -552,7 +598,7 @@ void main() {
     final cursor = ffi.cursorModel;
     await _feed(ffi, '1');
     ffi.cursor.core['2'] = CursorShape(
-        hotx: 0, hoty: 0, width: 8, height: 8, colors: Uint8List(3));
+        hotx: 0, hoty: 0, width: 8, height: 8, scale: 0, colors: Uint8List(3));
     await ffi.ffiModel.handleCursorData('2', 0, 0, 8, 8, Uint8List(3));
     expect(cursor.cache, isNull);
     expect(cursor.image, isNull);

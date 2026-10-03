@@ -287,7 +287,7 @@ class PlatformFFI {
 
   // web only
   void setCursorDataCallback(
-      void Function(String, int, int, int, int, Uint8List) fun) async {}
+      void Function(String, int, int, int, int, Uint8List, double) fun) async {}
 
   // web only, decoded WebCodecs frames arriving as ready-made images
   void setVideoFrameCallback(

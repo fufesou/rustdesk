@@ -167,6 +167,29 @@ pub fn cursor_content_id(width: i32, height: i32, hotx: i32, hoty: i32, colors: 
     hasher.digest() & ((1 << 53) - 1)
 }
 
+pub fn cursor_data_content_id(data: &base::message_proto::CursorData) -> u64 {
+    let id = cursor_content_id(data.width, data.height, data.hotx, data.hoty, &data.colors);
+    if data.scale == 0.0 && data.high_resolution.is_none() {
+        return id;
+    }
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(&id.to_le_bytes());
+    hasher.update(&data.scale.to_bits().to_le_bytes());
+    if let Some(physical) = data.high_resolution.as_ref() {
+        let id = cursor_content_id(
+            physical.width,
+            physical.height,
+            physical.hotx,
+            physical.hoty,
+            &physical.colors,
+        );
+        hasher.update(&id.to_le_bytes());
+        hasher.update(&physical.scale.to_bits().to_le_bytes());
+    }
+    hasher.digest() & MAX_SAFE_INTEGER
+}
+
 #[inline]
 #[cfg(feature = "unix-file-copy-paste")]
 pub fn is_support_file_copy_paste(ver: &str) -> bool {
@@ -2962,6 +2985,33 @@ mod tests {
                 assert!(cursor_content_id(32, 32, hotx, 0, colors) <= MAX_SAFE_INTEGER);
             }
         }
+    }
+
+    #[test]
+    fn cursor_density_and_physical_artwork_distinguish_content_ids() {
+        let mut cursor = base::message_proto::CursorData {
+            width: 2,
+            height: 2,
+            colors: vec![255; 16].into(),
+            ..Default::default()
+        };
+        let legacy = cursor_data_content_id(&cursor);
+        assert_eq!(legacy, cursor_content_id(2, 2, 0, 0, &cursor.colors));
+        cursor.scale = 1.0;
+        let logical = cursor_data_content_id(&cursor);
+        assert_ne!(logical, legacy);
+        let mut physical = cursor.clone();
+        physical.scale = 2.0;
+        cursor.high_resolution = Some(physical.clone()).into();
+        let retina = cursor_data_content_id(&cursor);
+        assert_ne!(retina, logical);
+        physical.colors = vec![128; 16].into();
+        cursor.high_resolution = Some(physical).into();
+        assert_ne!(cursor_data_content_id(&cursor), retina);
+        cursor.id = 42;
+        let renamed = cursor_data_content_id(&cursor);
+        cursor.id = 43;
+        assert_eq!(cursor_data_content_id(&cursor), renamed);
     }
 
     #[inline]

@@ -318,6 +318,10 @@ message CursorData {
   int32 width = 4;
   int32 height = 5;
   bytes colors = 6;
+  // Physical bitmap pixels per remote logical pixel; 0 means unknown density.
+  double scale = 7;
+  // Optional physical image. Legacy receivers keep using the logical-sized fields above.
+  CursorData high_resolution = 8;
 }
 
 message CursorPosition {
