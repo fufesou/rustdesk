@@ -201,6 +201,17 @@ impl LockModesHandler {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn new(key_event: &KeyEvent, is_numpad_key: bool) -> Self {
         let mut en = ENIGO.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        if !is_numpad_key
+            && key_event.mode != KeyboardMode::Map.into()
+            && super::rdp_input::ei::is_keyboard(&mut en)
+        {
+            // EI resolves text against the host's actual lock state without toggling its LEDs.
+            return Self {
+                caps_lock_changed: false,
+                num_lock_changed: false,
+            };
+        }
         let event_caps_enabled = Self::is_modifier_enabled(key_event, ControlKey::CapsLock);
         let local_caps_enabled = en.get_key_state(enigo::Key::CapsLock);
         let caps_lock_changed = event_caps_enabled != local_caps_enabled;
@@ -773,6 +784,23 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
 
 #[cfg(target_os = "linux")]
 pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
+    let devices = super::rdp_input::ei::create().await.map_err(|error| {
+        hbb_common::throttled_log!(
+            std::time::Duration::from_secs(5), error,
+            "Failed to initialize Portal input: {error}"
+        );
+        match error.downcast::<super::rdp_input::ei::InitializationError>() {
+            Ok(error) => Box::new(error) as Box<dyn std::error::Error>,
+            Err(error) => error.to_string().into(),
+        }
+    })?;
+    if let Some((keyboard, mouse)) = devices {
+        let mut en = ENIGO.lock()?;
+        en.set_is_x11(false);
+        en.set_custom_keyboard(Box::new(keyboard));
+        en.set_custom_mouse(Box::new(mouse));
+        return Ok(());
+    }
     let mut en = ENIGO.lock()?;
     // Same as `setup_uinput`: the caller is gated on `wayland_use_rdp_input()`.
     en.set_is_x11(false);

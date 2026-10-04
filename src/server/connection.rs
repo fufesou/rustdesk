@@ -2156,7 +2156,17 @@ impl Connection {
                     {
                         // use rdp_input when uinput is not available in wayland. Ex: flatpak
                         if input_service::wayland_use_rdp_input() {
-                            let _ = setup_rdp_input().await;
+                            let error = setup_rdp_input()
+                                .await
+                                .err()
+                                .filter(|error| {
+                                    error.is::<super::rdp_input::ei::InitializationError>()
+                                })
+                                .map(|error| error.to_string());
+                            if let Some(error) = error {
+                                self.send_login_error(error).await;
+                                return false;
+                            }
                         }
                     }
                 }

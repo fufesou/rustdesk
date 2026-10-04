@@ -8,6 +8,8 @@ use scrap::wayland::remote_desktop_portal::OrgFreedesktopPortalRemoteDesktop as 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) mod ei;
+
 pub mod client {
     use base::platform::linux::{DISPLAY_DESKTOP_KDE, XDG_CURRENT_DESKTOP};
 

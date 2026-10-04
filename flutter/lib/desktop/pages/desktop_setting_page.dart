@@ -2813,6 +2813,8 @@ class _WaylandCardState extends State<WaylandCard> {
                 "true";
 
         final children = [
+          if (isLinux && bind.mainCurrentIsWayland() && !bind.mainIsInstalled())
+            _OptionCheckBox(context, 'libei', kOptionAllowLibei),
           if (restoreToken.isNotEmpty)
             _buildClearScreenSelection(context, restoreToken),
           if (hasShortcutsPermission)

@@ -36,6 +36,7 @@ pub const OPTION_SYNC_AB_TAGS: &str = "sync-ab-tags";
 pub const OPTION_FILTER_AB_BY_INTERSECTION: &str = "filter-ab-by-intersection";
 pub const OPTION_ACCESS_MODE: &str = "access-mode";
 pub const OPTION_ENABLE_KEYBOARD: &str = "enable-keyboard";
+pub const OPTION_ALLOW_LIBEI: &str = "allow-libei";
 pub const OPTION_ENABLE_CLIPBOARD: &str = "enable-clipboard";
 pub const OPTION_ENABLE_FILE_TRANSFER: &str = "enable-file-transfer";
 pub const OPTION_ENABLE_CAMERA: &str = "enable-camera";
@@ -272,6 +273,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
 pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_ACCESS_MODE,
     OPTION_ENABLE_KEYBOARD,
+    OPTION_ALLOW_LIBEI,
     OPTION_ENABLE_CLIPBOARD,
     OPTION_ENABLE_FILE_TRANSFER,
     OPTION_ENABLE_CAMERA,

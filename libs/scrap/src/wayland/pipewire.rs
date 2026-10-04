@@ -104,15 +104,20 @@ pub struct RdpSessionInfo {
     pub is_support_restore_token: bool,
     pub resolution: Arc<Mutex<Option<(usize, usize)>>>,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PwStreamInfo {
     pub path: u64,
     source_type: u64,
     position: (i32, i32),
     size: (usize, usize),
+    mapping_id: Option<String>,
 }
 
 impl PwStreamInfo {
+    pub fn get_mapping_id(&self) -> Option<&str> {
+        self.mapping_id.as_deref()
+    }
+
     pub fn get_size(&self) -> (usize, usize) {
         self.size
     }
@@ -698,6 +703,10 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
                         .collect::<HashMap<String, &dyn RefArg>>();
                     let mut info = PwStreamInfo {
                         path,
+                        mapping_id: attributes
+                            .get("mapping_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned),
                         source_type: attributes
                             .get("source_type")
                             .map_or(Some(0), |v| v.as_u64())?,
