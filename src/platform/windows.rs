@@ -2653,6 +2653,29 @@ pub fn get_double_click_time() -> u32 {
     unsafe { GetDoubleClickTime() }
 }
 
+pub fn is_clipboard_empty() -> ResultType<bool> {
+    use winapi::um::errhandlingapi::SetLastError;
+
+    unsafe {
+        if OpenClipboard(null_mut()) == FALSE {
+            bail!("Failed to open clipboard: {}", io::Error::last_os_error());
+        }
+        SetLastError(ERROR_SUCCESS);
+        let count = CountClipboardFormats();
+        let error = GetLastError();
+        if CloseClipboard() == FALSE {
+            bail!("Failed to close clipboard: {}", io::Error::last_os_error());
+        }
+        if count == 0 && error != ERROR_SUCCESS {
+            bail!(
+                "Failed to count clipboard formats: {}",
+                io::Error::from_raw_os_error(error as _)
+            );
+        }
+        Ok(count == 0)
+    }
+}
+
 pub fn wide_string(s: &str) -> Vec<u16> {
     use std::os::windows::prelude::OsStrExt;
     std::ffi::OsStr::new(s)

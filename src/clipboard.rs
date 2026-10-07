@@ -405,6 +405,16 @@ impl ClipboardContext {
         let _lock = ARBOARD_MTX.lock().unwrap();
         let data = self.get_formats(formats)?;
         if data.is_empty() {
+            #[cfg(target_os = "windows")]
+            if !force
+                && formats
+                    .iter()
+                    .any(|format| matches!(format, ClipboardFormat::Text))
+                && crate::platform::windows::is_clipboard_empty()?
+            {
+                // An empty text entry clears the peer through the existing protocol.
+                return Ok(vec![ClipboardData::Text(String::new())]);
+            }
             return Ok(data);
         }
         if !force {
@@ -420,8 +430,8 @@ impl ClipboardContext {
             .into_iter()
             .filter(|c| match c {
                 ClipboardData::Special((s, _)) => s != RUSTDESK_CLIPBOARD_OWNER_FORMAT,
-                // Skip synchronizing empty text to the remote clipboard
-                ClipboardData::Text(text) => !text.is_empty(),
+                // Initial snapshots must not clear the peer's clipboard.
+                ClipboardData::Text(text) => !force || !text.is_empty(),
                 _ => true,
             })
             .collect())
