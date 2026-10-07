@@ -2656,9 +2656,17 @@ pub fn get_double_click_time() -> u32 {
 pub fn is_clipboard_empty() -> ResultType<bool> {
     use winapi::um::errhandlingapi::SetLastError;
 
+    const OPEN_MAX_RETRIES: usize = 5;
+    const OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
     unsafe {
-        if OpenClipboard(null_mut()) == FALSE {
-            bail!("Failed to open clipboard: {}", io::Error::last_os_error());
+        let mut remaining_retries = OPEN_MAX_RETRIES;
+        while OpenClipboard(null_mut()) == FALSE {
+            if remaining_retries == 0 {
+                bail!("Failed to open clipboard: {}", io::Error::last_os_error());
+            }
+            remaining_retries -= 1;
+            std::thread::sleep(OPEN_RETRY_INTERVAL);
         }
         SetLastError(ERROR_SUCCESS);
         let count = CountClipboardFormats();
