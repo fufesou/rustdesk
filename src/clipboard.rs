@@ -72,22 +72,14 @@ const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
 ];
 
 #[cfg(not(target_os = "android"))]
-pub fn check_clipboard(
-    ctx: &mut Option<ClipboardContext>,
-    side: ClipboardSide,
-    force: bool,
-) -> Option<Message> {
-    let (msg, _) = read_clipboard_message(ctx, side, force)?;
+pub fn check_clipboard(ctx: &mut Option<ClipboardContext>, side: ClipboardSide) -> Option<Message> {
+    let (msg, _) = read_clipboard_message(ctx, side, false)?;
     Some(msg)
 }
 
 #[cfg(target_os = "linux")]
-pub fn peek_clipboard(
-    ctx: &mut Option<ClipboardContext>,
-    side: ClipboardSide,
-    force: bool,
-) -> Option<Message> {
-    let (msg, _) = read_clipboard_message(ctx, side, force)?;
+pub fn peek_clipboard(ctx: &mut Option<ClipboardContext>, side: ClipboardSide) -> Option<Message> {
+    let (msg, _) = read_clipboard_message(ctx, side, false)?;
     Some(msg)
 }
 
@@ -95,13 +87,13 @@ pub fn peek_clipboard(
 fn read_clipboard_message(
     ctx: &mut Option<ClipboardContext>,
     side: ClipboardSide,
-    force: bool,
+    init_sync_read: bool,
 ) -> Option<(Message, MultiClipboards)> {
     if ctx.is_none() {
         *ctx = ClipboardContext::new().ok();
     }
     let ctx2 = ctx.as_mut()?;
-    match ctx2.get(side, force) {
+    match ctx2.get(side, init_sync_read) {
         Ok(content) => {
             if !content.is_empty() {
                 let mut msg = Message::new();
@@ -139,13 +131,12 @@ pub fn is_file_url_set_by_rustdesk(url: &Vec<String>) -> bool {
 pub fn check_clipboard_files(
     ctx: &mut Option<ClipboardContext>,
     side: ClipboardSide,
-    force: bool,
 ) -> Option<Vec<String>> {
     if ctx.is_none() {
         *ctx = ClipboardContext::new().ok();
     }
     let ctx2 = ctx.as_mut()?;
-    match ctx2.get_files(side, force) {
+    match ctx2.get_files(side) {
         Ok(Some(urls)) => {
             if !urls.is_empty() {
                 return Some(urls);
@@ -383,8 +374,12 @@ impl ClipboardContext {
         bail!("Failed to get clipboard formats, clipboard is occupied, {CLIPBOARD_GET_MAX_RETRY} retries failed");
     }
 
-    pub fn get(&mut self, side: ClipboardSide, force: bool) -> ResultType<Vec<ClipboardData>> {
-        let data = self.get_formats_filter(SUPPORTED_FORMATS, side, force)?;
+    pub fn get(
+        &mut self,
+        side: ClipboardSide,
+        init_sync_read: bool,
+    ) -> ResultType<Vec<ClipboardData>> {
+        let data = self.get_formats_filter(SUPPORTED_FORMATS, side, init_sync_read)?;
         // We have a separate service named `file-clipboard` to handle file copy-paste.
         // We need to read the file urls because file copy may set the other clipboard formats such as text.
         #[cfg(feature = "unix-file-copy-paste")]
@@ -400,13 +395,13 @@ impl ClipboardContext {
         &mut self,
         formats: &[ClipboardFormat],
         side: ClipboardSide,
-        force: bool,
+        init_sync_read: bool,
     ) -> ResultType<Vec<ClipboardData>> {
         let _lock = ARBOARD_MTX.lock().unwrap();
         let data = self.get_formats(formats)?;
         if data.is_empty() {
             #[cfg(target_os = "windows")]
-            if !force
+            if !init_sync_read
                 && formats
                     .iter()
                     .any(|format| matches!(format, ClipboardFormat::Text))
@@ -417,7 +412,7 @@ impl ClipboardContext {
             }
             return Ok(data);
         }
-        if !force {
+        if !init_sync_read {
             for c in data.iter() {
                 if let ClipboardData::Special((s, d)) = c {
                     if s == RUSTDESK_CLIPBOARD_OWNER_FORMAT && side.is_owner(d) {
@@ -431,25 +426,21 @@ impl ClipboardContext {
             .filter(|c| match c {
                 ClipboardData::Special((s, _)) => s != RUSTDESK_CLIPBOARD_OWNER_FORMAT,
                 // Initial snapshots must not clear the peer's clipboard.
-                ClipboardData::Text(text) => !force || !text.is_empty(),
+                ClipboardData::Text(text) => !init_sync_read || !text.is_empty(),
                 _ => true,
             })
             .collect())
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
-    pub fn get_files(
-        &mut self,
-        side: ClipboardSide,
-        force: bool,
-    ) -> ResultType<Option<Vec<String>>> {
+    pub fn get_files(&mut self, side: ClipboardSide) -> ResultType<Option<Vec<String>>> {
         let data = self.get_formats_filter(
             &[
                 ClipboardFormat::FileUrl,
                 ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
             ],
             side,
-            force,
+            false,
         )?;
         Ok(data.into_iter().find_map(|c| match c {
             ClipboardData::FileUrl(urls) => Some(urls),
