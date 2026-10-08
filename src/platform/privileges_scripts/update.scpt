@@ -1,5 +1,7 @@
 on run {user, cur_pid, source_path, expected_sha256}
 
+  -- RustDesk identifiers in this script are templates. correct_app_name()
+  -- rewrites them for the installed client before osascript executes it.
   set agent_plist to "/Library/LaunchAgents/com.carriez.RustDesk_server.plist"
   set daemon_plist to "/Library/LaunchDaemons/com.carriez.RustDesk_service.plist"
   set app_bundle to "/Applications/RustDesk.app"
@@ -23,6 +25,12 @@ on run {user, cur_pid, source_path, expected_sha256}
   set unload_service to "launchctl unload -w " & daemon_plist_q & " || true;"
   set kill_others to "pids=$(pgrep -x 'RustDesk' | grep -vx " & cur_pid & " || true); if [ -n \"$pids\" ]; then echo \"$pids\" | xargs kill -9 || true; fi;"
 
+  -- Update transaction:
+  -- source -> root-owned verified_app -> .new -> installed app
+  -- old installed app -> .old
+  -- failure before transaction starts: clean temporary files; installed state is unchanged
+  -- failure after transaction starts but before commit: restore app, plists, service, and agent
+  -- failure after commit: keep the new app and report cleanup errors only
   set prepare_swap_paths to "temp_bundle=" & quoted form of app_bundle & ".new.$$; old_bundle=" & quoted form of app_bundle & ".old.$$;"
   set cleanup_swap_paths to "rm -rf \"$temp_bundle\" \"$old_bundle\";"
   set backup_plists to "daemon_plist_backup=\"$verified_dir/daemon.plist\"; agent_plist_backup=\"$verified_dir/agent.plist\"; daemon_plist_existed=0; agent_plist_existed=0; if [ -e " & daemon_plist_q & " ]; then cp -p " & daemon_plist_q & " \"$daemon_plist_backup\"; daemon_plist_existed=1; fi; if [ -e " & quoted form of agent_plist & " ]; then cp -p " & quoted form of agent_plist & " \"$agent_plist_backup\"; agent_plist_existed=1; fi;"
@@ -47,7 +55,7 @@ on run {user, cur_pid, source_path, expected_sha256}
   set check_agent to "agent_info=$(launchctl print \"gui/$uid/$agent_label\" 2>/dev/null || launchctl print \"user/$uid/$agent_label\" 2>/dev/null || launchctl print \"system/$agent_label\" 2>/dev/null || true); printf '%s\n' \"$agent_info\" | grep -E '^[[:space:]]*state = running[[:space:]]*$' >/dev/null && [ -S \"/tmp/RustDesk-$uid/ipc\" ]"
   set wait_for_service to "service_ready=0; for _ in $(/usr/bin/seq 1 " & readiness_attempts & "); do if " & check_service & "; then service_ready=1; break; fi; sleep 1; done; [ \"$service_ready\" -eq 1 ];"
   set wait_for_agent to "agent_ready=0; for _ in $(/usr/bin/seq 1 " & readiness_attempts & "); do if " & check_agent & "; then agent_ready=1; break; fi; sleep 1; done; [ \"$agent_ready\" -eq 1 ];"
-  set verify_readiness to check_service & ";" & check_agent & ";"
+  set verify_readiness to check_service & " || exit 1;" & check_agent & " || exit 1;"
   set restore_service to "launchctl load -w " & daemon_plist_q & " || rollback_status=1;"
   set restore_agent to "if [ -n \"$uid\" ]; then launchctl bootstrap gui/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl bootstrap user/$uid " & quoted form of agent_plist & " 2>/dev/null || launchctl load -w " & quoted form of agent_plist & " || rollback_status=1; else launchctl load -w " & quoted form of agent_plist & " || rollback_status=1; fi;"
   set rollback_update to "status=$?; trap - EXIT; set +e; cleanup_status=0; if [ \"${transaction_started:-0}\" -eq 1 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then rollback_status=0;" & unload_agent & unload_service & rollback_bundle & rollback_plists & restore_service & restore_agent & "if [ \"$rollback_status\" -ne 0 ]; then status=1; fi; fi; if [ \"${rollback_status:-0}\" -eq 0 ]; then " & cleanup_verified & "fi; if [ \"$cleanup_status\" -ne 0 ] && [ \"${transaction_committed:-0}\" -ne 1 ]; then status=1; elif [ \"$cleanup_status\" -ne 0 ]; then echo 'UPDATE_CLEANUP_FAILED_AFTER_COMMIT'; fi; exit \"$status\";"
