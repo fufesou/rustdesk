@@ -662,6 +662,7 @@ impl InvokeUiSession for FlutterHandler {
                     hoty: cd.hoty,
                     width: cd.width,
                     height: cd.height,
+                    scale: cd.scale,
                     colors: colors.clone(),
                 });
             }

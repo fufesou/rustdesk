@@ -32,6 +32,7 @@ sealed class EventToUI {
     required int hoty,
     required int width,
     required int height,
+    required double scale,
     required Uint8List colors,
   }) = EventToUI_Cursor;
 }
@@ -65,6 +66,7 @@ class EventToUI_Cursor implements EventToUI {
     required this.hoty,
     required this.width,
     required this.height,
+    required this.scale,
     required this.colors,
   });
   final String id;
@@ -72,6 +74,7 @@ class EventToUI_Cursor implements EventToUI {
   final int hoty;
   final int width;
   final int height;
+  final double scale;
   final Uint8List colors;
 }
 
@@ -80,6 +83,7 @@ class CursorShape {
   final int hoty;
   final int width;
   final int height;
+  final double scale;
   final Uint8List colors;
 
   const CursorShape({
@@ -88,6 +92,7 @@ class CursorShape {
     required this.width,
     required this.height,
     required this.colors,
+    this.scale = 0,
   });
 }
 
@@ -98,7 +103,8 @@ class RustdeskImpl {
     final completer = Completer<CursorShape?>();
     js.context.callMethod('getCursorShape', [
       id,
-      (int hotx, int hoty, int width, int height, Uint8List? colors) {
+      (int hotx, int hoty, int width, int height, Uint8List? colors,
+          [double scale = 0]) {
         completer.complete(colors == null
             ? null
             : CursorShape(
@@ -106,6 +112,7 @@ class RustdeskImpl {
                 hoty: hoty,
                 width: width,
                 height: height,
+                scale: scale,
                 colors: colors));
       }
     ]);
