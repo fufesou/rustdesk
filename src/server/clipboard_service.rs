@@ -172,7 +172,7 @@ fn should_skip_wayland_clipboard_sync(msg: &Message) -> bool {
 impl Handler {
     #[cfg(feature = "unix-file-copy-paste")]
     fn check_clipboard_file(&mut self) {
-        if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Host, false) {
+        if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Host) {
             if !urls.is_empty() {
                 #[cfg(target_os = "macos")]
                 if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
@@ -233,7 +233,7 @@ impl Handler {
 
         #[cfg(target_os = "linux")]
         {
-            let msg = crate::clipboard::peek_clipboard(&mut self.ctx, ClipboardSide::Host, false)?;
+            let msg = crate::clipboard::peek_clipboard(&mut self.ctx, ClipboardSide::Host)?;
             if should_skip_wayland_clipboard_sync(&msg) {
                 log::debug!("Skip clipboard sync for recent Wayland keyboard injection");
                 return None;
@@ -242,7 +242,7 @@ impl Handler {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            crate::clipboard::check_clipboard(&mut self.ctx, ClipboardSide::Host, false)
+            crate::clipboard::check_clipboard(&mut self.ctx, ClipboardSide::Host)
         }
     }
 

@@ -2058,7 +2058,7 @@ impl ClientClipboardHandler {
         if CLIPBOARD_STATE.lock().unwrap().running {
             #[cfg(feature = "unix-file-copy-paste")]
             if self.is_file_required() {
-                if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false) {
+                if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client) {
                     if !urls.is_empty() {
                         #[cfg(target_os = "macos")]
                         if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
@@ -2081,7 +2081,7 @@ impl ClientClipboardHandler {
             }
 
             if check_text && self.is_text_required() {
-                if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
+                if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client) {
                     self.send_msg(msg, false);
                 }
             }
