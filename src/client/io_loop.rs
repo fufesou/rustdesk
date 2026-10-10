@@ -2489,12 +2489,12 @@ impl<T: InvokeUiSession> Remote<T> {
         match state {
             back_notification::PrivacyModeState::PrvOnByOther => {
                 self.handler.msgbox(
-                    "error",
+                    "custom-nocancel",
                     "Connecting...",
                     "Someone turns on privacy mode, exit",
                     "",
                 );
-                return false;
+                return true;
             }
             back_notification::PrivacyModeState::PrvNotSupported => {
                 self.handler
