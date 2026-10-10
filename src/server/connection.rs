@@ -1923,6 +1923,11 @@ impl Connection {
             self.tx_from_authed.clone(),
             self.lr.clone(),
         ));
+        // Recheck after registration: a later privacy-mode activation will find
+        // this connection in its close scan.
+        if auth_conn_type == AuthConnType::Remote && !self.check_privacy_mode_on().await {
+            return false;
+        }
         self.session_last_recv_time = SESSIONS
             .lock()
             .unwrap()
