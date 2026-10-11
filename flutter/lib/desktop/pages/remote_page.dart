@@ -1146,23 +1146,14 @@ class _ImagePaintState extends State<ImagePaint> {
                       useLocalPointer: true, unzoomed: true) /
                   (isWindows ? 1 : dpr);
             }
-            // Without density, preserve the legacy unzoomed size. Controller
-            // DPR alone cannot determine the remote bitmap's logical size.
-            final imageScale = isViewScaled() && zoomCursor.isTrue
-                ? _cursorImageScale(widget.ffi, cursor, useLocalPointer: true)
-                : s;
-            var cursorScale = 1.0;
-            if (isWindows) {
-              // debug win10
-              if (zoomCursor.value && isViewScaled()) {
-                cursorScale = imageScale * dpr;
-              }
-            } else {
-              if (zoomCursor.value || isViewOriginal()) {
-                cursorScale = imageScale;
-              }
+            if (isViewScaled() && zoomCursor.isTrue) {
+              final imageScale =
+                  _cursorImageScale(widget.ffi, cursor, useLocalPointer: true);
+              return imageScale * (isWindows ? dpr : 1.0);
             }
-            return cursorScale;
+            return !isWindows && (zoomCursor.isTrue || isViewOriginal())
+                ? s
+                : 1.0;
           }
 
           return MouseRegion(

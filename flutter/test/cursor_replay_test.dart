@@ -3,7 +3,6 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_custom_cursor/flutter_custom_cursor.dart';
-import 'package:flutter_custom_cursor/cursor_manager.dart' show CursorManager;
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/generated_bridge.dart' show CursorShape;
 import 'package:flutter_hbb/models/model.dart';
@@ -133,27 +132,6 @@ void main() {
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
   });
 
-  test('a restored native cursor retains the physical image density', () async {
-    final cursor = ffi.cursorModel;
-    await _feed(ffi, 'retina', size: 32, scale: 2.0);
-    buildCursorOfCache(cursor, 1.0, cursor.cache);
-    await Future.wait(
-        cursor.cachedKeys.map(CursorManager.instance.ensureCursorRegistered));
-    await _feed(ffi, 'next');
-    _select(ffi, 'retina');
-    buildCursorOfCache(cursor, 0.5, cursor.cache);
-    await _settle();
-    expect(ffi.cursor.fetched, ['retina']);
-    expect(cursor.cache!.pixelRatio, 2.0);
-    expect(cursor.cache!.width, 32);
-    expect(
-        _key(buildCursorOfCache(cursor, 0.5, cursor.cache)),
-        cursor.nativeKey(cursor.cache!, 0.5,
-            resizeImage: false, devicePixelRatio: 1.0));
-    await Future.wait(
-        cursor.cachedKeys.map(CursorManager.instance.ensureCursorRegistered));
-  });
-
   test(
       'only the shape in use keeps an image, and a shape its native cursor holds '
       'keeps no pixels', () async {
@@ -245,7 +223,7 @@ void main() {
   test('a new raster of a shape without pixels keeps the cursor shown before',
       () async {
     final cursor = ffi.cursorModel;
-    await _feed(ffi, '1', size: 32);
+    await _feed(ffi, '1', size: 32, scale: 2.0);
     buildCursorOfCache(cursor, 1.0, cursor.cache);
     await _settle();
     await _feed(ffi, '2', size: 32);
@@ -255,6 +233,8 @@ void main() {
     expect(_key(buildCursorOfCache(cursor, 0.5, cursor.cache)), shown);
     await _settle();
     expect(ffi.cursor.fetched, ['1']);
+    expect(cursor.cache!.pixelRatio, 2.0);
+    expect(cursor.cache!.width, 32);
     expect(
         _key(buildCursorOfCache(cursor, 0.5, cursor.cache)),
         cursor.nativeKey(cursor.cache!, 0.5,
