@@ -8,23 +8,31 @@ use std::{
     cell::Cell,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    io, ptr,
     sync::OnceLock,
 };
 use winapi::{
     shared::{
         minwindef::UINT,
-        windef::{HMONITOR, POINT},
+        windef::{HCURSOR, HMONITOR, POINT},
         winerror::S_OK,
     },
     um::{
         shellscalingapi::{MDT_EFFECTIVE_DPI, MONITOR_DPI_TYPE},
         winnt::HRESULT,
-        winuser::{MonitorFromPoint, CURSORINFO, MONITOR_DEFAULTTONULL, USER_DEFAULT_SCREEN_DPI},
+        winuser::{
+            CopyImage, DestroyCursor, LoadCursorW, MonitorFromPoint, CURSORINFO, IDC_APPSTARTING,
+            IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_ICON, IDC_NO, IDC_SIZE,
+            IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_UPARROW, IDC_WAIT,
+            IMAGE_CURSOR, LR_COPYFROMRESOURCE, MONITOR_DEFAULTTONULL, SM_CXCURSOR, SM_CYCURSOR,
+            USER_DEFAULT_SCREEN_DPI,
+        },
     },
 };
 
 type MonitorDpi =
     unsafe extern "system" fn(HMONITOR, MONITOR_DPI_TYPE, *mut UINT, *mut UINT) -> HRESULT;
+type CursorMetrics = unsafe extern "system" fn(i32, UINT) -> i32;
 
 #[derive(Clone, Copy)]
 struct Capture {
@@ -67,6 +75,100 @@ pub(super) fn captured(id: u64) -> ResultType<(u64, f64)> {
         .filter(|capture| capture.id == id)
         .map(|capture| (capture.handle, capture.scale))
         .ok_or_else(|| anyhow!("Windows cursor capture does not match requested ID {id}"))
+}
+
+pub(super) fn icon_info(handle: HCURSOR, scale: f64) -> ResultType<super::IconInfo> {
+    let original = super::IconInfo::new(handle)?;
+    if scale == 0.0 {
+        return Ok(original);
+    }
+    unsafe {
+        // Application-created cursors already carry their intended size and hotspot.
+        let system_cursor = [
+            IDC_ARROW,
+            IDC_IBEAM,
+            IDC_WAIT,
+            IDC_CROSS,
+            IDC_UPARROW,
+            IDC_SIZE,
+            IDC_ICON,
+            IDC_SIZENWSE,
+            IDC_SIZENESW,
+            IDC_SIZEWE,
+            IDC_SIZENS,
+            IDC_SIZEALL,
+            IDC_NO,
+            IDC_HAND,
+            IDC_APPSTARTING,
+            IDC_HELP,
+        ]
+        .into_iter()
+        .any(|resource| LoadCursorW(ptr::null_mut(), resource) == handle);
+        if !system_cursor {
+            return Ok(original);
+        }
+        let Some((width, height)) = cursor_size(scale)? else {
+            return Ok(original);
+        };
+        let bitmap = super::get_bitmap(original.0.hbmMask)?;
+        let mask_height = if original.is_color() {
+            height
+        } else {
+            height * 2
+        };
+        if bitmap.bmWidth == width && bitmap.bmHeight == mask_height {
+            return Ok(original);
+        }
+        // GetIconInfo can expose the primary monitor's raster on another monitor.
+        copy_icon_info(handle, (width, height))
+    }
+}
+
+fn copy_icon_info(handle: HCURSOR, size: (i32, i32)) -> ResultType<super::IconInfo> {
+    unsafe {
+        let cursor = CopyImage(
+            handle as _,
+            IMAGE_CURSOR,
+            size.0,
+            size.1,
+            LR_COPYFROMRESOURCE,
+        ) as HCURSOR;
+        if cursor.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        let result = super::IconInfo::new(cursor);
+        if DestroyCursor(cursor) == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        result
+    }
+}
+
+fn cursor_size(scale: f64) -> ResultType<Option<(i32, i32)>> {
+    static API: OnceLock<Option<(Library, CursorMetrics)>> = OnceLock::new();
+    let Some((_, query)) = API.get_or_init(|| match load_cursor_metrics() {
+        Ok(api) => Some(api),
+        Err(err) => {
+            log::warn!("Windows cursor size API unavailable; retaining original bitmap: {err}");
+            None
+        }
+    }) else {
+        return Ok(None);
+    };
+    let dpi = (scale * f64::from(USER_DEFAULT_SCREEN_DPI)).round() as UINT;
+    let (width, height) = unsafe { (query(SM_CXCURSOR, dpi), query(SM_CYCURSOR, dpi)) };
+    if width <= 0 || height <= 0 {
+        bail!("Invalid Windows cursor size ({width}, {height}) at DPI {dpi}");
+    }
+    Ok(Some((width, height)))
+}
+
+fn load_cursor_metrics() -> ResultType<(Library, CursorMetrics)> {
+    unsafe {
+        let library = Library::load_with_flags("user32.dll", LOAD_LIBRARY_SEARCH_SYSTEM32)?;
+        let query = *library.get::<CursorMetrics>(b"GetSystemMetricsForDpi\0")?;
+        Ok((library, query))
+    }
 }
 
 fn load_monitor_dpi() -> ResultType<(Library, MonitorDpi)> {
@@ -125,6 +227,7 @@ mod tests {
     fn cursor_dpi_does_not_require_a_load_time_import() {
         // Keep the production query reachable even when this is the only selected test.
         black_box(super::monitor_scale as fn(_) -> _);
+        black_box(super::cursor_size as fn(_) -> _);
         unsafe {
             let base = GetModuleHandleW(ptr::null()).cast::<u8>();
             assert!(!base.is_null());
@@ -138,7 +241,7 @@ mod tests {
             while (*descriptor).Name != 0 {
                 assert!(
                     !imports_cursor_dpi(base, *(*descriptor).u.OriginalFirstThunk()),
-                    "GetDpiForMonitor must be resolved at runtime"
+                    "Cursor DPI APIs must be resolved at runtime"
                 );
                 descriptor = descriptor.add(1);
             }
@@ -151,7 +254,10 @@ mod tests {
         while *entry != 0 {
             if *entry & IMAGE_ORDINAL_FLAG as usize == 0 {
                 let import = &*base.add(*entry).cast::<IMAGE_IMPORT_BY_NAME>();
-                if CStr::from_ptr(import.Name.as_ptr()).to_bytes() == b"GetDpiForMonitor" {
+                if matches!(
+                    CStr::from_ptr(import.Name.as_ptr()).to_bytes(),
+                    b"GetDpiForMonitor" | b"GetSystemMetricsForDpi"
+                ) {
                     return true;
                 }
             }

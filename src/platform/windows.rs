@@ -263,7 +263,7 @@ impl Drop for IconInfo {
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     let (handle, scale) = cursor::captured(hcursor)?;
     unsafe {
-        let mut ii = IconInfo::new(handle as _)?;
+        let mut ii = cursor::icon_info(handle as _, scale)?;
         let bm_mask = get_bitmap(ii.0.hbmMask)?;
         let mut width = bm_mask.bmWidth;
         let mut height = if ii.is_color() {
