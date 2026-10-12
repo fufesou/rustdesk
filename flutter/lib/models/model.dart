@@ -2865,8 +2865,8 @@ class CanvasModel with ChangeNotifier {
   }
 }
 
-// Bound integer cache keys and raster allocation: 1024 squared RGBA is 4 MiB.
-const _maxCursorRasterSize = 1024;
+// Bound integer cache keys and raster allocation: 512 squared RGBA is 1 MiB.
+const _maxCursorRasterSize = 512;
 
 bool _validCursorRasterSize(double width, double height,
         {double rasterScale = 1}) =>
@@ -3535,11 +3535,7 @@ class CursorModel with ChangeNotifier {
     if (_unavailable == id) _unavailable = null;
     final hotx = hotxInt.toDouble();
     final hoty = hotyInt.toDouble();
-    // Rust validates native packets; Web receives them directly from JavaScript.
-    if (isWeb && !_validCursorRasterSize(width.toDouble(), height.toDouble())) {
-      debugPrint('Rejected cursor $id: invalid source size ${width}x$height');
-      return;
-    }
+    // Web bypasses Rust's validation of the new cursor density field.
     if (isWeb &&
         (!pixelRatio.isFinite ||
             pixelRatio < 0 ||
@@ -3547,11 +3543,6 @@ class CursorModel with ChangeNotifier {
                 !_validCursorRasterSize(
                     width / pixelRatio, height / pixelRatio)))) {
       debugPrint('Rejected cursor $id: invalid pixel ratio $pixelRatio');
-      return;
-    }
-    const bytesPerPixel = 4;
-    if (isWeb && rgba.length != width * height * bytesPerPixel) {
-      debugPrint('Rejected cursor $id: invalid RGBA length ${rgba.length}');
       return;
     }
     final ui.Image? image;
