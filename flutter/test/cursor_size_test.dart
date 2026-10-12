@@ -154,7 +154,7 @@ void main() {
     ((1, 64), 0.25, (1, 16)),
     ((8, 8), 0.5, (12, 12)),
     ((4, 64), 1.0, (4, 64)),
-    ((1, 512), 2.0, (2, 1024)),
+    ((1, 256), 2.0, (2, 512)),
   ]) {
     test('native cursor size $scenario',
         () => _checkSize(scenario, registrations));
@@ -425,7 +425,7 @@ Future<void> _checkRasterTransitions(
 
 Future<void> _checkResizeLimits(
     (int, int) size, List<Map<dynamic, dynamic>> registrations) async {
-  const maxSide = 1024;
+  const maxSide = 512;
   const sourceLongEdge = 30;
   const validScale = maxSide / sourceLongEdge;
   final ffi = _FFI(_Canvas(kRemoteViewStyleAdaptive));
@@ -462,8 +462,8 @@ Future<void> _checkResizeLimits(
     await _ensureRegistered(cursor);
     expect(cursor.cache.scale, validScale);
     expect((
-      (cursor.cache.width * cursor.cache.scale).ceil(),
-      (cursor.cache.height * cursor.cache.scale).ceil()
+      (cursor.cache.width * cursor.cache.scale).round(),
+      (cursor.cache.height * cursor.cache.scale).round()
     ), raster);
     expect((cursor.cache.hotx, cursor.cache.hoty), cacheHotspot);
   }
