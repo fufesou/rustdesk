@@ -779,6 +779,8 @@ class FfiModel with ChangeNotifier {
 
   Future<void> updateCurDisplay(SessionID sessionId,
       {updateCursorPos = false}) async {
+    // Display selection or layout can change without changing the bounding rect.
+    parent.target?.inputModel.remotePointerPosition.value = null;
     final newRect = displaysRect();
     if (newRect == null) {
       return;
@@ -1653,13 +1655,15 @@ class FfiModel with ChangeNotifier {
   }
 
   /// A shape arriving is the shape in use, as a cursor_id is.
-  handleCursorData(String id, int hotx, int hoty, int width, int height,
-      Uint8List colors) async {
+  handleCursorData(
+      String id, int hotx, int hoty, int width, int height, Uint8List colors,
+      [double pixelRatio = 0]) async {
     // The replay selects this last, whatever the order the shapes are replayed in.
     cachedPeerData.lastCursorId = {'id': id};
     parent.target?.cursorModel.id = id;
-    await parent.target?.cursorModel
-        .updateCursorData(id, hotx, hoty, width, height, colors);
+    await parent.target?.cursorModel.updateCursorData(
+        id, hotx, hoty, width, height, colors,
+        pixelRatio: pixelRatio);
   }
 
   /// Handle the peer info synchronization event based on [evt].
@@ -2697,8 +2701,18 @@ class CanvasModel with ChangeNotifier {
 
     setScrollPercent(scrollPixelPercent.x, scrollPixelPercent.y);
     pushScrollPositionToUI(scrollPixel.x, scrollPixel.y);
+    // A no-op jump emits no notification to refresh the actual scroll fractions.
+    updateScrollPercent();
 
     notifyListeners();
+  }
+
+  void updateScrollAfterLayout((double, double) renderedScroll) {
+    updateScrollPercent();
+    // A delayed refresh may already have changed the model without repainting.
+    if (renderedScroll != (_scrollX, _scrollY)) {
+      notifyListeners();
+    }
   }
 
   panX(double dx) {
@@ -2851,15 +2865,31 @@ class CanvasModel with ChangeNotifier {
   }
 }
 
-// data for cursor
-class CursorData {
-  // At most 1 MiB of RGBA, including Linux's square cursor padding: twice the largest
-  // accessibility cursor, beyond which a cursor is shown smaller rather than larger.
-  static const _maxRasterSize = 512;
+// Bound integer cache keys and raster allocation: 1024 squared RGBA is 4 MiB.
+const _maxCursorRasterSize = 1024;
 
+bool _validCursorRasterSize(double width, double height,
+        {double rasterScale = 1}) =>
+    width.isFinite &&
+    height.isFinite &&
+    rasterScale.isFinite &&
+    width > 0 &&
+    height > 0 &&
+    rasterScale > 0 &&
+    width.ceilToDouble() * rasterScale <= _maxCursorRasterSize &&
+    height.ceilToDouble() * rasterScale <= _maxCursorRasterSize;
+
+// Scale the host's bitmap and hotspot together. Incorrect source geometry
+// must be fixed in host capture, independently of the client's sizing policy.
+class CursorData {
   final String peerId;
   final String id;
   img2.Image? _image;
+  // Own a handle while pixels await registration, independently of painted images.
+  ui.Image? _nativeImage;
+  ui.Image get nativeImage => _nativeImage!;
+  // Zero preserves legacy sizing for capture backends without density metadata.
+  final double pixelRatio;
   double scale;
   Uint8List? data;
   final double hotxOrigin;
@@ -2868,12 +2898,6 @@ class CursorData {
   double hoty;
   final int width;
   final int height;
-  int _rasterWidth;
-  int _rasterHeight;
-  bool _scaleLimitReported = false;
-
-  int get rasterWidth => _rasterWidth;
-  int get rasterHeight => _rasterHeight;
 
   img2.Image get image => _image!;
 
@@ -2882,6 +2906,8 @@ class CursorData {
 
   void releasePixels() {
     _image = null;
+    _nativeImage?.dispose();
+    _nativeImage = null;
     data = null;
   }
 
@@ -2889,6 +2915,8 @@ class CursorData {
     required this.peerId,
     required this.id,
     required img2.Image image,
+    required ui.Image nativeImage,
+    this.pixelRatio = 0,
     required this.scale,
     required this.data,
     required this.hotxOrigin,
@@ -2896,118 +2924,87 @@ class CursorData {
     required this.width,
     required this.height,
   })  : _image = image,
-        _rasterWidth = (width * scale).ceil(),
-        _rasterHeight = (height * scale).ceil(),
+        _nativeImage = nativeImage,
         hotx = hotxOrigin * scale,
         hoty = hotyOrigin * scale;
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
-  double _limitScale(double requestedScale) {
-    final valid = requestedScale.isFinite && requestedScale > 0;
-    // Invalid requests retain the last valid raster and hotspot.
-    final limitedScale = valid
-        ? min(requestedScale, _maxRasterSize / max(width, height))
-        : scale;
-    final limited = !valid || limitedScale != requestedScale;
-    if (limited && !_scaleLimitReported) {
-      debugPrint(
-          'Cursor $id: rejected scale $requestedScale for ${width}x$height; '
-          'using $limitedScale (maximum raster side $_maxRasterSize).');
+  // Keep the minimum-size policy here. Native callers let the plugin rasterize
+  // the original ui.Image; Web keeps the encoded-image resizing path.
+  double? _validatedScale(double scale,
+      {required bool useLegacyMinimum, required double rasterScale}) {
+    if (!scale.isFinite || scale <= 0) {
+      debugPrint('Rejected cursor $id: invalid scale $scale');
+      return null;
     }
-    _scaleLimitReported = limited;
-    return limitedScale;
-  }
-
-  double _checkUpdateScale(double scale) {
-    scale = _limitScale(scale);
-    if (scale != 1.0) {
-      // A thin cursor must not grow just to make its short edge reach the minimum.
+    // Preserve unscaled legacy artwork, but never enlarge a thin cursor just
+    // to make its short edge reach the visibility minimum.
+    if (!useLegacyMinimum || scale != 1.0) {
       scale = max(scale, kMinCursorSize / max(width, height));
     }
 
-    final targetWidth = (width * scale).ceil();
-    final targetHeight = (height * scale).ceil();
-    if ((_rasterWidth != targetWidth || _rasterHeight != targetHeight) &&
-        !hasPixels) {
-      // Nothing to make this raster from; buildCursorOfCache asks for the pixels unless its
-      // native cursor was made before.
-      data = null;
-      return scale;
+    if (!_validCursorRasterSize(width * scale, height * scale,
+        rasterScale: rasterScale)) {
+      debugPrint(
+          'Rejected cursor $id: raster ${width * scale}x${height * scale} '
+          'at pixel ratio $rasterScale exceeds $_maxCursorRasterSize');
+      return null;
     }
-    if (_rasterWidth != targetWidth || _rasterHeight != targetHeight) {
+    return scale;
+  }
+
+  double _checkUpdateScale(double scale, {required bool resizeImage}) {
+    final oldScale = this.scale;
+    // Web's long-edge minimum can round a thin axis below one raster pixel.
+    final webWidth = max(1, (width * scale).round());
+    final webHeight = max(1, (height * scale).round());
+    if (resizeImage &&
+        hasPixels &&
+        _doubleToInt(oldScale) != _doubleToInt(scale)) {
       if (isWindows) {
         data = img2
             .copyResize(
               image,
-              width: targetWidth,
-              height: targetHeight,
+              width: (width * scale).toInt(),
+              height: (height * scale).toInt(),
               interpolation: img2.Interpolation.average,
             )
             .getBytes(order: img2.ChannelOrder.bgra);
-      } else if (isDesktop && scale < 1.0 && !image.hasPalette) {
-        data = Uint8List.fromList(
-            img2.encodePng(_resizeWithAlpha(targetWidth, targetHeight)));
       } else {
         data = Uint8List.fromList(
           img2.encodePng(
             img2.copyResize(
               image,
-              width: targetWidth,
-              height: targetHeight,
+              width: isWeb ? webWidth : (width * scale).toInt(),
+              height: isWeb ? webHeight : (height * scale).toInt(),
               interpolation: img2.Interpolation.average,
             ),
           ),
         );
       }
-      _rasterWidth = targetWidth;
-      _rasterHeight = targetHeight;
     }
 
     this.scale = scale;
-    hotx = hotxOrigin * _rasterWidth / width;
-    hoty = hotyOrigin * _rasterHeight / height;
+    hotx = hotxOrigin * scale;
+    hoty = hotyOrigin * scale;
+    if (isWeb) {
+      // CSS hotspots must follow the actual rounded PNG dimensions.
+      hotx = hotxOrigin * webWidth / width;
+      hoty = hotyOrigin * webHeight / height;
+    }
     return scale;
   }
 
-  img2.Image _resizeWithAlpha(int targetWidth, int targetHeight) {
-    final resized =
-        img2.Image.fromResized(image, width: targetWidth, height: targetHeight);
-    final dx = image.width / targetWidth;
-    final dy = image.height / targetHeight;
-    // Use the average filter's sample area, but weight RGB by alpha so
-    // transparent pixels do not darken visible edges in the straight-alpha PNG.
-    for (final pixel in resized) {
-      final x = (pixel.x * dx).toInt();
-      final y = (pixel.y * dy).toInt();
-      final sampleWidth = ((pixel.x + 1) * dx).toInt() - x;
-      final sampleHeight = ((pixel.y + 1) * dy).toInt() - y;
-      final samples = image.getRange(x, y, sampleWidth, sampleHeight);
-      num r = 0;
-      num g = 0;
-      num b = 0;
-      num a = 0;
-      while (samples.moveNext()) {
-        final sample = samples.current;
-        r += sample.r * sample.a;
-        g += sample.g * sample.a;
-        b += sample.b * sample.a;
-        a += sample.a;
-      }
-      if (a == 0) {
-        pixel.setRgba(0, 0, 0, 0);
-        continue;
-      }
-      pixel.setRgba(r / a, g / a, b / a, a / (sampleWidth * sampleHeight));
-    }
-    return resized;
-  }
-
-  String updateGetKey(double scale) {
-    scale = _checkUpdateScale(scale);
-    // The raster asked for, not the one made last: a shape without pixels keeps the native
-    // cursors of every raster it was shown at.
-    return '${peerId}_${id}_${_doubleToInt(width * scale)}_${_doubleToInt(height * scale)}_${(width * scale).ceil()}_${(height * scale).ceil()}';
+  String? updateGetKey(double scale,
+      {bool resizeImage = true,
+      bool useLegacyMinimum = true,
+      double rasterScale = 1}) {
+    final effectiveScale = _validatedScale(scale,
+        useLegacyMinimum: useLegacyMinimum, rasterScale: rasterScale);
+    if (effectiveScale == null) return null;
+    _checkUpdateScale(effectiveScale, resizeImage: resizeImage);
+    return '${peerId}_${id}_${_doubleToInt(width * effectiveScale)}_${_doubleToInt(height * effectiveScale)}';
   }
 }
 
@@ -3047,7 +3044,8 @@ class PredefinedCursor {
   CursorData? get cache => _cache;
 
   init() {
-    _image2 = img2.decodePng(base64Decode(png));
+    final pngBytes = base64Decode(png);
+    _image2 = img2.decodePng(pngBytes);
     if (_image2 != null) {
       // The png type of forbidden cursor image is `PngColorType.indexed`.
       if (id == kPreForbiddenCursorId) {
@@ -3055,27 +3053,32 @@ class PredefinedCursor {
       }
 
       () async {
-        final defaultImg = _image2!;
-        // This function is called only one time, no need to care about the performance.
-        Uint8List data = defaultImg.getBytes(order: img2.ChannelOrder.rgba);
         _image?.dispose();
-        _image = await img.decodeImageFromPixels(
-            data, defaultImg.width, defaultImg.height, ui.PixelFormat.rgba8888);
-        if (_image == null) {
-          print("decodeImageFromPixels failed, pre-defined cursor $id");
-          return;
+        // Native registration uses this ui.Image. The RGBA bytes from img2 are
+        // straight alpha, but PixelFormat.rgba8888 requires premultiplied alpha.
+        // Decode the PNG directly to preserve translucent cursor colors.
+        final codec = await ui.instantiateImageCodec(pngBytes);
+        final ui.Image nativeImage;
+        try {
+          nativeImage = (await codec.getNextFrame()).image;
+        } finally {
+          codec.dispose();
         }
+        _image = nativeImage;
         double scale = 1.0;
+        final Uint8List data;
         if (isWindows) {
           data = _image2!.getBytes(order: img2.ChannelOrder.bgra);
         } else {
           data = Uint8List.fromList(img2.encodePng(_image2!));
         }
 
+        _cache?.releasePixels();
         _cache = CursorData(
           peerId: '',
           id: id,
           image: _image2!.clone(),
+          nativeImage: nativeImage.clone(),
           scale: scale,
           data: data,
           hotxOrigin:
@@ -3518,28 +3521,56 @@ class CursorModel with ChangeNotifier {
   }
 
   disposeImages() {
+    for (final cache in _cacheMap.values) {
+      cache.releasePixels();
+    }
     _images.forEach((_, v) => v.item1.dispose());
     _images.clear();
   }
 
-  /// Its image is kept with the ones used last, see [_imageLimit]; a shape that does not decode
-  /// is marked as one the core cannot give.
   Future<void> updateCursorData(String id, int hotxInt, int hotyInt, int width,
-      int height, Uint8List rgba) async {
+      int height, Uint8List rgba,
+      {double pixelRatio = 0}) async {
     final generation = _generation;
     if (_unavailable == id) _unavailable = null;
     final hotx = hotxInt.toDouble();
     final hoty = hotyInt.toDouble();
-    final image = await img.decodeImageFromPixels(
-        rgba, width, height, ui.PixelFormat.rgba8888);
+    // Rust validates native packets; Web receives them directly from JavaScript.
+    if (isWeb && !_validCursorRasterSize(width.toDouble(), height.toDouble())) {
+      debugPrint('Rejected cursor $id: invalid source size ${width}x$height');
+      return;
+    }
+    if (isWeb &&
+        (!pixelRatio.isFinite ||
+            pixelRatio < 0 ||
+            (pixelRatio > 0 &&
+                !_validCursorRasterSize(
+                    width / pixelRatio, height / pixelRatio)))) {
+      debugPrint('Rejected cursor $id: invalid pixel ratio $pixelRatio');
+      return;
+    }
+    const bytesPerPixel = 4;
+    if (isWeb && rgba.length != width * height * bytesPerPixel) {
+      debugPrint('Rejected cursor $id: invalid RGBA length ${rgba.length}');
+      return;
+    }
+    final ui.Image? image;
+    final platform = parent.target?.ffiModel.pi.platform;
+    if (!isWeb &&
+        (platform == kPeerPlatformMacOS || platform == kPeerPlatformWindows)) {
+      image = await _decodeStraightAlphaCursor(rgba, width, height);
+    } else {
+      image = await img.decodeImageFromPixels(
+          rgba, width, height, ui.PixelFormat.rgba8888);
+    }
     if (image == null) {
       // It did not decode; painting must not ask for it on every frame.
       _markUnavailable(generation, id);
       return;
     }
     if (!await _updateCache(
-        generation, rgba, image, id, hotx, hoty, width, height)) {
-      // Not kept, or the session was cleared while it decoded.
+        generation, rgba, image, id, hotx, hoty, width, height,
+        pixelRatio: pixelRatio)) {
       image.dispose();
       _markUnavailable(generation, id);
       return;
@@ -3558,6 +3589,26 @@ class CursorModel with ChangeNotifier {
     if (id != _id && cache != null) _switchedAway(cache);
   }
 
+  Future<ui.Image?> _decodeStraightAlphaCursor(
+      Uint8List rgba, int width, int height) async {
+    // macOS and Win32 capture send straight alpha; XFixes/DRM are premultiplied.
+    // Convert a copy for native ui.Image, preserving the wire and PNG cache colors.
+    final source = img2.Image.fromBytes(
+        width: width,
+        height: height,
+        bytes: rgba.buffer,
+        bytesOffset: rgba.offsetInBytes,
+        order: img2.ChannelOrder.rgba);
+    for (final pixel in source) {
+      final opacity = pixel.a / pixel.maxChannelValue;
+      pixel.r = (pixel.r * opacity).round();
+      pixel.g = (pixel.g * opacity).round();
+      pixel.b = (pixel.b * opacity).round();
+    }
+    return img.decodeImageFromPixels(
+        source.getBytes(), width, height, ui.PixelFormat.rgba8888);
+  }
+
   Future<bool> _updateCache(
     int generation,
     Uint8List rgba,
@@ -3566,8 +3617,9 @@ class CursorModel with ChangeNotifier {
     double hotx,
     double hoty,
     int w,
-    int h,
-  ) async {
+    int h, {
+    required double pixelRatio,
+  }) async {
     Uint8List? data;
     img2.Image imgOrigin = img2.Image.fromBytes(
         width: w,
@@ -3581,6 +3633,7 @@ class CursorModel with ChangeNotifier {
       ByteData? imgBytes =
           await image.toByteData(format: ui.ImageByteFormat.png);
       if (imgBytes == null) {
+        debugPrint('Unable to encode cursor $id as PNG');
         return false;
       }
       data = imgBytes.buffer.asUint8List();
@@ -3596,10 +3649,15 @@ class CursorModel with ChangeNotifier {
         imgOrigin = decoded;
       }
     }
+    if (generation != _generation) {
+      return false;
+    }
     final cache = CursorData(
       peerId: peerId,
       id: id,
       image: imgOrigin,
+      nativeImage: image.clone(),
+      pixelRatio: pixelRatio,
       scale: 1.0,
       data: data,
       hotxOrigin: hotx,
@@ -3607,9 +3665,7 @@ class CursorModel with ChangeNotifier {
       width: w,
       height: h,
     );
-    if (generation != _generation) {
-      return false;
-    }
+    _cacheMap[id]?.releasePixels();
     _cacheMap[id] = cache;
     return true;
   }
@@ -3626,8 +3682,18 @@ class CursorModel with ChangeNotifier {
   static int _nextKeyScope = 0;
   final int _keyScope = _nextKeyScope++;
 
-  String nativeKey(CursorData cache, double scale) {
-    final key = '${_keyScope}_${cache.updateGetKey(scale)}';
+  String? nativeKey(CursorData cache, double scale,
+      {bool resizeImage = true,
+      bool useLegacyMinimum = true,
+      double rasterScale = 1,
+      double? devicePixelRatio}) {
+    final rasterKey = cache.updateGetKey(scale,
+        resizeImage: resizeImage,
+        useLegacyMinimum: useLegacyMinimum,
+        rasterScale: rasterScale);
+    if (rasterKey == null) return null;
+    final key = '${_keyScope}_$rasterKey'
+        '${devicePixelRatio == null ? '' : '_$devicePixelRatio'}';
     // A native cursor at another raster does not hold the pixels this one is made from.
     if (!_cacheKeys.contains(key)) _nativeIds.remove(cache.id);
     return key;
@@ -3653,6 +3719,7 @@ class CursorModel with ChangeNotifier {
   /// The shape in use keeps its pixels, so a new raster is made from them at once; the others
   /// keep none once their native cursor holds them.
   void registered(CursorData cache, String key) {
+    if (!_cacheKeys.contains(key)) return;
     _nativeIds.add(cache.id);
     _awaitingNative.remove(cache.id);
     if (cache.id != _id && identical(_cacheMap[cache.id], cache)) {
@@ -3753,7 +3820,8 @@ class CursorModel with ChangeNotifier {
         } else {
           // Decoded even if the peer moved on: an animation comes back to it.
           await updateCursorData(id, shape.hotx, shape.hoty, shape.width,
-              shape.height, shape.colors);
+              shape.height, shape.colors,
+              pixelRatio: shape.scale);
         }
       } catch (e) {
         _markUnavailable(generation, id);
@@ -4290,8 +4358,14 @@ class FFI {
             platformFFI.nextRgba(sessionId, display);
           }
         } else if (message is EventToUI_Cursor) {
-          await ffiModel.handleCursorData(message.id, message.hotx,
-              message.hoty, message.width, message.height, message.colors);
+          await ffiModel.handleCursorData(
+              message.id,
+              message.hotx,
+              message.hoty,
+              message.width,
+              message.height,
+              message.colors,
+              message.scale);
         } else if (message is EventToUI_Texture) {
           final display = message.field0;
           final gpuTexture = message.field1;

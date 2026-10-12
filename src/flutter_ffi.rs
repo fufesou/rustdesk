@@ -105,6 +105,7 @@ pub enum EventToUI {
         hoty: i32,
         width: i32,
         height: i32,
+        scale: f64,
         colors: Vec<u8>,
     },
 }
@@ -217,6 +218,7 @@ pub struct CursorShape {
     pub hoty: i32,
     pub width: i32,
     pub height: i32,
+    pub scale: f64,
     pub colors: Vec<u8>,
 }
 
@@ -230,6 +232,7 @@ pub fn session_get_cursor_shape(session_id: SessionID, id: String) -> Option<Cur
             hoty: cd.hoty,
             width: cd.width,
             height: cd.height,
+            scale: cd.scale,
             colors: cd.colors.to_vec(),
         }),
         Err(err) => {

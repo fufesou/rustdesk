@@ -191,11 +191,12 @@ class PlatformFFI {
 
   // The web core calls this with a shape's pixels as bytes, as it calls onRgba for a frame.
   void setCursorDataCallback(
-      void Function(String, int, int, int, int, Uint8List) fun) {
-    context["onCursorData"] = (String id, int hotx, int hoty, int width,
-        int height, Uint8List? rgba) {
+      void Function(String, int, int, int, int, Uint8List, double) fun) {
+    context["onCursorData"] =
+        (String id, int hotx, int hoty, int width, int height, Uint8List? rgba,
+            [double scale = 0]) {
       if (rgba != null) {
-        fun(id, hotx, hoty, width, height, rgba);
+        fun(id, hotx, hoty, width, height, rgba, scale);
       }
     };
   }

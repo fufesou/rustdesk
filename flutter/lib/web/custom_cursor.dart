@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'package:flutter_hbb/models/model.dart' as model;
+import 'cursor_image.dart';
 
 class CursorData {
   final String key;
@@ -52,8 +53,9 @@ class CursorManager {
         'cursor',
         jsonEncode({
           'url': cursorData.url,
-          'hotx': cursorData.hotX.toInt(),
-          'hoty': cursorData.hotY.toInt(),
+          // Rounding must keep the hotspot inside even a one-pixel raster.
+          'hotx': cursorData.hotX.round().clamp(0, cursorData.width - 1),
+          'hoty': cursorData.hotY.round().clamp(0, cursorData.height - 1),
         })
       ]);
     }
@@ -104,7 +106,10 @@ MouseCursor buildCursorOfCache(
   if (cache == null) {
     return _shownCursor(cursor);
   } else {
-    final key = cursor.nativeKey(cache, scale);
+    // A short-edge minimum can enlarge thin artwork beyond CSS cursor limits.
+    // Keep unzoomed images unchanged and use the long edge when resizing.
+    final key = cursor.nativeKey(cache, scale, useLegacyMinimum: scale == 1.0);
+    if (key == null) return MouseCursor.defer;
     if (!cursor.cachedKeys.contains(key)) {
       // data should be checked here, because it may be changed after `updateGetKey()`
       final data = cache.data;
@@ -112,13 +117,15 @@ MouseCursor buildCursorOfCache(
         cursor.restorePixels(cache.id);
         return _shownCursor(cursor);
       }
+      final webCursor = trimWebCursor(data,
+          hotX: cache.hotx.round(), hotY: cache.hoty.round());
       debugPrint(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
       CursorManager.instance.registerCursor(CursorData(
           key: key,
-          url: 'data:image/rgba;base64,${base64Encode(data)}',
-          width: (cache.width * cache.scale).toInt(),
-          height: (cache.height * cache.scale).toInt(),
+          url: 'data:image/rgba;base64,${base64Encode(webCursor.png)}',
+          width: webCursor.width,
+          height: webCursor.height,
           hotX: cache.hotx,
           hotY: cache.hoty));
       cursor.addKey(key);

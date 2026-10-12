@@ -1659,7 +1659,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::CursorData(cd)) => {
                     let id = cd.id;
                     #[cfg(feature = "flutter")]
-                    let compressed = cd.colors.clone();
+                    let compressed = cursor_shape_source(&cd).colors.clone();
                     match decode_cursor_data(cd) {
                         Ok(cd) => {
                             #[cfg(feature = "flutter")]
@@ -2746,7 +2746,7 @@ impl<T: InvokeUiSession> Remote<T> {
             return;
         }
         #[cfg(feature = "flutter")]
-        let compressed = cd.colors.clone();
+        let compressed = cursor_shape_source(&cd).colors.clone();
         match decode_cursor_data(cd) {
             Ok(mut cd) => {
                 cd.id = id;
@@ -2764,6 +2764,11 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 }
 
+#[cfg(feature = "flutter")]
+fn cursor_shape_source(data: &CursorData) -> &CursorData {
+    data.high_resolution.as_ref().unwrap_or(data)
+}
+
 /// A shape that decoded, still compressed, under the id the UI knows it by. Copied once it
 /// decoded: the message's colors may be a slice of a larger received buffer, which a clone
 /// would keep alive.
@@ -2775,6 +2780,7 @@ fn cursor_shape(id: u64, cd: &CursorData, compressed: &[u8]) -> CursorData {
         hoty: cd.hoty,
         width: cd.width,
         height: cd.height,
+        scale: cd.scale,
         colors: compressed.to_vec().into(),
         ..Default::default()
     }
@@ -2795,6 +2801,12 @@ fn decode_cursor_data(data: CursorData) -> hbb_common::ResultType<CursorData> {
     const RGBA_CHANNELS: usize = 4;
 
     let mut cd = data;
+    // Sciter keeps the legacy outer image; Flutter uses the physical variant.
+    #[cfg(feature = "flutter")]
+    if let Some(mut physical) = cd.high_resolution.take() {
+        physical.id = cd.id;
+        cd = physical;
+    }
     if !(1..=MAX_CURSOR_SIZE).contains(&cd.width) || !(1..=MAX_CURSOR_SIZE).contains(&cd.height) {
         bail!("invalid source size {}x{}", cd.width, cd.height);
     }
@@ -2804,6 +2816,15 @@ fn decode_cursor_data(data: CursorData) -> hbb_common::ResultType<CursorData> {
             cd.hotx,
             cd.hoty
         );
+    }
+    // Zero preserves legacy sizing; positive density must bound the logical image too.
+    if !cd.scale.is_finite()
+        || cd.scale < 0.0
+        || (cd.scale > 0.0
+            && (f64::from(cd.width) / cd.scale > f64::from(MAX_CURSOR_SIZE)
+                || f64::from(cd.height) / cd.scale > f64::from(MAX_CURSOR_SIZE)))
+    {
+        bail!("invalid cursor density {}", cd.scale);
     }
     let expected = (cd.width as usize)
         .checked_mul(cd.height as usize)
@@ -2841,7 +2862,7 @@ impl CursorDedupe {
     /// Hashes the compressed colors: one peer compresses the same pixels to the same bytes, and
     /// a shape seen before is then never decompressed again.
     fn name(cd: &CursorData) -> u64 {
-        crate::cursor_content_id(cd.width, cd.height, cd.hotx, cd.hoty, &cd.colors)
+        crate::cursor_data_content_id(cd)
     }
 
     fn id(&self, peer_id: u64) -> u64 {
@@ -3111,8 +3132,10 @@ mod kept_cursor_tests {
     fn a_kept_shape_is_a_copy_under_the_ui_id() {
         let mut cd = compressed(4, 4);
         cd.hotx = 1;
+        cd.scale = 2.0;
         let kept = cursor_shape(42, &cd, &cd.colors);
         assert_eq!(kept.id, 42);
+        assert_eq!(kept.scale, 2.0);
         assert_eq!((kept.hotx, kept.width, kept.height), (1, 4, 4));
         assert_eq!(kept.colors, cd.colors);
         assert_ne!(
@@ -3132,5 +3155,21 @@ mod kept_cursor_tests {
         let mut bomb = compressed(4, 4);
         bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
         assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
+    }
+
+    #[cfg(feature = "flutter")]
+    #[test]
+    fn physical_cursor_replay_preserves_pixels_density_and_outer_id() {
+        let mut outer = compressed(2, 2);
+        outer.id = 42;
+        let mut physical = compressed(4, 4);
+        physical.scale = 2.0;
+        outer.high_resolution = Some(physical).into();
+        let compressed = cursor_shape_source(&outer).colors.clone();
+        let decoded = decode_cursor_data(outer).unwrap();
+        assert_eq!(decoded.id, 42);
+        let replay = kept_cursor_rgba(cursor_shape(42, &decoded, &compressed)).unwrap();
+        assert_eq!((replay.width, replay.height, replay.scale), (4, 4, 2.0));
+        assert_eq!(replay.colors, decoded.colors);
     }
 }
