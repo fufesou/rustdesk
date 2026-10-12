@@ -14,7 +14,7 @@ use std::{
 use winapi::{
     shared::{
         minwindef::UINT,
-        windef::{HCURSOR, HMONITOR, POINT},
+        windef::{DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_UNAWARE, HCURSOR, HMONITOR, POINT},
         winerror::S_OK,
     },
     um::{
@@ -33,6 +33,7 @@ use winapi::{
 type MonitorDpi =
     unsafe extern "system" fn(HMONITOR, MONITOR_DPI_TYPE, *mut UINT, *mut UINT) -> HRESULT;
 type CursorMetrics = unsafe extern "system" fn(i32, UINT) -> i32;
+type ThreadDpi = unsafe extern "system" fn(DPI_AWARENESS_CONTEXT) -> DPI_AWARENESS_CONTEXT;
 
 #[derive(Clone, Copy)]
 struct Capture {
@@ -107,7 +108,7 @@ pub(super) fn icon_info(handle: HCURSOR, scale: f64) -> ResultType<super::IconIn
         if !system_cursor {
             return Ok(original);
         }
-        let Some((width, height)) = cursor_size(scale)? else {
+        let Some(((width, height), set_dpi)) = cursor_size(scale)? else {
             return Ok(original);
         };
         let bitmap = super::get_bitmap(original.0.hbmMask)?;
@@ -120,12 +121,28 @@ pub(super) fn icon_info(handle: HCURSOR, scale: f64) -> ResultType<super::IconIn
             return Ok(original);
         }
         // GetIconInfo can expose the primary monitor's raster on another monitor.
-        copy_icon_info(handle, (width, height))
+        copy_icon_info(handle, (width, height), (scale == 1.0).then_some(set_dpi))
     }
 }
 
-fn copy_icon_info(handle: HCURSOR, size: (i32, i32)) -> ResultType<super::IconInfo> {
+fn copy_icon_info(
+    handle: HCURSOR,
+    size: (i32, i32),
+    set_dpi: Option<ThreadDpi>,
+) -> ResultType<super::IconInfo> {
     unsafe {
+        if let Some(set_dpi) = set_dpi {
+            // CopyImage rescales the primary I-beam instead of selecting its 100% variant.
+            let previous = set_dpi(DPI_AWARENESS_CONTEXT_UNAWARE);
+            if previous.is_null() {
+                return Err(io::Error::last_os_error().into());
+            }
+            let result = super::IconInfo::new(handle);
+            if set_dpi(previous).is_null() {
+                return Err(io::Error::last_os_error().into());
+            }
+            return result;
+        }
         let cursor = CopyImage(
             handle as _,
             IMAGE_CURSOR,
@@ -144,9 +161,9 @@ fn copy_icon_info(handle: HCURSOR, size: (i32, i32)) -> ResultType<super::IconIn
     }
 }
 
-fn cursor_size(scale: f64) -> ResultType<Option<(i32, i32)>> {
-    static API: OnceLock<Option<(Library, CursorMetrics)>> = OnceLock::new();
-    let Some((_, query)) = API.get_or_init(|| match load_cursor_metrics() {
+fn cursor_size(scale: f64) -> ResultType<Option<((i32, i32), ThreadDpi)>> {
+    static API: OnceLock<Option<(Library, CursorMetrics, ThreadDpi)>> = OnceLock::new();
+    let Some((_, query, set_dpi)) = API.get_or_init(|| match load_cursor_metrics() {
         Ok(api) => Some(api),
         Err(err) => {
             log::warn!("Windows cursor size API unavailable; retaining original bitmap: {err}");
@@ -160,14 +177,15 @@ fn cursor_size(scale: f64) -> ResultType<Option<(i32, i32)>> {
     if width <= 0 || height <= 0 {
         bail!("Invalid Windows cursor size ({width}, {height}) at DPI {dpi}");
     }
-    Ok(Some((width, height)))
+    Ok(Some(((width, height), *set_dpi)))
 }
 
-fn load_cursor_metrics() -> ResultType<(Library, CursorMetrics)> {
+fn load_cursor_metrics() -> ResultType<(Library, CursorMetrics, ThreadDpi)> {
     unsafe {
         let library = Library::load_with_flags("user32.dll", LOAD_LIBRARY_SEARCH_SYSTEM32)?;
         let query = *library.get::<CursorMetrics>(b"GetSystemMetricsForDpi\0")?;
-        Ok((library, query))
+        let set_dpi = *library.get::<ThreadDpi>(b"SetThreadDpiAwarenessContext\0")?;
+        Ok((library, query, set_dpi))
     }
 }
 
@@ -256,7 +274,9 @@ mod tests {
                 let import = &*base.add(*entry).cast::<IMAGE_IMPORT_BY_NAME>();
                 if matches!(
                     CStr::from_ptr(import.Name.as_ptr()).to_bytes(),
-                    b"GetDpiForMonitor" | b"GetSystemMetricsForDpi"
+                    b"GetDpiForMonitor"
+                        | b"GetSystemMetricsForDpi"
+                        | b"SetThreadDpiAwarenessContext"
                 ) {
                     return true;
                 }
