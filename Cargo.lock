@@ -4427,7 +4427,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e310b3a6b5907f99202fcdb4960ff45b93735d7c7d96b760fcff8db2dc0e103d"
 dependencies = [
  "cfg-if 1.0.0",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -6772,7 +6772,7 @@ dependencies = [
 [[package]]
 name = "rdev"
 version = "0.5.0-2"
-source = "git+https://github.com/rustdesk-org/rdev#a361d86a8b0245f3618a9efb375c149530a6b599"
+source = "git+https://github.com/fufesou/rdev?branch=fix/keepassxc-auto-type#1d9067f26525fe10466907da8b3524329a7746a8"
 dependencies = [
  "cocoa 0.24.1",
  "core-foundation 0.9.4",
