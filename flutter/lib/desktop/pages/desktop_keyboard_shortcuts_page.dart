@@ -1,12 +1,7 @@
 // flutter/lib/desktop/pages/desktop_keyboard_shortcuts_page.dart
 //
 // Desktop shell for the Keyboard Shortcuts configuration page. Users land
-// here from the General settings tab. The page exposes:
-//   * A top-level enable/disable toggle (mirrors the General-tab toggle —
-//     same JSON key, same semantics).
-//   * A grouped, scrollable list of actions, each with a current binding and
-//     edit / clear icons.
-//   * An AppBar "Reset to defaults" action with a confirmation dialog.
+// here from the General settings tab.
 //
 // All edits write back to LocalConfig under [kShortcutLocalConfigKey] in the
 // canonical {enabled, bindings:[{action,mods,key}]} shape that the Rust and
