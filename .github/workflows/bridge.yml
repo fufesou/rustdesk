@@ -25,14 +25,6 @@ jobs:
               flutter-version: "3.22.3",
               artifact-name: "bridge-artifact",
             }
-          # Dedicated bridge for the Windows arm64 build (Flutter 3.44); runs in parallel.
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-22.04,
-              extra-build-args: "",
-              flutter-version: "3.44.0",
-              artifact-name: "bridge-artifact-flutter-3.44",
-            }
     steps:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
