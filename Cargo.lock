@@ -6762,7 +6762,7 @@ dependencies = [
 [[package]]
 name = "rdev"
 version = "0.5.0-2"
-source = "git+https://github.com/fufesou/rdev?branch=fix/keepassxc-auto-type#f60611992136de8d1bc9a390bfb9413d77dba4bb"
+source = "git+https://github.com/fufesou/rdev?branch=fix/keepassxc-auto-type#522bd2f1f88684ed6878d5a687cf913b07bc47bf"
 dependencies = [
  "cocoa 0.24.1",
  "core-foundation 0.9.4",
