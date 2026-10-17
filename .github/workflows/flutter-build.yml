@@ -325,6 +325,14 @@ jobs:
         shell: bash
         run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
 
+      - name: Build and sign installer helper
+        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
+        shell: pwsh
+        env:
+          BASE_URL: ${{ env.SIGN_BASE_URL }}
+          SECRET_KEY: ${{ secrets.SIGN_SECRET_KEY }}
+        run: ./.github/scripts/build-sign-installer-helper.ps1 -Target '${{ matrix.job.target }}'
+
       - name: Build rustdesk
         run: |
           # Windows: build RustDesk
@@ -626,6 +634,14 @@ jobs:
           fi
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
         shell: bash
+
+      - name: Build and sign installer helper
+        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
+        shell: pwsh
+        env:
+          BASE_URL: ${{ env.SIGN_BASE_URL }}
+          SECRET_KEY: ${{ secrets.SIGN_SECRET_KEY }}
+        run: ./.github/scripts/build-sign-installer-helper.ps1 -Target '${{ matrix.job.target }}'
 
       - name: Build rustdesk
         id: build

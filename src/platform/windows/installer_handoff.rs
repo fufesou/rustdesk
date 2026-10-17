@@ -1,10 +1,13 @@
 mod directory;
+mod gate;
+mod helper;
+
+use self::{gate::InstallGate, helper::ProtectedHelper};
 
 use super::{
     installer_shell::{
-        get_system_executable, path_for_cmd_assignment, path_for_cmd_environment,
-        run_elevated_and_wait, trusted_install_environment,
-        BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE, CMD_RELATIVE_PATH,
+        get_system_executable, launch_elevated, path_for_cmd_assignment, path_for_cmd_environment,
+        trusted_install_environment, BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE, CMD_RELATIVE_PATH,
         WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS,
     },
     validate_install_app_name, ResultType,
@@ -20,14 +23,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const CERTUTIL_RELATIVE_PATH: &str = "certutil.exe";
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
-const FINDSTR_RELATIVE_PATH: &str = "findstr.exe";
 const UTF8_CODE_PAGE: u32 = 65001;
 const INSTALL_HANDOFF_RUNNER_EXISTS_EXIT_CODE: u32 = 0x5253_0001;
 const INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE: u32 = 0x5253_0002;
 const INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE: u32 = 0x5253_0003;
 const INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE: u32 = 0x5253_0004;
+const INSTALL_HANDOFF_GATE_FAILURE_EXIT_CODE: u32 = 0x5253_0009;
 const BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
 const BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE: u32 = 0x5253_0006;
 const BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE: u32 = 0x5253_0007;
@@ -64,7 +66,8 @@ fn prepare_install_commands(commands: &str) -> ResultType<String> {
          {}\r\n\
          if exist \"%~f0.dir\" exit /b {BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE}\r\n\
          md \"%~f0.dir\" || exit /b {BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE}\r\n\
-         set \"RUSTDESK_OUTPUT_DIR=%~f0.dir\"\r\n{commands}\r\nexit /b 0\r\n",
+         set \"RUSTDESK_OUTPUT_DIR=%~f0.dir\"\r\n\
+         set \"RUSTDESK_INSTALL_HELPER=%~dp0installer-helper.exe\"\r\n{commands}\r\nexit /b 0\r\n",
         trusted_install_environment()?
     ))
 }
@@ -91,56 +94,54 @@ fn write_install_script(cmds: String) -> ResultType<InstallCommandScript> {
     Ok(script)
 }
 
-fn install_hash_pattern(hash: &BatchHash) -> String {
-    hash.iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" *")
-}
-
 fn verified_install_bootstrap(
     script: &InstallCommandScript,
     runner_directory: &Path,
+    gate: &InstallGate,
 ) -> ResultType<String> {
     let source = path_for_cmd_assignment(&script.path)?;
     let directory = path_for_cmd_assignment(runner_directory)?;
     let runner = runner_directory.join("install.bat");
     let runner = path_for_cmd_assignment(&runner)?;
-    let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    let certutil_path = get_system_executable(CERTUTIL_RELATIVE_PATH)?;
-    let findstr_path = get_system_executable(FINDSTR_RELATIVE_PATH)?;
-    let cmd = path_for_cmd_assignment(&cmd_path)?;
-    let certutil = path_for_cmd_assignment(&certutil_path)?;
-    let findstr = path_for_cmd_assignment(&findstr_path)?;
-    // Short names preserve headroom under the Windows 7 ShellExecuteExW 2,048
-    // UTF-16-character parameter limit. Paths are stored with delayed expansion
-    // disabled, then expanded indirectly so literal `!` survives: S=source,
-    // R=runner, Q=cmd.exe, H=certutil.exe, F=findstr.exe, D=directory, E=exit code.
+    let source_helper = path_for_cmd_assignment(&runner_directory.with_extension("exe"))?;
+    let verifier = path_for_cmd_assignment(&runner_directory.join("installer-helper.exe"))?;
+    // Execute only from the protected runner directory, keeping DLL search away
+    // from adjacent files in Windows Temp or the portable application's directory.
+    // Short names preserve headroom under the Windows 7 ShellExecute limit.
+    // START /WAIT sets ERRORLEVEL, but || can still report successful process creation.
+    // Keep cleanup outside the gate so a failed handshake cannot skip it.
     Ok(format!(
         "setlocal DisableDelayedExpansion & set \"S={source}\" & set \"R={runner}\" & \
-         set \"Q={cmd}\" & set \"H={certutil}\" & set \"F={findstr}\" & \
-         set \"ERRORLEVEL=\" & set \"D={directory}\" & set \"E=0\" & setlocal EnableDelayedExpansion & \
+         set \"H={source_helper}\" & set \"V={verifier}\" & \
+         set \"ERRORLEVEL=\" & set \"D={directory}\" & set \"E={INSTALL_HANDOFF_GATE_FAILURE_EXIT_CODE}\" & \
+         setlocal EnableDelayedExpansion & set /p RUSTDESK_HANDOFF=<\"{gate}\" >nul && (set \"E=0\" & \
          if exist \"!R!\" (set \"E={INSTALL_HANDOFF_RUNNER_EXISTS_EXIT_CODE}\") else (\
-         copy /Y \"!S!\" \"!R!\" > nul || \
+         copy /B /Y \"!H!\" \"!V!\" > nul || \
          (set \"E={INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE}\") & \
-         if \"!E!\"==\"0\" (\"!H!\" -hashfile \"!R!\" SHA256 > \"!R!.hash\" || \
-         set \"E={INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE}\") & \
-         if \"!E!\"==\"0\" (\"!F!\" /R /I /X /C:\"{}\" \"!R!.hash\" > nul || \
+         if \"!E!\"==\"0\" (copy /Y \"!S!\" \"!R!\" > nul || \
+         set \"E={INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE}\") & \
+         if \"!E!\"==\"0\" (start \"\" /b /wait \"!V!\" --verify-install-file \
+         \"!R!\" {} \"!R!.verified\" & \
+         if errorlevel 1 set \"E={INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE}\") & \
+         if \"!E!\"==\"0\" (if not exist \"!R!.verified\" \
          set \"E={INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE}\") & \
-         if \"!E!\"==\"0\" (\"!Q!\" /D /E:ON /V:OFF /C \"\"!R!\"\" & \
-         set \"E=!errorlevel!\")) & \
+         if \"!E!\"==\"0\" (\"!R!\" & \
+         set \"E=!errorlevel!\"))) & \
+         del /f /q \"!H!\" > nul 2>&1 & \
          rd /s /q \"!D!\" > nul 2>&1 & exit /b !E!",
-        install_hash_pattern(&script.expected_hash),
+        hex::encode(script.expected_hash),
+        gate = gate.name(),
     ))
 }
 
 fn verified_install_parameters(
     script: &InstallCommandScript,
     directory: &Path,
+    gate: &InstallGate,
 ) -> ResultType<String> {
     let parameters = format!(
-        "/D /E:ON /V:ON /C {}",
-        verified_install_bootstrap(script, directory)?
+        "/D /E:ON /V:ON /C ({})",
+        verified_install_bootstrap(script, directory, gate)?
     );
     let length = parameters.encode_utf16().count();
     if length >= WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS {
@@ -154,14 +155,20 @@ pub(super) fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let script = write_install_script(cmds)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
     let directory = directory::path()?;
-    let parameters = verified_install_parameters(&script, &directory)?;
+    let mut helper = ProtectedHelper::new(&directory.with_extension("exe"))?;
+    let gate = InstallGate::new()?;
+    let parameters = verified_install_parameters(&script, &directory, &gate)?;
     directory::create(&directory)?;
-    let exit_code = run_elevated_and_wait(&cmd_path, &parameters, show).map_err(|err| {
+    let process = launch_elevated(&cmd_path, &parameters, show).map_err(|err| {
         anyhow!(
             "Installer handoff failed; protected directory may remain at {}: {err}",
             directory.display()
         )
     })?;
+    gate.wait_for_client(process.handle())?;
+    helper.release();
+    gate.release(process.handle())?;
+    let exit_code = gate.wait_for_exit(process.handle())?;
     // Cleanup must not change the result of an installation that already ran.
     match fs::symlink_metadata(&directory) {
         Ok(_) => log::warn!(
@@ -189,6 +196,7 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
         INSTALL_HANDOFF_COPY_FAILURE_EXIT_CODE => "failed to copy protected runner",
         INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE => "failed to hash protected runner",
         INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE => "protected runner hash mismatch",
+        INSTALL_HANDOFF_GATE_FAILURE_EXIT_CODE => "installer handoff was not authorized",
         BATCH_CODE_PAGE_FAILURE_EXIT_CODE => "failed to set the installer code page",
         BATCH_OUTPUT_DIRECTORY_EXISTS_EXIT_CODE => "installer output directory already exists",
         BATCH_OUTPUT_DIRECTORY_CREATE_FAILURE_EXIT_CODE => {
@@ -201,125 +209,92 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::installer_shell::{
-        embedded_shortcut_commands, shortcut_bytes, WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS,
-    };
+    use super::super::installer_shell::{embedded_shortcut_commands, shortcut_bytes};
     use super::*;
-    use ::windows::Win32::System::Threading;
-    use std::os::windows::process::CommandExt;
+    use ::windows::Win32::{Foundation::HANDLE, System::Threading};
+    use std::{
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        process::{Command, Stdio},
+    };
 
     #[test]
     fn native_install_handoff_verifies_before_execution() {
-        let marker = std::env::temp_dir().join(format!(
-            "rustdesk_install_marker_{}",
+        let runner = std::env::temp_dir().join(format!(
+            "rustdesk_install_!RUSTDESK_HANDOFF_EXPAND!&^@()_{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let runner_dir = std::env::temp_dir().join(format!(
-            "rustdesk_install_!RUSTDESK_HANDOFF_EXPAND!&^@()runner_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir(&runner_dir).expect("runner directory should be created");
-        let shortcut_commands = embedded_shortcut_commands(
-            shortcut_bytes(r"C:\RustDesk.exe", None, None)
-                .expect("native shortcut should be generated"),
-            "test.lnk",
-            "test",
-        );
+        let marker = runner.with_extension("lnk");
+        let bytes = shortcut_bytes(r"C:\RustDesk.exe", None, None).unwrap();
+        let shortcut = embedded_shortcut_commands(bytes.clone(), "test.lnk", "test");
+        assert!(!shortcut.contains("certutil"));
         let script = write_install_script(format!(
-            "if \"%PROGRAMDATA%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
-             if \"%PUBLIC%\"==\"rustdesk_untrusted\" exit /b 77\r\n\
-             {shortcut_commands}\r\n\
-             > \"{}\" echo verified",
+            "if \"%PROGRAMDATA%\"==\"rustdesk_untrusted\" exit /b 99\r\n\
+             if \"%PUBLIC%\"==\"rustdesk_untrusted\" exit /b 99\r\n\
+             {shortcut}\r\n\
+             copy /B /Y \"%RUSTDESK_OUTPUT_DIR%\\test.lnk\" \"{}\" >nul || exit /b 99\r\n\
+             exit /b %RUSTDESK_TEST_EXIT%",
             marker.display()
         ))
-        .expect("install script should be created");
-        let bootstrap = verified_install_bootstrap(&script, &runner_dir)
-            .expect("native verifier bootstrap should be generated");
-        assert_native_handoff_structure(&script, &shortcut_commands, &runner_dir);
-
-        let output = run_install_bootstrap_for_test(&bootstrap);
-        assert!(
-            output.status.success(),
-            "unchanged script failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(marker.exists(), "verified install script must execute");
-        std::fs::remove_file(&marker).expect("test marker should be removed");
-        assert!(
-            !runner_dir.exists(),
-            "protected runner directory must be removed"
-        );
-        std::fs::create_dir(&runner_dir).expect("runner directory should be created");
-        assert_replaced_install_script_is_rejected(&script, &runner_dir, &marker);
-        assert!(
-            !runner_dir.exists(),
-            "failed handoff directory must be removed"
-        );
-    }
-
-    fn assert_native_handoff_structure(
-        script: &InstallCommandScript,
-        shortcut_commands: &str,
-        runner_dir: &Path,
-    ) {
-        let bootstrap = verified_install_bootstrap(script, runner_dir)
-            .expect("native verifier bootstrap should be generated");
-        assert!(shortcut_commands.contains("certutil"));
-        assert!(shortcut_commands.contains("-decode"));
-        assert!(!shortcut_commands.to_ascii_lowercase().contains("cscript"));
-        assert!(!shortcut_commands
-            .to_ascii_lowercase()
-            .contains("powershell"));
-        let win7_hash_pattern = script
-            .expected_hash
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<Vec<_>>()
-            .join(" *");
-        assert!(bootstrap.contains(&format!("/R /I /X /C:\"{win7_hash_pattern}\"")));
-        let parameters = verified_install_parameters(script, runner_dir)
-            .expect("elevated parameters should be generated");
-        assert!(bootstrap.contains("certutil.exe"));
-        assert!(bootstrap.contains("findstr.exe"));
-        assert!(!bootstrap.to_ascii_lowercase().contains("powershell"));
-        assert!(parameters.encode_utf16().count() < WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS);
-    }
-
-    fn assert_replaced_install_script_is_rejected(
-        script: &InstallCommandScript,
-        runner_dir: &Path,
-        marker: &Path,
-    ) {
-        std::fs::write(
+        .unwrap();
+        for code in [0, 77] {
+            fs::create_dir(&runner).unwrap();
+            let result = run_install_bootstrap_for_test(&script, &runner, code);
+            assert_eq!(result.status.code(), Some(code), "{result:?}");
+            assert_eq!(fs::read(&marker).unwrap(), bytes);
+            fs::remove_file(&marker).unwrap();
+            assert!(
+                !runner.exists(),
+                "runner cleanup must preserve the BAT result"
+            );
+            assert!(
+                !runner.with_extension("exe").exists(),
+                "helper source remains"
+            );
+        }
+        fs::create_dir(&runner).unwrap();
+        fs::write(
             &script.path,
             format!("> \"{}\" echo hijacked\r\n", marker.display()),
         )
-        .expect("install script should be replaceable");
-        let replaced = verified_install_bootstrap(&script, &runner_dir)
-            .expect("replacement verifier should be generated");
-        let output = run_install_bootstrap_for_test(&replaced);
-        assert!(
-            !output.status.success(),
-            "replaced script unexpectedly passed verification"
-        );
+        .unwrap();
+        let result = run_install_bootstrap_for_test(&script, &runner, 0);
         assert_eq!(
-            output.status.code(),
-            Some(INSTALL_HANDOFF_HASH_MISMATCH_EXIT_CODE as i32)
+            result.status.code(),
+            Some(INSTALL_HANDOFF_HASH_FAILURE_EXIT_CODE as i32)
         );
-        assert!(!marker.exists(), "replaced script must not execute");
+        assert!(!marker.exists(), "a replaced BAT must not execute");
+        assert!(
+            !runner.exists(),
+            "failed verification must clean the runner"
+        );
+        assert!(!runner.with_extension("exe").exists());
     }
 
-    fn run_install_bootstrap_for_test(bootstrap: &str) -> std::process::Output {
-        let cmd = get_system_executable(CMD_RELATIVE_PATH).expect("system cmd.exe should resolve");
-        let mut command = std::process::Command::new(cmd);
-        command
+    fn run_install_bootstrap_for_test(
+        script: &InstallCommandScript,
+        directory: &Path,
+        exit_code: i32,
+    ) -> std::process::Output {
+        let mut helper = ProtectedHelper::new(&directory.with_extension("exe")).unwrap();
+        let gate = InstallGate::new().unwrap();
+        let parameters = verified_install_parameters(script, directory, &gate).unwrap();
+        assert!(!parameters.contains("certutil.exe") && !parameters.contains("findstr.exe"));
+        let child = Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
             .env("PROGRAMDATA", "rustdesk_untrusted")
             .env("PUBLIC", "rustdesk_untrusted")
-            .env("RUSTDESK_HANDOFF_EXPAND", "expanded");
-        command.raw_arg(format!("/D /E:ON /V:ON /C {bootstrap}"));
-        command
+            .env("RUSTDESK_HANDOFF_EXPAND", "expanded")
+            .env("RUSTDESK_TEST_EXIT", exit_code.to_string())
+            .raw_arg(parameters)
             .creation_flags(Threading::CREATE_NO_WINDOW.0)
-            .output()
-            .expect("native verifier should run")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let process = HANDLE(child.as_raw_handle());
+        gate.wait_for_client(process).unwrap();
+        helper.release();
+        gate.release(process).unwrap();
+        gate.wait_for_exit(process).unwrap();
+        child.wait_with_output().unwrap()
     }
 }

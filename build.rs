@@ -8,6 +8,54 @@ fn build_windows() {
     println!("cargo:rerun-if-changed={}", file2);
 }
 
+#[cfg(windows)]
+fn build_installer_helper() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{env, fs, path::PathBuf, process::Command};
+
+    let source = "res/installer_helper.rs";
+    let output = PathBuf::from(env::var("OUT_DIR")?).join("installer-helper.exe");
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-env-changed=RUSTDESK_INSTALLER_HELPER");
+    // Release builders can sign a target-matching helper before embedding it.
+    // Signing the outer application does not sign the embedded executable.
+    if let Some(path) = env::var_os("RUSTDESK_INSTALLER_HELPER") {
+        println!("cargo:rerun-if-changed={}", PathBuf::from(&path).display());
+        fs::copy(path, output)?;
+        return Ok(());
+    }
+    let target = env::var("TARGET")?;
+    let mut compiler = Command::new(env::var_os("RUSTC").ok_or("RUSTC is not set")?);
+    compiler
+        .args([
+            "--crate-name",
+            "rustdesk_installer_helper",
+            "--edition=2021",
+            "--target",
+        ])
+        .arg(&target)
+        .args([
+            "-C",
+            "opt-level=z",
+            "-C",
+            "target-feature=+crt-static",
+            "-C",
+            "strip=symbols",
+            "-o",
+        ])
+        .arg(output)
+        .arg(source);
+    if target.ends_with("windows-msvc") {
+        // The default asInvoker manifest prevents x86 installer detection from
+        // requesting elevation again. The parent cmd already owns the UAC flow.
+        compiler.args(["-C", "link-arg=/MANIFEST:EMBED"]);
+    }
+    let status = compiler.status()?;
+    if !status.success() {
+        return Err(format!("Installer helper compilation failed: {status}").into());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn build_mac() {
     let file = "src/platform/macos.mm";
@@ -85,13 +133,15 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
     build_manifest();
     #[cfg(windows)]
     build_windows();
+    #[cfg(windows)]
+    build_installer_helper()?;
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_os == "macos" {
         #[cfg(target_os = "macos")]
@@ -102,4 +152,5 @@ fn main() {
         build_android_ifaddrs();
     }
     println!("cargo:rerun-if-changed=build.rs");
+    Ok(())
 }

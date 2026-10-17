@@ -77,32 +77,28 @@ fn launch_verified_update(
     Ok(())
 }
 
-fn verified_update_hash_pattern(expected_sha256: &str) -> ResultType<String> {
+fn verified_update_sha256(expected_sha256: &str) -> ResultType<String> {
     let hash = hex::decode(expected_sha256.trim())
         .map_err(|err| anyhow!("Invalid expected update SHA-256: {err}"))?;
     if hash.len() != SHA256_HASH_LENGTH {
         bail!("Invalid expected update SHA-256 length");
     }
-    // FINDSTR /R /I /X /C matches the complete certutil hash line; ` *` allows
-    // optional spaces between byte pairs.
-    Ok(hash
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" *"))
+    Ok(hex::encode(hash))
 }
 
 fn launch_verified_exe(exe: &str, expected_sha256: &str) -> ResultType<()> {
     let source = path_for_cmd_environment(Path::new(exe))?;
-    let hash_pattern = verified_update_hash_pattern(expected_sha256)?;
-    // Keep the hash outside the EXE directory because update_me() copies that
+    let expected_sha256 = verified_update_sha256(expected_sha256)?;
+    // Keep the receipt outside the EXE directory because update_me() copies that
     // entire directory into the installation.
     let commands = format!(
         "set \"RUSTDESK_VERIFIED_EXE_SOURCE={source}\"\r\n\
          set \"RUSTDESK_VERIFIED_EXE=%RUSTDESK_OUTPUT_DIR%\\{VERIFIED_EXE_FILENAME}\"\r\n\
          copy /B /Y \"%RUSTDESK_VERIFIED_EXE_SOURCE%\" \"%RUSTDESK_VERIFIED_EXE%\" > nul || exit /b {VERIFIED_UPDATE_COPY_FAILURE_EXIT_CODE}\r\n\
-         certutil.exe -hashfile \"%RUSTDESK_VERIFIED_EXE%\" SHA256 > \"%~f0.exe.sha256\" || exit /b {VERIFIED_UPDATE_HASH_FAILURE_EXIT_CODE}\r\n\
-         findstr.exe /R /I /X /C:\"{hash_pattern}\" \"%~f0.exe.sha256\" > nul || exit /b {VERIFIED_UPDATE_HASH_MISMATCH_EXIT_CODE}\r\n\
+         start \"\" /b /wait \"%RUSTDESK_INSTALL_HELPER%\" --verify-install-file \
+         \"%RUSTDESK_VERIFIED_EXE%\" {expected_sha256} \"%~f0.exe.verified\"\r\n\
+         if errorlevel 1 exit /b {VERIFIED_UPDATE_HASH_FAILURE_EXIT_CODE}\r\n\
+         if not exist \"%~f0.exe.verified\" exit /b {VERIFIED_UPDATE_HASH_MISMATCH_EXIT_CODE}\r\n\
          start \"\" /wait \"%RUSTDESK_VERIFIED_EXE%\" --update || exit /b {VERIFIED_EXE_LAUNCH_FAILURE_EXIT_CODE}"
     );
     run_cmds(commands, false, "update-exe")
@@ -120,7 +116,7 @@ fn verified_msi_install_commands(
     // The open source handle prevents replacing that file, but not retargeting an
     // ancestor junction. Copy and reverify it in the protected runner directory.
     let source = path_for_cmd_environment(msi)?;
-    let hash_pattern = verified_update_hash_pattern(expected_sha256)?;
+    let expected_sha256 = verified_update_sha256(expected_sha256)?;
     let quiet_args = if quiet { " /qn LAUNCH_TRAY_APP=N" } else { "" };
     let app_name = crate::get_app_name();
     let subkey = format!(".{}", app_name.to_lowercase());
@@ -141,8 +137,10 @@ fn verified_msi_install_commands(
         "set \"RUSTDESK_VERIFIED_MSI_SOURCE={source}\"\r\n\
          set \"RUSTDESK_VERIFIED_MSI=%RUSTDESK_OUTPUT_DIR%\\{VERIFIED_MSI_FILENAME}\"\r\n\
          copy /B /Y \"%RUSTDESK_VERIFIED_MSI_SOURCE%\" \"%RUSTDESK_VERIFIED_MSI%\" > nul || exit /b {VERIFIED_UPDATE_COPY_FAILURE_EXIT_CODE}\r\n\
-         certutil.exe -hashfile \"%RUSTDESK_VERIFIED_MSI%\" SHA256 > \"%RUSTDESK_VERIFIED_MSI%.sha256\" || exit /b {VERIFIED_UPDATE_HASH_FAILURE_EXIT_CODE}\r\n\
-         findstr.exe /R /I /X /C:\"{hash_pattern}\" \"%RUSTDESK_VERIFIED_MSI%.sha256\" > nul || exit /b {VERIFIED_UPDATE_HASH_MISMATCH_EXIT_CODE}\r\n\
+         start \"\" /b /wait \"%RUSTDESK_INSTALL_HELPER%\" --verify-install-file \
+         \"%RUSTDESK_VERIFIED_MSI%\" {expected_sha256} \"%RUSTDESK_VERIFIED_MSI%.verified\"\r\n\
+         if errorlevel 1 exit /b {VERIFIED_UPDATE_HASH_FAILURE_EXIT_CODE}\r\n\
+         if not exist \"%RUSTDESK_VERIFIED_MSI%.verified\" exit /b {VERIFIED_UPDATE_HASH_MISMATCH_EXIT_CODE}\r\n\
          msiexec.exe /i \"%RUSTDESK_VERIFIED_MSI%\"{quiet_args}{printer_args} REBOOT=ReallySuppress /norestart\r\n\
          set \"RUSTDESK_MSI_EXIT_CODE=%ERRORLEVEL%\"\r\n\
          if \"%RUSTDESK_MSI_EXIT_CODE%\"==\"{reboot_initiated}\" exit /b {success}\r\n\
