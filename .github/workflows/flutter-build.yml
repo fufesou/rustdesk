@@ -386,7 +386,7 @@ jobs:
             fi
             cp -- "$1" "$destination"
           }
-          copy_package "${TEST_PACKAGE}-x86_64.pkg.tar.zst" res/rustdesk-*-x86_64.pkg.tar.zst
+          copy_package "${TEST_PACKAGE}-x86_64.pkg.tar.zst" res/rustdesk-[0-9]*-x86_64.pkg.tar.zst
 
       - name: Publish archlinux package
         if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
