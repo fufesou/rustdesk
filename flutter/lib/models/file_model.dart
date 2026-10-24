@@ -1845,7 +1845,7 @@ class JobProgress {
     return state.display();
   }
 
-  String getStatus() {
+  String getStatus({bool isWebClient = false}) {
     int handledFileCount = recvJobRes ? fileNum + 1 : fileNum;
     if (handledFileCount >= fileCount) {
       handledFileCount = fileCount;
@@ -1883,7 +1883,13 @@ class JobProgress {
     } else if (type == JobType.transfer) {
       var res = "";
       if (state != JobState.inProgress && state != JobState.none) {
-        res += display();
+        // Browser-managed downloads cannot confirm that the file was saved.
+        res += isWebClient &&
+                isRemoteToLocal &&
+                state == JobState.done &&
+                err.isEmpty
+            ? translate("Received — check browser downloads")
+            : display();
       }
       if (filesStr.isNotEmpty) {
         if (res.isNotEmpty) {

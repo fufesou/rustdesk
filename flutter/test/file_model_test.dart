@@ -1,11 +1,20 @@
 import 'dart:convert';
 
+import 'package:flutter_hbb/generated_bridge.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_hbb/models/model.dart';
+import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:uuid/uuid.dart';
 
 final _sessionId = UuidValue('00000000-0000-0000-0000-000000000000');
+
+class _TranslationBinding extends Fake implements RustdeskImpl {
+  @override
+  String translate(
+          {required String name, required String locale, dynamic hint}) =>
+      name;
+}
 
 class _FakeFFI implements FFI {
   @override
@@ -48,6 +57,28 @@ class _SentRead {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('web receipts do not claim a saved file or mask other job statuses', () {
+    platformFFI.setBindingForTesting(_TranslationBinding());
+    for (final (web, download, state, error, label) in [
+      (true, true, JobState.done, '', 'Received — check browser downloads'),
+      (false, true, JobState.done, '', 'Finished'),
+      (true, false, JobState.done, '', 'Finished'),
+      (true, true, JobState.done, 'cancel', 'Cancel'),
+      (true, true, JobState.done, 'skipped', 'Skipped'),
+      (true, true, JobState.error, 'write failed', 'Error'),
+    ]) {
+      final job = JobProgress()
+        ..type = JobType.transfer
+        ..state = state
+        ..isRemoteToLocal = download
+        ..err = error
+        ..fileCount = 1;
+      expect(job.getStatus(isWebClient: web), startsWith('$label, '));
+    }
+  });
+
   test('a fast remote response is matched after registration', () async {
     late final FileFetcher fileFetcher;
     fileFetcher = FileFetcher(

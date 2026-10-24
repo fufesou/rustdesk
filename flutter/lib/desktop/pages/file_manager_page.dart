@@ -235,7 +235,7 @@ class _FileManagerPageState extends State<FileManagerPage>
           controller: ScrollController(),
           itemBuilder: (BuildContext context, int index) {
             final item = jobs[index];
-            final status = item.getStatus();
+            final status = item.getStatus(isWebClient: isWeb);
             return Padding(
               padding: const EdgeInsets.only(bottom: 5),
               child: generateCard(
