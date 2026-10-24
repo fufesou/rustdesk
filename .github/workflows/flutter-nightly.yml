@@ -1,5 +1,5 @@
 name: Flutter Nightly Build
-run-name: Linux Wayland test 261023 fada664df
+run-name: Arch package test 261023 fada664df
 
 on:
   schedule:
