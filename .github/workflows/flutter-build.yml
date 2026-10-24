@@ -1,4 +1,4 @@
-name: Build the flutter version of the RustDesk
+name: Package the existing Linux build for Arch
 
 on:
   workflow_call:
@@ -14,363 +14,53 @@ permissions:
   contents: write
 
 env:
-  RUST_VERSION: "1.75" # sciter failed on m1 with 1.78 because of https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
-  FLUTTER_VERSION: "3.24.5"
   TAG_NAME: "${{ inputs.upload-tag }}"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
-  VERSION: "1.4.9"
-  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   TEST_PACKAGE: "RustDesk-test-261023-b4af82157"
+  SOURCE_COMMIT: "b4af82157bc5b44b62e66c1e7b50cc945bc42532"
+  VERSION: "1.4.9"
+  TEST_DEB_SHA256: "1dc2dfdc44f874c47147fa58e90fb3f63b313bc7e63999b1cea26d6a82663747"
 
 jobs:
-  generate-bridge:
-    uses: ./.github/workflows/bridge.yml
-
-  build-rustdesk-linux:
-    needs: [generate-bridge]
-    name: build rustdesk linux ${{ matrix.job.target }}
-    runs-on: ${{ matrix.job.on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # use a high level qemu-user-static
-        job:
-          - {
-              arch: x86_64,
-              target: x86_64-unknown-linux-gnu,
-              distro: ubuntu18.04,
-              on: ubuntu-22.04,
-              deb_arch: amd64,
-              vcpkg-triplet: x64-linux,
-            }
-          - {
-              arch: aarch64,
-              target: aarch64-unknown-linux-gnu,
-              distro: ubuntu18.04,
-              on: ubuntu-22.04-arm,
-              deb_arch: arm64,
-              vcpkg-triplet: arm64-linux,
-            }
+  build-arch-package:
+    name: package Arch x86_64 from the verified Linux build
+    runs-on: ubuntu-22.04
     steps:
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Maximize build space
-        run: |
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/share/dotnet
-          sudo apt-get update -y
-          sudo apt-get install -y nasm
-          if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
-            sudo apt-get install -y qemu-user-static
-          fi
-
-      - name: Checkout source code
+      - name: Read historical packaging files
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          submodules: recursive
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+          sparse-checkout: res
 
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
-        with:
-          swap-size-gb: 12
-
-      - name: Free Space
-        run: |
-          df -h
-          free -m
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: ${{ matrix.job.target }}
-          components: "rustfmt"
-
-      - name: Save Rust toolchain version
-        run: |
-          RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
-          echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_ENV
-
-      - name: Disable rust bridge build
-        run: |
-          # only build cdylib
-          sed -i  "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
-
-      - name: Restore bridge files
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: bridge-artifact
-          path: ./
-
-      - name: Setup vcpkg with Github Actions binary cache
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
-        with:
-          vcpkgDirectory: /opt/artifacts/vcpkg
-          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
-
-      - name: Install vcpkg dependencies
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        run: |
-          sudo apt install -y libva-dev && apt show libva-dev
-          if ! $VCPKG_ROOT/vcpkg \
-            install \
-            --triplet ${{ matrix.job.vcpkg-triplet }} \
-            --x-install-root="$VCPKG_ROOT/installed"; then
-            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
-              echo "$_1:"
-              echo "======"
-              cat "$_1"
-              echo "======"
-              echo ""
-            done
-            exit 1
-          fi
-          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
-        shell: bash
-
-      - name: Restore bridge files
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: bridge-artifact
-          path: ./
-
-      - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
-        name: Build rustdesk
-        id: vcpkg
-        if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        with:
-          arch: ${{ matrix.job.arch }}
-          distro: ${{ matrix.job.distro }}
-          githubToken: ${{ github.token }}
-          setup: |
-            ls -l "${PWD}"
-            ls -l /opt/artifacts/vcpkg/installed
-          dockerRunArgs: |
-            --volume "${PWD}:/workspace"
-            --volume "/opt/artifacts:/opt/artifacts"
-          shell: /bin/bash
-          install: |
-            apt-get update -y
-            echo -e "installing deps"
-            apt-get install -y \
-               build-essential \
-               clang \
-               cmake \
-               curl \
-               gcc \
-               git \
-               g++ \
-               libayatana-appindicator3-dev \
-               libasound2-dev \
-               libclang-10-dev \
-               libgstreamer1.0-dev \
-               libgstreamer-plugins-base1.0-dev \
-               libgtk-3-dev \
-               libpam0g-dev \
-               libpulse-dev \
-               libva-dev \
-               libxcb-randr0-dev \
-               libxcb-shape0-dev \
-               libxcb-xfixes0-dev \
-               libxdo-dev \
-               libxfixes-dev \
-               llvm-10-dev \
-               nasm \
-               ninja-build \
-               pkg-config \
-               tree \
-               python3 \
-               rpm \
-               unzip \
-               wget \
-               xz-utils \
-               libssl-dev
-            # we have libopus compiled by us.
-            apt-get remove -y libopus-dev || true
-            # output devs
-            ls -l ./
-            tree -L 3 /opt/artifacts/vcpkg/installed
-          run: |
-            # disable git safe.directory
-            git config --global --add safe.directory "*"
-            # rust
-            pushd /opt
-            # do not use rustup, because memory overflow in qemu
-            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}.tar.gz
-            tar -zxvf rust.tar.gz > /dev/null && rm rust.tar.gz
-            cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }} && ./install.sh
-            rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}
-            # edit config
-            mkdir -p ~/.cargo/
-            echo """
-              [source.crates-io]
-              registry = 'https://github.com/rust-lang/crates.io-index'
-            """ > ~/.cargo/config
-            cat ~/.cargo/config
-            # start build
-            pushd /workspace
-            export VCPKG_ROOT=/opt/artifacts/vcpkg
-            if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
-              export JOBS="--jobs 3"
-            else
-              export JOBS=""
-            fi
-            echo $JOBS
-            cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste --release
-            rm -rf target/release/deps target/release/build
-            rm -rf ~/.cargo
-
-            # Setup Flutter
-            # disable git safe.directory
-            git config --global --add safe.directory "*"
-            pushd /workspace
-            case ${{ matrix.job.arch }} in
-              aarch64)
-                export PATH=/opt/flutter-elinux/bin:$PATH
-                sed -i "s/flutter build linux --release/flutter-elinux build linux --verbose/g" ./build.py
-                sed -i "s/x64\/release/arm64\/release/g" ./build.py
-              ;;
-              x86_64)
-                export PATH=/opt/flutter/bin:$PATH
-              ;;
-            esac
-            popd
-            pushd /opt
-            wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
-            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
-            case ${{ matrix.job.arch }} in
-              aarch64)
-                # clone repo and reset to flutter ${{ env.FLUTTER_VERSION }}
-                git clone https://github.com/sony/flutter-elinux.git || true
-                pushd flutter-elinux
-                  git fetch
-                  git reset --hard ${{ env.FLUTTER_VERSION }}
-                  bin/flutter-elinux doctor -v
-                  bin/flutter-elinux precache --linux
-                popd
-                cp -R flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
-                rm -rf flutter
-              ;;
-              x86_64)
-                flutter doctor -v
-              ;;
-            esac
-
-            if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
-              case ${{ matrix.job.arch }} in
-                aarch64)
-                  pushd /opt/flutter-elinux/flutter
-                ;;
-                x86_64)
-                  pushd /opt/flutter
-                ;;
-              esac
-              git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
-              popd
-            fi
-
-            # build flutter
-            pushd /workspace
-            export CARGO_INCREMENTAL=0
-            export DEB_ARCH=${{ matrix.job.deb_arch }}
-            python3 ./build.py --flutter --skip-cargo
-            for name in rustdesk*??.deb; do
-              mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
-            done
-
-            # rpm package
-            echo -e "start packaging fedora package"
-            pushd /workspace
-            case ${{ matrix.job.arch }} in
-              aarch64)
-                sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter.spec
-                ;;
-            esac
-            HBB=`pwd` rpmbuild ./res/rpm-flutter.spec -bb
-            pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
-            for name in rustdesk*??.rpm; do
-                mv "$name" /workspace/"${name%%.rpm}.rpm"
-            done
-
-            # rpm suse package
-            echo -e "start packaging suse package"
-            pushd /workspace
-            case ${{ matrix.job.arch }} in
-              aarch64)
-                sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter-suse.spec
-                ;;
-            esac
-            HBB=`pwd` rpmbuild ./res/rpm-flutter-suse.spec -bb
-            pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
-            for name in rustdesk*??.rpm; do
-                mv "$name" /workspace/"${name%%.rpm}-suse.rpm"
-            done
-
-      - name: Name diagnostic native packages
-        if: env.UPLOAD_ARTIFACT == 'true'
+      - name: Restore the verified Flutter bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          copy_package() {
-            local destination="$1"; shift
-            if [ "$#" -ne 1 ]; then
-              echo "::error::Expected one package for $destination, found $#"
-              exit 1
-            fi
-            if [ ! -s "$1" ]; then
-              echo "::error::Missing or empty package: $1"
-              exit 1
-            fi
-            cp -- "$1" "$destination"
-          }
-          copy_package "${TEST_PACKAGE}-${{ matrix.job.arch }}.deb" rustdesk-*-${{ matrix.job.arch }}.deb
-          copy_package "${TEST_PACKAGE}-${{ matrix.job.arch }}.rpm" rustdesk-*.${{ matrix.job.arch }}.rpm
-          copy_package "${TEST_PACKAGE}-${{ matrix.job.arch }}-suse.rpm" rustdesk-*.${{ matrix.job.arch }}-suse.rpm
-
-      - name: Publish debian/rpm package
-        if: env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          target_commitish: ${{ github.sha }}
-          fail_on_unmatched_files: true
-          files: |
-            ${{ env.TEST_PACKAGE }}-${{ matrix.job.arch }}.deb
-            ${{ env.TEST_PACKAGE }}-${{ matrix.job.arch }}.rpm
-            ${{ env.TEST_PACKAGE }}-${{ matrix.job.arch }}-suse.rpm
-
-      - name: Patch archlinux PKGBUILD
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
-        run: |
-          sed -i "s/x86_64/${{ matrix.job.arch }}/g" res/PKGBUILD
-          if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
-            sed -i "s/x86_64/aarch64/g" ./res/PKGBUILD
-          fi
+          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${TEST_PACKAGE}-x86_64.deb" --dir "$RUNNER_TEMP/input"
+          deb="$RUNNER_TEMP/input/${TEST_PACKAGE}-x86_64.deb"
+          printf '%s  %s\n' "$TEST_DEB_SHA256" "$deb" | sha256sum --check -
+          test "$(dpkg-deb -f "$deb" Package)" = rustdesk
+          test "$(dpkg-deb -f "$deb" Version)" = "$VERSION"
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/deb"
+          bundle=flutter/build/linux/x64/release/bundle
+          mkdir -p "$bundle"
+          for item in rustdesk data lib; do
+            cp -a "$RUNNER_TEMP/deb/usr/share/rustdesk/$item" "$bundle/"
+          done
 
       - name: Build archlinux package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
-        uses: rustdesk-org/arch-makepkg-action@04200739ed1d0bf6f2188b6736b26a767c57a7f9 # no release tag; commit 2026-05-26
+        uses: rustdesk-org/arch-makepkg-action@04200739ed1d0bf6f2188b6736b26a767c57a7f9
         with:
           packages:
           scripts: |
             cd res && HBB=`pwd`/.. FLUTTER=1 makepkg -f
 
       - name: Name diagnostic Arch package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: inputs.upload-artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -387,15 +77,36 @@ jobs:
             fi
             cp -- "$1" "$destination"
           }
-          copy_package "${TEST_PACKAGE}-x86_64.pkg.tar.zst" res/rustdesk-[0-9]*-x86_64.pkg.tar.zst
+          copy_package "${RUNNER_TEMP}/${TEST_PACKAGE}-x86_64.pkg.tar.zst" res/rustdesk-[0-9]*-x86_64.pkg.tar.zst
+      - name: Verify the Arch package and its executable code
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/${TEST_PACKAGE}-x86_64.pkg.tar.zst"
+          mkdir -p "$RUNNER_TEMP/arch"
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP/arch"
+          grep -Fx 'pkgname = rustdesk' "$RUNNER_TEMP/arch/.PKGINFO"
+          grep -Fx "pkgver = ${VERSION}-0" "$RUNNER_TEMP/arch/.PKGINFO"
+          grep -Fx 'arch = x86_64' "$RUNNER_TEMP/arch/.PKGINFO"
+          test "$(readlink "$RUNNER_TEMP/arch/usr/bin/rustdesk")" = /usr/share/rustdesk/rustdesk
+          diff -qr "$RUNNER_TEMP/deb/usr/share/rustdesk/data" "$RUNNER_TEMP/arch/usr/share/rustdesk/data"
+          for file in rustdesk lib/librustdesk.so lib/libapp.so; do
+            objcopy --dump-section ".text=$RUNNER_TEMP/input.text" \
+              "$RUNNER_TEMP/deb/usr/share/rustdesk/$file" "$RUNNER_TEMP/input.elf"
+            objcopy --dump-section ".text=$RUNNER_TEMP/output.text" \
+              "$RUNNER_TEMP/arch/usr/share/rustdesk/$file" "$RUNNER_TEMP/output.elf"
+            cmp "$RUNNER_TEMP/input.text" "$RUNNER_TEMP/output.text"
+            echo "Verified executable code: $file"
+          done
+          for file in rustdesk.service rustdesk.desktop rustdesk-link.desktop; do
+            cmp "res/$file" "$RUNNER_TEMP/arch/usr/share/rustdesk/files/$file"
+          done
 
       - name: Publish archlinux package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: inputs.upload-artifact
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
-          target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
-          files: |
-            ${{ env.TEST_PACKAGE }}-x86_64.pkg.tar.zst
+          files: ${{ runner.temp }}/${{ env.TEST_PACKAGE }}-x86_64.pkg.tar.zst
