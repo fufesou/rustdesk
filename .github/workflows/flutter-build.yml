@@ -104,9 +104,11 @@ jobs:
 
       - name: Publish archlinux package
         if: inputs.upload-artifact
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          fail_on_unmatched_files: true
-          files: ${{ runner.temp }}/${{ env.TEST_PACKAGE }}-x86_64.pkg.tar.zst
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG_NAME" \
+            "$RUNNER_TEMP/${TEST_PACKAGE}-x86_64.pkg.tar.zst" \
+            --repo "$GITHUB_REPOSITORY"
