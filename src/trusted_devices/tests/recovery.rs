@@ -48,13 +48,19 @@ pub(super) async fn service_sync_preserves_grants_and_revocations() {
 
     // Explicit service sync replaces the older copy, including removals and enrollment.
     previous.sync_trusted_devices().unwrap();
-    config::sync_config(settings.clone(), current.clone()).unwrap();
+    config::sync_from_server(settings.clone(), current.clone()).unwrap();
     assert!(!is_trusted(&removed).await);
     assert!(is_trusted(&retained).await);
     assert!(is_trusted(&added).await);
+    // Installation imports this file, including the original grant deadlines.
+    let imported: Config2 = hbb_common::config::load_path(Config2::file());
+    assert_eq!(
+        imported, current,
+        "The service importer must receive current grants"
+    );
 
     Config2::set_trusted_devices_v2(String::new()).unwrap();
-    config::sync_config(settings.clone(), current).unwrap();
+    config::sync_from_server(settings.clone(), current).unwrap();
     super::super::initialize().unwrap();
     assert!(is_trusted(&retained).await);
     assert!(is_trusted(&added).await);
@@ -62,7 +68,7 @@ pub(super) async fn service_sync_preserves_grants_and_revocations() {
     authority::manage(true).await.unwrap();
     let cleared = Config2::get_for_sync().unwrap();
     previous.sync_trusted_devices().unwrap();
-    config::sync_config(settings, cleared).unwrap();
+    config::sync_from_server(settings, cleared).unwrap();
     assert!(configuration::devices().await.is_empty());
     stopped_service_password_changes().await;
 }
@@ -180,6 +186,7 @@ pub(super) async fn unusable_grant_scope_keeps_current_password_totp_available()
 }
 
 pub(super) async fn legacy_migration_preserves_revocation(hwid: &[u8], info: &DeviceInfo) {
+    legacy_migration_at_capacity_preserves_expiry(hwid, info).await;
     let (old, valid, _) = host::begin(legacy_proof(hwid, info, false))
         .await
         .unwrap()
@@ -227,4 +234,44 @@ pub(super) async fn legacy_migration_preserves_revocation(hwid: &[u8], info: &De
     for token in tokens {
         assert!(!is_trusted(&token).await);
     }
+}
+
+async fn legacy_migration_at_capacity_preserves_expiry(hwid: &[u8], info: &DeviceInfo) {
+    let original = Config2::get_for_sync().unwrap();
+    let mut options = Config::get_options();
+    options.insert(keys::OPTION_TRUSTED_DEVICE_EXPIRATION.into(), "1".into());
+    config::set_options(options).unwrap();
+    let device = configuration::devices()
+        .await
+        .into_iter()
+        .find(|device| device["id"] == info.id)
+        .unwrap();
+    let expiry = device["expires_at"].clone();
+    for _ in 1..super::super::MAX_RECORDS {
+        begin_enrollment()
+            .await
+            .finish(DeviceInfo::default())
+            .await
+            .unwrap();
+    }
+    let (attempt, valid, _) = host::begin(legacy_proof(hwid, info, true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(valid);
+    let token = attempt.unwrap().finish(info.clone()).await.unwrap();
+    assert!(
+        is_trusted(&token).await,
+        "The issued migration token must survive eviction"
+    );
+    let devices = configuration::devices().await;
+    assert_eq!(devices.len(), super::super::MAX_RECORDS);
+    assert_eq!(
+        devices
+            .iter()
+            .find(|device| device["id"] == info.id)
+            .unwrap()["expires_at"],
+        expiry
+    );
+    config::sync_config(Config::get(), original).unwrap();
 }
