@@ -5,8 +5,6 @@ pub mod host;
 mod legacy;
 mod management;
 mod policy;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
-pub mod service;
 mod storage;
 
 pub use management::{devices, remove, renew};
@@ -224,10 +222,6 @@ pub fn clear() -> ResultType<()> {
 }
 
 pub fn initialize() -> ResultType<()> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if (!crate::platform::is_root() || crate::is_server()) && authority::uses_service()? {
-        return Ok(());
-    }
     if !Config2::file().try_exists()? {
         return Ok(());
     }
