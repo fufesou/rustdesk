@@ -1785,6 +1785,7 @@ pub fn sync_permanent_password_storage_from_daemon() -> ResultType<()> {
     apply_permanent_password_storage_and_salt_payload(v.as_deref())
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn sync_permanent_password_storage_from_daemon_async() -> ResultType<()> {
     let ms_timeout = 1_000;
     let v = get_config_async("permanent-password-storage-and-salt", ms_timeout).await?;
@@ -1848,8 +1849,11 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
             let v = v.trim();
             let ok = v == "Y";
             if ok {
+                #[cfg(target_os = "windows")]
+                sync_security_config_from_server(&mut c).await?;
                 // Ensure the hashed permanent password storage is written to the user config file.
                 // This sync must not affect the daemon ACK outcome.
+                #[cfg(not(target_os = "windows"))]
                 if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
                     log::warn!("Failed to sync permanent password storage from daemon: {err}");
                 }
@@ -1907,16 +1911,47 @@ pub async fn trusted_devices(request: authority::Request) -> ResultType<String> 
     connection
         .send(&Data::TrustedDeviceManagement(Box::new(request)))
         .await?;
-    match connection.next_timeout(TIMEOUT_MS).await? {
+    let response = match connection.next_timeout(TIMEOUT_MS).await? {
         Some(Data::TrustedDeviceResponse(result)) => {
             match result.map_err(|error| hbb_common::anyhow::anyhow!(error))? {
-                authority::Response::Devices(devices) if list => Ok(devices),
-                authority::Response::Done if !list => Ok(String::new()),
+                authority::Response::Devices(devices) if list => devices,
+                authority::Response::Done if !list => String::new(),
                 _ => bail!("Invalid trusted-device management response"),
             }
         }
         _ => bail!("The host did not confirm the trusted-device operation"),
+    };
+    #[cfg(target_os = "windows")]
+    if !list {
+        sync_security_config_from_server(&mut connection).await?;
     }
+    Ok(response)
+}
+
+#[cfg(target_os = "windows")]
+async fn sync_security_config_from_server(
+    connection: &mut ConnectionTmpl<ConnClient>,
+) -> ResultType<()> {
+    use hbb_common::anyhow::Context;
+
+    const TIMEOUT_MS: u64 = 1000;
+    // MSI removal can reactivate this user copy without running our uninstall hooks.
+    async {
+        connection.send(&Data::SyncConfig(None)).await?;
+        match connection.next_timeout(TIMEOUT_MS).await? {
+            Some(Data::SyncConfig(Some(configs))) => {
+                let (config, config2) = *configs;
+                crate::trusted_devices::config::update(move || {
+                    crate::trusted_devices::config::sync_config(config, config2)
+                })
+                .await
+            }
+            Some(Data::SecurityConfigError(error)) => bail!(error),
+            _ => bail!("The host did not provide its current configuration"),
+        }
+    }
+    .await
+    .context("Host security update succeeded, but updating the local configuration failed")
 }
 
 pub fn get_id() -> String {
@@ -2004,6 +2039,10 @@ pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
         c.send(&Data::Options(Some(value.clone()))).await?;
         // do not put below before connect, because we need to check should_exit
         match c.next_timeout(1000).await {
+            #[cfg(target_os = "windows")]
+            Ok(Some(Data::Options(None))) if affected => {
+                sync_security_config_from_server(&mut c).await?;
+            }
             Ok(Some(Data::Options(None))) => {}
             Ok(Some(Data::SecurityConfigError(error))) => bail!(error),
             Err(error) if affected => return Err(error),
