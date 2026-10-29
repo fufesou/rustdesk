@@ -948,39 +948,12 @@ pub fn check_software_update() {
     }
 }
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
+// This test branch upgrades to the IPC server authentication release.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(&url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_not_cached = tls_type.is_none();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
-        Err(err) => {
-            if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
-            } else {
-                return Err(err.into());
-            }
-        }
-    };
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
+    let response_url =
+        "https://github.com/fufesou/rustdesk/releases/tag/test-windows-ipc-server-auth".to_owned();
+    let latest_release_version = "1.5.1";
 
     if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
         #[cfg(feature = "flutter")]

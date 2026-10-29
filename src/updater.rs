@@ -133,7 +133,8 @@ fn check_update(manually: bool) -> ResultType<()> {
         log::debug!("No update available.");
     } else {
         let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
+        // The test release tag is not a version number.
+        let version = "1.5.1";
         #[cfg(target_os = "windows")]
         let download_url = if cfg!(feature = "flutter") {
             let Some(arch) = crate::platform::windows::release_arch_suffix() else {

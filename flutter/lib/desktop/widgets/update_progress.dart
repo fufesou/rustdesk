@@ -12,7 +12,8 @@ final _isExtracting = false.obs;
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
   String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+  // The test release tag is not a version number.
+  const String version = '1.5.1';
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
   if (downloadFile.startsWith('error:')) {
