@@ -12,6 +12,9 @@ use std::sync::OnceLock;
 
 mod artifact;
 
+#[cfg(test)]
+mod build_keys;
+
 #[cfg(target_os = "macos")]
 mod offline;
 
@@ -27,6 +30,10 @@ const METADATA_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 
+#[cfg(rustdesk_custom_update_keys)]
+include!(concat!(env!("OUT_DIR"), "/trusted_update_keys.rs"));
+
+#[cfg(not(rustdesk_custom_update_keys))]
 const TRUSTED_UPDATE_KEYS: &[TrustedUpdateKey] = &[TrustedUpdateKey {
     key_id: "2026-ed25519-main",
     algorithm: SIGNATURE_ALGORITHM,

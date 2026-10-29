@@ -1,3 +1,6 @@
+#[path = "src/update_metadata/build_keys.rs"]
+mod update_keys;
+
 #[cfg(windows)]
 fn build_windows() {
     let file = "src/platform/windows.cc";
@@ -90,7 +93,8 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
-fn main() {
+fn main() -> hbb_common::ResultType<()> {
+    update_keys::generate()?;
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
@@ -107,4 +111,5 @@ fn main() {
         build_android_ifaddrs();
     }
     println!("cargo:rerun-if-changed=build.rs");
+    Ok(())
 }

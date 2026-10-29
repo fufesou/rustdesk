@@ -91,7 +91,7 @@ jobs:
         if: ${{ inputs.publish-update-metadata }}
         env:
           RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
-          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
         run: python res/update/generate_update_metadata.py check-key
 
   generate-sbom:
@@ -178,6 +178,14 @@ jobs:
               build-args: "",
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -563,6 +571,14 @@ jobs:
             }
           # - { target: aarch64-pc-windows-msvc, os: windows-2022 }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -740,6 +756,14 @@ jobs:
               vcpkg-triplet: arm64-ios,
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -872,6 +896,14 @@ jobs:
               vcpkg-triplet: arm64-osx,
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -1183,6 +1215,7 @@ jobs:
       - name: Sign update metadata
         env:
           RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
         run: |
           python res/update/generate_update_metadata.py sign \
             --artifact windows x86_64 exe "./artifacts/rustdesk-${VERSION}-x86_64.exe" \
@@ -1201,7 +1234,7 @@ jobs:
 
       - name: Verify update metadata
         env:
-          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
         run: |
           python res/update/generate_update_metadata.py verify \
             --metadata ./rustdesk-update.json \
@@ -1342,6 +1375,14 @@ jobs:
               suffix: "",
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
@@ -1816,6 +1857,14 @@ jobs:
               vcpkg-triplet: arm64-linux,
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -1932,6 +1981,7 @@ jobs:
           dockerRunArgs: |
             --volume "${PWD}:/workspace"
             --volume "/opt/artifacts:/opt/artifacts"
+            --env RUSTDESK_TRUSTED_UPDATE_KEYS
           shell: /bin/bash
           install: |
             apt-get update -y
@@ -2144,6 +2194,14 @@ jobs:
     name: build rustdesk linux drm x86_64
     runs-on: ubuntu-22.04
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -2253,6 +2311,7 @@ jobs:
           dockerRunArgs: |
             --volume "${PWD}:/workspace"
             --volume "/opt/artifacts:/opt/artifacts"
+            --env RUSTDESK_TRUSTED_UPDATE_KEYS
           shell: /bin/bash
           install: |
             apt-get update -y
@@ -2489,6 +2548,14 @@ jobs:
               extra_features: ",unix-file-copy-paste",
             }
     steps:
+      - name: Configure trusted update keys
+        if: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS != '' }}
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        env:
+          RUSTDESK_TRUSTED_UPDATE_KEYS: ${{ vars.RUSTDESK_TRUSTED_UPDATE_KEYS }}
+        with:
+          script: core.exportVariable('RUSTDESK_TRUSTED_UPDATE_KEYS', process.env.RUSTDESK_TRUSTED_UPDATE_KEYS);
+
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
         with:
@@ -2543,6 +2610,7 @@ jobs:
             ls -l "${PWD}"
           dockerRunArgs: |
             --volume "${PWD}:/workspace"
+            --env RUSTDESK_TRUSTED_UPDATE_KEYS
           shell: /bin/bash
           install: |
             apt-get update

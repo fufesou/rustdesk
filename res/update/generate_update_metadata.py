@@ -5,13 +5,13 @@ import binascii
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from trusted_update_keys import decode_key, load_trusted_keys
 from update_metadata_policy import (
     release_artifact_url,
     validate_artifact_file_name,
@@ -23,11 +23,8 @@ from update_metadata_policy import (
 
 APP_NAME = "rustdesk"
 SCHEMA_VERSION = 1
-SIGNATURE_ALGORITHM = "ed25519"
 SIGNATURE_CONTEXT = b"RustDesk update metadata v1\n"
-KEY_ID = "2026-ed25519-main"
 SEED_ENV = "RUSTDESK_UPDATE_ED25519_SEED"
-PUBLIC_KEY_ENV = "RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"
 
 
 def fail(message):
@@ -52,19 +49,21 @@ def sha256_hex(path):
     return hasher.hexdigest()
 
 
-def decode_env(name, expected_size):
-    encoded = os.environ.get(name)
+def signing_key():
+    encoded = os.environ.get(SEED_ENV)
     if not encoded:
-        fail(f"missing environment variable: {name}")
-    try:
-        value = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as error:
-        fail(f"invalid base64 in {name}: {error}")
-    if len(value) != expected_size:
-        fail(f"{name} must decode to {expected_size} bytes")
-    if base64.b64encode(value).decode("ascii") != encoded:
-        fail(f"{name} must use canonical base64")
-    return value
+        fail(f"missing environment variable: {SEED_ENV}")
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+        validate_or_fail(decode_key, encoded, SEED_ENV)
+    )
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    keys = validate_or_fail(load_trusted_keys)
+    for key in keys:
+        if key["public_key"] == public_key:
+            return private_key, key
+    fail(f"{SEED_ENV} does not match any trusted update key")
 
 
 def validate_or_fail(function, *args):
@@ -117,6 +116,7 @@ def command_sign(args):
     if len(set(names)) != len(names):
         fail("duplicate artifact file name")
     artifacts.sort(key=lambda item: (item["platform"], item["arch"], item["format"]))
+    private_key, key = signing_key()
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "app": APP_NAME,
@@ -124,15 +124,14 @@ def command_sign(args):
         "version": args.version,
         "release_id": args.release_id,
         "published_at": args.published_at,
-        "signature_key_id": KEY_ID,
+        "signature_key_id": key["key_id"],
         "artifacts": artifacts,
     }
-    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(decode_env(SEED_ENV, 32))
     metadata_bytes = stable_json(metadata)
     signature = {
         "schema_version": SCHEMA_VERSION,
-        "algorithm": SIGNATURE_ALGORITHM,
-        "key_id": KEY_ID,
+        "algorithm": key["algorithm"],
+        "key_id": key["key_id"],
         "signature": base64.b64encode(
             private_key.sign(SIGNATURE_CONTEXT + metadata_bytes)
         ).decode("ascii"),
@@ -142,13 +141,18 @@ def command_sign(args):
 
 
 def verify_metadata_signature(metadata_bytes, signature):
-    if (
-        signature.get("schema_version") != SCHEMA_VERSION
-        or signature.get("algorithm") != SIGNATURE_ALGORITHM
-        or signature.get("key_id") != KEY_ID
-    ):
+    if signature.get("schema_version") != SCHEMA_VERSION:
         fail("invalid signature metadata")
-    public_key = ed25519.Ed25519PublicKey.from_public_bytes(decode_env(PUBLIC_KEY_ENV, 32))
+    keys = validate_or_fail(load_trusted_keys)
+    key = next(
+        (key for key in keys
+         if key["key_id"] == signature.get("key_id")
+         and key["algorithm"] == signature.get("algorithm")),
+        None,
+    )
+    if key is None:
+        fail("unsupported update signature key")
+    public_key = ed25519.Ed25519PublicKey.from_public_bytes(key["public_key"])
     try:
         public_key.verify(
             base64.b64decode(signature["signature"], validate=True),
@@ -204,7 +208,7 @@ def command_verify(args):
         "package_id": package_id,
         "version": args.version,
         "release_id": args.release_id,
-        "signature_key_id": KEY_ID,
+        "signature_key_id": signature["key_id"],
     }
     if any(metadata.get(key) != value for key, value in expected_fields.items()):
         fail("metadata does not match the release")
@@ -229,33 +233,8 @@ def command_verify(args):
             fail(f"artifact sha256 mismatch for {file_name}")
 
 
-def command_check_key(args):
-    seed = decode_env(SEED_ENV, 32)
-    configured_key = decode_env(PUBLIC_KEY_ENV, 32)
-    derived_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed).public_key()
-    derived_key_bytes = derived_key.public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
-    if derived_key_bytes != configured_key:
-        fail(f"{SEED_ENV} does not match {PUBLIC_KEY_ENV}")
-
-    source = Path(args.rust_source).read_text(encoding="utf-8")
-    match = re.search(
-        rf'TrustedUpdateKey\s*\{{[^{{}}]*key_id:\s*"{KEY_ID}"[^{{}}]*public_key:\s*\[([^\]]+)\]',
-        source,
-        re.S,
-    )
-    if not match:
-        fail("failed to find embedded update public key")
-    try:
-        embedded_key = bytes(
-            int(part) for part in match.group(1).split(",") if part.strip()
-        )
-    except ValueError as error:
-        fail(f"invalid embedded update public key: {error}")
-    if embedded_key != configured_key:
-        fail(f"embedded update public key does not match {PUBLIC_KEY_ENV}")
+def command_check_key(_args):
+    signing_key()
 
 
 def build_parser():
@@ -281,9 +260,6 @@ def build_parser():
     verify.add_argument("--release-base-url", required=True)
     verify.set_defaults(func=command_verify)
     check_key = commands.add_parser("check-key")
-    check_key.add_argument(
-        "--rust-source", default="src/update_metadata.rs"
-    )
     check_key.set_defaults(func=command_check_key)
     return parser
 

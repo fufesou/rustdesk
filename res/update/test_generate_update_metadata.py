@@ -30,18 +30,24 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         )
         self.seed = base64.b64encode(seed).decode("ascii")
         self.public_key = base64.b64encode(public_key).decode("ascii")
+        self.trusted_keys = [
+            {"key_id": "previous", "algorithm": "ed25519",
+             "public_key": base64.b64encode(bytes(32)).decode("ascii")},
+            {"key_id": "test-rotated-key", "algorithm": "ed25519",
+             "public_key": self.public_key},
+        ]
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def run_script(self, *args, seed=None, public_key=None):
+    def run_script(self, *args, seed=None, trusted_keys=None):
         env = os.environ.copy()
         env.pop("RUSTDESK_UPDATE_ED25519_SEED", None)
-        env.pop("RUSTDESK_UPDATE_ED25519_PUBLIC_KEY", None)
         if seed is not None:
             env["RUSTDESK_UPDATE_ED25519_SEED"] = seed
-        if public_key is not None:
-            env["RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"] = public_key
+        env["RUSTDESK_TRUSTED_UPDATE_KEYS"] = (
+            json.dumps(self.trusted_keys) if trusted_keys is None else trusted_keys
+        )
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             cwd=SCRIPT.parents[2],
@@ -120,19 +126,10 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
             args.extend(["--artifact", str(artifact)])
         return self.run_script(
             *args,
-            public_key=public_key or self.public_key,
+            trusted_keys=json.dumps([
+                {**self.trusted_keys[-1], "public_key": public_key or self.public_key}
+            ]),
         )
-
-    def rust_source(self, public_key=None):
-        key_bytes = base64.b64decode(public_key or self.public_key)
-        source = self.root / "update_metadata.rs"
-        source.write_text(
-            'TrustedUpdateKey { key_id: "2026-ed25519-main", public_key: ['
-            + ",".join(str(byte) for byte in key_bytes)
-            + "] }",
-            encoding="utf-8",
-        )
-        return source
 
     def test_signs_and_verifies_release_artifacts(self):
         exe = self.artifact()
@@ -147,6 +144,10 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
         data = json.loads(metadata.read_text(encoding="utf-8"))
         self.assertEqual(data["release_id"], "v1.4.6")
         self.assertEqual({item["file_name"] for item in data["artifacts"]}, {exe.name, dmg.name})
+        signed_data = json.loads(signature.read_text(encoding="utf-8"))
+        self.assertEqual(data["signature_key_id"], "test-rotated-key")
+        self.assertEqual(signed_data["key_id"], "test-rotated-key")
+        self.assertEqual(signed_data["algorithm"], "ed25519")
 
     def test_verification_rejects_tampering(self):
         artifact = self.artifact()
@@ -234,19 +235,11 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
                     0,
                 )
 
-    def test_checks_embedded_public_key(self):
-        source = self.rust_source()
-        result = self.run_script(
-            "check-key",
-            "--rust-source",
-            str(source),
-            seed=self.seed,
-            public_key=self.public_key,
-        )
+    def test_checks_selected_public_key(self):
+        result = self.run_script("check-key", seed=self.seed)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_check_key_rejects_invalid_or_mismatched_seed(self):
-        source = self.rust_source()
         invalid_seeds = [
             None,
             "invalid",
@@ -256,45 +249,35 @@ class GenerateUpdateMetadataTest(unittest.TestCase):
 
         for seed in invalid_seeds:
             with self.subTest(seed=seed):
-                result = self.run_script(
-                    "check-key",
-                    "--rust-source",
-                    str(source),
-                    seed=seed,
-                    public_key=self.public_key,
-                )
+                result = self.run_script("check-key", seed=seed)
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_check_key_rejects_invalid_public_key(self):
-        source = self.rust_source()
-        invalid_keys = [
-            None,
-            "invalid",
-            base64.b64encode(b"x" * 31).decode("ascii"),
+    def test_check_key_rejects_invalid_or_ambiguous_key_lists(self):
+        key = self.trusted_keys[-1]
+        invalid_lists = [
+            [], None, {}, [{}],
+            [{**key, "key_id": ""}], [{**key, "algorithm": "rsa"}],
+            [{**key, "public_key": "invalid"}],
+            [{**key, "public_key": base64.b64encode(bytes(31)).decode("ascii")}],
+            [key, {**key, "key_id": "ambiguous"}],
+            [key, {**self.trusted_keys[0], "key_id": key["key_id"]}],
         ]
-
-        for public_key in invalid_keys:
-            with self.subTest(public_key=public_key):
+        for encoded in ["", "invalid"] + [json.dumps(keys) for keys in invalid_lists]:
+            with self.subTest(trusted_keys=encoded):
                 result = self.run_script(
-                    "check-key",
-                    "--rust-source",
-                    str(source),
-                    seed=self.seed,
-                    public_key=public_key,
+                    "check-key", seed=self.seed, trusted_keys=encoded,
                 )
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_check_key_rejects_mismatched_embedded_key(self):
-        embedded_key = base64.b64encode(b"x" * 32).decode("ascii")
-        result = self.run_script(
-            "check-key",
-            "--rust-source",
-            str(self.rust_source(embedded_key)),
-            seed=self.seed,
-            public_key=self.public_key,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
+    def test_verification_rejects_unknown_key_identity(self):
+        artifact = self.artifact()
+        metadata, signature, signed = self.sign([("windows", "x86_64", "exe", artifact)])
+        self.assertEqual(signed.returncode, 0, signed.stderr)
+        original = json.loads(signature.read_text(encoding="utf-8"))
+        for field, value in [("key_id", "unknown"), ("algorithm", "rsa")]:
+            with self.subTest(field=field):
+                signature.write_text(json.dumps({**original, field: value}), encoding="utf-8")
+                self.assertNotEqual(self.verify(metadata, signature, [artifact]).returncode, 0)
 
 if __name__ == "__main__":
     unittest.main()
