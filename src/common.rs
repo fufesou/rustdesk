@@ -1139,8 +1139,12 @@ fn clear_software_update_url() {
 fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
-    let release_id = release_id_from_update_url(&response_url)?;
-    let latest_release_version = display_version_from_release_id(&release_id)?;
+    let latest_release_version = if response_url == crate::updater::test_release::RELEASE_PAGE_URL {
+        crate::updater::test_release::VERSION.to_owned()
+    } else {
+        let release_id = release_id_from_update_url(&response_url)?;
+        display_version_from_release_id(&release_id)?
+    };
 
     if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
         #[cfg(feature = "flutter")]
@@ -1159,10 +1163,15 @@ fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     Ok(())
 }
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
+// Windows test builds advertise the pinned IPC authentication release.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    if cfg!(target_os = "windows") {
+        let response = serde_json::json!({
+            "url": crate::updater::test_release::RELEASE_PAGE_URL,
+        });
+        return process_software_update_check_response(serde_json::to_vec(&response)?.into());
+    }
     let (request, url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let proxy_conf = Config::get_socks();

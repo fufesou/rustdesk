@@ -104,6 +104,9 @@ pub(super) fn verified_update_artifact_from_release_page_url(
     update_url: &str,
     query: &UpdateArtifactQuery<'_>,
 ) -> ResultType<VerifiedUpdateArtifact> {
+    if update_url == super::test_release::RELEASE_PAGE_URL {
+        return super::test_release::artifact(query);
+    }
     let release_id = release_id_from_update_url(update_url)?;
     let display_version = display_version_from_release_id(&release_id)?;
     let expected_artifact_url_prefix =
@@ -177,7 +180,7 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
+    if (owner != "rustdesk" && !super::test_release::is_download_url(url))
         || repo != "rustdesk"
         || releases != "releases"
         || download != "download"

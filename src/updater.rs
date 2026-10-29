@@ -1,5 +1,6 @@
 mod artifact;
 mod download;
+pub(crate) mod test_release;
 
 use crate::common::do_check_software_update;
 use artifact::verified_update_artifact_from_release_page_url;
