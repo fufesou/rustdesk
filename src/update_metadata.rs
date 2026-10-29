@@ -29,14 +29,24 @@ const METADATA_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 
-const TRUSTED_UPDATE_KEYS: &[TrustedUpdateKey] = &[TrustedUpdateKey {
-    key_id: "2026-ed25519-main",
-    algorithm: SIGNATURE_ALGORITHM,
-    public_key: [
-        118, 252, 116, 215, 49, 217, 220, 109, 145, 119, 210, 101, 225, 198, 63, 2, 41, 127, 197,
-        127, 52, 251, 6, 204, 125, 117, 96, 204, 187, 166, 85, 59,
-    ],
-}];
+const TRUSTED_UPDATE_KEYS: &[TrustedUpdateKey] = &[
+    TrustedUpdateKey {
+        key_id: "2026-ed25519-main",
+        algorithm: SIGNATURE_ALGORITHM,
+        public_key: [
+            118, 252, 116, 215, 49, 217, 220, 109, 145, 119, 210, 101, 225, 198, 63, 2, 41, 127,
+            197, 127, 52, 251, 6, 204, 125, 117, 96, 204, 187, 166, 85, 59,
+        ],
+    },
+    TrustedUpdateKey {
+        key_id: "2026-ed25519-main-2",
+        algorithm: SIGNATURE_ALGORITHM,
+        public_key: [
+            174, 24, 1, 244, 223, 228, 20, 2, 117, 75, 146, 224, 118, 95, 220, 124, 138, 177, 201,
+            52, 104, 164, 148, 174, 73, 203, 229, 242, 30, 246, 171, 212,
+        ],
+    },
+];
 
 #[derive(Deserialize)]
 struct UpdateMetadata {
