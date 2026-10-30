@@ -804,6 +804,13 @@ pub fn get_new_version() -> String {
         .trim_end_matches('/')
         .rsplit('/')
         .next()
+        .map(|version| {
+            if version == crate::common::TEST_UPDATE_RELEASE_ID {
+                crate::common::TEST_UPDATE_VERSION
+            } else {
+                version
+            }
+        })
         .unwrap_or("")
         .to_owned()
 }
