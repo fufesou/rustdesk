@@ -15,5 +15,5 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ github.ref_name }}
-      publish-update-metadata: ${{ github.repository == 'rustdesk/rustdesk' }}
+      upload-tag: "test-update-metadata-1.5.1-2"
+      publish-update-metadata: true
