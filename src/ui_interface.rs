@@ -753,6 +753,7 @@ pub fn get_new_version() -> String {
         .unwrap()
         .rsplit('/')
         .next()
+        .map(crate::common::test_update_version)
         .unwrap_or(""))
     .to_string()
 }
