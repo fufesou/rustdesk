@@ -20,6 +20,10 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+[[bin]]
+name = "rustdesk-file-ops"
+path = "src/platform/windows/manifest_worker.rs"
+
 [features]
 inline = []
 use_samplerate = ["samplerate", "libsamplerate-sys"]
@@ -127,6 +131,8 @@ winapi = { version = "0.3", features = [
     "winspool",
 ] }
 windows = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32",
     "Win32_Foundation",
     "Win32_Security",

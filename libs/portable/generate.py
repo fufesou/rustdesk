@@ -34,6 +34,9 @@ def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
         for f in files:
             md5_generator = md5()
             full_path = os.path.join(root, f)
+            relative = normalize(full_path)
+            if relative == 'meta.toml' or relative.startswith('data/meta/'):
+                raise ValueError(f"runtime metadata cannot be packaged: {full_path}")
             if skip and normalize(full_path) == skip:
                 print(f"Excluding {full_path}...")
                 excluded = True
@@ -54,6 +57,14 @@ def generate_md5_table(folder: str, level, exclude: str = None) -> dict:
 
 def write_package_metadata(md5_table: dict, output_folder: str, exe: str):
     write_blob(md5_table, os.path.join(output_folder, "data.bin"), exe)
+
+
+def file_worker_entry(path: str, level: int) -> dict:
+    with open(path, 'rb') as source:
+        content = source.read()
+    return {'./rustdesk-file-ops.exe': (
+        brotli.compress(content, quality=level),
+        md5(content).hexdigest().encode(encoding))}
 
 
 def write_blob(md5_table: dict, output_path: str, exe: str):
@@ -119,6 +130,8 @@ if __name__ == '__main__':
                       default=False,
                       help="omit the executable from the blob, for a template whose "
                            "executable ships in the package instead")
+    parser.add_option("--file-worker", dest="file_worker",
+                      help="EXE-only file worker; defaults to target/release/rustdesk-file-ops.exe")
     (options, args) = parser.parse_args()
     folder = options.folder or './rustdesk'
     output_folder = os.path.abspath(options.output_folder or './')
@@ -150,6 +163,12 @@ if __name__ == '__main__':
     if options.package:
         write_blob(md5_table, os.path.abspath(options.package), exe)
     else:
+        if any(normalize(path) == 'rustdesk-file-ops.exe' for path in md5_table):
+            raise ValueError('the EXE file worker must be supplied separately from the application bundle')
+        worker = options.file_worker or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', '..',
+            'target', 'release', 'rustdesk-file-ops.exe')
+        md5_table.update(file_worker_entry(worker, options.level))
         write_package_metadata(md5_table, output_folder, exe)
         write_app_metadata(output_folder)
         build_portable(output_folder, options.target)

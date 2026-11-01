@@ -43,6 +43,10 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
 /// If it returns [`Some`], the action determines whether to start the UI or report failure.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<CoreMainAction> {
+    #[cfg(windows)]
+    if let Err(error) = crate::install_manifest::package::current() {
+        return Some(CoreMainAction::ExitFailure(error.into()));
+    }
     if !crate::common::global_init() {
         return None;
     }
@@ -234,9 +238,13 @@ pub fn core_main() -> Option<CoreMainAction> {
         #[cfg(windows)]
         {
             use crate::platform;
+            if let Some(result) = platform::run_manifest_component(&args[0]) {
+                return result.err().map(CoreMainAction::ExitFailure);
+            }
             if args[0] == "--uninstall" {
                 if let Err(err) = platform::uninstall_me(true) {
                     log::error!("Failed to uninstall: {}", err);
+                    return Some(CoreMainAction::ExitFailure(err));
                 }
                 return None;
             } else if args[0] == "--update" {
@@ -248,20 +256,21 @@ pub fn core_main() -> Option<CoreMainAction> {
                     return None;
                 }
 
-                let text = match crate::platform::prepare_custom_client_update() {
-                    Err(e) => {
-                        log::error!("Error preparing custom client update: {}", e);
-                        "Update failed!".to_string()
+                let result = crate::platform::prepare_custom_client_update().and_then(|ready| {
+                    if !ready {
+                        hbb_common::bail!("Custom client update preparation failed");
                     }
-                    Ok(false) => "Update failed!".to_string(),
-                    Ok(true) => match platform::update_me(false) {
-                        Ok(_) => "Updated successfully!".to_string(),
-                        Err(err) => {
-                            log::error!("Failed with error: {err}");
-                            "Update failed!".to_string()
-                        }
-                    },
-                };
+                    platform::update_me(false)
+                });
+                if let Err(error) = &result {
+                    log::error!("Failed to update: {error:#}");
+                }
+                let text = if result.is_ok() {
+                    "Updated successfully!"
+                } else {
+                    "Update failed!"
+                }
+                .to_owned();
                 Toast::new(Toast::POWERSHELL_APP_ID)
                     .title(&config::APP_NAME.read().unwrap())
                     .text1(&translate(text))
@@ -269,7 +278,7 @@ pub fn core_main() -> Option<CoreMainAction> {
                     .duration(Duration::Short)
                     .show()
                     .ok();
-                return None;
+                return result.err().map(CoreMainAction::ExitFailure);
             } else if args[0] == "--after-install" {
                 if let Err(err) = platform::run_after_install() {
                     log::error!("Failed to after-install: {}", err);
@@ -287,7 +296,7 @@ pub fn core_main() -> Option<CoreMainAction> {
                 let (printer_override, debug) = parse_silent_install_args(&args);
                 let options = platform::get_silent_install_options(printer_override);
                 let res = platform::install_me(options, "".to_owned(), true, debug);
-                let text = match res {
+                let text = match &res {
                     Ok(_) => translate("Installation Successful!".to_string()),
                     Err(err) => {
                         println!("Failed with error: {err}");
@@ -301,7 +310,7 @@ pub fn core_main() -> Option<CoreMainAction> {
                     .duration(Duration::Short)
                     .show()
                     .ok();
-                return None;
+                return res.err().map(CoreMainAction::ExitFailure);
             } else if args[0] == "--uninstall-cert" {
                 #[cfg(windows)]
                 hbb_common::allow_err!(crate::platform::windows::uninstall_cert());

@@ -99,6 +99,12 @@ pub fn get_id() -> String {
 
 #[inline]
 pub fn goto_install() {
+    #[cfg(windows)]
+    if let Err(error) = crate::install_manifest::package::relaunch_install() {
+        crate::platform::windows::message_box(&format!("Cannot start installation: {error}"));
+        return;
+    }
+    #[cfg(not(windows))]
     allow_err!(crate::run_me(vec!["--install"]));
     std::process::exit(0);
 }
@@ -118,6 +124,7 @@ pub fn install_me(_options: String, _path: String, _silent: bool, _debug: bool) 
             {
                 crate::platform::windows::message_box(&format!("Installation failed:\n{err:#}!"));
             }
+            std::process::exit(1);
         }
         std::process::exit(0);
     });

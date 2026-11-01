@@ -100,6 +100,8 @@ mod acl;
 pub(crate) mod installer_files;
 mod installer_handoff;
 mod installer_shell;
+mod manifest_install;
+pub use manifest_install::run_component as run_manifest_component;
 mod verified_update;
 mod msi_registry;
 pub(crate) use acl::current_process_user_sid_string;
@@ -1628,18 +1630,22 @@ fn get_after_install(
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
     // MSI and EXE installations use different registry layouts, so MSI-to-EXE upgrades are not supported.
     let (installed_subkey, _, _, _) = get_install_info();
-    if get_windows_installer_state(&installed_subkey)? == Some(true) {
+    if is_msi_installation(&installed_subkey)? {
         bail!("Cannot install the EXE package over an existing MSI installation");
     }
-    let uninstall_str = get_uninstall(false, false)?;
-    let mut path = path.trim_end_matches('\\').to_owned();
-    let (subkey, _path, start_menu, exe) = get_default_install_info();
-    let mut exe = exe;
-    if path.is_empty() {
-        path = _path;
-    } else {
-        exe = exe.replace(&_path, &path);
-    }
+    let path = manifest_install::install_path(&path)?;
+    let prepared = manifest_install::Prepared::new(
+        crate::install_manifest::request::Operation::Install,
+        PathBuf::from(&path),
+        silent,
+    )?;
+    let subkey = prepared.request.registry_subkey.clone();
+    let (_, _, start_menu, _) = get_install_info_with_subkey(subkey.clone());
+    let exe = PathBuf::from(&path)
+        .join(format!("{}.exe", crate::get_app_name()))
+        .to_string_lossy()
+        .into_owned();
+    let before_install = get_before_uninstall(false)?;
     let mut version_major = "0";
     let mut version_minor = "0";
     let mut version_build = "0";
@@ -1731,8 +1737,6 @@ if exist \"{tmp_path}\\Uninstall {app_name}.lnk\" del /f /q \"{tmp_path}\\Uninst
 if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} Tray.lnk\"
         "
     );
-    let src_exe = cur_exe.clone();
-
     // potential bug here: if run_cmd cancelled, but config file is changed.
     if let Some(lic) = get_license() {
         Config::set_option("key".into(), lic.key);
@@ -1750,11 +1754,9 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
     };
 
     let install_remote_printer = if install_printer {
-        // No need to use `|| true` here.
-        // The script will not exit even if `--install-remote-printer` panics.
-        format!("\"{}\" --install-remote-printer", &src_exe)
+        format!("\"{}\" --install-remote-printer", &exe)
     } else if is_win_10_or_greater() {
-        format!("\"{}\" --uninstall-remote-printer", &src_exe)
+        format!("\"{}\" --uninstall-remote-printer", &exe)
     } else {
         "".to_owned()
     };
@@ -1775,10 +1777,9 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
     // New code should be written in a common function.
     let cmds = format!(
         "
-{uninstall_str}
 chcp 65001
-md \"{path}\"
-{copy_exe}
+\"{exe}\" --uninstall-cert
+\"{exe}\" --uninstall-amyuni-idd
 reg add {subkey} /f
 reg add {subkey} /f /v DisplayIcon /t REG_SZ /d \"{display_icon}\"
 reg add {subkey} /f /v DisplayName /t REG_SZ /d \"{app_name}\"
@@ -1809,16 +1810,17 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         build_date = crate::BUILD_DATE,
         sleep = if debug { "timeout 300" } else { "" },
         dels = if debug { "" } else { &dels },
-        copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         import_config = get_import_config(&exe),
     );
-    run_cmds(
-        InstallCommands {
-            script: cmds,
-            files: vec![mk_shortcut_file, uninstall_shortcut_file, tray_shortcut_file],
-        },
+    prepared.run(
+        (
+            before_install,
+            InstallCommands {
+                script: cmds,
+                files: vec![mk_shortcut_file, uninstall_shortcut_file, tray_shortcut_file],
+            },
+        ),
         debug,
-        "install",
     )?;
     run_after_run_cmds(silent);
     Ok(())
@@ -1861,57 +1863,26 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
     ))
 }
 
-/// Constructs the uninstall command string for the application.
-///
-/// # Parameters
-/// - `kill_self`: The command will kill the process of current app name. If `true`, it will kill
-///   the current process as well. If `false`, it will exclude the current process from the kill
-///   command.
-/// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
-///
-/// # Details
-/// The `uninstall_printer` parameter determines whether the command to uninstall the remote printer
-/// is included in the generated uninstall script. If `uninstall_printer` is `false`, the printer
-/// related command is omitted from the script.
-fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String> {
-    let (subkey, path, start_menu, _) = get_install_info();
+fn get_uninstall() -> ResultType<String> {
+    let (subkey, _, _, _) = get_install_info();
     let installer_state = get_windows_installer_state(&subkey)?;
     if let Some(product_code) = get_msi_product_code(&subkey, installer_state)? {
         return Ok(build_msi_uninstall_command(&product_code));
     }
-    if installer_state == Some(true) {
-        bail!("MSI product code was not found in {subkey}");
-    }
-
-    let mut uninstall_cert_cmd = "".to_string();
-    let mut uninstall_printer_cmd = "".to_string();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_path) = exe.to_str() {
-            uninstall_cert_cmd = format!("\"{}\" --uninstall-cert", exe_path);
-            if uninstall_printer {
-                uninstall_printer_cmd = format!("\"{}\" --uninstall-remote-printer", &exe_path);
-            }
-        }
-    }
-    Ok(format!(
-        "
-    {before_uninstall}
-    {uninstall_printer_cmd}
-    {uninstall_cert_cmd}
-    reg delete {subkey} /f
-    {uninstall_amyuni_idd}
-    if exist \"{path}\" rd /s /q \"{path}\"
-    if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
-    if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
-    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-    ",
-        before_uninstall=get_before_uninstall(kill_self)?,
-        uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
-        app_name = crate::get_app_name(),
-    ))
+    bail!("MSI product code was not found in {subkey}");
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+    let (subkey, path, _, _) = get_install_info();
+    let prepared = if !is_msi_installation(&subkey)? {
+        Some(manifest_install::Prepared::new(
+            crate::install_manifest::request::Operation::Uninstall,
+            PathBuf::from(path),
+            true,
+        )?)
+    } else {
+        None
+    };
     if is_self_service_running() {
         // This CLI entry is synchronous. Portable builds reuse the retained user configuration.
         tokio::runtime::Builder::new_current_thread()
@@ -1919,7 +1890,10 @@ pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
             .build()?
             .block_on(crate::trusted_devices::config::refresh_from_server())?;
     }
-    run_cmds(get_uninstall(kill_self, true)?, true, "uninstall")
+    if let Some(prepared) = prepared {
+        return manifest_install::uninstall(prepared, kill_self);
+    }
+    run_cmds(get_uninstall()?, true, "uninstall")
 }
 
 fn write_vbs(cmds: String, tip: &str) -> ResultType<PathBuf> {
@@ -2076,6 +2050,12 @@ pub fn remove_custom_client_staging_dir(staging_dir: &Path) -> ResultType<bool> 
 //    (e.g., is a symlink or has invalid contents).
 // 3. Err if any unexpected error occurs during file operations.
 pub fn prepare_custom_client_update() -> ResultType<bool> {
+    if crate::install_manifest::package::current()?
+        .is_some_and(|package| package.has_custom_configuration())
+        && !is_msi_installation(&get_install_info().0)?
+    {
+        return Ok(true);
+    }
     let custom_client_staging_dir = get_custom_client_staging_dir();
     let current_exe = std::env::current_exe()?;
     let current_exe_dir = current_exe
@@ -3498,6 +3478,16 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     let is_msi = is_msi_installed().ok();
     let reg_msi_key = get_reg_msi_key(&subkey, is_msi)?;
 
+    let manifest_update = if !is_msi_installation(&subkey)? {
+        Some(manifest_install::Prepared::new(
+            crate::install_manifest::request::Operation::Update,
+            PathBuf::from(&path),
+            true,
+        )?)
+    } else {
+        None
+    };
+
     let app_exe_name = &format!("{}.exe", &app_name);
     // NOTE: The pids below are matched by command line, which can silently come
     // back empty even while the processes are running:
@@ -3518,14 +3508,18 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         .map(|pid| get_session_id_of_process(pid.as_u32()))
         .flatten()
         .collect::<Vec<_>>();
-    kill_process_by_pids(&app_exe_name, main_window_pids)?;
+    if manifest_update.is_none() {
+        kill_process_by_pids(&app_exe_name, main_window_pids)?;
+    }
     let tray_pids = crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
     let tray_sessions = tray_pids
         .iter()
         .map(|pid| get_session_id_of_process(pid.as_u32()))
         .flatten()
         .collect::<Vec<_>>();
-    kill_process_by_pids(&app_exe_name, tray_pids)?;
+    if manifest_update.is_none() {
+        kill_process_by_pids(&app_exe_name, tray_pids)?;
+    }
     let is_service_running = is_self_service_running();
 
     let mut version_major = "0";
@@ -3604,7 +3598,11 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
-        format!("sc start {}", &app_name)
+        if manifest_update.is_some() {
+            format!("sc start {app_name} || exit /b 1")
+        } else {
+            format!("sc start {app_name}")
+        }
     } else {
         "".to_owned()
     };
@@ -3612,28 +3610,31 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
     let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
     // Do nothing if the printer is not installed or failed to query if the printer is installed.
+    let printer_exe = if manifest_update.is_some() {
+        &exe
+    } else {
+        &src_exe
+    };
     let (uninstall_printer_cmd, install_printer_cmd) = if is_printer_installed {
         (
-            format!("\"{}\" --uninstall-remote-printer", &src_exe),
-            format!("\"{}\" --install-remote-printer", &src_exe),
+            format!("\"{}\" --uninstall-remote-printer", printer_exe),
+            format!("\"{}\" --install-remote-printer", printer_exe),
         )
     } else {
         ("".to_owned(), "".to_owned())
     };
 
-    // We do not try to remove all files in the old version.
-    // Because I don't know whether additional files will be installed here after installation, such as drivers.
-    // Just copy files to the installation directory works fine.
-    //if exist \"{path}\" rd /s /q \"{path}\"
-    // md \"{path}\"
-    //
+    // MSI retains its existing overlay copy; EXE ownership is handled by the manifest.
     // We need `taskkill` because:
     // 1. There may be some other processes like `rustdesk --connect` are running.
     // 2. Sometimes, the main window and the tray icon are showing
     // while I cannot find them by `tasklist` or the methods above.
     // There's should be 4 processes running: service, server, tray and main window.
     // But only 2 processes are shown in the tasklist.
-    let cmds = format!(
+    let cmds = if manifest_update.is_some() {
+        format!("{reg_cmd}\r\n{restore_service_cmd}\r\n{uninstall_printer_cmd}\r\n{install_printer_cmd}")
+    } else {
+        format!(
         "
 chcp 65001
 sc stop {app_name}
@@ -3652,7 +3653,8 @@ taskkill /F /IM {app_name}.exe{filter}
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
         sleep = if debug { "timeout 300" } else { "" },
-    );
+        )
+    };
 
     let _restore_session_guard = crate::common::SimpleCallOnReturn {
         b: true,
@@ -3711,7 +3713,12 @@ taskkill /F /IM {app_name}.exe{filter}
         }),
     };
 
-    run_cmds(cmds, debug, "update")?;
+    if let Some(prepared) = manifest_update {
+        let before = format!("sc stop {app_name}\r\ntaskkill /F /IM {app_name}.exe{filter}\r\ntaskkill /F /IM {WIN_TOPMOST_INJECTED_PROCESS_EXE}");
+        prepared.run((before, cmds.into()), debug)?;
+    } else {
+        run_cmds(cmds, debug, "update")?;
+    }
 
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");
@@ -3751,6 +3758,11 @@ fn get_reg_string_of(subkey: &str, name: &str) -> ResultType<Option<String>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => bail!("Failed to read {name} from registry key {subkey}: {err}"),
     }
+}
+
+fn is_msi_installation(subkey: &str) -> ResultType<bool> {
+    let state = get_windows_installer_state(subkey)?;
+    Ok(state == Some(true) || get_msi_product_code(subkey, state)?.is_some())
 }
 
 fn get_windows_installer_state(subkey: &str) -> ResultType<Option<bool>> {
@@ -4281,16 +4293,6 @@ impl Drop for WallPaperRemover {
     fn drop(&mut self) {
         // If the old background is a slideshow, it will be converted into an image. AnyDesk does the same.
         allow_err!(Self::set_wallpaper(Some(self.old_path.clone())));
-    }
-}
-
-fn get_uninstall_amyuni_idd() -> String {
-    match std::env::current_exe() {
-        Ok(path) => format!("\"{}\" --uninstall-amyuni-idd", path.to_str().unwrap_or("")),
-        Err(e) => {
-            log::warn!("Failed to get current exe path, cannot get command of uninstalling idd, Zzerror: {:?}", e);
-            "".to_string()
-        }
     }
 }
 

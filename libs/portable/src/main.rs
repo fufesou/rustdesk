@@ -9,6 +9,8 @@ use bin_reader::{normalize_path, BinaryReader};
 
 pub mod bin_reader;
 #[cfg(windows)]
+mod install_payload;
+#[cfg(windows)]
 mod ui;
 
 #[cfg(windows)]
@@ -229,19 +231,30 @@ fn is_windows_7() -> bool {
     false
 }
 
-fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
+struct ExecuteOptions {
+    ui: bool,
+    #[cfg(windows)]
+    package: install_payload::context::Package,
+}
+
+fn execute(path: PathBuf, args: Vec<String>, options: ExecuteOptions) -> Result<(), String> {
     println!("executing {}", path.display());
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_name = exe.file_name().unwrap_or_default();
     // run executable
     let mut cmd = Command::new(path);
-    cmd.args(args);
+    cmd.args(&args);
+    #[cfg(windows)]
+    let _package = options
+        .package
+        .attach(&mut cmd)
+        .map_err(|error| error.to_string())?;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
-        if _ui {
+        if options.ui {
             cmd.env(SET_FOREGROUND_WINDOW_ENV_KEY, "1");
         }
     }
@@ -256,19 +269,24 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
     }
-    let _child = cmd.spawn();
+    let mut child = cmd.spawn().map_err(|error| error.to_string())?;
 
     #[cfg(windows)]
-    if _ui {
-        match _child {
-            Ok(child) => unsafe {
-                winapi::um::winuser::AllowSetForegroundWindow(child.id() as u32);
-            },
-            Err(e) => {
-                eprintln!("{:?}", e);
-            }
+    if options.ui {
+        unsafe { winapi::um::winuser::AllowSetForegroundWindow(child.id()) };
+    }
+    if args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "--install" | "--silent-install" | "--update" | "--uninstall"
+        )
+    }) {
+        let status = child.wait().map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("Application operation failed: {status}"));
         }
     }
+    Ok(())
 }
 
 fn main() -> Result<(), String> {
@@ -298,6 +316,8 @@ fn main() -> Result<(), String> {
 
     let mut ui = false;
     let reader = BinaryReader::new()?;
+    #[cfg(windows)]
+    let package = install_payload::describe(&reader).map_err(|error| error.to_string())?;
     if let Some(exe) = setup(
         reader,
         None,
@@ -310,7 +330,15 @@ fn main() -> Result<(), String> {
         } else if quick_support {
             args = vec!["--quick_support".to_owned()];
         }
-        execute(exe, args, ui);
+        execute(
+            exe,
+            args,
+            ExecuteOptions {
+                ui,
+                #[cfg(windows)]
+                package,
+            },
+        )?;
     }
     Ok(())
 }

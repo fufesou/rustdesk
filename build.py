@@ -968,7 +968,7 @@ def build_flutter_arch_manjaro(version, features):
 
 def build_flutter_windows(version, features, skip_portable_pack):
     if not skip_cargo:
-        system2(f'cargo build --locked --features {features} --lib --release')
+        system2(f'cargo build --locked --features {features} --lib --bin rustdesk-file-ops --release')
         if not os.path.exists("target/release/librustdesk.dll"):
             print("cargo build failed, please check rust source code.")
             exit(-1)

@@ -12,6 +12,9 @@ build = "build.rs"
 brotli = "3.4"
 dirs = "5.0"
 md5 = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
 winapi = { version = "0.3", features = ["winbase", "libloaderapi"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -23,6 +26,10 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System",
     "Win32_System_SystemInformation",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }
 native-windows-gui = {version = "1.0", default-features = false, features = ["animation-timer", "image-decoder"]}
 
