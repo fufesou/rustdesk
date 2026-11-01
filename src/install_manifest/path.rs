@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::io;
 
 const INVALID_COMPONENT_CHARACTERS: &str = "<>:\"|?*";
 const DEVICE_NAMES: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
@@ -7,33 +7,12 @@ const DEVICE_SUFFIXES: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9", 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RelativePath(String);
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct PathError {
-    path: String,
-    reason: &'static str,
-}
-
-impl fmt::Display for PathError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Invalid manifest path {:?}: {}",
-            self.path, self.reason
-        )
-    }
-}
-
-impl Error for PathError {}
-
 impl RelativePath {
     // This only checks spelling; filesystem identity and reparse checks are still required.
-    pub(crate) fn parse(value: &str) -> Result<Self, PathError> {
+    pub(crate) fn parse(value: &str) -> io::Result<Self> {
         let normalized = value.replace('\\', "/");
         for component in normalized.split('/') {
-            validate_component(component).map_err(|reason| PathError {
-                path: value.to_owned(),
-                reason,
-            })?;
+            validate_component(component).map_err(|reason| invalid_path(value, reason))?;
         }
         Ok(Self(normalized))
     }
@@ -42,7 +21,7 @@ impl RelativePath {
         &self.0
     }
 
-    pub(crate) fn validate_payload_file(&self) -> Result<(), PathError> {
+    pub(crate) fn validate_payload_file(&self) -> io::Result<()> {
         let path = self.0.to_ascii_lowercase();
         if path == "meta.toml"
             || path.starts_with("meta.toml/")
@@ -50,13 +29,20 @@ impl RelativePath {
             || path == "data/meta"
             || path.starts_with("data/meta/")
         {
-            return Err(PathError {
-                path: self.0.clone(),
-                reason: "path conflicts with installer control metadata",
-            });
+            return Err(invalid_path(
+                &self.0,
+                "path conflicts with installer control metadata",
+            ));
         }
         Ok(())
     }
+}
+
+fn invalid_path(path: &str, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("Invalid manifest path {path:?}: {reason}"),
+    )
 }
 
 fn validate_component(component: &str) -> Result<(), &'static str> {

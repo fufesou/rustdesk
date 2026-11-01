@@ -106,9 +106,6 @@ impl InstallManifest {
                 "Manifest product, architecture and version are required",
             ));
         }
-        for file in &self.files {
-            file.validate_payload_file().map_err(invalid_data)?;
-        }
         self.validate_pending()?;
         migration::validate(self)?;
         collection::validate_manifest_sets(self)
@@ -127,14 +124,7 @@ impl InstallManifest {
             ));
         }
         pending.path.validate_payload_file().map_err(invalid_data)?;
-        if pending.sha256.len() != SHA256_HEX_LENGTH
-            || !pending.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(invalid_data(
-                "Pending publication has an invalid SHA-256 digest",
-            ));
-        }
-        Ok(())
+        request::validate_hash(&pending.sha256)
     }
 }
 
@@ -205,6 +195,21 @@ mod tests {
             .files
             .iter()
             .any(|path| path.as_str() == "legacy.dll"));
+        let target = &value["migration_targets"][0];
+        for (field, conflict) in [
+            ("files", json!(["legacy.dll"])),
+            ("files", json!(["legacy.dll/child"])),
+            ("created_dirs", json!(["legacy.dll/child"])),
+            ("migration_targets", json!([target, target])),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = conflict;
+            assert!(InstallManifest::from_bytes(
+                &serde_json::to_vec(&invalid).unwrap(),
+                &record.identity,
+            )
+            .is_err());
+        }
     }
 
     #[test]
