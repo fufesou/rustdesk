@@ -34,13 +34,16 @@ impl Prepared {
         let inputs = if operation == Operation::Uninstall {
             Vec::new()
         } else {
-            payload::prepare(&snapshot, &request, silent)?
+            payload::prepare(&snapshot, &request)?
         };
         let request = Request {
             files: inputs,
             ..request
         };
         request.to_bytes()?;
+        if operation != Operation::Uninstall {
+            payload::confirm_migration(&request, silent)?;
+        }
         inspect::verify(&request, &snapshot)?;
         let (inputs, files) = payload::stage(request.files)?;
         let request = Request {

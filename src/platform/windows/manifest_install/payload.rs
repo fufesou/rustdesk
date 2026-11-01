@@ -1,6 +1,5 @@
 use super::super::{installer_files::ProtectedInstallFile, ResultType};
 use crate::install_manifest::{
-    collection::{FileChanges, Replacement},
     package,
     request::{InputFile, Request, FILE_WORKER_NAME},
     windows::{files, inspect::Snapshot},
@@ -9,11 +8,7 @@ use crate::install_manifest::{
 use hbb_common::{anyhow::anyhow, bail};
 use std::path::PathBuf;
 
-pub(super) fn prepare(
-    snapshot: &Snapshot,
-    request: &Request,
-    silent: bool,
-) -> ResultType<Vec<InputFile>> {
+pub(super) fn prepare(snapshot: &Snapshot, request: &Request) -> ResultType<Vec<InputFile>> {
     let package = package::current()?
         .ok_or_else(|| anyhow!("Use a complete EXE package to install or update"))?;
     let source = std::env::current_exe()?;
@@ -42,20 +37,6 @@ pub(super) fn prepare(
             sha256: file.sha256.clone(),
         });
     }
-    let paths: Vec<_> = inputs.iter().map(|input| input.path.clone()).collect();
-    FileChanges::new(&[], &paths, Replacement::Complete)?;
-    for required in [
-        FILE_WORKER_NAME.to_owned(),
-        format!("{}.exe", request.product),
-    ] {
-        if !paths
-            .iter()
-            .any(|path| path.as_str().eq_ignore_ascii_case(&required))
-        {
-            bail!("Incomplete EXE package: missing {required}");
-        }
-    }
-    confirm_migration(&inputs, request, silent)?;
     Ok(inputs)
 }
 
@@ -85,14 +66,15 @@ fn previous(snapshot: &Snapshot, path: &RelativePath, hash: &str) -> ResultType<
     Ok(PreviousTarget::Legacy { identity })
 }
 
-fn confirm_migration(inputs: &[InputFile], request: &Request, silent: bool) -> ResultType<()> {
+pub(super) fn confirm_migration(request: &Request, silent: bool) -> ResultType<()> {
     use windows::{
         core::{w, PCWSTR},
         Win32::UI::WindowsAndMessaging::{
             MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
         },
     };
-    let collisions = inputs
+    let collisions = request
+        .files
         .iter()
         .filter(|file| matches!(file.previous, PreviousTarget::Legacy { .. }))
         .count();
