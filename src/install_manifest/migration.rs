@@ -1,5 +1,4 @@
 use super::{
-    collection::{FileChanges, Replacement},
     invalid_data,
     request::{validate_hash, InputFile},
     FileIdentity, InstallManifest, InstallState, PreviousTarget, RelativePath,
@@ -52,33 +51,12 @@ pub(super) fn validate(record: &InstallManifest) -> io::Result<()> {
             "Migration permission requires an unfinished installation",
         ));
     }
-    let paths: Vec<_> = record
-        .migration_targets
-        .iter()
-        .map(|target| target.path.clone())
-        .collect();
-    let combined = FileChanges::new(&record.files, &paths, Replacement::Overlay)?;
-    if combined.files.len() != record.files.len() + paths.len() {
-        return Err(invalid_data(
-            "Migration permission must not claim an owned file",
-        ));
-    }
     for target in &record.migration_targets {
         validate_hash(&target.sha256)?;
         if target.identity.volume_serial_number != record.identity.root.volume_serial_number {
             return Err(invalid_data(
                 "Migration target is outside the installation volume",
             ));
-        }
-        let path = target.path.as_str().to_ascii_lowercase();
-        if record.created_dirs.iter().any(|dir| {
-            dir.as_str().eq_ignore_ascii_case(&path)
-                || dir
-                    .as_str()
-                    .to_ascii_lowercase()
-                    .starts_with(&format!("{path}/"))
-        }) {
-            return Err(invalid_data("Migration target conflicts with a directory"));
         }
     }
     Ok(())
