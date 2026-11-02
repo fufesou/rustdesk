@@ -1,7 +1,7 @@
 use super::super::{installer_files::ProtectedInstallFile, ResultType};
 use crate::install_manifest::{
     package,
-    request::{InputFile, Request, FILE_WORKER_NAME},
+    request::{InputFile, Operation, Request, FILE_WORKER_NAME},
     windows::{files, inspect::Snapshot},
     PreviousTarget, RelativePath,
 };
@@ -31,7 +31,11 @@ pub(super) fn prepare(snapshot: &Snapshot, request: &Request) -> ResultType<Vec<
             .validate_payload_file()
             .map_err(|error| anyhow!(error))?;
         inputs.push(InputFile {
-            previous: previous(snapshot, &destination, &file.sha256)?,
+            previous: if request.operation == Operation::Uninstall {
+                PreviousTarget::Absent
+            } else {
+                previous(snapshot, &destination)?
+            },
             path: destination,
             source: source.join(path.as_str()),
             sha256: file.sha256.clone(),
@@ -40,7 +44,7 @@ pub(super) fn prepare(snapshot: &Snapshot, request: &Request) -> ResultType<Vec<
     Ok(inputs)
 }
 
-fn previous(snapshot: &Snapshot, path: &RelativePath, hash: &str) -> ResultType<PreviousTarget> {
+fn previous(snapshot: &Snapshot, path: &RelativePath) -> ResultType<PreviousTarget> {
     if snapshot
         .record
         .as_ref()
@@ -54,14 +58,8 @@ fn previous(snapshot: &Snapshot, path: &RelativePath, hash: &str) -> ResultType<
     let Some(identity) = files::current(root, path)? else {
         return Ok(PreviousTarget::Absent);
     };
-    if let Some(record) = &snapshot.record {
-        if !record
-            .migration_targets
-            .iter()
-            .any(|target| target.permits(path, hash, &identity))
-        {
-            bail!("Package would replace an unowned file: {}", path.as_str());
-        }
+    if snapshot.record.is_some() {
+        bail!("Package would replace an unowned file: {}", path.as_str());
     }
     Ok(PreviousTarget::Legacy { identity })
 }
@@ -85,9 +83,9 @@ pub(super) fn confirm_migration(request: &Request, silent: bool) -> ResultType<(
         return Ok(());
     }
     if silent {
-        bail!("Legacy migration requires --migrate-legacy-installation before overwriting {collisions} package paths");
+        bail!("Legacy migration requires --migrate-legacy-installation to adopt {collisions} existing package paths for replacement and uninstallation, including files not overwritten if installation fails");
     }
-    let message = format!("Migrate the existing {} installation to version {}?\n\nFolder: {}\n\nThis package will replace {collisions} existing files at its own paths and record them for uninstallation. Files outside the package list will be preserved.\n\nAllow this one-time migration?", request.product, request.package_version, request.root.display());
+    let message = format!("Migrate the existing {} installation to version {}?\n\nFolder: {}\n\nThis installer will manage {collisions} existing files at its package paths before copying starts. If installation fails, uninstall can remove these files even if they were not overwritten. Files outside the package list will be preserved.\n\nAllow this one-time migration?", request.product, request.package_version, request.root.display());
     let wide: Vec<_> = message.encode_utf16().chain([0]).collect();
     if unsafe {
         MessageBoxW(

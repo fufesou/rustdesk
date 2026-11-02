@@ -6,8 +6,8 @@ use super::{
 };
 use crate::{
     install_manifest::{
-        invalid_data, request::InputFile, FileIdentity, InstallManifest, PendingFile,
-        PreviousTarget, RelativePath,
+        invalid_data, request::InputFile, FileIdentity, InstallManifest, PreviousTarget,
+        RelativePath,
     },
     update_hash::verify_sha256_reader,
 };
@@ -24,31 +24,21 @@ impl Files<'_> {
         record: &InstallManifest,
         input: &InputFile,
     ) -> io::Result<InstallManifest> {
-        if record.pending_file.is_some() {
-            return Err(invalid_data("Unresolved file publication"));
+        if !contains(&record.files, &input.path) {
+            return Err(invalid_data(
+                "File is outside the installation's managed paths",
+            ));
         }
-        let mut next = self.ensure_parents(record, &input.path)?;
-        let previous = check_target(self.root, &next, input)?;
+        let next = self.ensure_parents(record, &input.path)?;
+        let previous = check_target(self.root, input)?;
         self.store.clear_unused_payload(&next)?;
         let staged = self.stage(input)?;
-        let prepared = (|| {
-            next.pending_file = Some(PendingFile {
-                path: input.path.clone(),
-                identity: identity(&staged)?,
-                sha256: input.sha256.clone(),
-                previous_target: input.previous.clone(),
-            });
-            self.store.save(&next)
-        })();
-        cleanup_failed_write(prepared, &staged)?;
         let (parent, name) = self.root.protected_parent(&input.path)?;
         match previous {
             Some(previous) => publish::replace_verified(&staged, &parent.file, (name, &previous))?,
             None => publish::publish_new(&staged, &parent.file, name)?,
         }
-        let registered = register(&next, &input.path);
-        self.store.save(&registered)?;
-        Ok(registered)
+        Ok(next)
     }
 
     fn stage(&self, input: &InputFile) -> io::Result<File> {
@@ -91,29 +81,23 @@ impl Files<'_> {
         &self,
         record: &InstallManifest,
         path: &RelativePath,
-    ) -> io::Result<InstallManifest> {
+    ) -> io::Result<()> {
         if !contains(&record.files, path) {
             return Err(invalid_data("File is not owned by this installation"));
         }
-        remove_relative(self.root, path)?;
-        let mut next = record.clone();
-        next.files.retain(|file| !same_path(file, path));
-        self.store.save(&next)?;
-        Ok(next)
+        remove_relative(self.root, path)
     }
 }
 
 pub(crate) fn check_target(
     root: &Directory,
-    record: &InstallManifest,
     input: &InputFile,
 ) -> io::Result<Option<FileIdentity>> {
     let previous = current(root, &input.path)?;
-    let owned = contains(&record.files, &input.path);
     let matches = match &input.previous {
-        PreviousTarget::Owned => owned,
-        PreviousTarget::Absent => !owned && previous.is_none(),
-        PreviousTarget::Legacy { identity } => !owned && previous.as_ref() == Some(identity),
+        PreviousTarget::Owned => true,
+        PreviousTarget::Absent => previous.is_none(),
+        PreviousTarget::Legacy { identity } => previous.as_ref() == Some(identity),
     };
     if !matches {
         return Err(invalid_data(format!(
@@ -150,16 +134,6 @@ pub(crate) fn remove_relative(root: &Directory, path: &RelativePath) -> io::Resu
     }
 }
 
-pub(crate) fn register(record: &InstallManifest, path: &RelativePath) -> InstallManifest {
-    let mut next = record.clone();
-    next.files.retain(|file| !same_path(file, path));
-    next.files.push(path.clone());
-    next.migration_targets
-        .retain(|target| !same_path(&target.path, path));
-    next.pending_file = None;
-    next
-}
-
 pub(crate) fn contains(files: &[RelativePath], path: &RelativePath) -> bool {
     files.iter().any(|file| same_path(file, path))
 }
@@ -190,7 +164,7 @@ mod tests {
     use super::*;
     use crate::install_manifest::{InstallIdentity, InstallState, SCHEMA_VERSION};
     use sha2::{Digest, Sha256};
-    use std::fs;
+    use std::{fs, io::Write};
 
     #[test]
     #[ignore = "requires an elevated Windows token to create administrator-owned fixtures"]
@@ -229,12 +203,13 @@ mod tests {
         assert!(files.remove_owned(&updated, &input.path).is_err());
         assert_eq!(store.load(&record.identity).unwrap(), updated);
         drop(held);
-        let removed = files.remove_owned(&updated, &input.path).unwrap();
-        assert!(removed.files.is_empty());
+        files.remove_owned(&updated, &input.path).unwrap();
+        files.remove_owned(&updated, &input.path).unwrap();
+        assert_eq!(store.load(&record.identity).unwrap(), updated);
         assert!(!temp.join("RustDesk.exe").exists());
         assert_eq!(fs::read(temp.join("unknown.txt")).unwrap(), b"preserve");
         store.delete().unwrap();
-        super::super::artifacts::remove_empty(&root, &removed.created_dirs).unwrap();
+        super::super::artifacts::remove_empty(&root, &updated.created_dirs).unwrap();
         drop(root);
         fs::remove_file(temp.join("source.bin")).unwrap();
         fs::remove_file(temp.join("unknown.txt")).unwrap();
@@ -253,7 +228,7 @@ mod tests {
             },
             package_version: "2.0".into(),
             state: InstallState::Installing,
-            files: Vec::new(),
+            files: vec![RelativePath::parse("RustDesk.exe").unwrap()],
             created_dirs: dirs,
             pending_file: None,
             migration_targets: Vec::new(),
@@ -271,5 +246,48 @@ mod tests {
 
     fn input_for_update(root: &Path) -> InputFile {
         input(root, PreviousTarget::Owned, b"older application")
+    }
+
+    #[test]
+    #[ignore = "requires an elevated Windows token to create administrator-owned fixtures"]
+    fn failed_copy_keeps_adopted_legacy_paths_available_for_uninstallation() {
+        let temp = std::env::temp_dir().join(format!("rustdesk-manifest-{}", uuid::Uuid::new_v4()));
+        let root = Directory::create(&temp).unwrap();
+        let (store, dirs) = Store::create(&root).unwrap();
+        let record = initial(&root, dirs);
+        let mut legacy = security::Descriptor::installer()
+            .unwrap()
+            .create(&root.file, "RustDesk.exe", Access::Create)
+            .unwrap();
+        legacy.write_all(b"legacy application").unwrap();
+        let previous = PreviousTarget::Legacy {
+            identity: identity(&legacy).unwrap(),
+        };
+        drop(legacy);
+        fs::write(temp.join("source.bin"), b"changed source").unwrap();
+        let input = input(&temp, previous, b"expected application");
+        let files = Files {
+            root: &root,
+            store: &store,
+        };
+        assert!(files.install(&record, &input).is_err());
+        assert_eq!(
+            fs::read(temp.join("RustDesk.exe")).unwrap(),
+            b"legacy application"
+        );
+        store.save(&record).unwrap();
+        assert!(files.install(&record, &input).is_err());
+        assert_eq!(store.load(&record.identity).unwrap(), record);
+        assert_eq!(
+            fs::read(temp.join("RustDesk.exe")).unwrap(),
+            b"legacy application"
+        );
+        files.remove_owned(&record, &input.path).unwrap();
+        assert!(!temp.join("RustDesk.exe").exists());
+        store.delete().unwrap();
+        super::super::artifacts::remove_empty(&root, &record.created_dirs).unwrap();
+        drop(root);
+        fs::remove_file(temp.join("source.bin")).unwrap();
+        fs::remove_dir(temp).unwrap();
     }
 }

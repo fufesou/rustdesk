@@ -374,9 +374,16 @@ jobs:
           # The build's own features, so the tests see the code that ships.
           FEATURES=$(python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} --print-features)
           cargo test --locked --release --lib --features "$FEATURES"
-          /usr/bin/timeout 60s cargo test --locked --release --lib --features "$FEATURES" publishes_updates_and_removes_owned_files_without_claiming_unknown_files -- --ignored
+          /usr/bin/timeout 60s cargo test --locked --release --lib --features "$FEATURES" install_manifest::windows::files::tests -- --ignored
           # Its Windows tests run nowhere else.
           cargo test --locked --release -p clipboard
+          pushd libs/portable
+          pip3 install -r requirements.txt
+          # Tests provide their own payloads; these inputs are only needed for compilation.
+          python3 -c "import generate; generate.write_package_metadata({}, '.', 'rustdesk.exe'); generate.write_app_metadata('.')"
+          popd
+          cargo test --locked --release -p rustdesk-portable-packer --no-run
+          /usr/bin/timeout 60s cargo test --locked --release -p rustdesk-portable-packer
 
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res

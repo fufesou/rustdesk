@@ -3,8 +3,6 @@ use std::io;
 
 #[path = "install_manifest/collection.rs"]
 pub(crate) mod collection;
-#[path = "install_manifest/migration.rs"]
-pub(crate) mod migration;
 #[cfg(windows)]
 #[path = "install_manifest/package.rs"]
 pub(crate) mod package;
@@ -55,15 +53,6 @@ pub(crate) enum PreviousTarget {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PendingFile {
-    pub path: RelativePath,
-    pub identity: FileIdentity,
-    pub sha256: String,
-    pub previous_target: PreviousTarget,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct InstallManifest {
     pub schema_version: u32,
     pub identity: InstallIdentity,
@@ -71,9 +60,11 @@ pub(crate) struct InstallManifest {
     pub state: InstallState,
     pub files: Vec<RelativePath>,
     pub created_dirs: Vec<RelativePath>,
-    pub pending_file: Option<PendingFile>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub migration_targets: Vec<migration::MigrationTarget>,
+    // Read old journals only to reject unfinished operations without expanding their authorization.
+    #[serde(default, skip_serializing)]
+    pub pending_file: Option<serde_json::Value>,
+    #[serde(default, skip_serializing)]
+    pub migration_targets: Vec<serde_json::Value>,
 }
 
 impl InstallManifest {
@@ -106,25 +97,12 @@ impl InstallManifest {
                 "Manifest product, architecture and version are required",
             ));
         }
-        self.validate_pending()?;
-        migration::validate(self)?;
-        collection::validate_manifest_sets(self)
-    }
-
-    fn validate_pending(&self) -> io::Result<()> {
-        let Some(pending) = &self.pending_file else {
-            return Ok(());
-        };
-        if !matches!(
-            self.state,
-            InstallState::Installing | InstallState::Updating
-        ) {
+        if self.pending_file.is_some() || !self.migration_targets.is_empty() {
             return Err(invalid_data(
-                "Pending publication requires an installation or update",
+                "Unfinished legacy publication journal; use the matching previous package to complete the operation first",
             ));
         }
-        pending.path.validate_payload_file().map_err(invalid_data)?;
-        request::validate_hash(&pending.sha256)
+        collection::validate_manifest_sets(self)
     }
 }
 
@@ -166,60 +144,59 @@ mod tests {
             files: vec![RelativePath::parse("uninstall.exe").unwrap()],
             created_dirs: vec![RelativePath::parse("data/meta").unwrap()],
             migration_targets: Vec::new(),
-            pending_file: Some(PendingFile {
-                path: RelativePath::parse("RustDesk.exe").unwrap(),
-                identity: FileIdentity {
-                    volume_serial_number: 1,
-                    file_index: 3,
-                },
-                sha256: "a".repeat(SHA256_HEX_LENGTH),
-                previous_target: PreviousTarget::Absent,
-            }),
+            pending_file: None,
         }
     }
 
     #[test]
-    fn preserves_migration_permission_without_claiming_legacy_files() {
+    fn accepts_completed_legacy_records_but_rejects_unresolved_authorization() {
         let record = manifest();
         let mut value = serde_json::to_value(&record).unwrap();
-        value["migration_targets"] = json!([{
-            "path": "legacy.dll", "sha256": "a".repeat(SHA256_HEX_LENGTH),
-            "identity": { "volume_serial_number": 1, "file_index": 30 }
-        }]);
-        let decoded =
+        value["pending_file"] = json!(null);
+        value["migration_targets"] = json!([]);
+        assert_eq!(
             InstallManifest::from_bytes(&serde_json::to_vec(&value).unwrap(), &record.identity)
-                .unwrap();
-        let saved = serde_json::to_value(&decoded).unwrap();
-        assert_eq!(saved["migration_targets"], value["migration_targets"]);
-        assert!(!decoded
-            .files
-            .iter()
-            .any(|path| path.as_str() == "legacy.dll"));
-        let target = &value["migration_targets"][0];
-        for (field, conflict) in [
-            ("files", json!(["legacy.dll"])),
-            ("files", json!(["legacy.dll/child"])),
-            ("created_dirs", json!(["legacy.dll/child"])),
-            ("migration_targets", json!([target, target])),
+                .unwrap(),
+            record
+        );
+        for (field, journal) in [
+            (
+                "pending_file",
+                json!({
+                    "path": "RustDesk.exe", "sha256": "a".repeat(SHA256_HEX_LENGTH),
+                    "identity": { "volume_serial_number": 1, "file_index": 3 },
+                    "previous_target": { "kind": "absent" }
+                }),
+            ),
+            (
+                "migration_targets",
+                json!([{
+                    "path": "legacy.dll", "sha256": "a".repeat(SHA256_HEX_LENGTH),
+                    "identity": { "volume_serial_number": 1, "file_index": 30 }
+                }]),
+            ),
         ] {
             let mut invalid = value.clone();
-            invalid[field] = conflict;
-            assert!(InstallManifest::from_bytes(
+            invalid[field] = journal;
+            let error = InstallManifest::from_bytes(
                 &serde_json::to_vec(&invalid).unwrap(),
                 &record.identity,
             )
-            .is_err());
+            .unwrap_err();
+            assert!(error.to_string().contains("matching previous package"));
         }
     }
 
     #[test]
-    fn round_trip_preserves_owned_and_pending_files_separately() {
+    fn round_trip_preserves_managed_paths_without_publication_journals() {
         let original = manifest();
         let bytes = original.to_bytes().unwrap();
         let decoded = InstallManifest::from_bytes(&bytes, &original.identity).unwrap();
         assert_eq!(decoded, original);
         assert_eq!(decoded.files.len(), 1);
-        assert_eq!(decoded.pending_file.unwrap().path.as_str(), "RustDesk.exe");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(saved.get("pending_file").is_none());
+        assert!(saved.get("migration_targets").is_none());
     }
 
     #[test]
@@ -229,7 +206,7 @@ mod tests {
             ("schema_version", json!(SCHEMA_VERSION + 1)),
             ("files", json!(["../outside.exe"])),
             ("files", json!(["data/meta/install-manifest.json"])),
-            ("state", json!("ready")),
+            ("state", json!("unknown")),
             ("unknown_field", json!(true)),
         ] {
             let mut invalid = serde_json::to_value(&original).unwrap();
@@ -256,14 +233,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_file_sets_and_pending_ownership() {
+    fn rejects_conflicting_managed_files_and_directories() {
         let original = manifest();
         for (field, value) in [
             ("files", json!(["App.dll", "app.dll"])),
             ("files", json!(["assets", "assets/logo.png"])),
             ("created_dirs", json!(["data", "DATA"])),
             ("created_dirs", json!(["uninstall.exe/logs"])),
-            ("files", json!(["RustDesk.exe"])),
+            ("created_dirs", json!(["uninstall.exe"])),
         ] {
             let mut invalid = serde_json::to_value(&original).unwrap();
             invalid[field] = value;
@@ -276,12 +253,5 @@ mod tests {
                 "accepted conflicting {field}: {invalid}"
             );
         }
-        let mut invalid = original.clone();
-        invalid.pending_file.as_mut().unwrap().previous_target = PreviousTarget::Owned;
-        assert!(InstallManifest::from_bytes(
-            &serde_json::to_vec(&invalid).unwrap(),
-            &original.identity,
-        )
-        .is_err());
     }
 }

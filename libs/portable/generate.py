@@ -3,7 +3,8 @@
 import os
 import optparse
 import subprocess
-from hashlib import md5
+import json
+from hashlib import md5, sha256
 import brotli
 import datetime
 
@@ -67,11 +68,18 @@ def file_worker_entry(path: str, level: int) -> dict:
         md5(content).hexdigest().encode(encoding))}
 
 
-def write_blob(md5_table: dict, output_path: str, exe: str):
+def write_blob(md5_table: dict, output_path: str, exe: str, *, package=False):
+    metadata = json.dumps({
+        'executable': normalize(exe),
+        'files': {normalize(path): sha256(brotli.decompress(data)).hexdigest()
+                  for path, (data, _) in md5_table.items()},
+    }).encode(encoding)
+    metadata_path = 'data/meta/package-custom.json' if package else 'data/meta/package-base.json'
+    entries = {**md5_table, metadata_path: (
+        brotli.compress(metadata), md5(metadata).hexdigest().encode(encoding))}
     with open(output_path, "wb") as f:
         f.write("rustdesk".encode(encoding=encoding))
-        for path in md5_table.keys():
-            (compressed_data, md5_code) = md5_table[path]
+        for path, (compressed_data, md5_code) in entries.items():
             data_length = len(compressed_data)
             path = path.encode(encoding=encoding)
             # path length & path
@@ -161,7 +169,7 @@ if __name__ == '__main__':
     md5_table = generate_md5_table(
         folder, options.level, exe if options.exclude_exe else None)
     if options.package:
-        write_blob(md5_table, os.path.abspath(options.package), exe)
+        write_blob(md5_table, os.path.abspath(options.package), exe, package=True)
     else:
         if any(normalize(path) == 'rustdesk-file-ops.exe' for path in md5_table):
             raise ValueError('the EXE file worker must be supplied separately from the application bundle')

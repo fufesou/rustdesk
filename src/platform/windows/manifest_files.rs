@@ -41,8 +41,6 @@ pub(crate) mod files;
 pub(crate) mod inspect;
 #[path = "manifest_files/operation.rs"]
 pub(crate) mod operation;
-#[path = "manifest_files/pending.rs"]
-pub(crate) mod pending;
 #[path = "manifest_files/publish.rs"]
 pub(crate) mod publish;
 #[path = "manifest_files/security.rs"]

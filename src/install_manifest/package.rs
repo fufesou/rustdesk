@@ -51,18 +51,22 @@ pub(crate) fn current() -> io::Result<Option<&'static Package>> {
         .map_err(|error| io::Error::other(error.clone()))
 }
 
-pub(crate) fn relaunch_install() -> io::Result<()> {
-    let package =
-        current()?.ok_or_else(|| io::Error::other("Install from a complete EXE package"))?;
+pub(crate) fn relaunch(argument: &str) -> io::Result<std::process::Child> {
+    let package = current()?;
+    if argument == "--install" && package.is_none() {
+        return Err(io::Error::other("Install from a complete EXE package"));
+    }
     let mut command = Command::new(std::env::current_exe()?);
-    command.arg("--install").env("SET_FOREGROUND_WINDOW", "1");
-    let _mapping = package.attach(&mut command)?;
+    command.arg(argument).env("SET_FOREGROUND_WINDOW", "1");
+    let _mapping = package
+        .map(|package| package.attach(&mut command))
+        .transpose()?;
     let child = command.spawn()?;
     if unsafe { winapi::um::winuser::AllowSetForegroundWindow(child.id()) } == 0 {
         eprintln!(
-            "Cannot grant installation window foreground access: {}",
+            "Cannot grant application window foreground access: {}",
             io::Error::last_os_error()
         );
     }
-    Ok(())
+    Ok(child)
 }

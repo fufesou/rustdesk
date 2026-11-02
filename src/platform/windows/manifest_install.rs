@@ -31,7 +31,11 @@ impl Prepared {
         let snapshot = inspect::read(&root, &product)?;
         let request = describe(operation, (root, product), &snapshot)?;
         system::verify_registration(&request)?;
-        let inputs = if operation == Operation::Uninstall {
+        let inputs = if operation == Operation::Uninstall
+            && (package::current()?.is_none()
+                || snapshot.record.as_ref().is_some_and(|record| {
+                    record.state == crate::install_manifest::InstallState::Uninstalling
+                })) {
             Vec::new()
         } else {
             payload::prepare(&snapshot, &request)?
@@ -192,15 +196,27 @@ pub(super) fn uninstall(mut prepared: Prepared, kill_self: bool) -> ResultType<(
     let before = if record.state == InstallState::Uninstalling {
         String::new()
     } else {
-        let executable = prepared
-            .request
-            .root
-            .join(format!("{}.exe", prepared.request.product));
-        let exe = path_for_cmd_environment(&executable)?;
+        let exe = component_executable(
+            &prepared.request.root,
+            &prepared.request.product,
+            !prepared.request.files.is_empty(),
+        )?;
         format!("{}\r\n\"{exe}\" --uninstall-remote-printer\r\n\"{exe}\" --uninstall-cert\r\n\"{exe}\" --uninstall-amyuni-idd", super::get_before_uninstall(kill_current)?)
     };
     drop(snapshot.root);
     prepared.run((before, String::new().into()), false)
+}
+
+fn component_executable(
+    root: &std::path::Path,
+    product: &str,
+    packaged: bool,
+) -> ResultType<String> {
+    if packaged {
+        let directory = crate::install_manifest::request::COMPONENT_RUNTIME_DIR;
+        return Ok(format!("%RUSTDESK_OUTPUT_DIR%\\{directory}\\{product}.exe"));
+    }
+    path_for_cmd_environment(&root.join(format!("{product}.exe"))).map(str::to_owned)
 }
 
 fn checked_commands(commands: &str) -> String {
@@ -225,6 +241,19 @@ fn checked_commands(commands: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_uninstall_does_not_run_the_installed_executable() {
+        let root = std::path::Path::new(r"C:\Missing installation");
+        assert_eq!(
+            component_executable(root, "RustDesk", true).unwrap(),
+            r"%RUSTDESK_OUTPUT_DIR%\components\RustDesk.exe"
+        );
+        assert_eq!(
+            component_executable(root, "RustDesk", false).unwrap(),
+            r"C:\Missing installation\RustDesk.exe"
+        );
+    }
 
     #[test]
     fn import_config_keeps_its_service_start_failure_contract() {

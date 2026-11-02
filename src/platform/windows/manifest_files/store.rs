@@ -90,9 +90,9 @@ impl Store {
 
     pub(crate) fn clear_unused_payload(&self, record: &InstallManifest) -> io::Result<()> {
         let persisted = self.load(&record.identity)?;
-        if persisted != *record || persisted.pending_file.is_some() {
+        if persisted != *record {
             return Err(io::Error::other(
-                "Cannot remove staging while ownership is unresolved",
+                "Installation manifest changed before staging cleanup",
             ));
         }
         self.remove_control(PAYLOAD_SLOT)

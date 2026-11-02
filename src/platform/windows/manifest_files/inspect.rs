@@ -1,9 +1,10 @@
-use super::{directory::Directory, files, identity, pending, security, store::Store};
+use super::{directory::Directory, files, identity, security, store::Store};
 use crate::{
     install_manifest::{
         collection::{FileChanges, Replacement},
         request::{Operation, Request},
-        InstallIdentity, InstallManifest, InstallState, RelativePath, SCHEMA_VERSION,
+        InstallIdentity, InstallManifest, InstallState, PreviousTarget, RelativePath,
+        SCHEMA_VERSION,
     },
     update_hash::sha256_reader_hex,
 };
@@ -32,7 +33,7 @@ pub(crate) fn read(path: &Path, product: &str) -> io::Result<Snapshot> {
     let loaded = Store::open(&root).and_then(|store| {
         let record = store.load(&expected)?;
         let digest = hash(&record)?;
-        Ok((pending::preview(&root, &store, &record)?, digest))
+        Ok((record, digest))
     });
     let (record, digest) = match loaded {
         Ok((record, digest)) => (Some(record), Some(digest)),
@@ -66,7 +67,7 @@ pub(crate) fn empty(root: &Directory, request: &Request) -> io::Result<InstallMa
         files: Vec::new(),
         created_dirs: Vec::new(),
         pending_file: None,
-        migration_targets: crate::install_manifest::migration::from_inputs(&request.files),
+        migration_targets: Vec::new(),
     })
 }
 
@@ -96,7 +97,9 @@ pub(crate) fn verify(request: &Request, snapshot: &Snapshot) -> io::Result<()> {
         .map(|record| record.files.as_slice())
         .unwrap_or(&[]);
     let incoming: Vec<_> = request.files.iter().map(|file| file.path.clone()).collect();
-    FileChanges::new(old, &incoming, replacement(request))?;
+    if request.operation != Operation::Uninstall {
+        FileChanges::new(old, &incoming, replacement(request))?;
+    }
     if let Some(root) = &snapshot.root {
         let empty = empty(root, request)?;
         let record = snapshot.record.as_ref().unwrap_or(&empty);
@@ -116,11 +119,17 @@ fn verify_targets(root: &Directory, record: &InstallManifest, request: &Request)
         ));
     }
     if request.operation != Operation::Uninstall {
-        crate::install_manifest::migration::verify_retry(record, &request.files)?;
-    }
-    for input in &request.files {
-        verify_parents(root, &input.path)?;
-        files::check_target(root, record, input)?;
+        for input in &request.files {
+            if files::contains(&record.files, &input.path)
+                != matches!(input.previous, PreviousTarget::Owned)
+            {
+                return Err(io::Error::other(
+                    "Replacement ownership changed; retry the operation",
+                ));
+            }
+            verify_parents(root, &input.path)?;
+            files::check_target(root, input)?;
+        }
     }
     for path in &record.files {
         verify_parents(root, path)?;

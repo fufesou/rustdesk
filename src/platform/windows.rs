@@ -1509,14 +1509,18 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
 }
 
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
+    // XCOPY does not accept quoted exclusion filenames; use the protected directory.
     let main_raw = format!(
-        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z",
+        "(echo \\{worker})>\"%RUSTDESK_OUTPUT_DIR%\\exclude-worker.txt\" || exit /b 1\r\n\
+         pushd \"%RUSTDESK_OUTPUT_DIR%\" || exit /b 1\r\n\
+         XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z /EXCLUDE:exclude-worker.txt\r\npopd",
         PathBuf::from(src_raw)
             .parent()
             .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
             .to_string_lossy()
             .to_string(),
-        _path
+        _path,
+        worker = crate::install_manifest::request::FILE_WORKER_NAME,
     );
     return Ok(main_raw);
 }
@@ -4879,6 +4883,51 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msi_update_copy_excludes_exe_worker() {
+        use crate::install_manifest::request::FILE_WORKER_NAME;
+
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("rustdesk msi copy {}", uuid::Uuid::new_v4()));
+        let source = root.join("package source");
+        let destination = root.join("installed app");
+        fs::create_dir_all(&source).unwrap();
+        let executable = source.join("RustDesk.exe");
+        fs::write(&executable, b"application").unwrap();
+        fs::write(source.join(FILE_WORKER_NAME), b"EXE worker").unwrap();
+        let commands = copy_raw_cmd(
+            executable.to_str().unwrap(),
+            "RustDesk.exe",
+            destination.to_str().unwrap(),
+        )
+        .unwrap();
+        let script = root.join("copy.bat");
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n{commands}\r\n"
+            ),
+        )
+        .unwrap();
+        let result =
+            std::process::Command::new(installer_shell::get_system_executable("cmd.exe").unwrap())
+                .raw_arg(format!(r#"/D /E:ON /V:OFF /C ""{}"""#, script.display()))
+                .env("RUSTDESK_OUTPUT_DIR", &root)
+                .current_dir(&root)
+                .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+                .output()
+                .unwrap();
+        let application = fs::read(destination.join("RustDesk.exe"));
+        let worker_copied = destination.join(FILE_WORKER_NAME).exists();
+        let resolved = root.canonicalize().unwrap();
+        assert!(resolved.starts_with(temp.canonicalize().unwrap()));
+        assert_eq!(resolved.file_name(), root.file_name());
+        fs::remove_dir_all(resolved).unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(application.unwrap(), b"application");
+        assert!(!worker_copied, "MSI must not copy the EXE-only worker");
+    }
 
     #[test]
     fn vbs_files_use_utf16le_with_bom_and_crlf() {

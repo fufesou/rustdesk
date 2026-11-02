@@ -1,4 +1,4 @@
-use super::{invalid_data, InstallManifest, PreviousTarget, RelativePath};
+use super::{invalid_data, InstallManifest, RelativePath};
 use std::{collections::BTreeMap, io};
 
 type PathIndex<'a> = BTreeMap<String, &'a RelativePath>;
@@ -10,6 +10,7 @@ pub(crate) enum Replacement {
 }
 
 pub(crate) struct FileChanges<'a> {
+    pub managed: Vec<&'a RelativePath>,
     pub remove: Vec<&'a RelativePath>,
 }
 
@@ -32,35 +33,15 @@ impl<'a> FileChanges<'a> {
                 .collect(),
             Replacement::Overlay => Vec::new(),
         };
-        Ok(Self { remove })
+        Ok(Self {
+            managed: combined.into_values().collect(),
+            remove,
+        })
     }
 }
 
 pub(super) fn validate_manifest_sets(manifest: &InstallManifest) -> io::Result<()> {
-    let mut files = payload_index(&manifest.files)?;
-    for target in &manifest.migration_targets {
-        target.path.validate_payload_file().map_err(invalid_data)?;
-        if files.insert(path_key(&target.path), &target.path).is_some() {
-            return Err(invalid_data(
-                "Migration permission conflicts with another file",
-            ));
-        }
-    }
-    if let Some(pending) = &manifest.pending_file {
-        let key = path_key(&pending.path);
-        let owned = manifest.files.iter().any(|file| path_key(file) == key);
-        if owned != matches!(pending.previous_target, PreviousTarget::Owned) {
-            return Err(invalid_data(
-                "Pending target ownership does not match the manifest",
-            ));
-        }
-        if pending.identity.volume_serial_number != manifest.identity.root.volume_serial_number {
-            return Err(invalid_data(
-                "Pending publication is not on the installation volume",
-            ));
-        }
-        files.insert(key, &pending.path);
-    }
+    let files = payload_index(&manifest.files)?;
     let directories = path_index(&manifest.created_dirs)?;
     validate_file_parents(&files)?;
     for key in directories.keys() {
@@ -126,11 +107,22 @@ mod tests {
         let new = paths(&["Custom.exe", "new.dll"]);
         let complete = FileChanges::new(&old, &new, Replacement::Complete).unwrap();
         assert_eq!(
+            names(&complete.managed),
+            [
+                "assets/logo.png",
+                "Custom.exe",
+                "custom.txt",
+                "new.dll",
+                "old.dll"
+            ]
+        );
+        assert_eq!(
             names(&complete.remove),
             ["assets/logo.png", "custom.txt", "old.dll"]
         );
         let overlay = FileChanges::new(&old, &new, Replacement::Overlay).unwrap();
         assert!(overlay.remove.is_empty());
+        assert_eq!(overlay.managed, complete.managed);
     }
 
     #[test]

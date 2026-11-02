@@ -100,7 +100,7 @@ pub fn get_id() -> String {
 #[inline]
 pub fn goto_install() {
     #[cfg(windows)]
-    if let Err(error) = crate::install_manifest::package::relaunch_install() {
+    if let Err(error) = crate::install_manifest::package::relaunch("--install") {
         crate::platform::windows::message_box(&format!("Cannot start installation: {error}"));
         return;
     }
@@ -137,6 +137,12 @@ pub fn update_me(_path: String) {
 
 #[inline]
 pub fn run_without_install() {
+    #[cfg(windows)]
+    if let Err(error) = crate::install_manifest::package::relaunch("--noinstall") {
+        crate::platform::windows::message_box(&format!("Cannot start portable mode: {error}"));
+        return;
+    }
+    #[cfg(not(windows))]
     crate::run_me(vec!["--noinstall"]).ok();
     std::process::exit(0);
 }

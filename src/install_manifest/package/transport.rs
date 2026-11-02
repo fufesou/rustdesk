@@ -105,20 +105,28 @@ mod tests {
 
     #[test]
     fn transfers_readonly_context_to_a_child() {
-        const PAYLOAD: &[u8] = b"embedded package list";
+        const PAYLOAD: &[u8] = br#"{"version":"test","executable":"RustDesk.exe","files":[]}"#;
+        const RELAUNCHED_ENV: &str = "RUSTDESK_TEST_PACKAGE_RELAUNCHED";
+        let module = module_path!().split_once("::").unwrap().1;
+        let test_name = format!("{module}::transfers_readonly_context_to_a_child");
         if std::env::var_os(CONTEXT_ENV).is_some() {
-            assert_eq!(receive().unwrap().unwrap(), PAYLOAD);
+            let package = super::super::current().unwrap().unwrap();
+            assert_eq!(serde_json::to_vec(package).unwrap(), PAYLOAD);
+            if std::env::var_os(RELAUNCHED_ENV).is_none() {
+                std::env::set_var(RELAUNCHED_ENV, "1");
+                assert!(super::super::relaunch(&test_name)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .success());
+            }
             return;
         }
+        assert!(std::env::var_os(RELAUNCHED_ENV).is_none());
         let mapping = Mapping::new(PAYLOAD).unwrap();
         assert!(map(*mapping.0, FILE_MAP_WRITE, PAYLOAD.len()).is_err());
         let mut command = Command::new(std::env::current_exe().unwrap());
-        let module = module_path!().split_once("::").unwrap().1;
-        command.args([
-            "--exact",
-            &format!("{module}::transfers_readonly_context_to_a_child"),
-            "--nocapture",
-        ]);
+        command.args(["--exact", &test_name, "--nocapture"]);
         mapping.attach(&mut command, PAYLOAD.len());
         let result = command.output().unwrap();
         assert!(

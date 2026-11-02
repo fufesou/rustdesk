@@ -315,9 +315,9 @@ fn main() -> Result<(), String> {
     }
 
     let mut ui = false;
-    let reader = BinaryReader::new()?;
+    let mut reader = BinaryReader::new()?;
     #[cfg(windows)]
-    let package = install_payload::describe(&reader).map_err(|error| error.to_string())?;
+    let package = install_payload::describe(&mut reader).map_err(|error| error.to_string())?;
     if let Some(exe) = setup(
         reader,
         None,
