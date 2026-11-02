@@ -115,13 +115,14 @@ jobs:
             -o cyclonedx-json=rustdesk-${{ env.VERSION }}.sbom.json
 
       - name: Publish Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         if: env.UPLOAD_ARTIFACT == 'true'
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            rustdesk-${{ env.VERSION }}.sbom.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # This test release already exists; upload assets without editing its metadata.
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "rustdesk-${VERSION}.sbom.json"
 
   generate-bridge:
     needs: [validate-update-metadata-keys]
@@ -535,13 +536,13 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ./SignOutput/rustdesk-*.msi
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            ./SignOutput/rustdesk-*.msi \
             ./SignOutput/rustdesk-*.exe
 
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
@@ -720,12 +721,12 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
@@ -1115,12 +1116,12 @@ jobs:
 
       - name: Publish DMG package
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            rustdesk*-${{ matrix.job.arch }}.dmg
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            rustdesk*-"${{ matrix.job.arch }}".dmg
 
   publish-signed-update-metadata:
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
@@ -1224,38 +1225,37 @@ jobs:
             --release-base-url https://github.com/fufesou/rustdesk/releases/download
 
       - name: Upload signed update artifacts
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          fail_on_unmatched_files: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.exe
-            ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.msi
-            ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.exe
-            ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.msi
-            ./artifacts/rustdesk-${{ env.VERSION }}-x86-sciter.exe
-            ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.dmg
-            ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.dmg
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "./artifacts/rustdesk-${VERSION}-x86_64.exe" \
+            "./artifacts/rustdesk-${VERSION}-x86_64.msi" \
+            "./artifacts/rustdesk-${VERSION}-aarch64.exe" \
+            "./artifacts/rustdesk-${VERSION}-aarch64.msi" \
+            "./artifacts/rustdesk-${VERSION}-x86-sciter.exe" \
+            "./artifacts/rustdesk-${VERSION}-aarch64.dmg" \
+            "./artifacts/rustdesk-${VERSION}-x86_64.dmg"
 
-      # The release action replaces same-name assets, so keep published sidecars
+      # Uploads replace same-name assets, so keep published sidecars
       # until replacements are ready.
       - name: Upload signed update metadata signature
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          fail_on_unmatched_files: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: ./rustdesk-update.json.sig
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            ./rustdesk-update.json.sig
 
       # Clients discover the release through metadata, so publish it only after every referenced asset.
       - name: Publish signed update metadata
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          fail_on_unmatched_files: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: ./rustdesk-update.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            ./rustdesk-update.json
 
   publish_unsigned:
     needs:
@@ -1312,11 +1312,12 @@ jobs:
           tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-aarch64 windows-x86 msi-template
 
       - name: Publish unsigned app
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "rustdesk-${VERSION}-unsigned.tar.gz"
 
   build-rustdesk-android:
     needs: [generate-bridge]
@@ -1595,21 +1596,22 @@ jobs:
 
       - name: Publish signed apk package
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$ASSET_PATH"
 
       - name: Publish unsigned apk package
         if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "signed-apk/rustdesk-${VERSION}-${{ matrix.job.arch }}.apk"
 
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
@@ -1780,21 +1782,22 @@ jobs:
 
       - name: Publish signed apk package
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$ASSET_PATH"
 
       - name: Publish unsigned apk package
         if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "signed-apk/rustdesk-${VERSION}-universal${suffix}.apk"
 
   build-rustdesk-linux:
     needs: [generate-bridge]
@@ -2097,12 +2100,12 @@ jobs:
 
       - name: Publish debian/rpm package
         if: env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            rustdesk-*.deb
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            rustdesk-*.deb \
             rustdesk-*.rpm
 
       - name: Upload deb
@@ -2133,12 +2136,12 @@ jobs:
 
       - name: Publish archlinux package
         if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            res/rustdesk-${{ env.VERSION }}*.zst
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            res/rustdesk-"${VERSION}"*.zst
 
   # Same build as build-rustdesk-linux x86_64 -- same vcpkg/ffmpeg, same ubuntu18.04 container, same
   # rust and flutter -- only with the drm feature on, so it ships as the separate
@@ -2448,12 +2451,12 @@ jobs:
 
       - name: Publish debian package
         if: env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ${{ env.DRM_DEB }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "${DRM_DEB}"
 
       # No UPLOAD_ARTIFACT gate: on a PR this is the only way to get at the deb that was just built.
       # always(), because a deb that failed the check above is the one most worth downloading.
@@ -2693,12 +2696,12 @@ jobs:
 
       - name: Publish debian package
         if: env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "rustdesk-${VERSION}-${{ matrix.job.arch }}-sciter.deb"
 
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -2753,12 +2756,12 @@ jobs:
 
       - name: Publish appimage package
         if: env.UPLOAD_ARTIFACT == 'true'
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            ./appimage/rustdesk-${{ env.VERSION }}-*.AppImage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            ./appimage/rustdesk-"${VERSION}"-*.AppImage
 
   build-flatpak:
     name: Build flatpak ${{ matrix.job.target }}${{ matrix.job.suffix }}
@@ -2838,12 +2841,12 @@ jobs:
             flatpak build-bundle ./repo rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak com.rustdesk.RustDesk
 
       - name: Publish flatpak package
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          files: |
-            flatpak/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "flatpak/rustdesk-${VERSION}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak"
 
   build-rustdesk-web:
     if: False
