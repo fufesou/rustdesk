@@ -14,6 +14,7 @@ length_count = 4
 encoding = 'utf-8'
 
 # output: {path: (compressed_data, file_md5)}
+# MD5 preserves the portable cache format; installation verifies SHA-256.
 
 
 def normalize(path: str) -> str:
@@ -65,7 +66,7 @@ def file_worker_entry(path: str, level: int) -> dict:
         content = source.read()
     return {'./rustdesk-file-ops.exe': (
         brotli.compress(content, quality=level),
-        md5(content).hexdigest().encode(encoding))}
+        md5(content, usedforsecurity=False).hexdigest().encode(encoding))}
 
 
 def write_blob(md5_table: dict, output_path: str, exe: str, *, package=False):
@@ -76,7 +77,7 @@ def write_blob(md5_table: dict, output_path: str, exe: str, *, package=False):
     }).encode(encoding)
     metadata_path = 'data/meta/package-custom.json' if package else 'data/meta/package-base.json'
     entries = {**md5_table, metadata_path: (
-        brotli.compress(metadata), md5(metadata).hexdigest().encode(encoding))}
+        brotli.compress(metadata), md5(metadata, usedforsecurity=False).hexdigest().encode(encoding))}
     with open(output_path, "wb") as f:
         f.write("rustdesk".encode(encoding=encoding))
         for path, (compressed_data, md5_code) in entries.items():

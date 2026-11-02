@@ -3486,7 +3486,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         Some(manifest_install::Prepared::new(
             crate::install_manifest::request::Operation::Update,
             PathBuf::from(&path),
-            true,
+            false,
         )?)
     } else {
         None
