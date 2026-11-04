@@ -1912,6 +1912,7 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String>
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+    crate::remote_print::setup::uninstall_if_owned()?;
     if is_self_service_running() {
         // This CLI entry is synchronous. Portable builds reuse the retained user configuration.
         tokio::runtime::Builder::new_current_thread()
@@ -3612,13 +3613,10 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
     let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
     // Do nothing if the printer is not installed or failed to query if the printer is installed.
-    let (uninstall_printer_cmd, install_printer_cmd) = if is_printer_installed {
-        (
-            format!("\"{}\" --uninstall-remote-printer", &src_exe),
-            format!("\"{}\" --install-remote-printer", &src_exe),
-        )
+    let install_printer_cmd = if is_printer_installed {
+        format!("\"{}\" --install-remote-printer", &src_exe)
     } else {
-        ("".to_owned(), "".to_owned())
+        "".to_owned()
     };
 
     // We do not try to remove all files in the old version.
@@ -3643,7 +3641,6 @@ taskkill /F /IM {app_name}.exe{filter}
 {rename_exe}
 {remove_meta_toml}
 {restore_service_cmd}
-{uninstall_printer_cmd}
 {install_printer_cmd}
 {sleep}
     ",

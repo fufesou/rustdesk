@@ -17,7 +17,13 @@
 		<CustomAction Id="SetPropertyServiceStop" DllEntry="SetPropertyFromConfig" Impersonate="yes" Execute="immediate" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
 		<CustomAction Id="AddRegSoftwareSASGeneration" DllEntry="AddRegSoftwareSASGeneration" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
 		<CustomAction Id="RemoveAmyuniIdd" DllEntry="RemoveAmyuniIdd" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
-		<CustomAction Id="InstallPrinter" DllEntry="InstallPrinter" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
-		<CustomAction Id="UninstallPrinter" DllEntry="UninstallPrinter" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+		<Property Id="PDFPRINTER_INSTALLED">
+			<RegistrySearch Id="PdfPrinterInstallMarker" Root="HKLM" Key="Software\$(var.Product)\RemotePrinting" Name="PDFPRINTER" Type="raw" />
+		</Property>
+		<CustomAction Id="CheckPdfPrinter" DllEntry="CheckPdfPrinter" Execute="immediate" Return="check" BinaryRef="Custom_Actions_Dll" />
+		<CustomAction Id="InstallPrinter" FileRef="App.exe" ExeCommand="--install-remote-printer" Impersonate="no" Execute="deferred" Return="check" />
+		<CustomAction Id="RollbackPrinter" FileRef="App.exe" ExeCommand="--uninstall-remote-printer" Impersonate="no" Execute="rollback" Return="check" />
+		<CustomAction Id="UninstallPrinter" FileRef="App.exe" ExeCommand="--uninstall-remote-printer" Impersonate="no" Execute="deferred" Return="check" />
+		<CustomAction Id="DisablePrinter" FileRef="App.exe" ExeCommand="--uninstall-remote-printer" Impersonate="no" Execute="deferred" Return="check" />
 	</Fragment>
 </Wix>
