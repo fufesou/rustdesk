@@ -1860,6 +1860,7 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        base::validate_relay_uuid(&uuid).map_err(hbb_common::anyhow::Error::msg)?;
         // The proxy's address family does not constrain the relay target.
         let relay_server = check_port(relay_server, RELAY_PORT);
         let use_ws_proxy = Config::is_proxy() && is_ws_endpoint(&check_ws(&relay_server));
@@ -2602,6 +2603,32 @@ impl AudioHandler {
 
 fn is_supported_audio_channel_count(channels: u32) -> bool {
     (1..=2).contains(&channels)
+}
+
+#[cfg(test)]
+mod relay_uuid_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_relay_uuid_is_rejected_before_connecting() {
+        assert!(base::validate_relay_uuid(&Uuid::new_v4().to_string()).is_ok());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let result = Client::create_relay(
+            "peer",
+            "\r\nPING\r\n".to_owned(),
+            listener.local_addr().unwrap().to_string(),
+            "",
+            ConnType::DEFAULT_CONN,
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(err) if err.to_string() == "Invalid relay UUID"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[cfg(test)]

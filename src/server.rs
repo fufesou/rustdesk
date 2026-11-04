@@ -404,6 +404,7 @@ async fn create_relay_connection_(
     ipv4: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
+    base::validate_relay_uuid(&uuid).map_err(hbb_common::anyhow::Error::msg)?;
     // The proxy's address family does not constrain the relay target.
     let relay_server = crate::check_port(relay_server, RELAY_PORT);
     let use_ws_proxy = Config::is_proxy() && is_ws_endpoint(&check_ws(&relay_server));
