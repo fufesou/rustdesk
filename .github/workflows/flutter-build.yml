@@ -78,14 +78,15 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
-          fetch-depth: 3
+          fetch-depth: 4
 
       - name: Verify historical source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ((git rev-parse HEAD^) -ne $env:BASELINE_BUILD_COMMIT) { throw 'Unexpected diagnostic baseline' }
-          if ((git rev-parse HEAD^^) -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
+          git merge-base --is-ancestor $env:BASELINE_BUILD_COMMIT HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected diagnostic baseline' }
+          if ((git rev-parse "$($env:BASELINE_BUILD_COMMIT)^") -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
           $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
           if (@($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
@@ -222,7 +223,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $messages = @(Get-Content -LiteralPath './handoff-test-build.jsonl' | ForEach-Object { $_ | ConvertFrom-Json })
-          $tests = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'rustdesk' -and $_.executable } | Select-Object -ExpandProperty executable -Unique)
+          $tests = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'librustdesk' -and $_.executable } | Select-Object -ExpandProperty executable -Unique)
           if ($tests.Count -ne 1) { throw 'Expected exactly one RustDesk unit-test executable' }
           $testName = 'platform::windows::installer_handoff::tests::protected_handoff_preserves_shortcuts_failures_and_cleanup'
           $started = [DateTime]::UtcNow
