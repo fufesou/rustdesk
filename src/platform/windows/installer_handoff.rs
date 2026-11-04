@@ -1,5 +1,4 @@
 pub(super) mod directory;
-mod gate;
 
 use super::{
     installer_files::ProtectedInstallFile,
@@ -10,13 +9,13 @@ use super::{
     },
     validate_install_app_name, ResultType,
 };
-use gate::InstallGate;
 use hbb_common::{bail, log};
 use std::{fs, io, path::Path};
 
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
 const UTF8_CODE_PAGE: u32 = 65001;
 const BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
+const DIAGNOSTIC_HANDOFF_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub(super) struct InstallCommands {
     pub script: String,
@@ -38,11 +37,16 @@ struct InstallCommandScript {
 }
 
 impl InstallCommandScript {
-    fn release_files(&mut self) {
+    fn release_files_and_wait(&mut self) {
         self.file.release();
         for file in &mut self._files {
             file.release();
         }
+        log::warn!(
+            "Diagnostic installer handoff: no named pipe; waiting {} seconds before elevated cmd",
+            DIAGNOSTIC_HANDOFF_DELAY.as_secs()
+        );
+        std::thread::sleep(DIAGNOSTIC_HANDOFF_DELAY);
     }
 }
 
@@ -82,14 +86,9 @@ fn write_install_script(cmds: InstallCommands, path: &Path) -> ResultType<Instal
     })
 }
 
-fn protected_install_parameters(
-    script: &InstallCommandScript,
-    gate: &InstallGate,
-) -> ResultType<String> {
+fn protected_install_parameters(script: &InstallCommandScript) -> ResultType<String> {
     let path = path_for_cmd_environment(script.file.path())?;
-    let pipe = gate.name();
-    let parameters =
-        format!("/D /E:ON /V:OFF /C \"set /p RUSTDESK_HANDOFF=<\"{pipe}\" >nul && \"{path}\"\"");
+    let parameters = format!("/D /E:ON /V:OFF /C \"\"{path}\"\"");
     let length = parameters.encode_utf16().count();
     if length >= WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS {
         bail!("Elevated command is too long: {length} UTF-16 characters");
@@ -103,9 +102,10 @@ pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) 
     let directory = path.with_extension("bat.dir");
     let mut script = write_install_script(cmds.into(), &path)?;
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
-    let gate = InstallGate::new()?;
-    let parameters = protected_install_parameters(&script, &gate)?;
+    let parameters = protected_install_parameters(&script)?;
     directory::create(&directory)?;
+    // Diagnostic only: releasing before UAC can leave protected files if elevation is cancelled.
+    script.release_files_and_wait();
     let process = launch_elevated(&cmd_path, &parameters, show).map_err(|err| {
         log::debug!("Failed to launch elevated installer: {err:#}");
         err.context(format!(
@@ -113,11 +113,6 @@ pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) 
             directory.display()
         ))
     })?;
-    gate.wait_for_client(process.handle())?;
-    // Keep DELETE-capable handles through UAC cancellation, but close them before
-    // cmd opens the BAT or copies its inputs. The protected DACL stays unchanged.
-    script.release_files();
-    gate.release(process.handle())?;
     let exit_code = process.wait()?;
     // Cleanup must not change the result of an installation that already ran.
     match fs::symlink_metadata(&directory) {
@@ -152,15 +147,12 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
 mod tests {
     use super::super::installer_shell::shortcut_bytes;
     use super::*;
-    use std::{
-        os::windows::{io::AsRawHandle, process::CommandExt},
-        process::Stdio,
-    };
-    use windows::Win32::Foundation::HANDLE;
+    use std::{os::windows::process::CommandExt, process::Stdio, time::Instant};
 
     #[test]
     fn protected_handoff_preserves_shortcuts_failures_and_cleanup() {
         const COMMAND_FAILURE: u32 = 77;
+        const MINIMUM_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
         for exit_code in [0, COMMAND_FAILURE] {
             let root =
                 std::env::temp_dir().join(format!("rustdesk-handoff-{}", uuid::Uuid::new_v4()));
@@ -183,7 +175,9 @@ mod tests {
             if !super::super::is_elevated(None).unwrap() {
                 assert!(fs::write(script.file.path(), "exit /b 0\r\n").is_err());
             }
-            let output = run_script(&mut script, true);
+            let started = Instant::now();
+            let output = run_script(&mut script);
+            assert!(started.elapsed() >= MINIMUM_DELAY);
             let copied = fs::read(&marker).unwrap();
             let cleaned = !runner.exists()
                 && !script.file.path().exists()
@@ -199,54 +193,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn interrupted_handoff_does_not_execute_the_batch() {
-        let root =
-            std::env::temp_dir().join(format!("rustdesk-interrupted-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
-        let source = root.join("source.bat");
-        let marker = root.join("executed");
-        let commands = format!("echo unexpected > \"{}\"", marker.display());
-        let mut script = write_install_script(commands.into(), &source).unwrap();
-        let output = run_script(&mut script, false);
-        assert!(!output.status.success(), "{output:?}");
-        assert!(!marker.exists());
-        drop(script);
-        assert!(!source.exists());
-        fs::remove_dir(&root).unwrap();
-
-        // A child exiting without connecting must also retire the pending pipe I/O.
-        let gate = InstallGate::new().unwrap();
-        let mut child =
-            std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
-                .args(["/D", "/C", "exit", "0"])
-                .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
-                .spawn()
-                .unwrap();
-        assert!(gate.wait_for_client(HANDLE(child.as_raw_handle())).is_err());
-        assert!(child.wait().unwrap().success());
-    }
-
-    fn run_script(script: &mut InstallCommandScript, release: bool) -> std::process::Output {
-        let gate = InstallGate::new().unwrap();
-        let parameters = protected_install_parameters(script, &gate).unwrap();
-        let mut child =
-            std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
-                .raw_arg(parameters)
-                .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-        let process = HANDLE(child.as_raw_handle());
-        gate.wait_for_client(process).unwrap();
-        assert!(child.try_wait().unwrap().is_none());
-        if release {
-            script.release_files();
-            gate.release(process).unwrap();
-        } else {
-            drop(gate);
-        }
+    fn run_script(script: &mut InstallCommandScript) -> std::process::Output {
+        let parameters = protected_install_parameters(script).unwrap();
+        script.release_files_and_wait();
+        let child = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .raw_arg(parameters)
+            .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         child.wait_with_output().unwrap()
     }
 }

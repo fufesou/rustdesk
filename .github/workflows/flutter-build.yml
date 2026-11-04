@@ -24,8 +24,9 @@ env:
   VERSION: "1.5.1"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
-  TEST_PACKAGE: "RustDesk-test-261104-H-23e5bb471-x86_64"
+  TEST_PACKAGE: "RustDesk-test-261104-I-23e5bb471-no-pipe-sleep3-x86_64"
   SOURCE_COMMIT: "23e5bb471a040d62f0a6ad52591fb30784265b73"
+  BASELINE_BUILD_COMMIT: "0b9882bff9c611aa65e14faa0ec10d4876dfcbbb"
 
 jobs:
   generate-bridge:
@@ -77,16 +78,17 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
-          fetch-depth: 2
+          fetch-depth: 3
 
       - name: Verify historical source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ((git rev-parse HEAD^) -ne $env:SOURCE_COMMIT) { throw 'Unexpected source parent' }
-          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml')
+          if ((git rev-parse HEAD^) -ne $env:BASELINE_BUILD_COMMIT) { throw 'Unexpected diagnostic baseline' }
+          if ((git rev-parse HEAD^^) -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
+          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
-          if (@($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Application source differs from the stated commit' }
+          if (@($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
 
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -208,6 +210,32 @@ jobs:
               throw
           }
 
+      - name: Compile diagnostic handoff test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked --release --lib --features flutter,hwcodec,vram --no-run --message-format=json > handoff-test-build.jsonl
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic handoff test compilation failed' }
+
+      - name: Run diagnostic handoff test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $messages = @(Get-Content -LiteralPath './handoff-test-build.jsonl' | ForEach-Object { $_ | ConvertFrom-Json })
+          $tests = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'rustdesk' -and $_.executable } | Select-Object -ExpandProperty executable -Unique)
+          if ($tests.Count -ne 1) { throw 'Expected exactly one RustDesk unit-test executable' }
+          $testName = 'platform::windows::installer_handoff::tests::protected_handoff_preserves_shortcuts_failures_and_cleanup'
+          $started = [DateTime]::UtcNow
+          $test = Start-Process -FilePath $tests[0] -ArgumentList @('--exact', $testName, '--nocapture') -WindowStyle Hidden -RedirectStandardOutput './handoff-test-stdout.txt' -RedirectStandardError './handoff-test-stderr.txt' -PassThru
+          if (-not $test.WaitForExit(60000)) { Stop-Process -Id $test.Id; throw 'Diagnostic handoff test exceeded 60 seconds' }
+          $stdout = Get-Content -LiteralPath './handoff-test-stdout.txt' -Raw
+          $stderr = Get-Content -LiteralPath './handoff-test-stderr.txt' -Raw
+          Write-Output $stdout
+          Write-Output $stderr
+          if ($test.ExitCode -ne 0 -or $stdout -notmatch 'test result: ok\. 1 passed;') { throw 'Diagnostic handoff test failed or did not run' }
+          New-Item -ItemType Directory -Path './SignOutput' -Force | Out-Null
+          [ordered]@{ test=$testName; exit_code=$test.ExitCode; elapsed_seconds=([DateTime]::UtcNow - $started).TotalSeconds; stdout=$stdout; stderr=$stderr } | ConvertTo-Json | Set-Content -LiteralPath "./SignOutput/$env:TEST_PACKAGE.handoff-test.json" -Encoding utf8
+
       - name: Download RustDeskTempTopMostWindow artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ inputs.upload-artifact }}
@@ -275,10 +303,15 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item -LiteralPath "./flutter/pubspec.lock" -Destination "./SignOutput/$env:TEST_PACKAGE.pubspec.lock"
           Copy-Item -LiteralPath "./dependency-lockfiles.patch" -Destination "./SignOutput/$env:TEST_PACKAGE.dependencies.patch"
+          $sourcePatch = git diff $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs | Out-String
+          [IO.File]::WriteAllText((Join-Path $PWD "SignOutput/$env:TEST_PACKAGE.source.patch"), $sourcePatch)
           $metadata = [ordered]@{
             dependency_lockfiles_changed=((Get-Item ./dependency-lockfiles.patch).Length -gt 0)
             pubspec_lock_sha256=(Get-FileHash ./flutter/pubspec.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
+            baseline_build_commit=$env:BASELINE_BUILD_COMMIT
+            diagnostic='installer pipe removed; protected file handles released; Rust sleeps 3 seconds before unchanged runas cmd launch'
+            source_patch_sha256=(Get-FileHash -LiteralPath "./SignOutput/$env:TEST_PACKAGE.source.patch" -Algorithm SHA256).Hash.ToLowerInvariant()
             hbb_common_commit=(git -C libs/hbb_common rev-parse HEAD)
             executable=$file.Name; file_version=$version; sha256=$hash; bytes=$file.Length
             authenticode=$signature.Status.ToString(); payload_authenticode=$payloadSignatures; reported_version=$reported
