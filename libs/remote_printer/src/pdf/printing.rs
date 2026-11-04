@@ -18,11 +18,13 @@ use windows::{
 };
 
 const DIPS_PER_INCH: f64 = 96.0;
+const MAX_RASTER_DPI: f64 = 600.0;
 const COLOR_BITS: u16 = 32;
 const COLOR_PLANES: u16 = 1;
 
 struct Layout {
     extent: [u32; 2],
+    raster_extent: [u32; 2],
     offset: [i32; 2],
 }
 
@@ -102,9 +104,9 @@ fn draw_pages(dc: HDC, document: &PdfDocument, renderer: &Rasterizer) -> ResultT
 
 fn draw_page(dc: HDC, page: &PdfPage, renderer: &Rasterizer) -> ResultType<()> {
     let layout = layout(dc, page)?;
-    let pixels = renderer.render(page, layout.extent)?;
-    let width = i32::try_from(layout.extent[0])?;
-    let height = i32::try_from(layout.extent[1])?;
+    let pixels = renderer.render(page, layout.raster_extent)?;
+    let width = i32::try_from(layout.raster_extent[0])?;
+    let height = i32::try_from(layout.raster_extent[1])?;
     let bitmap = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -123,8 +125,8 @@ fn draw_page(dc: HDC, page: &PdfPage, renderer: &Rasterizer) -> ResultType<()> {
             dc,
             layout.offset[0],
             layout.offset[1],
-            width,
-            height,
+            i32::try_from(layout.extent[0])?,
+            i32::try_from(layout.extent[1])?,
             0,
             0,
             width,
@@ -155,6 +157,10 @@ fn layout(dc: HDC, page: &PdfPage) -> ResultType<Layout> {
             GetDeviceCaps(Some(dc), LOGPIXELSY),
         ]
     };
+    page_layout(page_extent, printable, dpi)
+}
+
+fn page_layout(page_extent: [f64; 2], printable: [i32; 2], dpi: [i32; 2]) -> ResultType<Layout> {
     if printable.iter().chain(dpi.iter()).any(|value| *value <= 0)
         || page_extent
             .iter()
@@ -176,7 +182,14 @@ fn layout(dc: HDC, page: &PdfPage) -> ResultType<Layout> {
         (printable[0] - i32::try_from(extent[0])?) / 2,
         (printable[1] - i32::try_from(extent[1])?) / 2,
     ];
-    Ok(Layout { extent, offset })
+    Ok(Layout {
+        extent,
+        raster_extent: std::array::from_fn(|axis| {
+            let scale = (MAX_RASTER_DPI / f64::from(dpi[axis])).min(1.0);
+            (f64::from(extent[axis]) * scale).round().max(1.0) as u32
+        }),
+        offset,
+    })
 }
 
 fn check_gdi(value: i32, operation: &str) -> ResultType<()> {
@@ -239,6 +252,40 @@ impl Drop for Apartment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn high_dpi_rasters_preserve_a4_and_letter_output_size() {
+        for (printable, raster) in [
+            ([9921, 14031], [4961, 7016]),
+            ([10200, 13200], [5100, 6600]),
+        ] {
+            let page = printable.map(|pixels| f64::from(pixels) * 96.0 / 1200.0);
+            let layout = super::page_layout(page, printable, [1200, 1200]).unwrap();
+            assert_eq!(layout.raster_extent, raster);
+            assert_eq!(layout.extent, printable.map(|pixels| pixels as u32));
+            assert_eq!(layout.offset, [0, 0]);
+        }
+    }
+
+    #[test]
+    fn raster_retains_lower_dpi_and_centering() {
+        for dpi in [300, 600] {
+            let layout =
+                super::page_layout([96.0, 192.0], [8 * dpi, 10 * dpi], [dpi, dpi]).unwrap();
+            let extent = [5 * dpi as u32, 10 * dpi as u32];
+            assert_eq!(layout.raster_extent, extent);
+            assert_eq!(layout.extent, extent);
+            assert_eq!(layout.offset, [3 * dpi / 2, 0]);
+        }
+    }
+
+    #[test]
+    fn raster_caps_each_axis_of_an_asymmetric_printer() {
+        let layout = super::page_layout([96.0, 192.0], [8 * 1200, 10 * 300], [1200, 300]).unwrap();
+        assert_eq!(layout.raster_extent, [5 * 600, 10 * 300]);
+        assert_eq!(layout.extent, [5 * 1200, 10 * 300]);
+        assert_eq!(layout.offset, [3 * 1200 / 2, 0]);
+    }
+
     #[test]
     fn windows_pdf_renderer_initializes() {
         assert!(super::available().unwrap());

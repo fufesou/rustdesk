@@ -127,10 +127,11 @@ pub(crate) fn request(command: &str) -> ResultType<()> {
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut execution)? };
-    if execution.hProcess.is_invalid() {
+    let handle = execution.hProcess;
+    if handle.is_invalid() {
         bail!("Windows returned no PDF setup process");
     }
-    let process = Process(execution.hProcess);
+    let process = Process(handle);
     if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
         return Err(windows::core::Error::from_win32().into());
     }
