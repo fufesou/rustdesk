@@ -78,7 +78,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
-          fetch-depth: 5
+          fetch-depth: 8
 
       - name: Verify historical source
         shell: pwsh
@@ -87,7 +87,7 @@ jobs:
           git merge-base --is-ancestor $env:BASELINE_BUILD_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected diagnostic baseline' }
           if ((git rev-parse "$($env:BASELINE_BUILD_COMMIT)^") -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
-          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs')
+          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/native_service_stop.cpp', 'src/platform/windows/native_service_stop_fixture.cpp')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
           if (@($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
 
@@ -139,6 +139,105 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: ${{ matrix.job.os }}
+
+      - name: Compile native service-stop diagnostic and fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) { throw 'MSVC installation not found' }
+          New-Item -ItemType Directory -Path './target/native-service-stop/helper', './target/native-service-stop/fixture' -Force | Out-Null
+          $commands = @(
+            '@echo off',
+            "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul",
+            'if errorlevel 1 exit /b %errorlevel%',
+            'cl.exe /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX /D_WIN32_WINNT=0x0601 /Fe:target\native-service-stop\helper\rustdesk-service-stop.exe /Fo:target\native-service-stop\helper.obj src\platform\windows\native_service_stop.cpp /link /DYNAMICBASE /NXCOMPAT advapi32.lib shell32.lib ole32.lib uuid.lib',
+            'if errorlevel 1 exit /b %errorlevel%',
+            'cl.exe /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX /D_WIN32_WINNT=0x0601 /Fe:target\native-service-stop\fixture\native-service-fixture.exe /Fo:target\native-service-stop\fixture.obj src\platform\windows\native_service_stop_fixture.cpp /link /DYNAMICBASE /NXCOMPAT advapi32.lib',
+            'if errorlevel 1 exit /b %errorlevel%',
+            'dumpbin.exe /DEPENDENTS target\native-service-stop\helper\rustdesk-service-stop.exe >target\native-service-stop\helper-imports.txt',
+            'exit /b %errorlevel%'
+          )
+          $commands | Set-Content -LiteralPath './target/native-service-stop/build-native.cmd' -Encoding ascii
+          & $env:ComSpec /D /C '.\target\native-service-stop\build-native.cmd'
+          if ($LASTEXITCODE -ne 0) { throw 'Native helper compilation failed' }
+          $imports = @(Get-Content './target/native-service-stop/helper-imports.txt' | Where-Object { $_ -match '^\s+[A-Za-z0-9_.-]+\.dll\s*$' } | ForEach-Object { $_.Trim().ToLowerInvariant() })
+          if (-not $imports.Count -or @($imports | Where-Object { $_ -notin @('kernel32.dll', 'advapi32.dll', 'shell32.dll', 'ole32.dll') }).Count) { throw 'Unexpected native helper DLL dependency' }
+
+      - name: Test native service-stop with a real temporary service
+        shell: pwsh
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $started = [DateTime]::UtcNow
+          $application = 'RustDeskNativeStop' + [Guid]::NewGuid().ToString('N')
+          $brokerName = $application + 'Broker.exe'
+          $root = Join-Path $env:RUNNER_TEMP $application
+          $helper = (Resolve-Path './target/native-service-stop/helper/rustdesk-service-stop.exe').Path
+          $fixture = (Resolve-Path './target/native-service-stop/fixture/native-service-fixture.exe').Path
+          $shortcut = Join-Path ([Environment]::GetFolderPath('CommonStartup')) "$application Tray.lnk"
+          $children = @()
+          $serviceCreated = $false
+          New-Item -ItemType Directory -Path $root | Out-Null
+          function Invoke-NativeStop([string[]] $Arguments, [int] $Expected) {
+            $out = Join-Path $root 'stdout.txt'
+            $err = Join-Path $root 'stderr.txt'
+            $options = @{ FilePath=$helper; WindowStyle='Hidden'; RedirectStandardOutput=$out; RedirectStandardError=$err; PassThru=$true }
+            if ($Arguments.Count) { $options.ArgumentList = $Arguments }
+            $child = Start-Process @options
+            if (-not $child.WaitForExit(30000)) { Stop-Process -Id $child.Id; throw 'Native helper exceeded 30 seconds' }
+            Get-Content -LiteralPath $out, $err
+            if ($child.ExitCode -ne $Expected) { throw "Expected exit $Expected, got $($child.ExitCode)" }
+          }
+          try {
+            Invoke-NativeStop -Arguments @() -Expected 160
+            Copy-Item -LiteralPath $fixture -Destination (Join-Path $root "$application.exe")
+            Copy-Item -LiteralPath $fixture -Destination (Join-Path $root $brokerName)
+            foreach ($name in @("$application.exe", "$application.exe", $brokerName)) {
+              $children += Start-Process -FilePath (Join-Path $root $name) -ArgumentList '--idle' -WindowStyle Hidden -PassThru
+            }
+            [IO.File]::WriteAllText($shortcut, 'Temporary native-stop test shortcut')
+            (Get-Item -LiteralPath $shortcut).IsReadOnly = $true
+            & sc.exe create $application 'binPath=' ('"' + $fixture + '" --service') 'start=' 'demand'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create fixture service' }
+            $serviceCreated = $true
+            & sc.exe start $application
+            if ($LASTEXITCODE -ne 0) { throw 'Could not start fixture service' }
+            $service = Get-Service -Name $application
+            try { $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(10)) } finally { $service.Dispose() }
+            $arguments = @($application, $brokerName, [string]$children[0].Id)
+            Invoke-NativeStop -Arguments $arguments -Expected 0
+            & sc.exe query $application
+            if ($LASTEXITCODE -ne 1060) { throw 'Fixture service was not removed' }
+            if (Test-Path -LiteralPath $shortcut) { throw 'Startup shortcut was not removed' }
+            if ($children[0].HasExited) { throw 'The caller was terminated' }
+            foreach ($child in $children[1..2]) {
+              if (-not $child.WaitForExit(1000)) { throw 'Matching app or broker process remains' }
+            }
+            Invoke-NativeStop -Arguments $arguments -Expected 0
+            if ($children[0].HasExited) { throw 'Repeated stop terminated the caller' }
+            New-Item -ItemType Directory -Path './SignOutput' -Force | Out-Null
+            [ordered]@{
+              passed=$true; service_removed=$true; readonly_shortcut_removed=$true
+              app_and_broker_terminated=$true; caller_preserved=$true; repeated_stop_passed=$true
+              invalid_arguments_exit=160; elapsed_seconds=([DateTime]::UtcNow - $started).TotalSeconds
+              scope='Real disposable-runner fixtures; direct helper invocation; no F-Secure or UAC consent test'
+            } | ConvertTo-Json | Set-Content -LiteralPath "./SignOutput/$env:TEST_PACKAGE.native-stop-test.json" -Encoding utf8
+          } finally {
+            foreach ($child in $children) {
+              if (-not $child.HasExited) { Stop-Process -Id $child.Id }
+              $child.Dispose()
+            }
+            if ($serviceCreated) {
+              & sc.exe stop $application
+              if ($LASTEXITCODE -notin @(0, 1060, 1062)) { Write-Error 'Fixture service cleanup stop failed' }
+              & sc.exe delete $application
+              if ($LASTEXITCODE -notin @(0, 1060, 1072)) { Write-Error 'Fixture service cleanup delete failed' }
+            }
+            if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force }
+          }
+          exit 0
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
