@@ -11,6 +11,7 @@
 #include "flutter_window.h"
 #include "utils.h"
 #include "service_control.h"
+#include "native_service_stop.h"
 
 typedef char** (*FUNC_RUSTDESK_CORE_MAIN)(int*);
 typedef void (*FUNC_RUSTDESK_FREE_ARGS)( char**, int);
@@ -24,6 +25,9 @@ const wchar_t* getWindowClassName();
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
+  if (auto result = native_service_stop::HandleCommand(command_line)) {
+    return static_cast<int>(*result);
+  }
   if (auto result = service_control::HandleCommand(command_line)) {
     return static_cast<int>(*result);
   }
