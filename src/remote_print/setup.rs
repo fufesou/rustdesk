@@ -16,6 +16,22 @@ pub(crate) const INSTALL: &str = "--install-remote-printer";
 pub(crate) const UNINSTALL: &str = "--uninstall-remote-printer";
 const INSTALL_MARKER: &str = "PDFPRINTER";
 
+fn install_with_marker(
+    installed: bool,
+    write: impl Fn(bool) -> ResultType<()>,
+    install: impl FnOnce() -> ResultType<()>,
+) -> ResultType<()> {
+    // Do not migrate an existing queue until its capture marker is writable.
+    write(true)?;
+    if let Err(error) = install() {
+        if let Err(restore) = write(installed) {
+            bail!("PDF printer installation failed: {error:#}; failed to restore installation marker: {restore:#}");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn check_install_executable(current: &Path, installed: &Path) -> ResultType<()> {
     let current = std::fs::canonicalize(current)?;
     let installed = std::fs::canonicalize(installed)?;
@@ -52,14 +68,9 @@ pub(crate) fn execute(command: &str) -> ResultType<()> {
         INSTALL => {
             let instance = uuid::Uuid::new_v4().simple().to_string();
             remote_printer::pdf::verify_namespace(&instance)?;
-            let present = remote_printer::is_rd_printer_installed(&crate::get_app_name())?;
-            remote_printer::pdf::install(&crate::get_app_name(), &instance)?;
-            if let Err(error) = write_marker(true) {
-                if !present {
-                    remote_printer::pdf::uninstall(&crate::get_app_name())?;
-                }
-                return Err(error);
-            }
+            install_with_marker(installed_marker()?, write_marker, || {
+                remote_printer::pdf::install(&crate::get_app_name(), &instance).map(|_| ())
+            })?;
         }
         UNINSTALL => {
             remote_printer::pdf::uninstall(&crate::get_app_name())?;
@@ -205,6 +216,34 @@ impl Drop for Process {
 mod tests {
     use super::*;
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    #[test]
+    fn pdf_marker_failure_prevents_queue_changes() {
+        let result = install_with_marker(
+            false,
+            |_| bail!("marker denied"),
+            || panic!("Printer setup must not run when the marker cannot be written"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "marker denied");
+    }
+
+    #[test]
+    fn pdf_setup_failure_restores_previous_marker() {
+        for previous in [false, true] {
+            let marker = std::cell::Cell::new(previous);
+            let error = install_with_marker(
+                previous,
+                |value| {
+                    marker.set(value);
+                    Ok(())
+                },
+                || bail!("queue failed"),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "queue failed");
+            assert_eq!(marker.get(), previous);
+        }
+    }
 
     #[test]
     fn printer_install_rejects_a_different_executable() {
