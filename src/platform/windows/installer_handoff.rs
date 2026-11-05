@@ -9,7 +9,7 @@ use super::{
     },
     validate_install_app_name, ResultType,
 };
-use hbb_common::{bail, log};
+use hbb_common::{anyhow::anyhow, bail, log};
 use std::{fs, io, path::Path};
 
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
@@ -101,14 +101,13 @@ pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) 
     directory::create(&directory)?;
     // Diagnostic only: releasing before UAC can leave protected files if elevation is cancelled.
     script.release_files();
-    let process = launch_elevated(&cmd_path, &parameters, show).map_err(|err| {
+    let exit_code = run_install_command(&cmd_path, &parameters, show).map_err(|err| {
         log::debug!("Failed to launch elevated installer: {err:#}");
         err.context(format!(
             "Installer handoff failed; protected directory may remain at {}",
             directory.display()
         ))
     })?;
-    let exit_code = process.wait()?;
     // Cleanup must not change the result of an installation that already ran.
     match fs::symlink_metadata(&directory) {
         Ok(_) => log::warn!(
@@ -128,6 +127,37 @@ pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) 
         );
     }
     Ok(())
+}
+
+fn run_install_command(executable: &Path, parameters: &str, show: bool) -> ResultType<u32> {
+    if super::is_elevated(None)? {
+        log::info!("Diagnostic installer: elevated caller creates system CMD directly");
+        return run_install_command_direct(executable, parameters, show);
+    }
+    launch_elevated(executable, parameters, show)?.wait()
+}
+
+fn run_install_command_direct(executable: &Path, parameters: &str, show: bool) -> ResultType<u32> {
+    use std::{os::windows::process::CommandExt, process::Command};
+    use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW};
+
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("System executable has no parent directory"))?;
+    let flags = if show {
+        CREATE_NEW_CONSOLE
+    } else {
+        CREATE_NO_WINDOW
+    };
+    let status = Command::new(executable)
+        .raw_arg(parameters)
+        .current_dir(directory)
+        .creation_flags(flags.0)
+        .status()?;
+    status
+        .code()
+        .map(|code| code as u32)
+        .ok_or_else(|| anyhow!("Installer process exited without an exit code"))
 }
 
 fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
@@ -182,6 +212,44 @@ mod tests {
             );
             assert_eq!(copied, bytes);
             assert!(cleaned, "The runner and protected inputs must be removed");
+        }
+    }
+
+    #[test]
+    fn direct_command_preserves_staged_inputs_and_exit_codes() {
+        const COMMAND_FAILURE: u32 = 77;
+        for exit_code in [0, COMMAND_FAILURE] {
+            let root =
+                std::env::temp_dir().join(format!("rustdesk-direct-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let source = root.join("source !&^@().bat");
+            fs::create_dir(source.with_extension("bat.dir")).unwrap();
+            let bytes = shortcut_bytes(r"C:\RustDesk.exe", Some("--tray"), None).unwrap();
+            let shortcut =
+                ProtectedInstallFile::new(&root.join("input !&^@().lnk"), &bytes).unwrap();
+            let marker = root.join("copied.lnk");
+            let commands = InstallCommands {
+                script: format!(
+                    "copy /B /Y \"{}\" \"{}\" > nul\r\nexit /b {exit_code}",
+                    shortcut.path().display(),
+                    marker.display()
+                ),
+                files: vec![shortcut],
+            };
+            let mut script = write_install_script(commands, &source).unwrap();
+            let parameters = protected_install_parameters(&script).unwrap();
+            script.release_files();
+            let result = run_install_command_direct(
+                &get_system_executable(CMD_RELATIVE_PATH).unwrap(),
+                &parameters,
+                false,
+            )
+            .unwrap();
+            assert_eq!(result, exit_code);
+            assert_eq!(fs::read(&marker).unwrap(), bytes);
+            assert!(!source.exists() && !source.with_extension("bat.dir").exists());
+            assert!(script._files.iter().all(|file| !file.path().exists()));
+            fs::remove_dir_all(root).unwrap();
         }
     }
 
