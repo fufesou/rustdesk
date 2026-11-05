@@ -1,5 +1,6 @@
 use super::{handles::check_size, queues, raster::Rasterizer};
 use hbb_common::{bail, ResultType};
+use page_printer::PagePrinter;
 use std::{mem::size_of, path::Path};
 use windows::{
     core::{w, HSTRING, PCWSTR, PWSTR},
@@ -16,6 +17,8 @@ use windows::{
         System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
     },
 };
+
+mod page_printer;
 
 const DIPS_PER_INCH: f64 = 96.0;
 const MAX_RASTER_DPI: f64 = 600.0;
@@ -61,7 +64,7 @@ pub fn print_file(input: &Path, printer: &str) -> ResultType<u32> {
     if dc.is_invalid() {
         return Err(std::io::Error::last_os_error().into());
     }
-    let result = submit(dc, &document);
+    let result = submit(dc, &document, target);
     if !unsafe { DeleteDC(dc) }.as_bool() {
         let error = std::io::Error::last_os_error();
         hbb_common::log::error!("PDF printer DeleteDC failed: {error}");
@@ -71,8 +74,8 @@ pub fn print_file(input: &Path, printer: &str) -> ResultType<u32> {
     result
 }
 
-fn submit(dc: HDC, document: &PdfDocument) -> ResultType<u32> {
-    let renderer = Rasterizer::new()?;
+fn submit(dc: HDC, document: &PdfDocument, target: HSTRING) -> ResultType<u32> {
+    let mut printer = PagePrinter::new(target)?;
     let info = DOCINFOW {
         cbSize: size_of::<DOCINFOW>() as i32,
         lpszDocName: w!("Remote PDF print job"),
@@ -80,7 +83,7 @@ fn submit(dc: HDC, document: &PdfDocument) -> ResultType<u32> {
     };
     let job_id = unsafe { StartDocW(dc, &info) };
     check_gdi(job_id, "StartDocW")?;
-    let result = draw_pages(dc, document, &renderer)
+    let result = draw_pages(dc, document, &mut printer)
         .and_then(|()| check_gdi(unsafe { EndDoc(dc) }, "EndDoc"));
     if result.is_err() {
         if let Err(error) = check_gdi(unsafe { AbortDoc(dc) }, "AbortDoc") {
@@ -91,10 +94,10 @@ fn submit(dc: HDC, document: &PdfDocument) -> ResultType<u32> {
     Ok(u32::try_from(job_id)?)
 }
 
-fn draw_pages(dc: HDC, document: &PdfDocument, renderer: &Rasterizer) -> ResultType<()> {
+fn draw_pages(dc: HDC, document: &PdfDocument, printer: &mut PagePrinter) -> ResultType<()> {
     for index in 0..document.PageCount()? {
         let page = document.GetPage(index)?;
-        let result = draw_page(dc, &page, renderer);
+        let result = draw_page(dc, &page, printer);
         let close = page.Close();
         result?;
         close?;
@@ -102,9 +105,10 @@ fn draw_pages(dc: HDC, document: &PdfDocument, renderer: &Rasterizer) -> ResultT
     Ok(())
 }
 
-fn draw_page(dc: HDC, page: &PdfPage, renderer: &Rasterizer) -> ResultType<()> {
+fn draw_page(dc: HDC, page: &PdfPage, printer: &mut PagePrinter) -> ResultType<()> {
+    printer.prepare(dc, page.Size()?)?;
     let layout = layout(dc, page)?;
-    let pixels = renderer.render(page, layout.raster_extent)?;
+    let pixels = printer.renderer.render(page, layout.raster_extent)?;
     let width = i32::try_from(layout.raster_extent[0])?;
     let height = i32::try_from(layout.raster_extent[1])?;
     let bitmap = BITMAPINFO {
@@ -242,6 +246,9 @@ impl Drop for Apartment {
         unsafe { RoUninitialize() };
     }
 }
+
+#[cfg(test)]
+mod orientation_tests;
 
 #[cfg(test)]
 mod tests {
