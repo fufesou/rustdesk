@@ -1,5 +1,5 @@
 name: Windows service regression test build
-run-name: Windows service diagnostic A1 1.5.1 native stop in existing runner
+run-name: Windows service diagnostics A2 and A3 1.5.1 elevated direct and signed ZIP
 
 on:
   workflow_dispatch:

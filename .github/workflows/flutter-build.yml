@@ -24,7 +24,8 @@ env:
   VERSION: "1.5.1"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
-  TEST_PACKAGE: "RustDesk-test-261105-A1-23e5bb471-native-stop-runner-x86_64"
+  TEST_PACKAGE: "RustDesk-test-261105-A2-23e5bb471-elevated-direct-x86_64"
+  ZIP_PACKAGE: "RustDesk-test-261105-A3-23e5bb471-signed-payload-x86_64"
   SOURCE_COMMIT: "23e5bb471a040d62f0a6ad52591fb30784265b73"
   BASELINE_BUILD_COMMIT: "0b9882bff9c611aa65e14faa0ec10d4876dfcbbb"
 
@@ -78,13 +79,13 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
-          fetch-depth: 10
+          fetch-depth: 12
 
       - name: Verify historical source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:SIGN_BASE_URL -eq '-2') { throw 'A1 requires the configured signing service' }
+          if ($env:SIGN_BASE_URL -eq '-2') { throw 'A2 requires the configured signing service' }
           git merge-base --is-ancestor $env:BASELINE_BUILD_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected diagnostic baseline' }
           if ((git rev-parse "$($env:BASELINE_BUILD_COMMIT)^") -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
@@ -245,15 +246,15 @@ jobs:
           $messages = @(Get-Content -LiteralPath './handoff-test-build.jsonl' | ForEach-Object { $_ | ConvertFrom-Json })
           $tests = @($messages | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'librustdesk' -and $_.executable } | Select-Object -ExpandProperty executable -Unique)
           if ($tests.Count -ne 1) { throw 'Expected exactly one RustDesk unit-test executable' }
-          $testName = 'platform::windows::installer_handoff::tests::protected_handoff_preserves_shortcuts_failures_and_cleanup'
+          $testName = 'platform::windows::installer_handoff::tests::'
           $started = [DateTime]::UtcNow
-          $test = Start-Process -FilePath $tests[0] -ArgumentList @('--exact', $testName, '--nocapture') -WindowStyle Hidden -RedirectStandardOutput './handoff-test-stdout.txt' -RedirectStandardError './handoff-test-stderr.txt' -PassThru
+          $test = Start-Process -FilePath $tests[0] -ArgumentList @($testName, '--nocapture') -WindowStyle Hidden -RedirectStandardOutput './handoff-test-stdout.txt' -RedirectStandardError './handoff-test-stderr.txt' -PassThru
           if (-not $test.WaitForExit(60000)) { Stop-Process -Id $test.Id; throw 'Diagnostic handoff test exceeded 60 seconds' }
           $stdout = Get-Content -LiteralPath './handoff-test-stdout.txt' -Raw
           $stderr = Get-Content -LiteralPath './handoff-test-stderr.txt' -Raw
           Write-Output $stdout
           Write-Output $stderr
-          if ($test.ExitCode -ne 0 -or $stdout -notmatch 'test result: ok\. 1 passed;') { throw 'Diagnostic handoff test failed or did not run' }
+          if ($test.ExitCode -ne 0 -or $stdout -notmatch 'test result: ok\. 2 passed;') { throw 'Diagnostic handoff test failed or did not run' }
           New-Item -ItemType Directory -Path './SignOutput' -Force | Out-Null
           [ordered]@{ test=$testName; exit_code=$test.ExitCode; elapsed_seconds=([DateTime]::UtcNow - $started).TotalSeconds; stdout=$stdout; stderr=$stderr } | ConvertTo-Json | Set-Content -LiteralPath "./SignOutput/$env:TEST_PACKAGE.handoff-test.json" -Encoding utf8
 
@@ -303,6 +304,25 @@ jobs:
           set -e
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
 
+      - name: Package the same signed payload as diagnostic A3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path './rustdesk').Path
+          $files = @(Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+            [ordered]@{ path=[IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/'); bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          })
+          $zip = "./SignOutput/$env:ZIP_PACKAGE.zip"
+          Compress-Archive -Path './rustdesk/*' -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            diagnostic='A3: exact signed A2 payload, without the self-extracting wrapper'
+            source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
+            comparison_package="$env:TEST_PACKAGE.exe"; filename="$env:ZIP_PACKAGE.zip"
+            sha256=$hash; bytes=(Get-Item -LiteralPath $zip).Length; files=$files
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "./SignOutput/$env:ZIP_PACKAGE.json" -Encoding utf8
+          "$hash  $env:ZIP_PACKAGE.zip" | Set-Content -LiteralPath "./SignOutput/$env:ZIP_PACKAGE.sha256" -Encoding ascii
+
       - name: Record package provenance
         shell: pwsh
         run: |
@@ -336,7 +356,7 @@ jobs:
             pubspec_lock_sha256=(Get-FileHash ./flutter/pubspec.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
             baseline_build_commit=$env:BASELINE_BUILD_COMMIT
-            diagnostic='A1: J installer; native Stop service in the existing signed runner; no separate helper EXE'
+            diagnostic='A2: A1 native Stop service; already-elevated run_cmds callers create system CMD directly; ordinary callers retain J elevation'
             source_patch_sha256=(Get-FileHash -LiteralPath "./SignOutput/$env:TEST_PACKAGE.source.patch" -Algorithm SHA256).Hash.ToLowerInvariant()
             hbb_common_commit=(git -C libs/hbb_common rev-parse HEAD)
             executable=$file.Name; file_version=$version; sha256=$hash; bytes=$file.Length
@@ -352,6 +372,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ env.TEST_PACKAGE }}
-          path: ./SignOutput/${{ env.TEST_PACKAGE }}.*
+          path: |
+            ./SignOutput/${{ env.TEST_PACKAGE }}.*
+            ./SignOutput/${{ env.ZIP_PACKAGE }}.*
           if-no-files-found: error
           retention-days: 14
