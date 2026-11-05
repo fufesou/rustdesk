@@ -15,7 +15,6 @@ use std::{fs, io, path::Path};
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
 const UTF8_CODE_PAGE: u32 = 65001;
 const BATCH_CODE_PAGE_FAILURE_EXIT_CODE: u32 = 0x5253_0005;
-const DIAGNOSTIC_HANDOFF_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub(super) struct InstallCommands {
     pub script: String,
@@ -37,16 +36,12 @@ struct InstallCommandScript {
 }
 
 impl InstallCommandScript {
-    fn release_files_and_wait(&mut self) {
+    fn release_files(&mut self) {
         self.file.release();
         for file in &mut self._files {
             file.release();
         }
-        log::warn!(
-            "Diagnostic installer handoff: no named pipe; waiting {} seconds before elevated cmd",
-            DIAGNOSTIC_HANDOFF_DELAY.as_secs()
-        );
-        std::thread::sleep(DIAGNOSTIC_HANDOFF_DELAY);
+        log::warn!("Diagnostic installer handoff: no named pipe; no delay before elevated cmd");
     }
 }
 
@@ -105,7 +100,7 @@ pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) 
     let parameters = protected_install_parameters(&script)?;
     directory::create(&directory)?;
     // Diagnostic only: releasing before UAC can leave protected files if elevation is cancelled.
-    script.release_files_and_wait();
+    script.release_files();
     let process = launch_elevated(&cmd_path, &parameters, show).map_err(|err| {
         log::debug!("Failed to launch elevated installer: {err:#}");
         err.context(format!(
@@ -147,12 +142,11 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
 mod tests {
     use super::super::installer_shell::shortcut_bytes;
     use super::*;
-    use std::{os::windows::process::CommandExt, process::Stdio, time::Instant};
+    use std::{os::windows::process::CommandExt, process::Stdio};
 
     #[test]
     fn protected_handoff_preserves_shortcuts_failures_and_cleanup() {
         const COMMAND_FAILURE: u32 = 77;
-        const MINIMUM_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
         for exit_code in [0, COMMAND_FAILURE] {
             let root =
                 std::env::temp_dir().join(format!("rustdesk-handoff-{}", uuid::Uuid::new_v4()));
@@ -175,9 +169,7 @@ mod tests {
             if !super::super::is_elevated(None).unwrap() {
                 assert!(fs::write(script.file.path(), "exit /b 0\r\n").is_err());
             }
-            let started = Instant::now();
             let output = run_script(&mut script);
-            assert!(started.elapsed() >= MINIMUM_DELAY);
             let copied = fs::read(&marker).unwrap();
             let cleaned = !runner.exists()
                 && !script.file.path().exists()
@@ -195,7 +187,7 @@ mod tests {
 
     fn run_script(script: &mut InstallCommandScript) -> std::process::Output {
         let parameters = protected_install_parameters(script).unwrap();
-        script.release_files_and_wait();
+        script.release_files();
         let child = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
             .raw_arg(parameters)
             .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)

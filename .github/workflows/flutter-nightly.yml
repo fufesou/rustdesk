@@ -1,5 +1,5 @@
 name: Windows service regression test build
-run-name: Windows service diagnostic I 1.5.1 no pipe sleep3
+run-name: Windows service diagnostic J 1.5.1 no pipe no sleep
 
 on:
   workflow_dispatch:

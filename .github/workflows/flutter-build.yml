@@ -24,7 +24,7 @@ env:
   VERSION: "1.5.1"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
-  TEST_PACKAGE: "RustDesk-test-261104-I-23e5bb471-no-pipe-sleep3-x86_64"
+  TEST_PACKAGE: "RustDesk-test-261105-J-23e5bb471-no-pipe-no-sleep-x86_64"
   SOURCE_COMMIT: "23e5bb471a040d62f0a6ad52591fb30784265b73"
   BASELINE_BUILD_COMMIT: "0b9882bff9c611aa65e14faa0ec10d4876dfcbbb"
 
@@ -78,7 +78,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
-          fetch-depth: 4
+          fetch-depth: 5
 
       - name: Verify historical source
         shell: pwsh
@@ -311,7 +311,7 @@ jobs:
             pubspec_lock_sha256=(Get-FileHash ./flutter/pubspec.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
             baseline_build_commit=$env:BASELINE_BUILD_COMMIT
-            diagnostic='installer pipe removed; protected file handles released; Rust sleeps 3 seconds before unchanged runas cmd launch'
+            diagnostic='installer pipe removed; protected file handles released before unchanged runas cmd launch; no fixed delay'
             source_patch_sha256=(Get-FileHash -LiteralPath "./SignOutput/$env:TEST_PACKAGE.source.patch" -Algorithm SHA256).Hash.ToLowerInvariant()
             hbb_common_commit=(git -C libs/hbb_common rev-parse HEAD)
             executable=$file.Name; file_version=$version; sha256=$hash; bytes=$file.Length
