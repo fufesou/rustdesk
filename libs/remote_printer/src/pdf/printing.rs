@@ -213,14 +213,7 @@ pub fn available() -> ResultType<bool> {
 }
 
 pub fn printer_names() -> ResultType<Vec<String>> {
-    queues::all()?
-        .into_iter()
-        .filter_map(|info| match super::is_remote_queue(&info.name) {
-            Ok(true) => None,
-            Ok(false) => Some(Ok(info.name)),
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
+    Ok(queues::printer_names(queues::all()?))
 }
 
 fn default_printer() -> ResultType<String> {

@@ -41,6 +41,8 @@ pub(crate) const APP_TYPE_CM: &str = "main";
 const CORE_MAIN_EXIT_SUCCESS: i32 = 0;
 #[cfg(target_os = "macos")]
 const CORE_MAIN_EXIT_FAILURE: i32 = 1;
+#[cfg(windows)]
+const CORE_MAIN_ARGS_FAILED: c_int = -1;
 
 // Do not remove the following constants.
 // Uncomment them when they are used.
@@ -146,6 +148,7 @@ pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
     crate::platform::macos::handle_application_should_open_untitled_file();
 }
 
+/// A null pointer ends command execution; a negative argument count indicates failure.
 #[cfg(windows)]
 #[no_mangle]
 pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_char {
@@ -158,6 +161,7 @@ pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_c
             }
             Some(crate::core_main::CoreMainAction::ExitFailure(err)) => {
                 log::error!("Command failed: {err}");
+                unsafe { std::ptr::write(args_len, CORE_MAIN_ARGS_FAILED) };
             }
             None => {}
         }
