@@ -87,7 +87,7 @@ jobs:
           git merge-base --is-ancestor $env:BASELINE_BUILD_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected diagnostic baseline' }
           if ((git rev-parse "$($env:BASELINE_BUILD_COMMIT)^") -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
-          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/native_service_stop.cpp', 'src/platform/windows/native_service_stop_fixture.cpp')
+          $allowed = @('.github/workflows/bridge.yml', '.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/native_service_stop.cpp', 'src/platform/windows/native_service_stop_fixture.cpp', 'src/platform/windows/native_service_stop.rs', 'src/platform/windows.rs')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
           if (@($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
 
@@ -278,6 +278,7 @@ jobs:
           $lockDiff = (git diff -- Cargo.lock flutter/pubspec.lock | Out-String)
           [IO.File]::WriteAllText((Join-Path $PWD 'dependency-lockfiles.patch'), $lockDiff)
           mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
+          Copy-Item -LiteralPath './target/native-service-stop/helper/rustdesk-service-stop.exe' -Destination './rustdesk/rustdesk-service-stop.exe'
 
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
