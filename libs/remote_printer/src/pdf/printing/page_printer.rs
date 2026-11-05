@@ -3,7 +3,7 @@ use super::{
     Rasterizer,
 };
 use hbb_common::{bail, ResultType};
-use std::mem::size_of;
+use std::{mem::size_of, time::Duration};
 use windows::{
     core::{HSTRING, PCWSTR},
     Foundation::Size,
@@ -17,6 +17,7 @@ use windows::{
 };
 
 const DOCUMENT_PROPERTIES_OK: i32 = 1;
+const ORIENTATION_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) struct PagePrinter {
     pub(super) renderer: Rasterizer,
@@ -62,7 +63,12 @@ impl PagePrinter {
         let mode = self.mode.bytes().as_mut_ptr().cast::<DEVMODEW>();
         unsafe {
             if !(*mode).dmFields.contains(DM_ORIENTATION) {
-                bail!("The printer driver does not support page orientation");
+                hbb_common::throttled_log!(
+                    ORIENTATION_LOG_INTERVAL,
+                    info,
+                    "Printer has no orientation setting; fitting PDF pages to its current printable area"
+                );
+                return Ok(());
             }
             (*mode).Anonymous1.Anonymous1.dmOrientation = orientation;
             check_properties(DocumentPropertiesW(
@@ -90,4 +96,35 @@ fn check_properties(result: i32) -> ResultType<()> {
         bail!("DocumentPropertiesW failed: result={result}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::{
+        core::w,
+        Win32::Graphics::Gdi::{CreateDCW, DeleteDC},
+    };
+
+    #[test]
+    #[ignore = "Requires Microsoft Print to PDF; run explicitly on Windows"]
+    fn fixed_orientation_accepts_portrait_pdf_pages() {
+        let _apartment = super::super::Apartment::initialize().unwrap();
+        let mut printer = PagePrinter::new(HSTRING::from("Microsoft Print to PDF")).unwrap();
+        let target = PCWSTR(printer.name.as_ptr());
+        let dc = unsafe { CreateDCW(w!("WINSPOOL"), target, PCWSTR::null(), None) };
+        assert!(!dc.is_invalid());
+        unsafe {
+            (*printer.mode.bytes().as_mut_ptr().cast::<DEVMODEW>()).dmFields &= !DM_ORIENTATION;
+        }
+        let result = printer.prepare(
+            dc,
+            Size {
+                Width: 96.0,
+                Height: 192.0,
+            },
+        );
+        assert!(unsafe { DeleteDC(dc) }.as_bool());
+        result.unwrap();
+    }
 }
