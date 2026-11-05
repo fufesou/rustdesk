@@ -1,5 +1,5 @@
 name: Windows service regression test build
-run-name: Windows service diagnostic L master elevated direct
+run-name: Windows service diagnostic M master native stop
 
 on:
   workflow_dispatch:

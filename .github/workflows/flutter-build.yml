@@ -1,4 +1,4 @@
-name: Build signed Windows service diagnostic L
+name: Build signed Windows service diagnostic M
 
 on:
   workflow_call:
@@ -24,9 +24,10 @@ env:
   VERSION: "1.5.1"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
-  TEST_PACKAGE: "RustDesk-test-261105-L-79c63639e-elevated-direct-x86_64"
+  TEST_PACKAGE: "RustDesk-test-261105-M-79c63639e-native-stop-x86_64"
   SOURCE_COMMIT: "79c63639ea44cf385d28efce4f8921ab2f483290"
-  APPLICATION_COMMIT: "c09dc89ad"
+  APPLICATION_COMMIT: "32bdfdbe3"
+  COMPARISON_BUILD_COMMIT: "d08eb9010b45be5cc5d8c054bdd78c3f0cd6f3a0"
 
 jobs:
   generate-bridge:
@@ -84,13 +85,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:SIGN_BASE_URL -eq '-2') { throw 'M requires the configured signing service' }
           git merge-base --is-ancestor $env:SOURCE_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected master baseline' }
           git merge-base --is-ancestor $env:APPLICATION_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Missing installer change' }
-          $allowed = @('.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/installer_handoff/elevated.rs', 'src/platform/windows/installer_files.rs')
+          $allowed = @('.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/installer_handoff/elevated.rs', 'src/platform/windows/installer_files.rs', '.github/scripts/test-native-service-stop.ps1', 'src/platform/windows.rs', 'src/platform/windows/native_service_stop.rs', 'flutter/windows/runner/main.cpp', 'flutter/windows/runner/native_service_stop.h', 'flutter/windows/runner/native_service_stop_test.cpp')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
           if ($LASTEXITCODE -ne 0 -or @($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
+          git diff --exit-code $env:COMPARISON_BUILD_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows/installer_handoff src/platform/windows/installer_files.rs
+          if ($LASTEXITCODE -ne 0) { throw 'M must preserve the L installer and ACL paths' }
 
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -141,6 +145,25 @@ jobs:
         with:
           prefix-key: ${{ matrix.job.os }}
           cache-on-failure: true
+
+      - name: Compile native service-stop fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) { throw 'MSVC installation not found' }
+          New-Item -ItemType Directory -Path './target/native-service-stop' -Force | Out-Null
+          $commands = @(
+            '@echo off',
+            "call `"$visualStudio\VC\Auxiliary\Build\vcvars64.bat`" >nul",
+            'if errorlevel 1 exit /b %errorlevel%',
+            'cl.exe /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX /D_WIN32_WINNT=0x0601 /Fe:target\native-service-stop\fixture.exe /Fo:target\native-service-stop\fixture.obj flutter\windows\runner\native_service_stop_test.cpp /link /DYNAMICBASE /NXCOMPAT advapi32.lib shell32.lib ole32.lib uuid.lib',
+            'exit /b %errorlevel%'
+          )
+          $commands | Set-Content -LiteralPath './target/native-service-stop/build.cmd' -Encoding ascii
+          & $env:ComSpec /D /C '.\target\native-service-stop\build.cmd'
+          if ($LASTEXITCODE -ne 0) { throw 'Native fixture compilation failed' }
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
@@ -262,6 +285,11 @@ jobs:
           pip3 install requests argparse
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./rustdesk/
 
+      - name: Test signed native service-stop runner
+        shell: pwsh
+        timeout-minutes: 1
+        run: ./.github/scripts/test-native-service-stop.ps1
+
       - name: Copy executable version resource
         shell: pwsh
         run: |
@@ -315,14 +343,15 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item -LiteralPath "./flutter/pubspec.lock" -Destination "./SignOutput/$env:TEST_PACKAGE.pubspec.lock"
           Copy-Item -LiteralPath "./dependency-lockfiles.patch" -Destination "./SignOutput/$env:TEST_PACKAGE.dependencies.patch"
-          $sourcePatch = git diff --abbrev=40 $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows/installer_handoff/elevated.rs src/platform/windows/installer_files.rs | Out-String
+          $sourcePatch = git diff --abbrev=40 $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows/installer_handoff/elevated.rs src/platform/windows/installer_files.rs src/platform/windows.rs src/platform/windows/native_service_stop.rs flutter/windows/runner/main.cpp flutter/windows/runner/native_service_stop.h flutter/windows/runner/native_service_stop_test.cpp .github/scripts/test-native-service-stop.ps1 | Out-String
           [IO.File]::WriteAllText((Join-Path $PWD "SignOutput/$env:TEST_PACKAGE.source.patch"), $sourcePatch)
           $metadata = [ordered]@{
             dependency_lockfiles_changed=((Get-Item ./dependency-lockfiles.patch).Length -gt 0)
             pubspec_lock_sha256=(Get-FileHash ./flutter/pubspec.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
             application_commit=(git rev-parse $env:APPLICATION_COMMIT)
-            diagnostic='master: already-elevated callers run protected BAT directly with system cmd; unelevated runas/pipe path and ACLs unchanged'
+            comparison_build_commit=$env:COMPARISON_BUILD_COMMIT
+            diagnostic='M: L installer and protected ACLs retained; installed Flutter Stop service uses the existing EXE native entry; elevated callers launch directly, ordinary callers use UAC'
             source_patch_sha256=(Get-FileHash -LiteralPath "./SignOutput/$env:TEST_PACKAGE.source.patch" -Algorithm SHA256).Hash.ToLowerInvariant()
             hbb_common_commit=(git -C libs/hbb_common rev-parse HEAD)
             executable=$file.Name; file_version=$version; sha256=$hash; bytes=$file.Length
