@@ -100,6 +100,8 @@ mod acl;
 pub(crate) mod installer_files;
 mod installer_handoff;
 mod installer_shell;
+#[cfg(feature = "flutter")]
+mod native_service_stop;
 mod verified_update;
 mod msi_registry;
 pub(crate) use acl::current_process_user_sid_string;
@@ -3359,28 +3361,37 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
             return true;
         }
     }
-    let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    let (_, _, _, exe) = get_install_info();
-    let remove_service = match service_control_command("remove", &exe, false) {
-        Ok(commands) => commands,
-        Err(err) => {
-            log::error!("Failed to prepare service removal: {err}");
-            return true;
-        }
+    #[cfg(feature = "flutter")]
+    let result = {
+        Config::set_option("stop-service".into(), "Y".into());
+        native_service_stop::run()
     };
-    Config::set_option("stop-service".into(), "Y".into());
-    let cmds = format!(
-        "
+    #[cfg(not(feature = "flutter"))]
+    let result = {
+        let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+        let (_, _, _, exe) = get_install_info();
+        let remove_service = match service_control_command("remove", &exe, false) {
+            Ok(commands) => commands,
+            Err(err) => {
+                log::error!("Failed to prepare service removal: {err}");
+                return true;
+            }
+        };
+        Config::set_option("stop-service".into(), "Y".into());
+        let cmds = format!(
+            "
     chcp 65001
     {remove_service}
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
     ",
-        app_name = crate::get_app_name(),
-        broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
-    );
-    if let Err(err) = run_cmds(cmds, false, "uninstall") {
+            app_name = crate::get_app_name(),
+            broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        );
+        run_cmds(cmds, false, "uninstall")
+    };
+    if let Err(err) = result {
         Config::set_option("stop-service".into(), "".into());
         log::debug!("{err}");
         return true;
