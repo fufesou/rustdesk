@@ -53,9 +53,12 @@ fn prepare_install_commands(cmds: &InstallCommands) -> ResultType<String> {
     let files = cmds
         .files
         .iter()
-        .map(|file| path_for_cmd_environment(file.path()).map(|path| format!("\"{path}\"")))
+        .map(|file| {
+            path_for_cmd_environment(file.path())
+                .map(|path| format!("del /q \"{path}\" > nul 2>&1"))
+        })
         .collect::<ResultType<Vec<_>>>()?
-        .join(" ");
+        .join("\r\n");
     // Call a fixed label so early EXIT /B still reaches cleanup, without reparsing a path.
     // Exit the dedicated cmd after self-deletion; EXIT /B would reopen the missing BAT.
     Ok(format!(
@@ -64,7 +67,8 @@ fn prepare_install_commands(cmds: &InstallCommands) -> ResultType<String> {
          call :rustdesk_install\r\n\
          set \"RUSTDESK_INSTALL_EXIT_CODE=%ERRORLEVEL%\"\r\n\
          rd /s /q \"%~f0.dir\" > nul 2>&1\r\n\
-         (del /q \"%~f0\" {files} > nul 2>&1 & exit %RUSTDESK_INSTALL_EXIT_CODE%)\r\n\
+         {files}\r\n\
+         (del /q \"%~f0\" > nul 2>&1 & exit %RUSTDESK_INSTALL_EXIT_CODE%)\r\n\
          :rustdesk_install\r\n\
          \"{chcp}\" {UTF8_CODE_PAGE} > nul || exit /b \
          {BATCH_CODE_PAGE_FAILURE_EXIT_CODE}\r\n\
@@ -197,6 +201,38 @@ mod tests {
             assert_eq!(copied, bytes);
             assert!(cleaned, "The runner and protected inputs must be removed");
         }
+    }
+
+    #[test]
+    fn complete_payload_cleanup_does_not_exceed_command_line_limits() {
+        const PAYLOAD_FILES: usize = 160;
+        const OPERATION_FAILURE: u32 = 77;
+        let root = std::env::temp_dir().join(format!("rustdesk-payload-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("installer.bat");
+        fs::create_dir(source.with_extension("bat.dir")).unwrap();
+        let files = (0..PAYLOAD_FILES)
+            .map(|index| {
+                ProtectedInstallFile::new(&root.join(format!("payload-{index}.tmp")), b"payload")
+                    .unwrap()
+            })
+            .collect();
+        let commands = InstallCommands {
+            script: format!("exit /b {OPERATION_FAILURE}"),
+            files,
+        };
+        let mut script = write_install_script(commands, &source).unwrap();
+        let output = run_script(&mut script, true);
+        let cleaned =
+            !script.file.path().exists() && script._files.iter().all(|file| !file.path().exists());
+        drop(script);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(OPERATION_FAILURE as i32),
+            "{output:?}"
+        );
+        assert!(cleaned, "All protected payloads must be removed");
     }
 
     #[test]
