@@ -24,7 +24,7 @@ env:
   VERSION: "1.5.1"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
-  TEST_PACKAGE: "RustDesk-test-261105-J-23e5bb471-no-pipe-no-sleep-x86_64"
+  TEST_PACKAGE: "RustDesk-test-261105-K-23e5bb471-native-service-stop-x86_64"
   SOURCE_COMMIT: "23e5bb471a040d62f0a6ad52591fb30784265b73"
   BASELINE_BUILD_COMMIT: "0b9882bff9c611aa65e14faa0ec10d4876dfcbbb"
 
@@ -84,6 +84,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:SIGN_BASE_URL -eq '-2') { throw 'Diagnostic K requires the configured signing service' }
           git merge-base --is-ancestor $env:BASELINE_BUILD_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected diagnostic baseline' }
           if ((git rev-parse "$($env:BASELINE_BUILD_COMMIT)^") -ne $env:SOURCE_COMMIT) { throw 'Unexpected historical source' }
@@ -392,7 +393,7 @@ jobs:
           $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
           if ($env:SIGN_BASE_URL -ne '-2' -and $signature.Status -ne 'Valid') { throw 'Test executable signing failed' }
           $payloadSignatures = @{}
-          foreach ($name in @('rustdesk.exe', 'librustdesk.dll')) {
+          foreach ($name in @('rustdesk.exe', 'librustdesk.dll', 'rustdesk-service-stop.exe')) {
             $status = (Get-AuthenticodeSignature -LiteralPath "./rustdesk/$name").Status.ToString()
             if ($env:SIGN_BASE_URL -ne '-2' -and $status -ne 'Valid') { throw "Payload signing failed: $name" }
             $payloadSignatures[$name] = $status
@@ -404,14 +405,16 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item -LiteralPath "./flutter/pubspec.lock" -Destination "./SignOutput/$env:TEST_PACKAGE.pubspec.lock"
           Copy-Item -LiteralPath "./dependency-lockfiles.patch" -Destination "./SignOutput/$env:TEST_PACKAGE.dependencies.patch"
-          $sourcePatch = git diff $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs | Out-String
+          Copy-Item -LiteralPath './target/native-service-stop/helper-imports.txt' -Destination "./SignOutput/$env:TEST_PACKAGE.native-helper-imports.txt"
+          $sourcePatch = git diff $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows.rs src/platform/windows/native_service_stop.rs src/platform/windows/native_service_stop.cpp src/platform/windows/native_service_stop_fixture.cpp | Out-String
           [IO.File]::WriteAllText((Join-Path $PWD "SignOutput/$env:TEST_PACKAGE.source.patch"), $sourcePatch)
           $metadata = [ordered]@{
             dependency_lockfiles_changed=((Get-Item ./dependency-lockfiles.patch).Length -gt 0)
             pubspec_lock_sha256=(Get-FileHash ./flutter/pubspec.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             source_commit=$env:SOURCE_COMMIT; workflow_commit=(git rev-parse HEAD)
             baseline_build_commit=$env:BASELINE_BUILD_COMMIT
-            diagnostic='installer pipe removed; protected file handles released before unchanged runas cmd launch; no fixed delay'
+            diagnostic='J installation/start-service path; Stop service uses an installed signed native helper instead of elevated CMD/BAT; no installer pipe or fixed delay'
+            native_helper_sha256=(Get-FileHash -LiteralPath './rustdesk/rustdesk-service-stop.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
             source_patch_sha256=(Get-FileHash -LiteralPath "./SignOutput/$env:TEST_PACKAGE.source.patch" -Algorithm SHA256).Hash.ToLowerInvariant()
             hbb_common_commit=(git -C libs/hbb_common rev-parse HEAD)
             executable=$file.Name; file_version=$version; sha256=$hash; bytes=$file.Length
