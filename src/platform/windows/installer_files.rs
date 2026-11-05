@@ -191,12 +191,12 @@ mod tests {
             Foundation::HANDLE,
             Security::{
                 AccessCheck,
-                Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+                Authorization::{GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT},
                 CreateRestrictedToken, CreateWellKnownSid, DuplicateToken, SecurityImpersonation,
                 WinBuiltinAdministratorsSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
                 GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-                PRIVILEGE_SET, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
-                TOKEN_QUERY,
+                PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
+                SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_QUERY,
             },
             Storage::FileSystem::{
                 FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -260,6 +260,7 @@ mod tests {
         let file =
             ProtectedInstallFile::create(&path, &mut io::Cursor::new(b"rustdesk"), Some(HASH))
                 .unwrap();
+        set_fixture_user_owner(file.path());
         assert_eq!(
             ordinary_owner_access(file.path()),
             (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE).0
@@ -276,6 +277,51 @@ mod tests {
         assert!(!rejected.exists());
         drop(file);
         fs::remove_dir(root).unwrap();
+    }
+
+    fn set_fixture_user_owner(path: &Path) {
+        use super::super::acl::{current_process_user_sid_string, sid_string_to_local_alloc_guard};
+        if !super::super::is_elevated(None).unwrap() {
+            return;
+        }
+        // Elevated files may belong to Administrators, which the test token disables.
+        // Use the user as owner so this actually tests the OWNER RIGHTS entry.
+        let sid = current_process_user_sid_string().unwrap();
+        let sid = sid_string_to_local_alloc_guard(&sid).unwrap();
+        let path = wide_string(path.to_str().unwrap());
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let mut dacl = std::ptr::null_mut();
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(path.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut descriptor,
+            )
+            .ok()
+            .unwrap();
+        }
+        let _descriptor = unsafe { Owned::new(HLOCAL(descriptor.0)) };
+        // Owner-only updates disable OWNER RIGHTS ACEs; preserve the created DACL.
+        unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(path.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(PSID(sid.as_sid_ptr())),
+                None,
+                Some(dacl),
+                None,
+            )
+            .ok()
+            .unwrap();
+        }
     }
 
     fn ordinary_owner_access(path: &Path) -> u32 {
