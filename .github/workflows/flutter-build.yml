@@ -88,7 +88,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected master baseline' }
           git merge-base --is-ancestor $env:APPLICATION_COMMIT HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Missing installer change' }
-          $allowed = @('.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/installer_handoff/elevated.rs')
+          $allowed = @('.github/workflows/flutter-build.yml', '.github/workflows/flutter-nightly.yml', 'src/platform/windows/installer_handoff.rs', 'src/platform/windows/installer_handoff/elevated.rs', 'src/platform/windows/installer_files.rs')
           $changes = @(git diff --name-only $env:SOURCE_COMMIT HEAD)
           if ($LASTEXITCODE -ne 0 -or @($changes | Where-Object { $_ -notin $allowed }).Count) { throw 'Unexpected source changes outside the diagnostic scope' }
 
@@ -140,6 +140,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: ${{ matrix.job.os }}
+          cache-on-failure: true
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
@@ -314,7 +315,7 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item -LiteralPath "./flutter/pubspec.lock" -Destination "./SignOutput/$env:TEST_PACKAGE.pubspec.lock"
           Copy-Item -LiteralPath "./dependency-lockfiles.patch" -Destination "./SignOutput/$env:TEST_PACKAGE.dependencies.patch"
-          $sourcePatch = git diff --abbrev=40 $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows/installer_handoff/elevated.rs | Out-String
+          $sourcePatch = git diff --abbrev=40 $env:SOURCE_COMMIT HEAD -- src/platform/windows/installer_handoff.rs src/platform/windows/installer_handoff/elevated.rs src/platform/windows/installer_files.rs | Out-String
           [IO.File]::WriteAllText((Join-Path $PWD "SignOutput/$env:TEST_PACKAGE.source.patch"), $sourcePatch)
           $metadata = [ordered]@{
             dependency_lockfiles_changed=((Get-Item ./dependency-lockfiles.patch).Length -gt 0)
