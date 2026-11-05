@@ -1,6 +1,6 @@
+use self::{apartment::Apartment, page_printer::PagePrinter};
 use super::{handles::check_size, queues, raster::Rasterizer};
 use hbb_common::{bail, ResultType};
-use page_printer::PagePrinter;
 use std::{mem::size_of, path::Path};
 use windows::{
     core::{w, HSTRING, PCWSTR, PWSTR},
@@ -14,10 +14,10 @@ use windows::{
         },
         Graphics::Printing::GetDefaultPrinterW,
         Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW},
-        System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
     },
 };
 
+mod apartment;
 mod page_printer;
 
 const DIPS_PER_INCH: f64 = 96.0;
@@ -232,21 +232,6 @@ fn default_printer() -> ResultType<String> {
     Ok(name)
 }
 
-struct Apartment;
-
-impl Apartment {
-    fn initialize() -> ResultType<Self> {
-        unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
-        Ok(Self)
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        unsafe { RoUninitialize() };
-    }
-}
-
 #[cfg(test)]
 mod orientation_tests;
 
@@ -288,7 +273,13 @@ mod tests {
 
     #[test]
     fn windows_pdf_renderer_initializes() {
-        assert!(super::available().unwrap());
+        const PROBE_ATTEMPTS: usize = 2;
+        for _ in 0..PROBE_ATTEMPTS {
+            assert!(std::thread::spawn(super::available)
+                .join()
+                .unwrap()
+                .unwrap());
+        }
         let _apartment = super::Apartment::initialize().unwrap();
         super::Rasterizer::new().unwrap();
     }
