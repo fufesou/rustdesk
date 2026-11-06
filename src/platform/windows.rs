@@ -1752,7 +1752,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
     let install_remote_printer = if install_printer {
         // No need to use `|| true` here.
         // The script will not exit even if `--install-remote-printer` panics.
-        format!("\"{}\" --install-remote-printer", &src_exe)
+        format!("\"{}\" --install-remote-printer", &exe)
     } else if is_win_10_or_greater() {
         format!("\"{}\" --uninstall-remote-printer", &src_exe)
     } else {
@@ -3614,7 +3614,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
     // Do nothing if the printer is not installed or failed to query if the printer is installed.
     let install_printer_cmd = if is_printer_installed {
-        format!("\"{}\" --install-remote-printer", &src_exe)
+        format!("\"{}\" --install-remote-printer", &exe)
     } else {
         "".to_owned()
     };

@@ -1,5 +1,5 @@
 use hbb_common::{bail, ResultType};
-use std::mem::size_of;
+use std::{mem::size_of, path::Path};
 use windows::{
     core::{w, HSTRING, PCWSTR},
     Win32::{
@@ -16,6 +16,42 @@ pub(crate) const INSTALL: &str = "--install-remote-printer";
 pub(crate) const UNINSTALL: &str = "--uninstall-remote-printer";
 const INSTALL_MARKER: &str = "PDFPRINTER";
 
+fn install_with_marker(
+    installed: bool,
+    write: impl Fn(bool) -> ResultType<()>,
+    install: impl FnOnce() -> ResultType<()>,
+) -> ResultType<()> {
+    // Do not migrate an existing queue until its capture marker is writable.
+    write(true)?;
+    if let Err(error) = install() {
+        if let Err(restore) = write(installed) {
+            bail!("PDF printer installation failed: {error:#}; failed to restore installation marker: {restore:#}");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn check_install_executable(current: &Path, installed: &Path) -> ResultType<()> {
+    let current = std::fs::canonicalize(current)?;
+    let installed = std::fs::canonicalize(installed)?;
+    if !current
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&installed.to_string_lossy())
+    {
+        bail!("Run the installed application to configure PDF capture");
+    }
+    Ok(())
+}
+
+fn check_install_source(command: &str) -> ResultType<()> {
+    if command != INSTALL {
+        return Ok(());
+    }
+    let (_, _, _, installed) = crate::platform::get_install_info();
+    check_install_executable(&std::env::current_exe()?, Path::new(&installed))
+}
+
 pub(crate) fn execute(command: &str) -> ResultType<()> {
     #[cfg(not(feature = "flutter"))]
     if command == INSTALL {
@@ -24,6 +60,7 @@ pub(crate) fn execute(command: &str) -> ResultType<()> {
     if !crate::platform::is_win_10_or_greater() {
         bail!("PDF capture requires Windows 10 or 11");
     }
+    check_install_source(command)?;
     if !remote_printer::pdf::is_elevated()? {
         bail!("PDF printer setup requires administrator privileges");
     }
@@ -31,14 +68,9 @@ pub(crate) fn execute(command: &str) -> ResultType<()> {
         INSTALL => {
             let instance = uuid::Uuid::new_v4().simple().to_string();
             remote_printer::pdf::verify_namespace(&instance)?;
-            let present = remote_printer::is_rd_printer_installed(&crate::get_app_name())?;
-            remote_printer::pdf::install(&crate::get_app_name(), &instance)?;
-            if let Err(error) = write_marker(true) {
-                if !present {
-                    remote_printer::pdf::uninstall(&crate::get_app_name())?;
-                }
-                return Err(error);
-            }
+            install_with_marker(installed_marker()?, write_marker, || {
+                remote_printer::pdf::install(&crate::get_app_name(), &instance).map(|_| ())
+            })?;
         }
         UNINSTALL => {
             remote_printer::pdf::uninstall(&crate::get_app_name())?;
@@ -112,6 +144,7 @@ pub(crate) fn request(command: &str) -> ResultType<()> {
     if !crate::platform::is_installed() {
         bail!("Install the application before configuring PDF capture");
     }
+    check_install_source(command)?;
     if remote_printer::pdf::is_elevated()? {
         return execute(command);
     }
@@ -127,10 +160,11 @@ pub(crate) fn request(command: &str) -> ResultType<()> {
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut execution)? };
-    if execution.hProcess.is_invalid() {
+    let handle = execution.hProcess;
+    if handle.is_invalid() {
         bail!("Windows returned no PDF setup process");
     }
-    let process = Process(execution.hProcess);
+    let process = Process(handle);
     if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
         return Err(windows::core::Error::from_win32().into());
     }
@@ -182,6 +216,54 @@ impl Drop for Process {
 mod tests {
     use super::*;
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    #[test]
+    fn pdf_marker_failure_prevents_queue_changes() {
+        let result = install_with_marker(
+            false,
+            |_| bail!("marker denied"),
+            || panic!("Printer setup must not run when the marker cannot be written"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "marker denied");
+    }
+
+    #[test]
+    fn pdf_setup_failure_restores_previous_marker() {
+        for previous in [false, true] {
+            let marker = std::cell::Cell::new(previous);
+            let error = install_with_marker(
+                previous,
+                |value| {
+                    marker.set(value);
+                    Ok(())
+                },
+                || bail!("queue failed"),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "queue failed");
+            assert_eq!(marker.get(), previous);
+        }
+    }
+
+    #[test]
+    fn printer_install_rejects_a_different_executable() {
+        let directory = std::env::temp_dir().join(format!("pdf-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let installed = directory.join("installed.exe");
+        let portable = directory.join("portable.exe");
+        std::fs::write(&installed, b"installed version").unwrap();
+        std::fs::write(&portable, b"portable version").unwrap();
+        let accepted = check_install_executable(&installed, &installed);
+        let rejected = check_install_executable(&portable, &installed);
+        std::fs::remove_file(installed).unwrap();
+        std::fs::remove_file(portable).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        accepted.unwrap();
+        assert!(
+            rejected.is_err(),
+            "A portable build must not reconfigure the installed printer"
+        );
+    }
 
     #[test]
     fn pdf_marker_survives_file_association_cleanup() {

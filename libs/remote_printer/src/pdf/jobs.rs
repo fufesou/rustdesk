@@ -34,6 +34,7 @@ impl Job {
         let mut printing = Vec::new();
         for index in 0..count {
             let info = unsafe { buffer.item::<JOB_INFO_1W>(index as usize)? };
+            // Retained completed jobs cannot identify the current pipe connection.
             if info.Status & JOB_STATUS_PRINTING != 0 {
                 printing.push(info);
             }

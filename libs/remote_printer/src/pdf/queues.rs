@@ -89,6 +89,17 @@ pub fn is_remote_queue(name: &str) -> ResultType<bool> {
         || info.driver.eq_ignore_ascii_case(LEGACY_DRIVER_NAME))
 }
 
+pub(crate) fn printer_names(printers: Vec<Info>) -> Vec<String> {
+    printers
+        .into_iter()
+        .filter(|info| {
+            !info.comment.starts_with(OWNER_PREFIX)
+                && !info.driver.eq_ignore_ascii_case(LEGACY_DRIVER_NAME)
+        })
+        .map(|info| info.name)
+        .collect()
+}
+
 pub(crate) fn get(name: &str) -> ResultType<Option<Info>> {
     let printer = match Printer::open(name, PRINTER_ACCESS_USE) {
         Ok(printer) => printer,
@@ -179,6 +190,32 @@ mod tests {
             attributes: PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS,
             jobs: 0,
         }
+    }
+
+    #[test]
+    fn discovery_keeps_unavailable_and_local_printers() {
+        let unavailable = Info {
+            name: "Unavailable printer regression fixture".to_owned(),
+            driver: "Network printer driver".to_owned(),
+            ..legacy_queue()
+        };
+        let local = Info {
+            name: "Local PDF printer regression fixture".to_owned(),
+            driver: DRIVER_NAME.to_owned(),
+            ..legacy_queue()
+        };
+        let remote = Info {
+            driver: DRIVER_NAME.to_owned(),
+            comment: owner_marker("Branded Client").unwrap(),
+            ..legacy_queue()
+        };
+        assert_eq!(
+            printer_names(vec![unavailable, local, remote, legacy_queue()]),
+            [
+                "Unavailable printer regression fixture",
+                "Local PDF printer regression fixture"
+            ]
+        );
     }
 
     #[test]

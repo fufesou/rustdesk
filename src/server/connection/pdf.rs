@@ -1,4 +1,4 @@
-use super::{AuthConnType, Connection, AUTHED_CONNS, CONTROL_PERMISSIONS_ARRAY};
+use super::{AuthConnType, AuthedConn, Connection, AUTHED_CONNS, CONTROL_PERMISSIONS_ARRAY};
 use crate::{ipc::Data, remote_print::job};
 use base::{
     config::keys,
@@ -22,15 +22,33 @@ pub(crate) struct PdfTarget {
 
 pub(crate) fn pdf_printer_target() -> ResultType<PdfTarget> {
     let connections = AUTHED_CONNS.lock().unwrap();
-    let connection = job::unique_target(connections.iter().filter(|connection| {
-        connection.conn_type == AuthConnType::Remote
-            && connection.pdf_printer
-            && !connection.sender.is_closed()
-            && permitted(connection.conn_id)
-    }))?;
+    let connection = select_pdf_receiver(&connections, permitted)?;
     Ok(PdfTarget {
         id: connection.conn_id,
         sender: connection.sender.clone(),
+    })
+}
+
+fn select_pdf_receiver(
+    connections: &[AuthedConn],
+    permitted: impl Fn(i32) -> bool,
+) -> ResultType<&AuthedConn> {
+    job::unique_target(connections.iter().filter(|connection| {
+        connection.conn_type == AuthConnType::Remote
+            && connection.pdf_printer
+            && !connection.sender.is_closed()
+            && !superseded(connection, connections)
+            && permitted(connection.conn_id)
+    }))
+}
+
+fn superseded(connection: &AuthedConn, connections: &[AuthedConn]) -> bool {
+    connections.iter().any(|newer| {
+        super::raii::AuthedConnID::is_newer_session_remote(
+            newer,
+            connection.conn_id,
+            &connection.session_key,
+        )
     })
 }
 
@@ -49,16 +67,18 @@ impl PdfTarget {
         if self.sender.is_closed() || !permitted(self.id) {
             return false;
         }
-        AUTHED_CONNS.lock().unwrap().iter().any(|connection| {
+        let connections = AUTHED_CONNS.lock().unwrap();
+        connections.iter().any(|connection| {
             connection.conn_id == self.id
                 && connection.pdf_printer
                 && connection.sender.same_channel(&self.sender)
+                && !superseded(connection, &connections)
         })
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) -> ResultType<()> {
         if !self.authorized() {
-            bail!("The bound PDF receiver disconnected or lost printing permission");
+            bail!("The bound PDF receiver disconnected, was replaced, or lost printing permission");
         }
         self.sender
             .send(Data::PdfPrinterData(data))
@@ -126,5 +146,52 @@ impl Connection {
             bail!("The PDF print request expired or was already consumed");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::SessionKey, *};
+
+    fn receiver(id: i32, session_id: u64) -> (AuthedConn, mpsc::UnboundedReceiver<Data>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            AuthedConn {
+                conn_id: id,
+                conn_type: AuthConnType::Remote,
+                session_key: SessionKey {
+                    peer_id: "peer".to_owned(),
+                    name: "name".to_owned(),
+                    session_id,
+                },
+                sender,
+                pdf_printer: true,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn pdf_reconnect_selects_new_session_and_rejects_independent_receivers() {
+        let (old, _old_rx) = receiver(1, 7);
+        let (new, _new_rx) = receiver(2, 7);
+        let (other, _other_rx) = receiver(3, 8);
+        let mut connections = vec![old, new];
+        assert_eq!(
+            select_pdf_receiver(&connections, |_| true).unwrap().conn_id,
+            2
+        );
+        connections.push(other);
+        assert!(select_pdf_receiver(&connections, |_| true).is_err());
+    }
+
+    #[test]
+    fn pdf_reconnect_does_not_fall_back_to_a_superseded_receiver() {
+        let (old, _old_rx) = receiver(1, 7);
+        let (new, _new_rx) = receiver(2, 7);
+        let mut connections = vec![old, new];
+        assert!(select_pdf_receiver(&connections, |id| id != 2).is_err());
+        connections[1].pdf_printer = false;
+        assert!(select_pdf_receiver(&connections, |_| true).is_err());
     }
 }
