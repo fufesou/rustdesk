@@ -12,5 +12,5 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "nightly"
+      upload-tag: "test-installer-handoff-no-pipe"
       publish-update-metadata: ${{ github.repository == 'rustdesk/rustdesk' }}
