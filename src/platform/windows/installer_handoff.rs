@@ -1,4 +1,5 @@
 pub(super) mod directory;
+mod elevated;
 mod gate;
 
 use super::{
@@ -99,6 +100,9 @@ fn protected_install_parameters(
 
 pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) -> ResultType<()> {
     validate_install_app_name(&crate::get_app_name())?;
+    if super::is_elevated(None)? {
+        return elevated::run_cmds(cmds.into(), show, tip);
+    }
     let path = directory::path()?.with_extension("bat");
     let directory = path.with_extension("bat.dir");
     let mut script = write_install_script(cmds.into(), &path)?;
