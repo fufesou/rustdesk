@@ -9,7 +9,7 @@ use super::{
     },
     validate_install_app_name, ResultType,
 };
-use hbb_common::{bail, log};
+use hbb_common::{anyhow::anyhow, bail, log};
 use std::{fs, io, path::Path};
 
 const CHCP_RELATIVE_PATH: &str = "chcp.com";
@@ -54,15 +54,29 @@ fn prepare_install_commands(cmds: &InstallCommands) -> ResultType<String> {
         .map(|file| path_for_cmd_environment(file.path()).map(|path| format!("\"{path}\"")))
         .collect::<ResultType<Vec<_>>>()?
         .join(" ");
+    let directories = cmds
+        .files
+        .iter()
+        .map(|file| {
+            let parent = file
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow!("Staged installer file has no parent directory"))?;
+            let path = path_for_cmd_environment(parent)?;
+            Ok(format!(" & rd \"{path}\" > nul 2>&1"))
+        })
+        .collect::<ResultType<Vec<_>>>()?
+        .join("");
     // Call a fixed label so early EXIT /B still reaches cleanup, without reparsing a path.
     // Exit the dedicated cmd after self-deletion; EXIT /B would reopen the missing BAT.
+    // CMD removes empty staging directories if uninstall has terminated their Rust owner.
     Ok(format!(
         "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n\
          set \"ERRORLEVEL=\"\r\n\
          call :rustdesk_install\r\n\
          set \"RUSTDESK_INSTALL_EXIT_CODE=%ERRORLEVEL%\"\r\n\
          rd /s /q \"%~f0.dir\" > nul 2>&1\r\n\
-         (del /q \"%~f0\" {files} > nul 2>&1 & exit %RUSTDESK_INSTALL_EXIT_CODE%)\r\n\
+         (del /q \"%~f0\" {files} > nul 2>&1{directories} & rd \"%~dp0\" > nul 2>&1 & exit %RUSTDESK_INSTALL_EXIT_CODE%)\r\n\
          :rustdesk_install\r\n\
          \"{chcp}\" {UTF8_CODE_PAGE} > nul || exit /b \
          {BATCH_CODE_PAGE_FAILURE_EXIT_CODE}\r\n\
@@ -93,15 +107,16 @@ fn protected_install_parameters(script: &InstallCommandScript) -> ResultType<Str
 pub(super) fn run_cmds(cmds: impl Into<InstallCommands>, show: bool, tip: &str) -> ResultType<()> {
     validate_install_app_name(&crate::get_app_name())?;
     let path = directory::path()?.with_extension("bat");
-    let directory = path.with_extension("bat.dir");
     let mut script = write_install_script(cmds.into(), &path)?;
+    let directory = script.file.path().with_extension("bat.dir");
     let cmd_path = get_system_executable(CMD_RELATIVE_PATH)?;
     let parameters = protected_install_parameters(&script)?;
     directory::create(&directory)?;
     // cmd cannot open the BAT or copy its inputs while a DELETE-capable handle is open, so
     // close them before launching it; a cancelled UAC prompt then leaves the files behind.
-    // Holding them until cmd read a release signal from a named pipe made F-Secure's
-    // behavior detection end the elevated cmd (#16840, #16842). The DACL still protects them.
+    // Holding them until cmd read a release signal from a named pipe failed under F-Secure's
+    // behavior detection, which closed cmd's end first (#16840, #16842). The directory guards
+    // prevent path replacement while this process remains alive.
     script.release_files();
     let process = launch_elevated(&cmd_path, &parameters, show).map_err(|err| {
         log::debug!("Failed to launch elevated installer: {err:#}");
@@ -153,8 +168,7 @@ mod tests {
             let root =
                 std::env::temp_dir().join(format!("rustdesk-handoff-{}", uuid::Uuid::new_v4()));
             let source = root.join("source !&^@().bat");
-            let runner = source.with_extension("bat.dir");
-            fs::create_dir_all(&runner).unwrap();
+            fs::create_dir(&root).unwrap();
             let bytes = shortcut_bytes(r"C:\RustDesk.exe", Some("--tray"), None).unwrap();
             let shortcut =
                 ProtectedInstallFile::new(&root.join("shortcut !&^@().tmp"), &bytes).unwrap();
@@ -168,25 +182,69 @@ mod tests {
                 files: vec![shortcut],
             };
             let mut script = write_install_script(commands, &source).unwrap();
-            // The DACL, not a held handle, keeps the unelevated owner from editing the BAT.
-            script.release_files();
-            if !super::super::is_elevated(None).unwrap() {
-                assert!(fs::write(script.file.path(), "exit /b 0\r\n").is_err());
-            }
+            let runner = script.file.path().with_extension("bat.dir");
+            fs::create_dir(&runner).unwrap();
             let output = run_script(&mut script);
             let copied = fs::read(&marker).unwrap();
             let cleaned = !runner.exists()
                 && !script.file.path().exists()
                 && script._files.iter().all(|file| !file.path().exists());
-            fs::remove_dir_all(&root).unwrap();
+            let protected = script.file.path().exists()
+                && script._files.iter().all(|file| file.path().exists());
+            let directories_cleaned = finish_fixture(script, &root);
             assert_eq!(
                 output.status.code().map(|code| code as u32),
                 Some(exit_code),
                 "{output:?}"
             );
             assert_eq!(copied, bytes);
-            assert!(cleaned, "The runner and protected inputs must be removed");
+            if super::super::is_elevated(None).unwrap() {
+                assert!(
+                    cleaned && directories_cleaned,
+                    "The runner and staged inputs must be removed"
+                );
+            } else {
+                assert!(protected, "Unelevated CMD must not remove protected inputs");
+            }
         }
+    }
+
+    #[test]
+    fn completed_batch_removes_its_own_staging_directory() {
+        const COMMAND_FAILURE: i32 = 77;
+        let root =
+            std::env::temp_dir().join(format!("rustdesk-batch-cleanup-{}", uuid::Uuid::new_v4()));
+        let source = root.join("stage !&^@()").join("cleanup.bat");
+        fs::create_dir_all(source.with_extension("bat.dir")).unwrap();
+        let commands =
+            prepare_install_commands(&format!("exit /b {COMMAND_FAILURE}").into()).unwrap();
+        fs::write(&source, commands).unwrap();
+        let output = std::process::Command::new(get_system_executable(CMD_RELATIVE_PATH).unwrap())
+            .raw_arg(format!("/D /E:ON /V:OFF /C \"\"{}\"\"", source.display()))
+            .creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let removed = !source.parent().unwrap().exists();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(output.status.code(), Some(COMMAND_FAILURE), "{output:?}");
+        assert!(removed, "The completed batch left its staging directory");
+    }
+
+    fn finish_fixture(script: InstallCommandScript, root: &Path) -> bool {
+        let directories = std::iter::once(&script.file)
+            .chain(&script._files)
+            .map(|file| file.path().parent().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        drop(script);
+        let cleaned = directories.iter().all(|path| !path.exists());
+        if let Err(error) = fs::remove_dir_all(root) {
+            eprintln!(
+                "Protected test fixtures remain at {}: {error}",
+                root.display()
+            );
+        }
+        cleaned
     }
 
     // Mirrors run_cmds without UAC: the files are released before cmd starts and nothing
