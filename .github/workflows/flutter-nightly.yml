@@ -12,5 +12,5 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: "nightly"
+      upload-tag: "test-windows-service-ipc-startup-grace"
       publish-update-metadata: ${{ github.repository == 'rustdesk/rustdesk' }}
