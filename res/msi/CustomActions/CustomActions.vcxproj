@@ -103,7 +103,7 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="ReadConfig.cpp" />
-    <ClCompile Include="RemotePrinter.cpp" />
+    <ClCompile Include="PdfPrinter.cpp" />
     <ClCompile Include="ServiceUtils.cpp" />
   </ItemGroup>
   <ItemGroup>

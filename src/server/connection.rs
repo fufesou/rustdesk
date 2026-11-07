@@ -1159,13 +1159,9 @@ impl Connection {
                             break;
                         }
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
-                        ipc::Data::PrinterData(data) => {
-                            if Self::permission(keys::OPTION_ENABLE_REMOTE_PRINTER, &conn.control_permissions) {
-                                conn.send_printer_request(data).await;
-                            } else {
-                                conn.send_remote_printing_disallowed().await;
-                            }
-                        }
+                        ipc::Data::PdfPrinterData(data) => conn.send_pdf_request(data).await,
+                        #[cfg(all(target_os = "windows", feature = "flutter"))]
+                        ipc::Data::PdfPrinterError(error) => conn.send_pdf_error(error).await,
                         _ => {}
                     }
                 }
@@ -3723,6 +3719,11 @@ impl Connection {
                                         }
                                     }
                                     JobType::Printer => {
+                                        #[cfg(all(target_os = "windows", feature = "flutter"))]
+                                        if let Err(error) = self.check_pdf_download(&path) {
+                                            self.send(fs::new_error(id, error, -1)).await;
+                                            return true;
+                                        }
                                         if let Some((_, _, data)) = self
                                             .printer_data
                                             .iter()
@@ -6264,18 +6265,6 @@ impl Connection {
     }
 
     #[cfg(all(target_os = "windows", feature = "flutter"))]
-    async fn send_printer_request(&mut self, data: Vec<u8>) {
-        // This path is only used to identify the printer job.
-        let path = format!("RustDesk://FsJob//Printer/{}", get_time());
-
-        let msg = fs::new_send(0, fs::JobType::Printer, path.clone(), 1, false);
-        self.send(msg).await;
-        self.printer_data
-            .retain(|(t, _, _)| t.elapsed().as_secs() < 60);
-        self.printer_data.push((Instant::now(), path, data));
-    }
-
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
     async fn send_remote_printing_disallowed(&mut self) {
         let mut msg_out = Message::new();
         let res = MessageBox {
@@ -6726,19 +6715,6 @@ fn start_wakelock_thread() -> std::sync::mpsc::Sender<(usize, usize)> {
     tx
 }
 
-#[cfg(all(target_os = "windows", feature = "flutter"))]
-pub fn on_printer_data(data: Vec<u8>) {
-    crate::server::AUTHED_CONNS
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|c| c.printer)
-        .next()
-        .map(|c| {
-            c.sender.send(Data::PrinterData(data)).ok();
-        });
-}
-
 #[cfg(windows)]
 pub struct PortableState {
     pub last_uac: bool,
@@ -6880,12 +6856,18 @@ pub fn get_control_permission_state(
     }
 }
 
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+mod pdf;
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+pub(crate) use pdf::pdf_printer_target;
+
 pub struct AuthedConn {
     pub conn_id: i32,
     pub conn_type: AuthConnType,
     pub session_key: SessionKey,
     pub sender: mpsc::UnboundedSender<Data>,
-    pub printer: bool,
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    pub pdf_printer: bool,
 }
 
 mod raii {
@@ -6933,17 +6915,15 @@ mod raii {
             conn_type: AuthConnType,
             session_key: SessionKey,
             sender: mpsc::UnboundedSender<Data>,
-            lr: LoginRequest,
+            _lr: LoginRequest,
         ) -> Self {
-            let printer = conn_type == crate::server::AuthConnType::Remote
-                && crate::is_support_remote_print(&lr.version)
-                && lr.my_platform == hbb_common::whoami::Platform::Windows.to_string();
             AUTHED_CONNS.lock().unwrap().push(AuthedConn {
                 conn_id,
                 conn_type,
                 session_key,
                 sender,
-                printer,
+                #[cfg(all(target_os = "windows", feature = "flutter"))]
+                pdf_printer: conn_type == AuthConnType::Remote && _lr.pdf_printing_supported,
             });
             Self::check_wake_lock();
             use std::sync::Once;
@@ -7878,7 +7858,8 @@ mod test {
             conn_type,
             session_key,
             sender: mpsc::unbounded_channel().0,
-            printer: false,
+            #[cfg(all(target_os = "windows", feature = "flutter"))]
+            pdf_printer: false,
         };
         let mine = key(7, "peer");
         let remote = AuthConnType::Remote;
