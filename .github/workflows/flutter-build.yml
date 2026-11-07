@@ -1213,7 +1213,7 @@ jobs:
   publish-signed-update-metadata:
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'fufesou/rustdesk' && inputs.upload-tag == 'test-update-metadata-1.5.1-2' }}
+    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'fufesou/rustdesk' && inputs.upload-tag == 'test-update-metadata-1.5.2' }}
     concurrency:
       group: signed-update-${{ inputs.upload-tag }}
       cancel-in-progress: false
