@@ -1067,6 +1067,9 @@ pub fn check_software_update() {
     }
 }
 
+pub(crate) const TEST_UPDATE_RELEASE_ID: &str = "test-update-metadata-1.5.1-2";
+pub(crate) const TEST_UPDATE_VERSION: &str = "1.5.3";
+
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
     let url = url::Url::parse(update_url)?;
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
@@ -1097,6 +1100,10 @@ pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String>
     };
     let segments = segments.collect::<Vec<_>>();
     let release_id = match segments.as_slice() {
+        ["fufesou", "rustdesk", "releases", "tag", TEST_UPDATE_RELEASE_ID]
+        | ["fufesou", "rustdesk", "releases", "tag", TEST_UPDATE_RELEASE_ID, ""] => {
+            TEST_UPDATE_RELEASE_ID
+        }
         ["rustdesk", "rustdesk", "releases", "tag", release_id] => *release_id,
         ["rustdesk", "rustdesk", "releases", "tag", release_id, ""] => *release_id,
         _ => bail!(
@@ -1128,8 +1135,8 @@ pub(crate) fn url_has_explicit_port(raw_url: &str) -> bool {
 }
 
 pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<String> {
-    if release_id == "test-update-metadata-1.5.1-2" {
-        return Ok(crate::VERSION.to_owned());
+    if release_id == TEST_UPDATE_RELEASE_ID {
+        return Ok(TEST_UPDATE_VERSION.to_owned());
     }
     let display_version = release_id.strip_prefix('v').unwrap_or(release_id);
     let segments = display_version.split('.').collect::<Vec<_>>();
@@ -1178,9 +1185,14 @@ fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    // This version is the final destination of the three-version update test.
-    clear_software_update_url();
-    Ok(())
+    let response = format!(
+        r#"{{"url":"https://github.com/fufesou/rustdesk/releases/tag/{TEST_UPDATE_RELEASE_ID}"}}"#
+    );
+    let result = process_software_update_check_response(Bytes::from(response));
+    if result.is_err() {
+        clear_software_update_url();
+    }
+    result
 }
 
 #[inline]
@@ -3089,6 +3101,21 @@ mod tests {
             release_id_from_update_url(&format!("{update_url}/")).unwrap(),
             "v1.4.6"
         );
+    }
+
+    #[test]
+    fn test_update_release_targets_153() {
+        let update_url =
+            "https://github.com/fufesou/rustdesk/releases/tag/test-update-metadata-1.5.1-2";
+        let release_id = release_id_from_update_url(update_url).unwrap();
+        assert_eq!(
+            display_version_from_release_id(&release_id).unwrap(),
+            "1.5.3"
+        );
+        assert!(release_id_from_update_url(
+            "https://github.com/fufesou/rustdesk/releases/tag/other"
+        )
+        .is_err());
     }
 
     #[test]

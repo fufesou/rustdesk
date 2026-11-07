@@ -106,8 +106,13 @@ pub(super) fn verified_update_artifact_from_release_page_url(
 ) -> ResultType<VerifiedUpdateArtifact> {
     let release_id = release_id_from_update_url(update_url)?;
     let display_version = display_version_from_release_id(&release_id)?;
+    let owner = if release_id == crate::common::TEST_UPDATE_RELEASE_ID {
+        "fufesou"
+    } else {
+        "rustdesk"
+    };
     let expected_artifact_url_prefix =
-        format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/");
+        format!("https://github.com/{owner}/rustdesk/releases/download/{release_id}/");
     let metadata_url = format!("{expected_artifact_url_prefix}rustdesk-update.json");
     let signature_url = format!("{metadata_url}.sig");
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
@@ -177,7 +182,8 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
+    if (owner != "rustdesk"
+        && !(owner == "fufesou" && tag == crate::common::TEST_UPDATE_RELEASE_ID))
         || repo != "rustdesk"
         || releases != "releases"
         || download != "download"
@@ -222,6 +228,20 @@ mod tests {
             file.file_name().and_then(|name| name.to_str()),
             Some("rustdesk-1.4.0-x86_64.dmg")
         );
+    }
+
+    #[test]
+    fn update_download_file_accepts_shared_test_release() {
+        let url = "https://github.com/fufesou/rustdesk/releases/download/test-update-metadata-1.5.1-2/rustdesk-1.5.3-x86_64.exe";
+        let file = get_update_download_file_from_url(url).expect("valid test release asset");
+        assert_eq!(
+            file.file_name().and_then(|name| name.to_str()),
+            Some("rustdesk-1.5.3-x86_64.exe")
+        );
+        assert!(get_update_download_file_from_url(
+            "https://github.com/fufesou/rustdesk/releases/download/other/rustdesk.exe"
+        )
+        .is_none());
     }
 
     #[test]

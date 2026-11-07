@@ -1003,11 +1003,8 @@ mod windows_gui_startup_tests {
 
     const CHILD_TEST: &str = "RUSTDESK_TEST_GUI_IPC_CHILD";
     const CHILD_TIMEOUT_MS: u32 = 10_000;
-<<<<<<< HEAD
-=======
     // An unmatched test filter exits with zero without running the child assertions.
     const CHILD_SUCCESS_EXIT_CODE: i32 = 42;
->>>>>>> fix/windows-installer-directory-guard
 
     #[test]
     fn windows_gui_survives_ipc_bind_failure() {
