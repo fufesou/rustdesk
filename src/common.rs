@@ -1067,7 +1067,7 @@ pub fn check_software_update() {
     }
 }
 
-pub(crate) const TEST_UPDATE_RELEASE_ID: &str = "test-update-metadata-1.5.1-2";
+pub(crate) const TEST_UPDATE_RELEASE_ID: &str = "test-update-metadata-1.5.2";
 pub(crate) const TEST_UPDATE_VERSION: &str = "1.5.3";
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
@@ -3106,7 +3106,7 @@ mod tests {
     #[test]
     fn test_update_release_targets_153() {
         let update_url =
-            "https://github.com/fufesou/rustdesk/releases/tag/test-update-metadata-1.5.1-2";
+            "https://github.com/fufesou/rustdesk/releases/tag/test-update-metadata-1.5.2";
         let release_id = release_id_from_update_url(update_url).unwrap();
         assert_eq!(
             display_version_from_release_id(&release_id).unwrap(),

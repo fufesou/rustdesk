@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn update_download_file_accepts_shared_test_release() {
-        let url = "https://github.com/fufesou/rustdesk/releases/download/test-update-metadata-1.5.1-2/rustdesk-1.5.3-x86_64.exe";
+        let url = "https://github.com/fufesou/rustdesk/releases/download/test-update-metadata-1.5.2/rustdesk-1.5.3-x86_64.exe";
         let file = get_update_download_file_from_url(url).expect("valid test release asset");
         assert_eq!(
             file.file_name().and_then(|name| name.to_str()),
