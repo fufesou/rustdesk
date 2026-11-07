@@ -614,6 +614,20 @@ fn legacy_hot_measured() -> bool {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn start(postfix: &str) -> ResultType<()> {
+    #[cfg(windows)]
+    let incoming = match new_listener(postfix).await {
+        Err(err) if postfix.is_empty() && is_server() => {
+            const MAIN_IPC_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+            log::debug!(
+                "Main IPC startup failed: {err}; retrying after {MAIN_IPC_STARTUP_GRACE:?}"
+            );
+            // Give the GUI time to finish Start Service and arrange its replacement.
+            tokio::time::sleep(MAIN_IPC_STARTUP_GRACE).await;
+            new_listener(postfix).await?
+        }
+        result => result?,
+    };
+    #[cfg(not(windows))]
     let incoming = new_listener(postfix).await?;
     start_with_listener(postfix, incoming).await;
     Ok(())
