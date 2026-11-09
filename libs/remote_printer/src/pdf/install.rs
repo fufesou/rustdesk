@@ -2,12 +2,19 @@ use super::{
     display_name, handles::Printer, owner_marker, port_name, ports, queues, Queue, DRIVER_NAME,
 };
 use hbb_common::{anyhow::Context, bail, ResultType};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 use windows::{
     core::{w, HSTRING, PCWSTR, PWSTR},
-    Win32::Graphics::Printing::{
-        AddPrinterW, DeletePrinter, SetPrinterW, PRINTER_ALL_ACCESS,
-        PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS, PRINTER_ATTRIBUTE_LOCAL, PRINTER_CONTROL_PURGE,
-        PRINTER_HANDLE, PRINTER_INFO_2W,
+    Win32::{
+        Foundation::ERROR_BUSY,
+        Graphics::Printing::{
+            AddPrinterW, DeletePrinter, SetPrinterW, PRINTER_ALL_ACCESS,
+            PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS, PRINTER_ATTRIBUTE_LOCAL, PRINTER_CONTROL_PURGE,
+            PRINTER_HANDLE, PRINTER_INFO_2W,
+        },
     },
 };
 
@@ -15,6 +22,8 @@ const QUEUE_INFO_LEVEL: u32 = 2;
 const DEFAULT_PRIORITY: u32 = 1;
 const UPDATE_PRINTER: u32 = 0;
 const CONTROL_LEVEL: u32 = 0;
+const QUEUE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(10);
+const QUEUE_REMOVAL_POLL: Duration = Duration::from_millis(100);
 
 pub fn install(app_name: &str, instance_id: &str) -> ResultType<Queue> {
     if let Some(queue) = queues::installed(app_name)? {
@@ -60,12 +69,45 @@ pub fn uninstall(app_name: &str) -> ResultType<()> {
         }
     };
     let printer = removable_printer(&queue, app_name)?;
+    let started = Instant::now();
     unsafe { SetPrinterW(printer.0, CONTROL_LEVEL, None, PRINTER_CONTROL_PURGE) }
         .context("Failed to cancel print jobs before removing the printer")?;
     unsafe { DeletePrinter(printer.0)? };
+    // Output committed during cancellation can leave a retained COMPLETE job.
+    while unsafe { queues::read(&printer)?.item::<PRINTER_INFO_2W>(0)? }.cJobs != 0 {
+        if started.elapsed() >= QUEUE_REMOVAL_TIMEOUT {
+            bail!("Timed out waiting for the PDF printer queue to release its jobs");
+        }
+        unsafe { SetPrinterW(printer.0, CONTROL_LEVEL, None, PRINTER_CONTROL_PURGE) }
+            .context("Failed to cancel remaining jobs while removing the printer")?;
+        thread::sleep(QUEUE_REMOVAL_POLL);
+    }
     drop(printer);
-    ports::remove(&queue.port)
-        .context("The PDF queue was removed, but its port could not be removed")
+    finish_removal(&queue, started)
+        .context("Failed to finish removing the PDF printer queue and port")
+}
+
+fn finish_removal(queue: &Queue, started: Instant) -> ResultType<()> {
+    // An open printer handle can keep the port busy even after the queue disappears.
+    loop {
+        if !queues::all()?.iter().any(|current| {
+            current.name.eq_ignore_ascii_case(&queue.name)
+                && current.port.eq_ignore_ascii_case(&queue.port)
+        }) {
+            match ports::remove(&queue.port) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|error| error.code() == ERROR_BUSY.to_hresult()) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if started.elapsed() >= QUEUE_REMOVAL_TIMEOUT {
+            bail!("Timed out waiting for the PDF printer queue and port to be released");
+        }
+        thread::sleep(QUEUE_REMOVAL_POLL);
+    }
 }
 
 fn removable_printer(queue: &Queue, app_name: &str) -> ResultType<Printer> {
@@ -146,6 +188,7 @@ mod tests {
     };
 
     const DOCUMENT_INFO_LEVEL: u32 = 1;
+    const CAPTURE_HANDLE_RELEASE_DELAY: Duration = Duration::from_millis(500);
 
     #[test]
     #[ignore = "Requires administrator privileges and Microsoft Print to PDF; creates a temporary queue"]
@@ -156,7 +199,12 @@ mod tests {
         let result = catch_unwind(|| {
             queue_pending_document(&queue);
             assert_eq!(queues::get(&queue.name).unwrap().unwrap().jobs, 1);
-            uninstall(&app).unwrap();
+            let capture = Printer::open(&queue.name, PRINTER_ALL_ACCESS).unwrap();
+            let removing_app = app.clone();
+            let removal = thread::spawn(move || uninstall(&removing_app));
+            thread::sleep(CAPTURE_HANDLE_RELEASE_DELAY);
+            drop(capture);
+            removal.join().unwrap().unwrap();
             assert!(queues::get(&queue.name).unwrap().is_none());
             assert!(!ports::exists(&queue.port).unwrap());
         });
