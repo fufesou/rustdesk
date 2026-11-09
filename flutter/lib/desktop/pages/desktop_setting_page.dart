@@ -2423,7 +2423,7 @@ class _Printer extends StatefulWidget {
 }
 
 class __PrinterState extends State<_Printer> {
-  late final Future<PdfPrinterList> _pdfPrinters;
+  late Future<PdfPrinterList> _pdfPrinters;
   late Future<String> _printerStatus;
 
   @override
@@ -2569,7 +2569,17 @@ class __PrinterState extends State<_Printer> {
         printerOptions.printerName,
       ...printerOptions.printerNames,
     ];
-    return _Card(title: 'Incoming Print Jobs', children: [
+    return _Card(title: 'Incoming Print Jobs', title_suffix: [
+      IconButton(
+        tooltip: translate('Refresh'),
+        icon: const Icon(Icons.refresh),
+        onPressed: () {
+          setState(() {
+            _pdfPrinters = PdfPrinterList.load();
+          });
+        },
+      ),
+    ], children: [
       if (printerOptions.error.isNotEmpty)
         Text(printerOptions.error,
             style: TextStyle(color: Theme.of(context).colorScheme.error)),
