@@ -6,14 +6,15 @@ use windows::{
     core::{w, HSTRING, PCWSTR, PWSTR},
     Win32::Graphics::Printing::{
         AddPrinterW, DeletePrinter, SetPrinterW, PRINTER_ALL_ACCESS,
-        PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS, PRINTER_ATTRIBUTE_LOCAL, PRINTER_HANDLE,
-        PRINTER_INFO_2W,
+        PRINTER_ATTRIBUTE_KEEPPRINTEDJOBS, PRINTER_ATTRIBUTE_LOCAL, PRINTER_CONTROL_PURGE,
+        PRINTER_HANDLE, PRINTER_INFO_2W,
     },
 };
 
 const QUEUE_INFO_LEVEL: u32 = 2;
 const DEFAULT_PRIORITY: u32 = 1;
 const UPDATE_PRINTER: u32 = 0;
+const CONTROL_LEVEL: u32 = 0;
 
 pub fn install(app_name: &str, instance_id: &str) -> ResultType<Queue> {
     if let Some(queue) = queues::installed(app_name)? {
@@ -59,6 +60,8 @@ pub fn uninstall(app_name: &str) -> ResultType<()> {
         }
     };
     let printer = removable_printer(&queue, app_name)?;
+    unsafe { SetPrinterW(printer.0, CONTROL_LEVEL, None, PRINTER_CONTROL_PURGE) }
+        .context("Failed to cancel print jobs before removing the printer")?;
     unsafe { DeletePrinter(printer.0)? };
     drop(printer);
     ports::remove(&queue.port)
@@ -76,9 +79,6 @@ fn removable_printer(queue: &Queue, app_name: &str) -> ResultType<Printer> {
     }
     if info.port != queue.port {
         bail!("The PDF queue changed ownership during uninstall");
-    }
-    if info.jobs != 0 {
-        bail!("The PDF queue still contains jobs; finish or cancel them before uninstalling");
     }
     Ok(printer)
 }
@@ -135,4 +135,69 @@ fn add_queue(queue: &Queue, comment: &str) -> ResultType<()> {
     };
     let _printer = Printer(PRINTER_HANDLE { Value: handle.0 });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, resume_unwind};
+    use windows::Win32::Graphics::Printing::{
+        EndDocPrinter, StartDocPrinterW, WritePrinter, DOC_INFO_1W, PRINTER_CONTROL_PAUSE,
+    };
+
+    const DOCUMENT_INFO_LEVEL: u32 = 1;
+
+    #[test]
+    #[ignore = "Requires administrator privileges and Microsoft Print to PDF; creates a temporary queue"]
+    fn uninstall_cancels_pending_jobs() {
+        let instance = hbb_common::uuid::Uuid::new_v4().simple().to_string();
+        let app = format!("RustDesk uninstall test {instance}");
+        let queue = install(&app, &instance).unwrap();
+        let result = catch_unwind(|| {
+            queue_pending_document(&queue);
+            assert_eq!(queues::get(&queue.name).unwrap().unwrap().jobs, 1);
+            uninstall(&app).unwrap();
+            assert!(queues::get(&queue.name).unwrap().is_none());
+            assert!(!ports::exists(&queue.port).unwrap());
+        });
+        if queues::get(&queue.name).unwrap().is_some() {
+            let printer = Printer::open(&queue.name, PRINTER_ALL_ACCESS).unwrap();
+            unsafe {
+                SetPrinterW(printer.0, CONTROL_LEVEL, None, PRINTER_CONTROL_PURGE).unwrap();
+                DeletePrinter(printer.0).unwrap();
+            }
+        }
+        ports::remove(&queue.port).unwrap();
+        if let Err(error) = result {
+            resume_unwind(error);
+        }
+    }
+
+    fn queue_pending_document(queue: &Queue) {
+        let printer = Printer::open(&queue.name, PRINTER_ALL_ACCESS).unwrap();
+        let document = DOC_INFO_1W {
+            pDocName: PWSTR(w!("Pending uninstall regression").as_ptr().cast_mut()),
+            pDatatype: PWSTR(w!("RAW").as_ptr().cast_mut()),
+            ..Default::default()
+        };
+        let data = b"Pending uninstall regression";
+        let mut written = 0;
+        unsafe {
+            SetPrinterW(printer.0, CONTROL_LEVEL, None, PRINTER_CONTROL_PAUSE).unwrap();
+            assert_ne!(
+                StartDocPrinterW(printer.0, DOCUMENT_INFO_LEVEL, &document),
+                0
+            );
+            WritePrinter(
+                printer.0,
+                data.as_ptr().cast(),
+                data.len() as u32,
+                &mut written,
+            )
+            .ok()
+            .unwrap();
+            EndDocPrinter(printer.0).ok().unwrap();
+        }
+        assert_eq!(written as usize, data.len());
+    }
 }

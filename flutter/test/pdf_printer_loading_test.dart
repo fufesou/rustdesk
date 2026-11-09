@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:flutter_hbb/generated_bridge.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -9,8 +11,24 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:uuid/uuid.dart';
 
 class _Binding extends Fake implements RustdeskImpl {
-  late final printers = Completer<String>();
+  late Completer<String> printers = Completer<String>();
   final canceled = <int>[];
+
+  @override
+  bool isOutgoingOnly({dynamic hint}) => true;
+  @override
+  bool isIncomingOnly({dynamic hint}) => true;
+  @override
+  bool isDisableSettings({dynamic hint}) => false;
+  @override
+  bool isDisableAccount({dynamic hint}) => true;
+  @override
+  bool mainIsInstalled({dynamic hint}) => false;
+  @override
+  bool mainIsOptionFixed({required String key, dynamic hint}) => false;
+  @override
+  String mainGetBuildinOption({required String key, dynamic hint}) =>
+      key == kOptionHideRemotePrinterSetting ? '' : 'Y';
 
   @override
   String translate(
@@ -28,13 +46,19 @@ class _Binding extends Fake implements RustdeskImpl {
 
   @override
   Future<String> mainGetCommon({required String key, dynamic hint}) {
+    if (key == 'is-pdf-printer-installed') return Future.value('false');
+    if (key == 'is-remote-modify-enabled-by-control-permissions') {
+      return Future.value('true');
+    }
     expect(key, 'pdf-printer-names');
     return printers.future;
   }
 
   @override
   String mainGetCommonSync({required String key, dynamic hint}) =>
-      throw StateError('Printer discovery must not run on the UI thread');
+      key == 'is-support-printer-driver'
+          ? 'true'
+          : throw StateError('Printer discovery must not run on the UI thread');
 
   @override
   Future<void> sessionCancelJob({
@@ -88,6 +112,26 @@ void main() {
     });
     await tester.pump();
   }
+
+  testWidgets('printer settings refresh added and removed printers',
+      (tester) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    binding.printers.complete('{"printers":["Old printer"]}');
+    await tester.pumpWidget(MaterialApp(
+      home: DesktopSettingPage(initialTabkey: SettingsTabKey.printer),
+    ));
+    await tester.pumpAndSettle();
+    expect(tester.widget<ComboBox>(find.byType(ComboBox)).keys,
+        ['', 'Old printer']);
+
+    binding.printers = Completer<String>();
+    await tester.tap(find.byTooltip('Refresh'));
+    await tester.pump();
+    binding.printers.complete('{"printers":["New printer"]}');
+    await tester.pumpAndSettle();
+    expect(tester.widget<ComboBox>(find.byType(ComboBox)).keys,
+        ['', 'New printer']);
+  });
 
   testWidgets('legacy XPS requests keep their existing confirmation workflow',
       (tester) async {
