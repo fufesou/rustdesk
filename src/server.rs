@@ -82,6 +82,8 @@ pub mod video_service;
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]
 mod pdf_printer_service;
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+pub mod printer_service;
 
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
@@ -163,6 +165,8 @@ pub fn new() -> ServerPtr {
     }
     #[cfg(all(target_os = "windows", feature = "flutter"))]
     pdf_printer_service::register(&mut server);
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    printer_service::register(&mut server);
     // Terminal service is created per connection, not globally
     Arc::new(RwLock::new(server))
 }

@@ -165,6 +165,7 @@ mod tests {
                     session_id,
                 },
                 sender,
+                printer: true,
                 pdf_printer: true,
             },
             receiver,

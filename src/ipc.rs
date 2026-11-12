@@ -503,6 +503,8 @@ pub enum Data {
     TrustedDeviceResponse(Result<crate::trusted_devices::authority::Response, String>),
     SecurityConfigError(String),
     #[cfg(all(target_os = "windows", feature = "flutter"))]
+    PrinterData(Vec<u8>),
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
     PdfPrinterData(Vec<u8>),
     #[cfg(all(target_os = "windows", feature = "flutter"))]
     PdfPrinterError(String),
