@@ -3514,6 +3514,15 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     let is_msi = is_msi_installed().ok();
     let reg_msi_key = get_reg_msi_key(&subkey, is_msi)?;
 
+    // No need to check the install option here, `is_rd_printer_installed` rarely fails.
+    let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
+    // Do nothing if the printer is not installed or failed to query if the printer is installed.
+    let install_printer_cmd = crate::remote_print::legacy::update_command(
+        &exe,
+        is_printer_installed,
+        crate::remote_print::legacy::installed,
+    )?;
+
     let app_exe_name = &format!("{}.exe", &app_name);
     // NOTE: The pids below are matched by command line, which can silently come
     // back empty even while the processes are running:
@@ -3621,15 +3630,6 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
         format!("sc start {}", &app_name)
-    } else {
-        "".to_owned()
-    };
-
-    // No need to check the install option here, `is_rd_printer_installed` rarely fails.
-    let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
-    // Do nothing if the printer is not installed or failed to query if the printer is installed.
-    let install_printer_cmd = if is_printer_installed {
-        format!("\"{}\" --install-remote-printer", &exe)
     } else {
         "".to_owned()
     };

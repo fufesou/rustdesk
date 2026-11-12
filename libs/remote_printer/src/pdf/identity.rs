@@ -16,8 +16,8 @@ use windows::{
         Storage::FileSystem::CreateDirectoryW,
         System::{
             RemoteDesktop::{
-                ProcessIdToSessionId, WTSDomainName, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-                WTSQuerySessionInformationW, WTSUserName, WTS_INFO_CLASS,
+                ProcessIdToSessionId, WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW,
+                WTSUserName, WTS_INFO_CLASS,
             },
             Services::{
                 CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE,
@@ -31,10 +31,8 @@ use windows::{
 
 pub fn controlled_user_sid() -> ResultType<String> {
     let mut session = 0;
+    // The privileged server runs in the selected desktop session, including RDP.
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session)? };
-    if session != unsafe { WTSGetActiveConsoleSessionId() } {
-        bail!("PDF capture requires the active physical console session");
-    }
     let user = session_text(session, WTSUserName)?;
     let domain = session_text(session, WTSDomainName)?;
     if user.is_empty() || domain.is_empty() {
@@ -164,5 +162,16 @@ impl Drop for ServiceHandle {
                 "PDF service handle cleanup failed: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Run as the signed-in desktop user; use an RDP session for non-console regression coverage"]
+    fn controlled_user_matches_session_user() {
+        assert_eq!(controlled_user_sid().unwrap(), current_user_sid().unwrap());
     }
 }

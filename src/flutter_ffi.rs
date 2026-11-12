@@ -2775,8 +2775,10 @@ pub fn main_get_common(key: String) -> String {
     }
     #[cfg(windows)]
     if key == "is-pdf-printer-installed" {
-        return match remote_printer::pdf::installed(&get_app_name()) {
-            Ok(queue) => queue.is_some().to_string(),
+        let ready = remote_printer::pdf::installed(&get_app_name())
+            .and_then(|queue| Ok(queue.is_some() || crate::remote_print::legacy::ready()?));
+        return match ready {
+            Ok(ready) => ready.to_string(),
             Err(error) => format!("{error:#}"),
         };
     }
