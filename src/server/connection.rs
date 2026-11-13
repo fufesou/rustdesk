@@ -1166,6 +1166,10 @@ impl Connection {
                                 conn.send_remote_printing_disallowed().await;
                             }
                         }
+                        #[cfg(all(target_os = "windows", feature = "flutter"))]
+                        ipc::Data::PdfPrinterData(data) => conn.send_pdf_request(data).await,
+                        #[cfg(all(target_os = "windows", feature = "flutter"))]
+                        ipc::Data::PdfPrinterError(error) => conn.send_pdf_error(error).await,
                         _ => {}
                     }
                 }
@@ -3723,6 +3727,11 @@ impl Connection {
                                         }
                                     }
                                     JobType::Printer => {
+                                        #[cfg(all(target_os = "windows", feature = "flutter"))]
+                                        if let Err(error) = self.check_pdf_download(&path) {
+                                            self.send(fs::new_error(id, error, -1)).await;
+                                            return true;
+                                        }
                                         if let Some((_, _, data)) = self
                                             .printer_data
                                             .iter()
@@ -6730,15 +6739,11 @@ fn start_wakelock_thread() -> std::sync::mpsc::Sender<(usize, usize)> {
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]
 pub fn on_printer_data(data: Vec<u8>) {
-    crate::server::AUTHED_CONNS
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|c| c.printer)
-        .next()
-        .map(|c| {
-            c.sender.send(Data::PrinterData(data)).ok();
-        });
+    if let Some(connection) = AUTHED_CONNS.lock().unwrap().iter().find(|c| c.printer) {
+        if let Err(error) = connection.sender.send(Data::PrinterData(data)) {
+            log::trace!("The legacy printer receiver disconnected: {error}");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -6882,12 +6887,19 @@ pub fn get_control_permission_state(
     }
 }
 
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+mod pdf;
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+pub(crate) use pdf::pdf_printer_target;
+
 pub struct AuthedConn {
     pub conn_id: i32,
     pub conn_type: AuthConnType,
     pub session_key: SessionKey,
     pub sender: mpsc::UnboundedSender<Data>,
     pub printer: bool,
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    pub pdf_printer: bool,
 }
 
 mod raii {
@@ -6946,6 +6958,8 @@ mod raii {
                 session_key,
                 sender,
                 printer,
+                #[cfg(all(target_os = "windows", feature = "flutter"))]
+                pdf_printer: conn_type == AuthConnType::Remote && lr.pdf_printing_supported,
             });
             Self::check_wake_lock();
             use std::sync::Once;
@@ -7881,6 +7895,8 @@ mod test {
             session_key,
             sender: mpsc::unbounded_channel().0,
             printer: false,
+            #[cfg(all(target_os = "windows", feature = "flutter"))]
+            pdf_printer: false,
         };
         let mine = key(7, "peer");
         let remote = AuthConnType::Remote;
