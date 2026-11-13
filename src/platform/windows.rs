@@ -640,12 +640,15 @@ fn authorize_service_scoped_ipc_connection(
     if let Err(err) =
         ipc::ensure_peer_executable_matches_current_by_pid_opt(peer_pid, crate::POSTFIX_SERVICE)
     {
-        log::warn!(
-                "Rejected unauthorized connection on protected service-scoped IPC channel due to executable mismatch: postfix={}, peer_pid={:?}, err={}",
-                crate::POSTFIX_SERVICE,
-                peer_pid,
-                err
-            );
+        const REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+        hbb_common::throttled_log!(
+            REJECTION_LOG_INTERVAL,
+            warn,
+            "Rejected service IPC connection: executable verification failed: postfix={}, peer_pid={:?}, err={}",
+            crate::POSTFIX_SERVICE,
+            peer_pid,
+            err
+        );
         return false;
     }
     true
@@ -662,7 +665,12 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
         match control_event {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
-                send_close(crate::POSTFIX_SERVICE).ok();
+                if let Err(err) = send_close(crate::POSTFIX_SERVICE) {
+                    log::error!(
+                        "Failed to deliver service stop control over IPC: pid={}, error={err}",
+                        std::process::id()
+                    );
+                }
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NotImplemented,
@@ -794,7 +802,12 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     }
 
     if !h_process.is_null() {
-        send_close_async("").await.ok();
+        if let Err(err) = send_close_async("").await {
+            log::error!(
+                "Failed to request --server shutdown over IPC: pid={}, error={err}",
+                unsafe { winapi::um::processthreadsapi::GetProcessId(h_process) }
+            );
+        }
         unsafe { CloseHandle(h_process) };
     }
 
