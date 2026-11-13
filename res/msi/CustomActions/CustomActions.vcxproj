@@ -104,6 +104,7 @@
     </ClCompile>
     <ClCompile Include="ReadConfig.cpp" />
     <ClCompile Include="PdfPrinter.cpp" />
+    <ClCompile Include="PrinterRollback.cpp" />
     <ClCompile Include="ServiceUtils.cpp" />
   </ItemGroup>
   <ItemGroup>
