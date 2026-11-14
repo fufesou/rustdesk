@@ -12,7 +12,7 @@ class IosKeyboardEditQueue {
       {required Future<void> Function(String) sendKey,
       required Future<void> Function(String) sendText}) {
     if (edit.backspaces == 0 && edit.text.isEmpty) return Future.value();
-    return enqueue(() async {
+    return _pending = _pending.then((_) async {
       await Future.wait(
           List.generate(edit.backspaces, (_) => sendKey('VK_BACK')));
       if (edit.text.length > 1) {
@@ -27,8 +27,4 @@ class IosKeyboardEditQueue {
       }
     });
   }
-
-  // Toolbar keys must follow pending edits and precede any subsequent typing.
-  Future<void> enqueue(Future<void> Function() send) =>
-      _pending = _pending.then((_) => send());
 }

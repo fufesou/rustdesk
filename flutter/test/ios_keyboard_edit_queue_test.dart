@@ -5,7 +5,7 @@ import 'package:flutter_hbb/mobile/utils/ios_soft_keyboard_input.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Backspaces, replacement, toolbar keys and later typing stay ordered',
+  test('Backspaces, replacement, Return and later typing stay ordered',
       verifyOrderedReplacement);
   test('failed deletion is reported and prevents dependent text edits',
       verifyFailedDeletion);
@@ -26,15 +26,13 @@ Future<void> verifyOrderedReplacement() async {
       sendKey: (key) => record('key:$key'),
       sendText: (text) => record('text:$text'));
   final first = send(const IosKeyboardEdit(backspaces: 2, text: 'hello'));
-  final enter = queue.enqueue(() => record('key:VK_ENTER'));
-  final left = queue.enqueue(() => record('key:VK_LEFT'));
+  final enter = send(const IosKeyboardEdit(text: '\n'));
   final second = send(const IosKeyboardEdit(backspaces: 1, text: 'é'));
   const expected = [
     'key:VK_BACK',
     'key:VK_BACK',
     'text:hello',
-    'key:VK_ENTER',
-    'key:VK_LEFT',
+    'key:VK_RETURN',
     'key:VK_BACK',
     'key:é',
   ];
@@ -50,7 +48,7 @@ Future<void> verifyOrderedReplacement() async {
     expect(calls, expected.take(i + 1).toList());
     completed[i].complete();
   }
-  await Future.wait([first, enter, left, second]);
+  await Future.wait([first, enter, second]);
   expect(calls, expected);
 }
 

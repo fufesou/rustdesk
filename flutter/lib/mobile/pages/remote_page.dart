@@ -380,32 +380,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }).catchError(_reportIOSKeyboardError));
   }
 
-  void _queueIOSKeyboardKey(String key) {
-    final model = inputModel;
-    // Preserve the toolbar's inputKey checks, including use with keyboard hidden.
-    if (!model.keyboardPerm || model.isViewCamera) return;
-    final id = sessionId;
-    // sendPrompt restores Ctrl/Cmd immediately after this callback returns.
-    final modifiers = (
-      alt: model.alt,
-      ctrl: model.ctrl,
-      shift: model.shift,
-      command: model.command,
-    );
-    unawaited(_iosKeyboardQueue.enqueue(() async {
-      if (!mounted) return;
-      await bind.sessionInputKey(
-          sessionId: id,
-          name: key,
-          down: false,
-          press: true,
-          alt: modifiers.alt,
-          ctrl: modifiers.ctrl,
-          shift: modifiers.shift,
-          command: modifiers.command);
-    }).catchError(_reportIOSKeyboardError));
-  }
-
   void _reportIOSKeyboardError(Object error, StackTrace stack) {
     FlutterError.reportError(FlutterErrorDetails(
         exception: error,
@@ -763,7 +737,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               final chatKeyboardRequested =
                   gFFI.chatModel.softKeyboardRequested.value;
               return KeyHelpTools(
-                  onKey: isIOS ? _queueIOSKeyboardKey : null,
                   keyboardIsVisible: keyboardVisibilityController.isVisible &&
                       (_showEdit || chatKeyboardRequested),
                   showGestureHelp: _showGestureHelp);
@@ -1028,15 +1001,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 class KeyHelpTools extends StatefulWidget {
   final bool keyboardIsVisible;
   final bool showGestureHelp;
-  final ValueChanged<String>? onKey;
 
   /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
   bool get requestShow => keyboardIsVisible || showGestureHelp;
 
   KeyHelpTools(
-      {required this.keyboardIsVisible,
-      required this.showGestureHelp,
-      this.onKey});
+      {required this.keyboardIsVisible, required this.showGestureHelp});
 
   @override
   State<KeyHelpTools> createState() => _KeyHelpToolsState();
@@ -1050,15 +1020,6 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
   final _key = GlobalKey();
 
   InputModel get inputModel => gFFI.inputModel;
-
-  void _sendKey(String key) {
-    final onKey = widget.onKey;
-    if (onKey != null) {
-      onKey(key);
-    } else {
-      inputModel.inputKey(key);
-    }
-  }
 
   Widget wrap(String text, void Function() onPressed,
       {bool? active, IconData? icon}) {
@@ -1165,78 +1126,78 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
     for (var i = 1; i <= 12; ++i) {
       final name = 'F$i';
       fn.add(wrap(name, () {
-        _sendKey('VK_$name');
+        inputModel.inputKey('VK_$name');
       }));
     }
     final more = <Widget>[
       SizedBox(width: 9999),
       wrap('Esc', () {
-        _sendKey('VK_ESCAPE');
+        inputModel.inputKey('VK_ESCAPE');
       }),
       wrap('Tab', () {
-        _sendKey('VK_TAB');
+        inputModel.inputKey('VK_TAB');
       }),
       wrap('Home', () {
-        _sendKey('VK_HOME');
+        inputModel.inputKey('VK_HOME');
       }),
       wrap('End', () {
-        _sendKey('VK_END');
+        inputModel.inputKey('VK_END');
       }),
       wrap('Ins', () {
-        _sendKey('VK_INSERT');
+        inputModel.inputKey('VK_INSERT');
       }),
       wrap('Del', () {
-        _sendKey('VK_DELETE');
+        inputModel.inputKey('VK_DELETE');
       }),
       wrap('PgUp', () {
-        _sendKey('VK_PRIOR');
+        inputModel.inputKey('VK_PRIOR');
       }),
       wrap('PgDn', () {
-        _sendKey('VK_NEXT');
+        inputModel.inputKey('VK_NEXT');
       }),
       // to-do: support PrtScr on Mac
       if (isWin || isLinux)
         wrap('PrtScr', () {
-          _sendKey('VK_SNAPSHOT');
+          inputModel.inputKey('VK_SNAPSHOT');
         }),
       if (isWin || isLinux)
         wrap('ScrollLock', () {
-          _sendKey('VK_SCROLL');
+          inputModel.inputKey('VK_SCROLL');
         }),
       if (isWin || isLinux)
         wrap('Pause', () {
-          _sendKey('VK_PAUSE');
+          inputModel.inputKey('VK_PAUSE');
         }),
       if (isWin || isLinux)
         // Maybe it's better to call it "Menu"
         // https://en.wikipedia.org/wiki/Menu_key
         wrap('Menu', () {
-          _sendKey('Apps');
+          inputModel.inputKey('Apps');
         }),
       wrap('Enter', () {
-        _sendKey('VK_ENTER');
+        inputModel.inputKey('VK_ENTER');
       }),
       SizedBox(width: 9999),
       wrap('', () {
-        _sendKey('VK_LEFT');
+        inputModel.inputKey('VK_LEFT');
       }, icon: Icons.keyboard_arrow_left),
       wrap('', () {
-        _sendKey('VK_UP');
+        inputModel.inputKey('VK_UP');
       }, icon: Icons.keyboard_arrow_up),
       wrap('', () {
-        _sendKey('VK_DOWN');
+        inputModel.inputKey('VK_DOWN');
       }, icon: Icons.keyboard_arrow_down),
       wrap('', () {
-        _sendKey('VK_RIGHT');
+        inputModel.inputKey('VK_RIGHT');
       }, icon: Icons.keyboard_arrow_right),
       wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
-        sendPrompt(isMac, 'VK_C', sendKey: widget.onKey);
+        sendPrompt(isMac, 'VK_C');
       }),
       wrap(isMac ? 'Cmd+V' : 'Ctrl+V', () {
-        sendPrompt(isMac, 'VK_V', sendKey: widget.onKey);
+        sendPrompt(isMac, 'VK_V');
       }),
       wrap(isMac ? 'Cmd+S' : 'Ctrl+S', () {
-        sendPrompt(isMac, 'VK_S', sendKey: widget.onKey);
+        sendPrompt(isMac, 'VK_S');
       }),
     ];
     final space = size.width > 320 ? 4.0 : 2.0;
@@ -1626,18 +1587,14 @@ TTextMenu? getResolutionMenu(FFI ffi, String id) {
   );
 }
 
-void sendPrompt(bool isMac, String key, {ValueChanged<String>? sendKey}) {
+void sendPrompt(bool isMac, String key) {
   final old = isMac ? gFFI.inputModel.command : gFFI.inputModel.ctrl;
   if (isMac) {
     gFFI.inputModel.command = true;
   } else {
     gFFI.inputModel.ctrl = true;
   }
-  if (sendKey == null) {
-    gFFI.inputModel.inputKey(key);
-  } else {
-    sendKey(key);
-  }
+  gFFI.inputModel.inputKey(key);
   if (isMac) {
     gFFI.inputModel.command = old;
   } else {
