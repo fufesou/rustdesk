@@ -23,10 +23,15 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
+import '../utils/ios_keyboard_edit_queue.dart';
+import '../utils/ios_soft_keyboard_input.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 
-final initText = '1' * 1024;
+// Keep deletable local text so Backspace can reach existing remote content.
+// iOS spaces separate the first word from padding; digits affect IME word
+// context, and a single separator would be lost when deleting into padding.
+final initText = (isIOS ? ' ' : '1') * 1024;
 
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
 // When connecting a physical keyboard, `KeyEvent.physicalKey.usbHidUsage` are wrong is using Microsoft SwiftKey keyboard.
@@ -110,8 +115,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
 
-  final TextEditingController _textController =
-      TextEditingController(text: initText);
+  final TextEditingController _textController = isIOS
+      ? IosSoftKeyboardController(text: initText)
+      : TextEditingController(text: initText);
+  final _iosKeyboardInput = IosSoftKeyboardInput(initText);
+  final _iosKeyboardQueue = IosKeyboardEditQueue();
 
   _RemotePageState(String id) {
     initSharedStates(id);
@@ -122,6 +130,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    // IME commits can change only the composing range, without onChanged.
+    if (isIOS) _textController.addListener(_handleIOSKeyboardChanged);
     gFFI.ffiModel.updateEventListener(sessionId, widget.id);
     gFFI.start(
       widget.id,
@@ -186,6 +196,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Future<void> dispose() async {
+    if (isIOS) _textController.removeListener(_handleIOSKeyboardChanged);
     HardwareKeyboard.instance.removeHandler(_handleLocalKeyEvent);
     WidgetsBinding.instance.removeObserver(this);
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
@@ -320,54 +331,61 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     setState(() {});
   }
 
-  void _handleIOSSoftKeyboardInput(String newValue) {
-    var oldValue = _value;
-    _value = newValue;
-    var i = newValue.length - 1;
-    for (; i >= 0 && newValue[i] != '1'; --i) {}
-    var j = oldValue.length - 1;
-    for (; j >= 0 && oldValue[j] != '1'; --j) {}
-    if (i < j) j = i;
-    var subNewValue = newValue.substring(j + 1);
-    var subOldValue = oldValue.substring(j + 1);
+  void _handleIOSKeyboardChanged() {
+    // Disabled input still needs its native buffer restored to the accepted value.
+    if (_showEdit) _handleIOSSoftKeyboardInput(_textController.value);
+  }
 
-    // get common prefix of subNewValue and subOldValue
-    var common = 0;
-    for (;
-        common < subOldValue.length &&
-            common < subNewValue.length &&
-            subNewValue[common] == subOldValue[common];
-        ++common) {}
-
-    // get newStr from subNewValue
-    var newStr = "";
-    if (subNewValue.length > common) {
-      newStr = subNewValue.substring(common);
+  void _handleIOSSoftKeyboardInput(TextEditingValue value) {
+    final model = inputModel;
+    final edit = _iosKeyboardInput.update(value,
+        hasFocus: _mobileFocusNode.hasFocus,
+        inputAllowed: model.keyboardInputAllowed &&
+            model.keyboardPerm &&
+            !model.isViewOnly &&
+            !model.isViewCamera);
+    if (edit.backspaces != 0 || edit.text.isNotEmpty) {
+      _queueIOSKeyboardEdit(edit);
     }
+    // Reentrant field corrections stay synchronous, independent of FFI latency.
+    if (edit.localValue != null) _textController.value = edit.localValue!;
+  }
 
-    // Set the value to the old value and early return if is still composing. (1 && 2)
-    // 1. The composing range is valid
-    // 2. The new string is shorter than the composing range.
-    if (_textController.value.isComposingRangeValid) {
-      final composingLength = _textController.value.composing.end -
-          _textController.value.composing.start;
-      if (composingLength > newStr.length) {
-        _value = oldValue;
-        return;
-      }
-    }
+  void _queueIOSKeyboardEdit(IosKeyboardEdit edit) {
+    final model = inputModel;
+    final id = sessionId;
+    // Capture the edit's target/modifiers now; later input may change them.
+    final modifiers = (
+      alt: model.alt,
+      ctrl: model.ctrl,
+      shift: model.shift,
+      command: model.command,
+    );
+    // The handler accepts the whole edit. Rechecking modes between its deletion
+    // and insertion could leave only the deletion applied to the remote text.
+    unawaited(_iosKeyboardQueue.send(edit, sendKey: (name) async {
+      if (!mounted) return;
+      await bind.sessionInputKey(
+          sessionId: id,
+          name: name,
+          down: false,
+          press: true,
+          alt: modifiers.alt,
+          ctrl: modifiers.ctrl,
+          shift: modifiers.shift,
+          command: modifiers.command);
+    }, sendText: (text) async {
+      if (!mounted) return;
+      await bind.sessionInputString(sessionId: id, value: text);
+    }).catchError(_reportIOSKeyboardError));
+  }
 
-    // Delete the different part in the old value.
-    for (i = 0; i < subOldValue.length - common; ++i) {
-      inputModel.inputKey('VK_BACK');
-    }
-
-    // Input the new string.
-    if (newStr.length > 1) {
-      bind.sessionInputString(sessionId: sessionId, value: newStr);
-    } else {
-      inputChar(newStr);
-    }
+  void _reportIOSKeyboardError(Object error, StackTrace stack) {
+    FlutterError.reportError(FlutterErrorDetails(
+        exception: error,
+        stack: stack,
+        library: 'iOS soft keyboard',
+        context: ErrorDescription('while sending remote keyboard input')));
   }
 
   void _handleNonIOSSoftKeyboardInput(String newValue) {
@@ -420,11 +438,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (!inputModel.keyboardInputAllowed) {
       return;
     }
-    if (isIOS) {
-      _handleIOSSoftKeyboardInput(newValue);
-    } else {
-      _handleNonIOSSoftKeyboardInput(newValue);
-    }
+    _handleNonIOSSoftKeyboardInput(newValue);
   }
 
   void inputChar(String char) {
@@ -466,6 +480,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
     _value = initText;
+    // Reset first: assigning controller text can synchronously notify iOS.
+    if (isIOS) _iosKeyboardInput.reset();
     _textController.text = _value;
     setState(() => _showEdit = false);
     _timer?.cancel();
@@ -725,14 +741,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       (_showEdit || chatKeyboardRequested),
                   showGestureHelp: _showGestureHelp);
             }),
-            SizedBox(
-              width: 0,
-              height: 0,
+            HiddenKeyboardInput(
+              isIOS: isIOS,
               child: !_showEdit
                   ? Container()
                   : TextFormField(
                       textInputAction: TextInputAction.newline,
                       autocorrect: false,
+                      // Keep remote commands and passwords literal on iOS.
+                      smartDashesType: isIOS ? SmartDashesType.disabled : null,
+                      smartQuotesType: isIOS ? SmartQuotesType.disabled : null,
                       // Flutter 3.16.9 Android.
                       // `enableSuggestions` causes secure keyboard to be shown.
                       // https://github.com/flutter/flutter/issues/139143
@@ -752,7 +770,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       //      2. The button will trigger `onKeyEvent` if the text field is empty.
                       // ko/zh/ja input method: the button will trigger `onKeyEvent`
                       //                     and the event will not popup if `KeyEventResult.handled` is returned.
-                      onChanged: handleSoftKeyboardInput,
+                      onChanged: isIOS ? null : handleSoftKeyboardInput,
                     ).workaroundFreezeLinuxMint(),
             ),
           ];
