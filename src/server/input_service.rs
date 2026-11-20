@@ -1299,7 +1299,7 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         #[cfg(target_os = "macos")]
         en.reset_flag();
         for ref ck in evt.modifiers.iter() {
-            if let Some(key) = KEY_MAP.get(&ck.value()) {
+            if let Some(key) = MODIFIER_MAP.get(&ck.value()) {
                 #[cfg(target_os = "macos")]
                 en.add_flag(key);
                 #[cfg(not(target_os = "macos"))]
@@ -1768,7 +1768,7 @@ fn get_control_key_value(key_event: &KeyEvent) -> i32 {
 }
 
 #[inline]
-fn has_hotkey_modifiers(key_event: &KeyEvent) -> bool {
+pub(super) fn has_hotkey_modifiers(key_event: &KeyEvent) -> bool {
     key_event.modifiers.iter().any(|ck| {
         let v = ck.value();
         v == ControlKey::Control.value()
@@ -2628,6 +2628,8 @@ impl Drop for TemporaryMouseMoveHandle {
 lazy_static::lazy_static! {
     static ref MODIFIER_MAP: HashMap<i32, Key> = [
         (ControlKey::Alt, Key::Alt),
+        (ControlKey::Menu, Key::Alt),
+        (ControlKey::Option, Key::Option),
         (ControlKey::RAlt, Key::RightAlt),
         (ControlKey::Control, Key::Control),
         (ControlKey::RControl, Key::RightControl),
