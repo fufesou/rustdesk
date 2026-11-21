@@ -89,7 +89,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 hbb_common::log::trace!("PDF accepted by the local print queue as job {job}")
             }
             Err(error) => handler.msgbox(
-                "error",
+                "custom-error",
                 "Remote printing",
                 &format!("PDF printing failed: {error:#}"),
                 "",
@@ -116,7 +116,7 @@ impl<T: InvokeUiSession> Remote<T> {
 
     pub(super) fn pdf_error(&self, error: hbb_common::anyhow::Error) {
         self.handler.msgbox(
-            "error",
+            "custom-error",
             "Remote printing",
             &format!("PDF printing failed: {error:#}"),
             "",

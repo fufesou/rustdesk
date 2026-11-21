@@ -118,7 +118,7 @@ impl Connection {
     pub(super) async fn send_pdf_error(&mut self, error: String) {
         let mut message = Message::new();
         message.set_message_box(MessageBox {
-            msgtype: "error".to_owned(),
+            msgtype: "custom-error".to_owned(),
             title: "Remote printing".to_owned(),
             text: error,
             ..Default::default()

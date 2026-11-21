@@ -92,6 +92,7 @@
     <ClInclude Include="Common.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="PrinterServiceState.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CustomActions.cpp" />
@@ -104,6 +105,7 @@
     </ClCompile>
     <ClCompile Include="ReadConfig.cpp" />
     <ClCompile Include="PdfPrinter.cpp" />
+    <ClCompile Include="PrinterRollback.cpp" />
     <ClCompile Include="ServiceUtils.cpp" />
   </ItemGroup>
   <ItemGroup>
