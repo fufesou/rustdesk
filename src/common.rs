@@ -1067,7 +1067,7 @@ pub fn check_software_update() {
     }
 }
 
-pub(crate) const TEST_UPDATE_RELEASE_ID: &str = "test-update-metadata-1.5.4";
+pub(crate) const TEST_UPDATE_RELEASE_ID: &str = "test-update-metadata-1.5.4-pdf";
 pub(crate) const TEST_UPDATE_VERSION: &str = "1.5.5";
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
