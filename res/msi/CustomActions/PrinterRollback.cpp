@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Common.h"
+#include "PrinterServiceState.h"
 #include <winspool.h>
 #include <memutil.h>
 #include <procutil.h>
@@ -147,24 +148,34 @@ HRESULT InstallOriginalQueue(LPCWSTR product, const std::wstring& app) {
     return result;
 }
 
-HRESULT StartOriginalService(LPCWSTR product, const std::wstring& app) {
+HRESULT RestoreOriginalService(LPCWSTR product, const std::wstring& app, const PrinterServiceState& original) {
     std::wstring exe;
     HRESULT result = OriginalExecutable(product, app, exe);
     if (FAILED(result)) return result;
     const auto binary = L"\"" + exe + L"\" --service";
     const auto display = app + L" Service";
+    const bool running = original.current == SERVICE_RUNNING;
+    // A running service can have future starts disabled; restore that setting after starting it.
+    const DWORD startType = running ? SERVICE_DEMAND_START : original.startType;
     using Service = std::unique_ptr<SC_HANDLE__, decltype(&CloseServiceHandle)>;
     Service manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT), CloseServiceHandle);
     if (!manager) return HRESULT_FROM_WIN32(GetLastError());
-    Service service(CreateServiceW(manager.get(), app.c_str(), display.c_str(), SERVICE_START,
-        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+    Service service(CreateServiceW(manager.get(), app.c_str(), display.c_str(), SERVICE_START | SERVICE_CHANGE_CONFIG,
+        SERVICE_WIN32_OWN_PROCESS, startType, SERVICE_ERROR_NORMAL,
         binary.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr), CloseServiceHandle);
-    if (!service && GetLastError() == ERROR_SERVICE_EXISTS)
-        service.reset(OpenServiceW(manager.get(), app.c_str(), SERVICE_START));
+    if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
+        service.reset(OpenServiceW(manager.get(), app.c_str(), SERVICE_START | SERVICE_CHANGE_CONFIG));
+        if (service && !ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, startType,
+            SERVICE_NO_CHANGE, binary.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr))
+            return HRESULT_FROM_WIN32(GetLastError());
+    }
     if (!service) return HRESULT_FROM_WIN32(GetLastError());
-    if (!StartServiceW(service.get(), 0, nullptr) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
+    if (running && !StartServiceW(service.get(), 0, nullptr) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
+        result = HRESULT_FROM_WIN32(GetLastError());
+    if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, original.startType,
+        SERVICE_NO_CHANGE, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr))
         return HRESULT_FROM_WIN32(GetLastError());
-    return S_OK;
+    return result;
 }
 
 HRESULT ApplyQueue(const std::wstring& name, const PRINTER_INFO_2W& info) {
@@ -194,22 +205,9 @@ HRESULT ApplyQueue(const std::wstring& name, const PRINTER_INFO_2W& info) {
     return S_OK;
 }
 
-HRESULT ScheduleRecovery() {
-    CaString product, actionData;
-    HRESULT result = WcaGetProperty(L"WIX_UPGRADE_DETECTED", &product.value);
-    if (FAILED(result)) return result;
-    if (!product.value || !*product.value) return S_OK;
-    std::wstring appName, name;
-    result = ProductProperty(product.value, INSTALLPROPERTY_INSTALLEDPRODUCTNAME, appName);
-    if (FAILED(result)) return result;
-    result = FindQueue(appName, name);
-    if (result != S_OK) return result;
-    SERVICE_STATUS_PROCESS service{};
-    if (!QueryServiceStatusExW(appName.c_str(), &service) && GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
-        return HRESULT_FROM_WIN32(GetLastError());
-    const int running = service.dwCurrentState == SERVICE_RUNNING;
+HRESULT AppendQueueSnapshot(const std::wstring& name, LPWSTR* actionData) {
     std::vector<BYTE> bytes;
-    result = ReadQueue(name, bytes);
+    HRESULT result = ReadQueue(name, bytes);
     if (FAILED(result)) return result;
     auto info = reinterpret_cast<const PRINTER_INFO_2W*>(bytes.data());
     SECURITY_DESCRIPTOR_CONTROL control = 0;
@@ -218,13 +216,30 @@ HRESULT ScheduleRecovery() {
         || !(control & SE_SELF_RELATIVE)) return E_INVALIDARG;
     result = Rebase(bytes.data(), bytes.size(), false);
     if (FAILED(result)) return result;
-    result = WcaWriteStringToCaData(product.value, &actionData.value);
-    if (SUCCEEDED(result)) result = WcaWriteIntegerToCaData(running, &actionData.value);
-    if (SUCCEEDED(result)) result = WcaWriteStreamToCaData(bytes.data(), bytes.size(), &actionData.value);
+    return WcaWriteStreamToCaData(bytes.data(), bytes.size(), actionData);
+}
+
+HRESULT ScheduleRecovery() {
+    CaString product, actionData;
+    HRESULT result = WcaGetProperty(L"WIX_UPGRADE_DETECTED", &product.value);
     if (FAILED(result)) return result;
-    WcaLog(LOGMSG_STANDARD, "Scheduling upgrade printer recovery for %ls", name.c_str());
+    if (!product.value || !*product.value) return S_OK;
+    std::wstring appName, name;
+    result = ProductProperty(product.value, INSTALLPROPERTY_INSTALLEDPRODUCTNAME, appName);
+    if (SUCCEEDED(result)) result = FindQueue(appName, name);
+    if (FAILED(result)) return result;
+    PrinterServiceState service;
+    result = ReadPrinterServiceState(appName.c_str(), service);
+    if (FAILED(result)) return result;
+    if (name.empty() && service.current == 0) return S_OK;
+    result = WcaWriteStringToCaData(product.value, &actionData.value);
+    if (SUCCEEDED(result)) result = WcaWriteIntegerToCaData(service.current, &actionData.value);
+    if (SUCCEEDED(result)) result = WcaWriteIntegerToCaData(service.startType, &actionData.value);
+    if (SUCCEEDED(result) && !name.empty()) result = AppendQueueSnapshot(name, &actionData.value);
+    if (FAILED(result)) return result;
+    WcaLog(LOGMSG_STANDARD, "Scheduling upgrade recovery for %ls", appName.c_str());
     result = WcaSetProperty(kRestoreAction, actionData.value);
-    if (SUCCEEDED(result) && running)
+    if (SUCCEEDED(result) && service.current != 0)
         result = WcaSetProperty(L"StopUpgradePrinterService", appName.c_str());
     return result;
 }
@@ -235,14 +250,17 @@ HRESULT RestoreRecovery() {
     if (FAILED(result)) return result;
     LPWSTR cursor = actionData.value;
     result = WcaReadStringFromCaData(&cursor, &product.value);
-    int running = 0;
-    if (SUCCEEDED(result)) result = WcaReadIntegerFromCaData(&cursor, &running);
-    CaBuffer data;
-    if (SUCCEEDED(result)) result = WcaReadStreamFromCaData(&cursor, &data.value, &data.size);
-    if (SUCCEEDED(result)) result = Rebase(data.value, data.size, true);
-    if (FAILED(result)) return result;
+    PrinterServiceState original;
+    if (SUCCEEDED(result)) result = WcaReadIntegerFromCaData(&cursor, &original.current);
+    if (SUCCEEDED(result)) result = WcaReadIntegerFromCaData(&cursor, &original.startType);
     std::wstring app, name;
-    result = ProductProperty(product.value, INSTALLPROPERTY_INSTALLEDPRODUCTNAME, app);
+    if (SUCCEEDED(result)) result = ProductProperty(product.value, INSTALLPROPERTY_INSTALLEDPRODUCTNAME, app);
+    if (FAILED(result)) return result;
+    // With no old queue, the service state is the last field in the rollback data.
+    if (!cursor) return original.current ? RestoreOriginalService(product.value, app, original) : E_INVALIDARG;
+    CaBuffer data;
+    result = WcaReadStreamFromCaData(&cursor, &data.value, &data.size);
+    if (SUCCEEDED(result)) result = Rebase(data.value, data.size, true);
     if (FAILED(result)) return result;
     result = FindQueue(app, name);
     if (result == S_FALSE) {
@@ -251,8 +269,8 @@ HRESULT RestoreRecovery() {
         if (result == S_FALSE) result = HRESULT_FROM_WIN32(ERROR_PRINTER_NOT_FOUND);
     }
     if (SUCCEEDED(result)) result = ApplyQueue(name, *reinterpret_cast<PRINTER_INFO_2W*>(data.value));
-    if (running) {
-        const HRESULT service = StartOriginalService(product.value, app);
+    if (original.current != 0) {
+        const HRESULT service = RestoreOriginalService(product.value, app, original);
         if (FAILED(service)) WcaLog(LOGMSG_STANDARD, "Restoring the original service failed: 0x%08lx", service);
         if (SUCCEEDED(result)) result = service;
     }
