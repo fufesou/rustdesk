@@ -85,8 +85,8 @@ impl LocalFile {
             path: path.to_string_lossy().to_string(),
             err: e,
         })?;
-        let size = mt.len() as u64;
         let is_dir = mt.is_dir();
+        let size = if is_dir { 0 } else { mt.len() as u64 };
         let read_only = mt.permissions().readonly();
         let system = false;
         let hidden = path.to_string_lossy().starts_with('.');
