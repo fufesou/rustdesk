@@ -1992,6 +1992,11 @@ pub fn get_id() -> String {
     // otherwise the empty id is adopted below and wipes the local one.
     if let Ok(Some(v)) = get_config("id") {
         if !v.is_empty() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if crate::platform::is_installed() {
+                Config::cache_host_id(&v);
+                return v;
+            }
             // update salt also, so that next time reinstallation not causing first-time auto-login failure
             if let Ok(Some(v2)) = get_config("salt") {
                 Config::set_salt(&v2);
