@@ -79,6 +79,13 @@ fn legacy_proof(hwid: &[u8], info: &DeviceInfo, supports_v2: bool) -> host::Logi
 #[hbb_common::tokio::test]
 async fn password_and_configuration_revocation_gate_real_persisted_grants() {
     let mut options = configure();
+    let salt = Config::get_local_permanent_password_storage_and_salt().1;
+    config::set_salt(&salt).unwrap();
+    assert!(config::set_salt(&format!("{salt}-changed")).is_err());
+    assert_eq!(
+        Config::get_local_permanent_password_storage_and_salt().1,
+        salt
+    );
     configuration::malformed_host_field_preserves_authentication();
     configuration::legacy_settings_survive_saving().await;
     configuration::expiration_changes_preserve_grants().await;
