@@ -1027,6 +1027,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     if (mounted) setState(() => locked = true);
   }
 
+  void changePermanentPassword({VoidCallback? notEmptyCallback}) {
+    setPasswordDialog(
+      notEmptyCallback: notEmptyCallback,
+      onUnlockRequired: relock,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -1341,7 +1348,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                                 await callback();
                                 return;
                               }
-                              setPasswordDialog(notEmptyCallback: callback);
+                              changePermanentPassword(notEmptyCallback: callback);
                             } else {
                               await callback();
                             }
@@ -1446,7 +1453,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             if (usePassword) numericOneTimePassword,
             if (usePassword) radios[1],
             if (usePassword && !isChangePermanentPasswordDisabled())
-              _SubButton('Set permanent password', setPasswordDialog,
+              _SubButton('Set permanent password', changePermanentPassword,
                   permEnabled && !locked),
             // if (usePassword)
             //   hide_cm(!locked).marginOnly(left: _kContentHSubMargin - 6),

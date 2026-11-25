@@ -212,8 +212,17 @@ impl UI {
         update_temporary_password()
     }
 
-    fn set_permanent_password(&self, password: String) {
-        let _ = set_permanent_password_with_result(password);
+    fn password_settings_auth(&self, _action: String) -> String {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if crate::platform::is_installed() {
+            return ipc::unix_unlock_pin::gui_request(&_action)
+                .unwrap_or_else(|err| format!("error:{err}"));
+        }
+        "true".into()
+    }
+
+    fn set_permanent_password(&self, password: String) -> bool {
+        set_permanent_password_with_result(password)
     }
 
     fn is_local_permanent_password_set(&self) -> bool {
@@ -736,6 +745,7 @@ impl sciter::EventHandler for UI {
         fn temporary_password();
         fn update_temporary_password();
         fn set_permanent_password(String);
+        fn password_settings_auth(String);
         fn is_local_permanent_password_set();
         fn is_permanent_password_set();
         fn get_remote_id();

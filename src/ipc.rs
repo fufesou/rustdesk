@@ -1,5 +1,8 @@
 #[path = "ipc/auth.rs"]
 mod ipc_auth;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[path = "ipc/credentials.rs"]
+mod credentials;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "ipc/unix_credentials.rs"]
 pub(crate) mod unix_credentials;
@@ -667,6 +670,9 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                         }
                     }
                     tokio::spawn(async move {
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        let mut credentials = (postfix.is_empty() && crate::platform::is_installed())
+                            .then(|| unix_credentials::Session::new(&stream));
                         loop {
                             match stream.next().await {
                                 Err(err) => {
@@ -702,6 +708,12 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                             break;
                                         }
                                         continue;
+                                    }
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    if let Some(session) = credentials.as_mut() {
+                                        if session.handle(&data, &mut stream).await {
+                                            continue;
+                                        }
                                     }
                                     handle(data, &mut stream).await;
                                 }
@@ -1108,6 +1120,10 @@ async fn handle(data: Data, stream: &mut Connection) {
                     Config::set_unlock_pin(&value);
                 } else {
                     return;
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if name == "salt" && crate::platform::is_installed() {
+                    allow_err!(stream.send_config(&name, "Y".into()).await);
                 }
                 if updated {
                     log::info!("{} updated", name);
@@ -1835,6 +1851,11 @@ pub async fn get_config(name: &str) -> ResultType<Option<String>> {
 }
 
 async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<String>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if name == unix_credentials::PASSWORD_STORAGE_KEY && crate::platform::is_installed() {
+        let mut c = unix_credentials::for_read(ms_timeout).await?;
+        return unix_credentials::read_password_storage(&mut c, ms_timeout).await;
+    }
     let mut c = connect(ms_timeout, "").await?;
     c.send(&Data::Config((name.to_owned(), None))).await?;
     if let Some(Data::Config((name2, value))) = c.next_timeout(ms_timeout).await? {
@@ -1846,6 +1867,10 @@ async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<Stri
 }
 
 pub async fn set_config_async(name: &str, value: String) -> ResultType<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() && credentials::is_credential_key(name) {
+        return unix_credentials::set_credential(name, value).await;
+    }
     let mut c = connect(1000, "").await?;
     c.send_config(name, value).await?;
     Ok(())
@@ -1889,7 +1914,13 @@ pub fn sync_permanent_password_storage_from_daemon() -> ResultType<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn sync_permanent_password_storage_from_daemon_async() -> ResultType<()> {
+async fn sync_permanent_password_storage_from_daemon_async(
+    _connection: &mut ConnectionTmpl<ConnClient>,
+) -> ResultType<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return unix_credentials::sync_password_storage(_connection).await;
+    }
     let ms_timeout = 1_000;
     let v = get_config_async("permanent-password-storage-and-salt", ms_timeout).await?;
     apply_permanent_password_storage_and_salt_payload(v.as_deref())
@@ -1945,6 +1976,13 @@ pub async fn set_permanent_password_with_ack(v: String) -> ResultType<bool> {
 async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
     // The daemon ACK/NACK is expected quickly since it applies the config in-process.
     let ms_timeout = 1_000;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut c = if crate::platform::is_installed() {
+        unix_credentials::for_write().await?
+    } else {
+        connect(ms_timeout, "").await?
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut c = connect(ms_timeout, "").await?;
     c.send_config("permanent-password", v).await?;
     if let Some(Data::Config((name2, Some(v)))) = c.next_timeout(ms_timeout).await? {
@@ -1957,7 +1995,7 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
                 // Ensure the hashed permanent password storage is written to the user config file.
                 // This sync must not affect the daemon ACK outcome.
                 #[cfg(not(target_os = "windows"))]
-                if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
+                if let Err(err) = sync_permanent_password_storage_from_daemon_async(&mut c).await {
                     log::warn!("Failed to sync permanent password storage from daemon: {err}");
                 }
             }

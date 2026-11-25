@@ -20,7 +20,7 @@ const TIMEOUT_MS: u64 = 1000;
 const IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_GRANTS: usize = 16;
 const RETRY: Duration = Duration::from_secs(1);
-const REQUIRED: &str = "Authentication Required";
+pub(super) const REQUIRED: &str = "Authentication Required";
 static GRANTS: OnceLock<Mutex<Grants>> = OnceLock::new();
 static CLIENT: Mutex<Option<Token>> = Mutex::new(None);
 
@@ -35,6 +35,11 @@ pub enum Request {
 }
 
 impl Request {
+    pub(super) fn cached_authorization() -> ResultType<Self> {
+        let token = (*CLIENT.lock().unwrap()).ok_or_else(|| anyhow!(REQUIRED))?;
+        Ok(Self::Authorized(token))
+    }
+
     fn check_active_user(
         &self,
         peer: u32,
@@ -160,7 +165,7 @@ pub(super) async fn reply(request: Request, stream: &mut Connection) -> ResultTy
         .await
 }
 
-async fn exchange(stream: &mut Connection, request: Request) -> ResultType<bool> {
+pub(super) async fn exchange(stream: &mut Connection, request: Request) -> ResultType<bool> {
     stream.send(&Data::UnlockPin(request)).await?;
     match stream.next_timeout(TIMEOUT_MS).await? {
         Some(Data::UnlockPinResult(result)) => result.map_err(|err| anyhow!(err)),
@@ -220,7 +225,6 @@ pub(super) async fn set(pin: String) -> ResultType<()> {
     Ok(())
 }
 
-#[cfg(feature = "flutter")]
 #[tokio::main(flavor = "current_thread")]
 pub(crate) async fn gui_request(action: &str) -> ResultType<String> {
     use std::io::ErrorKind::{ConnectionRefused, NotFound};
@@ -230,7 +234,7 @@ pub(crate) async fn gui_request(action: &str) -> ResultType<String> {
             let io = err
                 .downcast_ref::<crate::trusted_devices::authority::Unavailable>()
                 .and_then(|error| error.0.downcast_ref::<std::io::Error>());
-            if action == "unlock-method"
+            if matches!(action, "unlock-method" | "status")
                 && io.is_some_and(|e| matches!(e.kind(), NotFound | ConnectionRefused))
             {
                 return Ok("offline".into());
@@ -238,6 +242,7 @@ pub(crate) async fn gui_request(action: &str) -> ResultType<String> {
             return Err(err);
         }
     };
+    let token = *CLIENT.lock().unwrap();
     let root = unsafe { libc::geteuid() } == 0;
     let ok = match action {
         "unlock-method" if root => return Ok("root".into()),
@@ -246,6 +251,10 @@ pub(crate) async fn gui_request(action: &str) -> ResultType<String> {
             return Ok(if configured { "pin" } else { "admin" }.into());
         }
         "pin-set" => exchange(&mut stream, Request::Configured).await?,
+        "status" => match token {
+            Some(t) if !root => exchange(&mut stream, Request::Authorized(t)).await?,
+            _ => root,
+        },
         "admin" => root || unlock(&mut stream, None).await?,
         _ => match action.split_once(':') {
             Some(("pin", pin)) => unlock(&mut stream, Some(pin.to_owned())).await?,

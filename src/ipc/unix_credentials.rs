@@ -1,13 +1,22 @@
 use super::{
-    connect_with_path, ipc_auth::ensure_peer_executable_matches_current_by_pid_opt, Connection,
+    connect_root_service, connect_with_path,
+    credentials::requires_approval,
+    ipc_auth::ensure_peer_executable_matches_current_by_pid_opt,
+    unix_unlock_pin::{self, Request, REQUIRED as AUTH_REQUIRED},
+    Connection, Data,
 };
 use hbb_common::{
     anyhow::{anyhow, ensure},
     config::Config,
-    ResultType,
+    libc, log, ResultType,
 };
 
 const IPC_TIMEOUT: u64 = 1_000;
+pub(super) const PASSWORD_STORAGE_KEY: &str = "permanent-password-storage-and-salt";
+
+fn uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
 
 pub(super) async fn verified_main(ms_timeout: u64, target: u32) -> ResultType<Connection> {
     let connection = connect_with_path(ms_timeout, &Config::ipc_path_for_uid(target, "")).await?;
@@ -41,6 +50,105 @@ pub(super) async fn verify_sync_client(connection: &Connection) -> ResultType<()
     );
     Ok(())
 }
+
+pub(super) struct Session {
+    authorized: bool,
+}
+
+impl Session {
+    pub(super) fn new(connection: &Connection) -> Self {
+        Self {
+            authorized: connection.peer_uid() == Some(0),
+        }
+    }
+
+    pub(super) async fn handle(&mut self, data: &Data, connection: &mut Connection) -> bool {
+        let response = match data {
+            Data::UnlockPin(request @ Request::Authorized(_)) => {
+                // An accepted non-root peer shares the main server's UID. The root
+                // service verifies that UID's settings grant for this connection.
+                let accepted = check_with_root(request.clone()).await;
+                self.authorized |= matches!(accepted, Ok(true));
+                Data::UnlockPinResult(accepted.map_err(|err| err.to_string()))
+            }
+            _ if !self.authorized && requires_approval(data) => {
+                Data::SecurityConfigError(AUTH_REQUIRED.into())
+            }
+            _ => return false,
+        };
+        if let Err(err) = connection.send(&response).await {
+            log::trace!("Credential IPC response failed: {err}");
+        }
+        true
+    }
+}
+
+pub(super) async fn for_read(ms_timeout: u64) -> ResultType<Connection> {
+    let caller = uid();
+    let target = if caller == 0 && super::USE_USER_MAIN_IPC.with(|scope| scope.get()) {
+        super::user_main_ipc_server_uid()?
+    } else {
+        caller
+    };
+    verified_main(ms_timeout, target).await
+}
+
+pub(super) async fn for_write() -> ResultType<Connection> {
+    let mut connection = for_read(IPC_TIMEOUT).await?;
+    if uid() != 0 {
+        use_cached(&mut connection).await?;
+    }
+    Ok(connection)
+}
+
+pub(super) async fn read_password_storage(
+    connection: &mut Connection,
+    ms_timeout: u64,
+) -> ResultType<Option<String>> {
+    connection
+        .send(&Data::Config((PASSWORD_STORAGE_KEY.into(), None)))
+        .await?;
+    match connection.next_timeout(ms_timeout).await? {
+        Some(Data::Config((name, value))) if name == PASSWORD_STORAGE_KEY => Ok(value),
+        Some(Data::SecurityConfigError(error)) => Err(anyhow!(error)),
+        _ => Ok(None),
+    }
+}
+
+pub(super) async fn sync_password_storage(connection: &mut Connection) -> ResultType<()> {
+    let value = read_password_storage(connection, IPC_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("Missing permanent password storage response"))?;
+    super::apply_permanent_password_storage_and_salt_payload(Some(&value))
+}
+
+async fn check_with_root(request: Request) -> ResultType<bool> {
+    let mut service = connect_root_service(IPC_TIMEOUT).await?;
+    unix_unlock_pin::exchange(&mut service, request).await
+}
+
+async fn use_cached(stream: &mut Connection) -> ResultType<()> {
+    let request = Request::cached_authorization()?;
+    ensure!(
+        unix_unlock_pin::exchange(stream, request).await?,
+        "{AUTH_REQUIRED}"
+    );
+    Ok(())
+}
+
+pub(super) async fn set_credential(key: &str, value: String) -> ResultType<()> {
+    let mut connection = for_write().await?;
+    connection.send_config(key, value).await?;
+    match connection.next_timeout(IPC_TIMEOUT).await? {
+        Some(Data::Config((name, Some(ack)))) if key == name && ack == "Y" => Ok(()),
+        Some(Data::SecurityConfigError(error)) => Err(anyhow!(error)),
+        _ => Err(anyhow!("Credential update rejected")),
+    }
+}
+
+#[cfg(test)]
+#[path = "unix_credentials_tests.rs"]
+mod grant_tests;
 
 #[cfg(test)]
 mod tests {

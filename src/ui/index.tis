@@ -1143,6 +1143,11 @@ class PasswordArea: Reactor.Component {
 
     event click $(li#set-password) {
         var me = this;
+        withUnlockedPasswordSettings(function() { me.openPasswordDialog(); });
+    }
+
+    function openPasswordDialog() {
+        var me = this;
         var has_local_password = handler.is_local_permanent_password_set();
         var permanent_password_set = handler.is_permanent_password_set();
         var password_hidden_tip = translate('password-hidden-tip');
@@ -1171,7 +1176,7 @@ class PasswordArea: Reactor.Component {
             if (p0 != p1) {
                 return translate("The confirmation is not identical.");
             }
-            handler.set_permanent_password(p0);
+            if (!handler.set_permanent_password(p0)) return passwordUpdateError();
             me.update();
         }, msgbox_default_height, get_msgbox_width());
         self.timer(30ms, function() {
@@ -1181,8 +1186,11 @@ class PasswordArea: Reactor.Component {
 
     event click $(li#clear-password) {
         if (this.$(li#clear-password).state.disabled) return;
-        handler.set_permanent_password("");
-        this.update();
+        var me = this;
+        withUnlockedPasswordSettings(function() {
+            if (handler.set_permanent_password("")) me.update();
+            else msgbox("custom-error", translate("Set Password"), passwordUpdateError());
+        });
     }
 
     event click $(menu#edit-password-context>li) (_, me) {
@@ -1233,6 +1241,40 @@ class PasswordArea: Reactor.Component {
 }
 
 var password_cache = ["","","",""];
+function passwordUpdateError() {
+    return translate(handler.password_settings_auth("status") == "false" ? "Authentication Required" : "Failed");
+}
+
+function withUnlockedPasswordSettings(action) {
+    var status = handler.password_settings_auth("status");
+    if (status == "true") { action(); return; }
+    if (status == "offline") {
+        var hint = is_osx && !handler.is_installed_daemon(false) ? "install_daemon_tip" : "Start service";
+        msgbox("custom-error", translate("Unlock Security Settings"), translate("Service is not running") + ". " + translate(hint));
+        return;
+    }
+    if (status == "false") {
+        var configured = handler.password_settings_auth("pin-set");
+        if (configured == "true") {
+            msgbox("custom-unlock-pin", translate("Unlock Security Settings"),
+                <div .form><span>{translate("PIN")}</span><input|password(pin) .outline-focus /></div>,
+                "", function(res=null) {
+                    if (!res) return;
+                    var ok = handler.password_settings_auth("pin:" + (res.pin || "").trim());
+                    if (ok == "error:Too frequent") return translate("Too frequent");
+                    if (ok != "true") return translate(ok == "false" ? "Wrong PIN" : "Authentication Required");
+                    self.timer(1ms, function() { action(); });
+                });
+            return;
+        }
+        if (configured == "false" && handler.password_settings_auth("admin") == "true") {
+            action();
+            return;
+        }
+    }
+    msgbox("custom-error", translate("Unlock Security Settings"), translate("Authentication Required"));
+}
+
 function updatePasswordArea() {
     self.timer(1s, function() {
         var temporary_password = handler.temporary_password();

@@ -18,6 +18,7 @@ import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/platform_channel.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge.dart' show FfiException;
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -905,7 +906,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 }
 
-void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
+void setPasswordDialog(
+    {VoidCallback? notEmptyCallback, VoidCallback? onUnlockRequired}) async {
   final p0 = TextEditingController(text: "");
   final p1 = TextEditingController(text: "");
   var errMsg0 = "";
@@ -936,6 +938,25 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
       canSubmit = p0.text.trim().isNotEmpty || p1.text.trim().isNotEmpty;
     }
 
+    Future<bool> save(String password) async {
+      var message = 'Failed';
+      try {
+        if (await bind.mainSetPermanentPasswordWithResult(password: password)) {
+          return true;
+        }
+      } on FfiException catch (error) {
+        message = error.message.split('\n').first.trimRight();
+        if (message == 'Authentication Required' && onUnlockRequired != null) {
+          close();
+          onUnlockRequired();
+          showToast(translate(message));
+          return false;
+        }
+      }
+      setState(() => errMsg0 = '${translate('Prompt')}: ${translate(message)}');
+      return false;
+    }
+
     submit() async {
       if (!canSubmit) {
         return;
@@ -962,13 +983,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
         });
         return;
       }
-      final ok = await bind.mainSetPermanentPasswordWithResult(password: pass);
-      if (!ok) {
-        setState(() {
-          errMsg0 = '${translate('Prompt')}: ${translate("Failed")}';
-        });
-        return;
-      }
+      if (!await save(pass)) return;
       if (pass.isNotEmpty) {
         notEmptyCallback?.call();
       }
@@ -1092,14 +1107,7 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
               errMsg0 = "";
               errMsg1 = "";
             });
-            final ok =
-                await bind.mainSetPermanentPasswordWithResult(password: "");
-            if (!ok) {
-              setState(() {
-                errMsg0 = '${translate('Prompt')}: ${translate("Failed")}';
-              });
-              return;
-            }
+            if (!await save("")) return;
             close();
           },
           buttonStyle: ButtonStyle(

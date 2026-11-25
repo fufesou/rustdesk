@@ -1840,8 +1840,14 @@ pub fn main_get_temporary_password() -> String {
     ui_interface::temporary_password()
 }
 
-pub fn main_set_permanent_password_with_result(password: String) -> bool {
-    ui_interface::set_permanent_password_with_result(password)
+pub fn main_set_permanent_password_with_result(
+    password: String,
+) -> hbb_common::anyhow::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() && !config::Config::is_disable_change_permanent_password() {
+        return crate::ipc::set_permanent_password_with_ack(password);
+    }
+    Ok(ui_interface::set_permanent_password_with_result(password))
 }
 
 pub fn main_get_fingerprint() -> String {
