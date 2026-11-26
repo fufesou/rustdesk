@@ -1522,18 +1522,17 @@ impl<T: InvokeUiSession> Remote<T> {
         if !self.peer_info.is_support_virtual_display() {
             return;
         }
-        let displays = {
+        let displays = if self.peer_info.idd_impl == "rustdesk_idd" {
             let mut lc = self.handler.lc.write().unwrap();
             let saved = lc.get_option("virtual-display");
-            let migrated = (self.peer_info.idd_impl == "rustdesk_idd")
-                .then(|| migrate_virtual_displays(&saved))
-                .flatten();
-            if let Some(displays) = migrated {
+            if let Some(displays) = migrate_virtual_displays(&saved) {
                 lc.set_option("virtual-display".into(), displays.clone());
                 displays
             } else {
                 saved
             }
+        } else {
+            self.handler.lc.read().unwrap().get_option("virtual-display")
         };
         for d in displays.split(',') {
             if let Ok(index) = d.parse::<i32>() {
