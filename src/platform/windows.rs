@@ -100,6 +100,7 @@ use windows_service::{
 use winreg::{enums::*, RegKey};
 
 mod acl;
+pub(crate) mod idd_uninstall;
 pub(crate) mod installer_files;
 mod installer_handoff;
 mod installer_shell;
@@ -1928,10 +1929,8 @@ fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String>
     }
     let uninstall_idd = if uninstall_drivers && !crate::virtual_display_manager::is_amyuni_idd() {
         format!(
-            r#"if exist "{path}\RustDeskIddDriver\RustDeskIddDriver.inf" (
-        "{installed_exe}" --uninstall-rustdesk-idd
-        if errorlevel 1 exit /b 1
-    )"#
+            r#""{installed_exe}" --uninstall-rustdesk-idd
+    if errorlevel 1 exit /b 1"#
         )
     } else {
         String::new()

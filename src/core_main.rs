@@ -339,7 +339,8 @@ pub fn core_main() -> Option<CoreMainAction> {
                     && crate::virtual_display_manager::is_virtual_display_supported()
                 {
                     let mut reboot = false;
-                    if let Err(error) = virtual_display::uninstall_driver(&mut reboot) {
+                    if let Err(error) = crate::platform::windows::idd_uninstall::uninstall(&mut reboot)
+                    {
                         return Some(CoreMainAction::ExitFailure(error));
                     }
                     if reboot {
