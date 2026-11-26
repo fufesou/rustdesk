@@ -388,6 +388,8 @@ pub struct Connection {
     // Dropping the receiver cancels the pending activation.
     #[cfg(windows)]
     privacy_preparation: Option<(String, privacy_mode::Preparation)>,
+    #[cfg(windows)]
+    anonymous_display_controls: bool,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -605,6 +607,8 @@ impl Connection {
             privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
             #[cfg(windows)]
             privacy_preparation: None,
+            #[cfg(windows)]
+            anonymous_display_controls: false,
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -1132,6 +1136,14 @@ impl Connection {
                             conn.refresh_video_display(None);
                             #[cfg(target_os = "macos")]
                             conn.retina.set_displays(&_pi.displays);
+                            #[cfg(windows)]
+                            if conn.anonymous_display_controls {
+                                if let Some(message::Union::PeerInfo(pi)) = &mut Arc::make_mut(&mut msg).union {
+                                    if let Err(error) = virtual_display_manager::use_anonymous_display_controls(&mut pi.platform_additions) {
+                                        log::error!("Failed to send count-based display controls: {error}");
+                                    }
+                                }
+                            }
                         }
                         Some(message::Union::CursorPosition(pos)) => {
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -4846,6 +4858,10 @@ impl Connection {
 
     #[cfg(windows)]
     async fn toggle_virtual_display(&mut self, t: ToggleVirtualDisplay) {
+        if t.display == 0 && t.on && !self.anonymous_display_controls && !virtual_display_manager::is_amyuni_idd() {
+            self.anonymous_display_controls = true;
+            self.inner.send(display_service::displays_to_msg(display_service::get_sync_displays()).into());
+        }
         let make_msg = |text: String| {
             let mut msg_out = Message::new();
             let res = MessageBox {

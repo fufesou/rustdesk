@@ -3,7 +3,7 @@ use hbb_common::{anyhow::Context, bail, ResultType};
 
 pub(crate) fn plug_out_monitor(index: i32, force: bool) -> ResultType<()> {
     let mut manager = MANAGER.lock().unwrap();
-    let indices: Vec<u32> = if index == super::super::IDD_PLUG_OUT_ALL_INDEX {
+    let indices: Vec<u32> = if index == super::super::IDD_PLUG_OUT_ALL_INDEX || (index == 0 && !force) {
         manager
             .monitors
             .range(PEER_INDICES)
@@ -33,7 +33,12 @@ pub(crate) fn plug_out_monitor(index: i32, force: bool) -> ResultType<()> {
     let paths =
         display_target::active_paths()?.context("Display topology changed, retry unplug")?;
     let active: Vec<_> = paths.iter().map(display_target::path_target).collect();
-    manager.detach(&removable(&requested, &active)?)
+    let indices = removable(&requested, &active)?;
+    if index == 0 {
+        // The count-based minus button removes one removable peer monitor.
+        return manager.detach(indices.last().copied().as_slice());
+    }
+    manager.detach(&indices)
 }
 
 fn removable<T: PartialEq>(requested: &[(u32, T)], active: &[T]) -> ResultType<Vec<u32>> {
@@ -52,6 +57,16 @@ fn removable<T: PartialEq>(requested: &[(u32, T)], active: &[T]) -> ResultType<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_virtual_display_controls_report_the_count_after_unplug() {
+        let mut additions = r#"{"idd_impl":"rustdesk_idd","rustdesk_virtual_displays":[1],"is_installed":true}"#.to_owned();
+        crate::virtual_display_manager::use_anonymous_display_controls(&mut additions).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&additions).unwrap(),
+            serde_json::json!({"idd_impl": "amyuni_idd", "amyuni_virtual_displays": 1, "is_installed": true})
+        );
+    }
 
     #[test]
     fn manual_removal_keeps_one_active_target_when_all_are_requested() {
