@@ -20,7 +20,9 @@ struct CaptureColor {
 }
 pub(super) const REPLY_SIZE: usize = size_of::<CaptureColor>();
 
-pub(super) fn active_source(reply: &[u8]) -> ResultType<Option<String>> {
+pub(super) type Target = (LUID, u32);
+
+pub(super) fn target_id(reply: &[u8]) -> ResultType<Target> {
     if reply.len() != REPLY_SIZE {
         bail!(
             "Invalid RustDesk IDD target response length: {}",
@@ -29,11 +31,15 @@ pub(super) fn active_source(reply: &[u8]) -> ResultType<Option<String>> {
     }
     // The wire fields are integers and the byte buffer need not be aligned.
     let target = unsafe { reply.as_ptr().cast::<CaptureColor>().read_unaligned() };
+    Ok((target.adapter, target.target_id))
+}
+
+pub(super) fn active_paths() -> ResultType<Option<Vec<DISPLAYCONFIG_PATH_INFO>>> {
     let (mut path_count, mut mode_count) = (0, 0);
     unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) }
         .ok()?;
     if path_count == 0 {
-        return Ok(None);
+        return Ok(Some(Vec::new()));
     }
     let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
     let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
@@ -51,9 +57,19 @@ pub(super) fn active_source(reply: &[u8]) -> ResultType<Option<String>> {
         return Ok(None); // Windows changed the topology between the two queries.
     }
     status.ok()?;
-    let Some(path) = paths[..path_count as usize].iter().find(|path| {
-        path.targetInfo.adapterId == target.adapter && path.targetInfo.id == target.target_id
-    }) else {
+    paths.truncate(path_count as usize);
+    Ok(Some(paths))
+}
+
+pub(super) fn path_target(path: &DISPLAYCONFIG_PATH_INFO) -> Target {
+    (path.targetInfo.adapterId, path.targetInfo.id)
+}
+
+pub(super) fn active_source(target: Target) -> ResultType<Option<String>> {
+    let Some(paths) = active_paths()? else {
+        return Ok(None);
+    };
+    let Some(path) = paths.iter().find(|path| path_target(path) == target) else {
         return Ok(None);
     };
     let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();

@@ -1,5 +1,9 @@
 mod display_target;
+mod peer;
+pub(crate) mod privacy;
 mod profile;
+
+pub(crate) use peer::plug_out_monitor;
 
 use hbb_common::{
     anyhow::{anyhow, Context},
@@ -20,6 +24,7 @@ const DEFAULT_MODE: MonitorMode = MonitorMode {
 lazy_static::lazy_static! {
     static ref MANAGER: Mutex<Manager> = Mutex::new(Manager::default());
 }
+static INSTALLED: Mutex<bool> = Mutex::new(false);
 
 struct Monitor {
     profile: Profile,
@@ -43,35 +48,35 @@ impl Monitor {
 #[derive(Default)]
 struct Manager {
     monitors: BTreeMap<u32, Monitor>,
-    installed: bool,
+}
+
+fn install_driver(force: bool) -> ResultType<()> {
+    let mut installed = INSTALLED.lock().unwrap();
+    if *installed && !force {
+        return Ok(());
+    }
+    let mut reboot = false;
+    virtual_display::install_update_driver(&mut reboot).context("Install RustDesk IDD driver")?;
+    if reboot {
+        bail!("Restart Windows to finish installing RustDesk IDD");
+    }
+    *installed = true;
+    Ok(())
 }
 
 impl Manager {
-    fn install(&mut self) -> ResultType<()> {
-        let mut reboot = false;
-        virtual_display::install_update_driver(&mut reboot)
-            .context("Install RustDesk IDD driver")?;
-        if reboot {
-            bail!("Restart Windows to finish installing RustDesk IDD");
-        }
-        self.installed = true;
-        Ok(())
-    }
-
     fn plug_in(&mut self, index: u32, modes: &[MonitorMode]) -> ResultType<()> {
-        if !self.installed {
-            self.install()?;
-        }
+        install_driver(false)?;
         if let Some(monitor) = self.monitors.get_mut(&index) {
             monitor.name = Some(monitor.profile.wait_for_source(None)?);
             return Ok(());
         }
-        let profile = Profile::new(index);
-        profile.attach(if modes.is_empty() {
+        let modes = if modes.is_empty() {
             std::slice::from_ref(&DEFAULT_MODE)
         } else {
             modes
-        })?;
+        };
+        let profile = Profile::new(index).attach(modes, || false)?;
         let mut monitor = Monitor {
             profile,
             name: None,
@@ -123,7 +128,7 @@ fn detach_monitors<T>(
 }
 
 pub fn install_update_driver() -> ResultType<()> {
-    MANAGER.lock().unwrap().install()
+    install_driver(true)
 }
 
 pub fn plug_in_headless() -> ResultType<()> {
@@ -141,6 +146,10 @@ pub fn get_virtual_displays() -> Vec<u32> {
 }
 
 pub fn plug_in_index_modes(index: u32, modes: Vec<MonitorMode>) -> ResultType<()> {
+    // Released Amyuni clients replay one anonymous request per saved monitor.
+    if index == 0 {
+        return plug_in_peer_request(vec![modes]).map(|_| ());
+    }
     if !PEER_INDICES.contains(&index) {
         bail!("Invalid virtual display index {index}");
     }
@@ -168,7 +177,10 @@ pub fn plug_in_peer_request(modes: Vec<Vec<MonitorMode>>) -> ResultType<Vec<u32>
 }
 
 pub fn plug_out_peer_request(indices: &[u32]) -> ResultType<()> {
-    if let Some(index) = indices.iter().find(|i| !PEER_INDICES.contains(i)) {
+    if let Some(index) = indices
+        .iter()
+        .find(|i| !PEER_INDICES.contains(i) && **i != privacy::CONNECTOR)
+    {
         bail!("Invalid virtual display index {index}");
     }
     MANAGER.lock().unwrap().detach(indices)
@@ -222,13 +234,13 @@ pub(crate) fn change_resolution_if_is_virtual_display(
     if privacy_active {
         bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
     }
+    // Even a failed replacement can recreate the old mode under a new GDI name.
+    monitor.name = None;
     monitor.profile.set_mode(MonitorMode {
         width: w,
         height: h,
         sync: DEFAULT_MODE.sync,
     })?;
-    // Profile replacement can assign a different Windows display source, even on the same connector.
-    monitor.name = None;
     let active = monitor.profile.wait_for_source(Some((w, h)))?;
     monitor.name = Some(active.clone());
     crate::platform::change_resolution(&active, w as _, h as _)?;

@@ -1,5 +1,7 @@
 use super::display_target;
-use crate::platform::win_device::{device_io_control, DeviceError};
+use crate::platform::win_device::{
+    device_io_control_by_path, get_instance_device_path, DeviceError,
+};
 use hbb_common::{anyhow::Context, bail, ResultType};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -18,6 +20,8 @@ const INTERFACE: GUID = GUID {
     Data3: 0x11d2,
     Data4: [0xb8, 0x52, 0x00, 0xc0, 0x4e, 0xaf, 0x52, 0x72],
 };
+// DeviceCreateWithLifetime uses these enumerator and instance names in SwDeviceCreate.
+const DEVICE_INSTANCE: &str = r"SWD\RustDeskIddDriver\RustDeskIddDriver";
 // RustDeskIddDriver/DisplayProfile.h uses METHOD_BUFFERED with read and write access.
 const fn profile_ioctl(function: u32) -> u32 {
     (winapi::um::winioctl::FILE_DEVICE_UNKNOWN << 16) | (3 << 14) | (function << 2)
@@ -31,6 +35,7 @@ const DEVICE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(super) struct Profile {
+    device_path: Vec<u16>,
     index: u32,
     id: Uuid,
     attachment: Uuid,
@@ -39,6 +44,7 @@ pub(super) struct Profile {
 impl Profile {
     pub(super) fn new(index: u32) -> Self {
         Self {
+            device_path: Vec::new(),
             index,
             id: Uuid::new_v4(),
             attachment: Uuid::new_v4(),
@@ -63,12 +69,25 @@ impl Profile {
         Ok(packet)
     }
 
-    pub(super) fn attach(&self, modes: &[MonitorMode]) -> ResultType<()> {
+    pub(super) fn attach(
+        mut self,
+        modes: &[MonitorMode],
+        cancelled: impl Fn() -> bool,
+    ) -> ResultType<Self> {
         let packet = self.packet(modes)?;
         let deadline = Instant::now() + DEVICE_TIMEOUT;
         loop {
-            match unsafe { device_io_control(&INTERFACE, SESSION_PROFILE, &packet, 0) } {
-                Ok(_) => return Ok(()),
+            if cancelled() {
+                bail!("Virtual display preparation cancelled");
+            }
+            let attach = (|| unsafe {
+                if self.device_path.is_empty() {
+                    self.device_path = get_instance_device_path(&INTERFACE, DEVICE_INSTANCE)?;
+                }
+                device_io_control_by_path(&self.device_path, SESSION_PROFILE, &packet, 0)
+            })();
+            match attach {
+                Ok(_) => return Ok(self),
                 Err(error) if device_starting(&error) && Instant::now() < deadline => {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -87,29 +106,47 @@ impl Profile {
 
     fn submit(&self, code: u32, modes: &[MonitorMode]) -> ResultType<()> {
         let packet = self.packet(modes)?;
-        unsafe { device_io_control(&INTERFACE, code, &packet, 0) }?;
+        unsafe { device_io_control_by_path(&self.device_path, code, &packet, 0) }?;
         Ok(())
     }
 
-    pub(super) fn source(&self) -> ResultType<Option<String>> {
+    pub(super) fn target(&self) -> ResultType<Option<display_target::Target>> {
         let mut identity = self.index.to_le_bytes().to_vec();
         identity.extend(self.id.to_bytes_le());
         match unsafe {
-            device_io_control(
-                &INTERFACE,
+            device_io_control_by_path(
+                &self.device_path,
                 QUERY_COLOR,
                 &identity,
                 display_target::REPLY_SIZE,
             )
         } {
-            Ok(reply) => display_target::active_source(&reply),
+            Ok(reply) => display_target::target_id(&reply).map(Some),
             Err(error) if device_starting(&error) => Ok(None),
             Err(error) => Err(error).context("Query RustDesk IDD monitor"),
         }
     }
 
+    pub(super) fn source(&self) -> ResultType<Option<String>> {
+        match self.target()? {
+            Some(target) => display_target::active_source(target),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn wait_for_source(&self, size: Option<(u32, u32)>) -> ResultType<String> {
+        self.wait_for_source_while(size, || false)
+    }
+
+    pub(super) fn wait_for_source_while(
+        &self,
+        size: Option<(u32, u32)>,
+        cancelled: impl Fn() -> bool,
+    ) -> ResultType<String> {
         wait_for_activation(|| {
+            if cancelled() {
+                bail!("Virtual display preparation cancelled");
+            }
             let Some(name) = self.source()? else {
                 return Ok(None);
             };

@@ -222,13 +222,21 @@ fn get_supported_impl(impl_key: &str) -> String {
 }
 
 #[cfg(windows)]
-pub fn prepare_virtual_display(
+pub(crate) enum PreparedDisplay {
+    Amyuni(u32),
+    RustDesk(crate::virtual_display_manager::rustdesk_idd::privacy::PreparedMonitor),
+}
+
+#[cfg(windows)]
+pub(crate) type Preparation = oneshot::Receiver<ResultType<Option<PreparedDisplay>>>;
+
+#[cfg(windows)]
+pub(crate) fn prepare_virtual_display(
     impl_key: &str,
     conn_id: i32,
-) -> ResultType<Option<oneshot::Receiver<ResultType<Option<u32>>>>> {
+) -> ResultType<Option<Preparation>> {
     const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     if get_supported_impl(impl_key) != PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
-        || !crate::virtual_display_manager::is_amyuni_idd()
         || !crate::virtual_display_manager::is_virtual_display_supported()
         || get_privacy_mode_conn_id()
             .is_some_and(|owner| owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id)
@@ -239,10 +247,15 @@ pub fn prepare_virtual_display(
     std::thread::Builder::new()
         .name("privacy-prepare".to_owned())
         .spawn(move || {
-            let result =
-                crate::virtual_display_manager::amyuni_idd::prepare_privacy_monitor(|| {
-                    tx.is_closed()
-                });
+            use crate::virtual_display_manager::{amyuni_idd, is_amyuni_idd, rustdesk_idd};
+            let cancelled = || tx.is_closed();
+            let result = if is_amyuni_idd() {
+                amyuni_idd::prepare_privacy_monitor(cancelled)
+                    .map(|m| m.map(PreparedDisplay::Amyuni))
+            } else {
+                rustdesk_idd::privacy::PreparedMonitor::prepare(cancelled)
+                    .map(|m| m.map(PreparedDisplay::RustDesk))
+            };
             if let Err(Err(error)) = tx.send(result) {
                 hbb_common::throttled_log!(
                     LOG_INTERVAL,
@@ -292,10 +305,10 @@ pub(crate) fn toggle_virtual_display(index: i32, on: bool) -> ResultType<()> {
     })
 }
 
-pub async fn turn_on_privacy(
+pub(crate) async fn turn_on_privacy(
     impl_key: &str,
     conn_id: i32,
-    #[cfg(windows)] prepared_display: Option<u32>,
+    #[cfg(windows)] prepared_display: Option<PreparedDisplay>,
 ) -> Option<ResultType<bool>> {
     #[cfg(windows)]
     if get_supported_impl(impl_key) == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY {
@@ -343,7 +356,7 @@ fn is_async_privacy_mode() -> bool {
 async fn turn_on_privacy_async(
     impl_key: String,
     conn_id: i32,
-    #[cfg(windows)] prepared_display: Option<u32>,
+    #[cfg(windows)] prepared_display: Option<PreparedDisplay>,
 ) -> Option<ResultType<bool>> {
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
@@ -370,7 +383,7 @@ async fn turn_on_privacy_async(
 fn turn_on_privacy_sync(
     impl_key: &str,
     conn_id: i32,
-    #[cfg(windows)] prepared_display: Option<u32>,
+    #[cfg(windows)] prepared_display: Option<PreparedDisplay>,
 ) -> Option<ResultType<bool>> {
     // Check if privacy mode is already on or occupied by another one
     let mut privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
@@ -414,9 +427,18 @@ fn turn_on_privacy_sync(
 
     let privacy_mode = privacy_mode_lock.as_mut()?;
     #[cfg(windows)]
-    if let Some(index) = prepared_display {
+    if let Some(display) = prepared_display {
+        let index = match &display {
+            PreparedDisplay::Amyuni(index) => *index,
+            PreparedDisplay::RustDesk(_) => {
+                crate::virtual_display_manager::rustdesk_idd::privacy::CONNECTOR
+            }
+        };
         if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
             return Some(Err(error));
+        }
+        if let PreparedDisplay::RustDesk(monitor) = display {
+            monitor.adopt();
         }
     }
 

@@ -387,10 +387,7 @@ pub struct Connection {
     privacy_mode: bool,
     // Dropping the receiver cancels the pending activation.
     #[cfg(windows)]
-    privacy_preparation: Option<(
-        String,
-        hbb_common::tokio::sync::oneshot::Receiver<ResultType<Option<u32>>>,
-    )>,
+    privacy_preparation: Option<(String, privacy_mode::Preparation)>,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -5256,7 +5253,7 @@ impl Connection {
     fn poll_privacy_preparation(
         &mut self,
         impl_key: &str,
-    ) -> ResultType<std::task::Poll<Option<u32>>> {
+    ) -> ResultType<std::task::Poll<Option<privacy_mode::PreparedDisplay>>> {
         use hbb_common::tokio::sync::oneshot::error::TryRecvError;
         use std::task::Poll;
         if matches!(&self.privacy_preparation, Some((key, _)) if key != impl_key) {

@@ -96,14 +96,7 @@ pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> Re
 
 pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => {
-            let indices = if index == IDD_PLUG_OUT_ALL_INDEX {
-                rustdesk_idd::get_virtual_displays()
-            } else {
-                vec![index as _]
-            };
-            rustdesk_idd::plug_out_peer_request(&indices)
-        }
+        IDD_IMPL_RUSTDESK => rustdesk_idd::plug_out_monitor(index, force_all),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_out_monitor(index, force_all, force_one),
         _ => bail!("Unsupported virtual display implementation."),
     }

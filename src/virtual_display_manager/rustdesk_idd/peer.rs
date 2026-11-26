@@ -1,0 +1,66 @@
+use super::{display_target, MANAGER, PEER_INDICES};
+use hbb_common::{anyhow::Context, bail, ResultType};
+
+pub(crate) fn plug_out_monitor(index: i32, force: bool) -> ResultType<()> {
+    let mut manager = MANAGER.lock().unwrap();
+    let indices: Vec<u32> = if index == super::super::IDD_PLUG_OUT_ALL_INDEX {
+        manager
+            .monitors
+            .range(PEER_INDICES)
+            .map(|(&i, _)| i)
+            .collect()
+    } else if PEER_INDICES.contains(&(index as u32)) {
+        vec![index as u32]
+    } else {
+        bail!("Invalid virtual display index {index}");
+    };
+    if force || indices.is_empty() {
+        return manager.detach(&indices);
+    }
+    let mut requested = Vec::new();
+    for index in indices {
+        if let Some(monitor) = manager.monitors.get(&index) {
+            let target = monitor
+                .profile
+                .target()?
+                .context("Virtual display target is unavailable")?;
+            requested.push((index, target));
+        }
+    }
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let paths =
+        display_target::active_paths()?.context("Display topology changed, retry unplug")?;
+    let active: Vec<_> = paths.iter().map(display_target::path_target).collect();
+    manager.detach(&removable(&requested, &active)?)
+}
+
+fn removable<T: PartialEq>(requested: &[(u32, T)], active: &[T]) -> ResultType<Vec<u32>> {
+    let mut indices: Vec<_> = requested.iter().map(|(index, _)| *index).collect();
+    if active.iter().all(|t| requested.iter().any(|(_, r)| r == t)) {
+        if let Some((keep, _)) = requested.iter().find(|(_, r)| active.contains(r)) {
+            if indices.len() == 1 {
+                bail!("This only virtual display cannot be plugged out.");
+            }
+            indices.retain(|i| i != keep);
+        }
+    }
+    Ok(indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_removal_keeps_one_active_target_when_all_are_requested() {
+        let requested = [(1, "inactive"), (2, "active"), (3, "clone")];
+        assert_eq!(removable(&requested, &["active", "clone"]).unwrap(), [1, 3]);
+        assert!(removable(&requested[1..2], &["active"]).is_err());
+        assert_eq!(
+            removable(&requested, &["active", "physical"]).unwrap(),
+            [1, 2, 3]
+        );
+    }
+}

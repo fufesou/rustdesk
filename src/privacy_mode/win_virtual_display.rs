@@ -576,6 +576,9 @@ impl PrivacyMode for PrivacyModeImpl {
         }
         self.set_displays();
         if self.displays.is_empty() {
+            if !virtual_display_manager::is_amyuni_idd() {
+                self.restore_plug_out_monitor()?;
+            }
             log::debug!("{}", NO_PHYSICAL_DISPLAYS);
             bail!(NO_PHYSICAL_DISPLAYS);
         }
@@ -586,7 +589,9 @@ impl PrivacyMode for PrivacyModeImpl {
             succeeded: false,
         };
 
-        guard.ensure_virtual_display(is_async_mode)?;
+        if is_async_mode {
+            guard.ensure_virtual_display(is_async_mode)?;
+        }
         if guard.virtual_displays.is_empty() {
             log::debug!("No virtual displays");
             bail!("No virtual displays.");

@@ -334,7 +334,21 @@ pub unsafe fn device_io_control(
     inbuf: &[u8],
     outbuf_max_len: usize,
 ) -> Result<Vec<u8>, DeviceError> {
-    let h_device = open_device_handle(interface_guid)?;
+    let devices = DeviceInfo::setup_di_get_class_devs_ex_w(
+        interface_guid,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+    )?;
+    let path = get_device_path(interface_guid, devices)?;
+    device_io_control_by_path(&path, control_code, inbuf, outbuf_max_len)
+}
+
+pub(crate) unsafe fn device_io_control_by_path(
+    path: &[u16],
+    control_code: u32,
+    inbuf: &[u8],
+    outbuf_max_len: usize,
+) -> Result<Vec<u8>, DeviceError> {
+    let h_device = open_device_handle(path)?;
     let mut bytes_returned = 0;
     let mut outbuf: Vec<u8> = vec![];
     let outbuf_ptr = if outbuf_max_len > 0 {
@@ -366,11 +380,27 @@ pub unsafe fn device_io_control(
     }
 }
 
-unsafe fn get_device_path(interface_guid: &GUID) -> Result<Vec<u16>, DeviceError> {
-    let dev_info = DeviceInfo::setup_di_get_class_devs_ex_w(
+pub(crate) unsafe fn get_instance_device_path(
+    interface_guid: &GUID,
+    instance: &str,
+) -> Result<Vec<u16>, DeviceError> {
+    let instance: Vec<_> = instance.encode_utf16().chain(Some(0)).collect();
+    let devices = SetupDiGetClassDevsW(
         interface_guid,
+        instance.as_ptr(),
+        null_mut(),
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
-    )?;
+    );
+    if devices == INVALID_HANDLE_VALUE {
+        return Err(DeviceError::new_api_last_err("SetupDiGetClassDevsW"));
+    }
+    get_device_path(interface_guid, DeviceInfo(devices))
+}
+
+unsafe fn get_device_path(
+    interface_guid: &GUID,
+    dev_info: DeviceInfo,
+) -> Result<Vec<u16>, DeviceError> {
     let mut device_interface_data = SP_DEVICE_INTERFACE_DATA {
         cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as _,
         InterfaceClassGuid: *interface_guid,
@@ -442,8 +472,7 @@ unsafe fn get_device_path(interface_guid: &GUID) -> Result<Vec<u16>, DeviceError
     Ok(path)
 }
 
-unsafe fn open_device_handle(interface_guid: &GUID) -> Result<HANDLE, DeviceError> {
-    let device_path = get_device_path(interface_guid)?;
+unsafe fn open_device_handle(device_path: &[u16]) -> Result<HANDLE, DeviceError> {
     let h_device = CreateFileW(
         device_path.as_ptr(),
         GENERIC_READ | GENERIC_WRITE,
