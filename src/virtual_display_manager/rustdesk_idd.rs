@@ -209,10 +209,10 @@ pub(crate) fn change_resolution_if_is_virtual_display(
 ) -> ResultType<bool> {
     let requested_name = name.trim_end_matches('\0');
     let mut manager = MANAGER.lock().unwrap();
-    let Some(monitor) = manager
+    let Some((index, monitor)) = manager
         .monitors
-        .values_mut()
-        .find_map(|m| m.matches_source(requested_name).then_some(m))
+        .iter_mut()
+        .find_map(|(&i, m)| m.matches_source(requested_name).then_some((i, m)))
     else {
         return Ok(false);
     };
@@ -236,11 +236,16 @@ pub(crate) fn change_resolution_if_is_virtual_display(
     }
     // Even a failed replacement can recreate the old mode under a new GDI name.
     monitor.name = None;
-    monitor.profile.set_mode(MonitorMode {
+    if let Err(error) = monitor.profile.set_mode(MonitorMode {
         width: w,
         height: h,
         sync: DEFAULT_MODE.sync,
-    })?;
+    }) {
+        if monitor.profile.no_longer_attached() {
+            manager.monitors.remove(&index);
+        }
+        return Err(error);
+    }
     let active = monitor.profile.wait_for_source(Some((w, h)))?;
     monitor.name = Some(active.clone());
     crate::platform::change_resolution(&active, w as _, h as _)?;

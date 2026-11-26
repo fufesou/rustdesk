@@ -9,8 +9,8 @@ use virtual_display::MonitorMode;
 use winapi::shared::{
     guiddef::GUID,
     winerror::{
-        ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_READY, ERROR_NO_MORE_ITEMS,
-        ERROR_SHARING_VIOLATION,
+        ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_NOT_READY,
+        ERROR_NO_MORE_ITEMS, ERROR_SHARING_VIOLATION,
     },
 };
 
@@ -132,6 +132,13 @@ impl Profile {
             Some(target) => display_target::active_source(target),
             None => Ok(None),
         }
+    }
+
+    pub(super) fn no_longer_attached(&self) -> bool {
+        self.target().is_err_and(|error| {
+            matches!(error.downcast_ref::<DeviceError>(), Some(DeviceError::WinApiLastErr(api, e))
+                if api == "DeviceIoControl" && e.raw_os_error() == Some(ERROR_NOT_FOUND as i32))
+        })
     }
 
     pub(super) fn wait_for_source(&self, size: Option<(u32, u32)>) -> ResultType<String> {
