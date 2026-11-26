@@ -254,7 +254,7 @@ pub(crate) fn prepare_virtual_display(
                     .map(|m| m.map(PreparedDisplay::Amyuni))
             } else {
                 rustdesk_idd::privacy::PreparedMonitor::prepare(cancelled)
-                    .map(|m| m.map(PreparedDisplay::RustDesk))
+                    .map(|m| Some(PreparedDisplay::RustDesk(m)))
             };
             if let Err(Err(error)) = tx.send(result) {
                 hbb_common::throttled_log!(
@@ -273,12 +273,13 @@ fn with_virtual_display_privacy<T>(operation: impl FnOnce(bool) -> T) -> T {
     if crate::virtual_display_manager::is_amyuni_idd() {
         return operation(false);
     }
-    // Keep the privacy topology stable until the requested display operation finishes.
+    let _topology = crate::virtual_display_manager::rustdesk_idd::privacy::TOPOLOGY.blocking_lock();
     let mode = PRIVACY_MODE.lock().unwrap();
     let private = mode.as_ref().is_some_and(|m| {
         m.get_impl_key() == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
             && m.pre_conn_id() != INVALID_PRIVACY_MODE_CONN_ID
     });
+    drop(mode);
     operation(private)
 }
 
@@ -429,13 +430,15 @@ fn turn_on_privacy_sync(
     #[cfg(windows)]
     if let Some(display) = prepared_display {
         let index = match &display {
-            PreparedDisplay::Amyuni(index) => *index,
-            PreparedDisplay::RustDesk(_) => {
-                crate::virtual_display_manager::rustdesk_idd::privacy::CONNECTOR
-            }
+            PreparedDisplay::Amyuni(index) => Some(*index),
+            PreparedDisplay::RustDesk(monitor) => monitor
+                .created()
+                .then_some(crate::virtual_display_manager::rustdesk_idd::privacy::CONNECTOR),
         };
-        if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
-            return Some(Err(error));
+        if let Some(index) = index {
+            if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
+                return Some(Err(error));
+            }
         }
         if let PreparedDisplay::RustDesk(monitor) = display {
             monitor.adopt();

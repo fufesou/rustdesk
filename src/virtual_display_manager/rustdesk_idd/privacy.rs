@@ -9,7 +9,8 @@ use hbb_common::{
 
 // The driver exposes ten connectors. Zero is headless and 1–4 are selectable by peers.
 pub(crate) const CONNECTOR: u32 = 5;
-static PREPARATION: Mutex<()> = Mutex::const_new(());
+// Keep peer display changes out of the interval between preparation and privacy activation.
+pub(crate) static TOPOLOGY: Mutex<()> = Mutex::const_new(());
 
 pub(crate) struct PreparedMonitor {
     monitor: Option<Monitor>,
@@ -17,15 +18,18 @@ pub(crate) struct PreparedMonitor {
 }
 
 impl PreparedMonitor {
-    pub(crate) fn prepare(cancelled: impl Fn() -> bool) -> ResultType<Option<Self>> {
-        let reservation = PREPARATION
+    pub(crate) fn prepare(cancelled: impl Fn() -> bool) -> ResultType<Self> {
+        let reservation = TOPOLOGY
             .try_lock()
-            .context("Privacy display preparation in progress")?;
+            .context("Another virtual display change is in progress")?;
         if cancelled() {
             bail!("Privacy mode preparation cancelled");
         }
         if !get_device_names(Some(RUSTDESK_IDD_DEVICE_STRING)).is_empty() {
-            return Ok(None);
+            return Ok(Self {
+                monitor: None,
+                _reservation: reservation,
+            });
         }
         if get_device_names(None).is_empty() {
             bail!(crate::privacy_mode::NO_PHYSICAL_DISPLAYS);
@@ -41,7 +45,11 @@ impl PreparedMonitor {
             _reservation: reservation,
         };
         name?;
-        Ok(Some(prepared))
+        Ok(prepared)
+    }
+
+    pub(crate) fn created(&self) -> bool {
+        self.monitor.is_some()
     }
 
     pub(crate) fn adopt(mut self) {
