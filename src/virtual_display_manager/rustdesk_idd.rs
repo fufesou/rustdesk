@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 use virtual_display::MonitorMode;
 
 const HEADLESS: u32 = 0;
-const PEER_INDICES: std::ops::RangeInclusive<u32> = 1..=4;
+pub(crate) const PEER_INDICES: std::ops::RangeInclusive<u32> = 1..=4;
 const DEFAULT_MODE: MonitorMode = MonitorMode {
     width: 1920,
     height: 1080,
@@ -68,8 +68,16 @@ impl Manager {
     fn plug_in(&mut self, index: u32, modes: &[MonitorMode]) -> ResultType<()> {
         install_driver(false)?;
         if let Some(monitor) = self.monitors.get_mut(&index) {
-            monitor.name = Some(monitor.profile.wait_for_source(None)?);
-            return Ok(());
+            match monitor.profile.wait_for_source(None) {
+                Ok(name) => {
+                    monitor.name = Some(name);
+                    return Ok(());
+                }
+                Err(error) if profile::target_is_gone(&error) => {
+                    self.monitors.remove(&index);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let modes = if modes.is_empty() {
             std::slice::from_ref(&DEFAULT_MODE)

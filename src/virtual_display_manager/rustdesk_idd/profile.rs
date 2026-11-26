@@ -135,10 +135,7 @@ impl Profile {
     }
 
     pub(super) fn no_longer_attached(&self) -> bool {
-        self.target().is_err_and(|error| {
-            matches!(error.downcast_ref::<DeviceError>(), Some(DeviceError::WinApiLastErr(api, e))
-                if api == "DeviceIoControl" && e.raw_os_error() == Some(ERROR_NOT_FOUND as i32))
-        })
+        self.target().is_err_and(|error| target_is_gone(&error))
     }
 
     pub(super) fn wait_for_source(&self, size: Option<(u32, u32)>) -> ResultType<String> {
@@ -170,6 +167,12 @@ impl Profile {
             )
         })
     }
+}
+
+pub(super) fn target_is_gone(error: &hbb_common::anyhow::Error) -> bool {
+    // The named query returns NOT_FOUND for both an empty slot and a different owner.
+    matches!(error.downcast_ref::<DeviceError>(), Some(DeviceError::WinApiLastErr(api, e))
+        if api == "DeviceIoControl" && e.raw_os_error() == Some(ERROR_NOT_FOUND as i32))
 }
 
 pub(super) fn supports_resolution(name: &str, size: (u32, u32)) -> bool {

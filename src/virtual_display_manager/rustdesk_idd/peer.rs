@@ -1,30 +1,34 @@
-use super::{display_target, MANAGER, PEER_INDICES};
+use super::{display_target, profile, MANAGER, PEER_INDICES};
 use hbb_common::{anyhow::Context, bail, ResultType};
 
 pub(crate) fn plug_out_monitor(index: i32, force: bool) -> ResultType<()> {
     let mut manager = MANAGER.lock().unwrap();
-    let indices: Vec<u32> = if index == super::super::IDD_PLUG_OUT_ALL_INDEX || (index == 0 && !force) {
-        manager
-            .monitors
-            .range(PEER_INDICES)
-            .map(|(&i, _)| i)
-            .collect()
-    } else if PEER_INDICES.contains(&(index as u32)) {
-        vec![index as u32]
-    } else {
-        bail!("Invalid virtual display index {index}");
-    };
+    let indices: Vec<u32> =
+        if index == super::super::IDD_PLUG_OUT_ALL_INDEX || (index == 0 && !force) {
+            manager
+                .monitors
+                .range(PEER_INDICES)
+                .map(|(&i, _)| i)
+                .collect()
+        } else if PEER_INDICES.contains(&(index as u32)) {
+            vec![index as u32]
+        } else {
+            bail!("Invalid virtual display index {index}");
+        };
     if force || indices.is_empty() {
         return manager.detach(&indices);
     }
     let mut requested = Vec::new();
     for index in indices {
         if let Some(monitor) = manager.monitors.get(&index) {
-            let target = monitor
-                .profile
-                .target()?
-                .context("Virtual display target is unavailable")?;
-            requested.push((index, target));
+            match monitor.profile.target() {
+                Ok(Some(target)) => requested.push((index, target)),
+                Ok(None) => bail!("Virtual display target is unavailable"),
+                Err(error) if profile::target_is_gone(&error) => {
+                    manager.monitors.remove(&index);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     if requested.is_empty() {
@@ -60,7 +64,9 @@ mod tests {
 
     #[test]
     fn legacy_virtual_display_controls_report_the_count_after_unplug() {
-        let mut additions = r#"{"idd_impl":"rustdesk_idd","rustdesk_virtual_displays":[1],"is_installed":true}"#.to_owned();
+        let mut additions =
+            r#"{"idd_impl":"rustdesk_idd","rustdesk_virtual_displays":[1],"is_installed":true}"#
+                .to_owned();
         crate::virtual_display_manager::use_anonymous_display_controls(&mut additions).unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&additions).unwrap(),
