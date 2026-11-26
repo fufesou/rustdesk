@@ -75,6 +75,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
+#[cfg(windows)]
+mod display_jobs;
 mod trusted_devices;
 
 const FAILURE_IDX_ID_WHITELIST: usize = 2;
@@ -390,6 +392,8 @@ pub struct Connection {
     privacy_preparation: Option<(String, privacy_mode::Preparation)>,
     #[cfg(windows)]
     anonymous_display_controls: bool,
+    #[cfg(windows)]
+    display_jobs: display_jobs::DisplayJobs,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -609,6 +613,8 @@ impl Connection {
             privacy_preparation: None,
             #[cfg(windows)]
             anonymous_display_controls: false,
+            #[cfg(windows)]
+            display_jobs: Default::default(),
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -1138,10 +1144,9 @@ impl Connection {
                             conn.retina.set_displays(&_pi.displays);
                             #[cfg(windows)]
                             if conn.anonymous_display_controls {
-                                if let Some(message::Union::PeerInfo(pi)) = &mut Arc::make_mut(&mut msg).union {
-                                    if let Err(error) = virtual_display_manager::use_anonymous_display_controls(&mut pi.platform_additions) {
-                                        log::error!("Failed to send count-based display controls: {error}");
-                                    }
+                                let pi = Arc::make_mut(&mut msg).mut_peer_info();
+                                if let Err(error) = virtual_display_manager::use_anonymous_display_controls(&mut pi.platform_additions) {
+                                    log::error!("Failed to send count-based display controls: {error}");
                                 }
                             }
                         }
@@ -3988,7 +3993,7 @@ impl Connection {
                     #[cfg(windows)]
                     Some(misc::Union::ToggleVirtualDisplay(t)) => {
                         if !self.view_camera {
-                            self.toggle_virtual_display(t).await;
+                            self.toggle_virtual_display(t);
                         }
                     }
                     Some(misc::Union::TogglePrivacyMode(t)) => {
@@ -4093,14 +4098,13 @@ impl Connection {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeResolution(r)) => {
                         if !self.view_camera {
-                            self.change_resolution(None, &r).await;
+                            self.change_resolution(None, &r);
                         }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeDisplayResolution(dr)) => {
                         if !self.view_camera {
-                            self.change_resolution(Some(dr.display as _), &dr.resolution)
-                                .await;
+                            self.change_resolution(Some(dr.display as _), &dr.resolution);
                         }
                     }
                     Some(misc::Union::AutoAdjustFps(fps)) => video_service::VIDEO_QOS
@@ -4699,8 +4703,7 @@ impl Connection {
                             height: s.height,
                             ..Default::default()
                         },
-                    )
-                    .await;
+                    );
                 }
             }
 
@@ -4857,49 +4860,27 @@ impl Connection {
     }
 
     #[cfg(windows)]
-    async fn toggle_virtual_display(&mut self, t: ToggleVirtualDisplay) {
-        if t.display == 0 && t.on && !self.anonymous_display_controls && !virtual_display_manager::is_amyuni_idd() {
-            self.anonymous_display_controls = true;
-            self.inner.send(display_service::displays_to_msg(display_service::get_sync_displays()).into());
-        }
-        let make_msg = |text: String| {
-            let mut msg_out = Message::new();
-            let res = MessageBox {
-                msgtype: "nook-nocancel-hasclose".to_owned(),
-                title: "Virtual display".to_owned(),
-                text,
-                link: "".to_owned(),
-                ..Default::default()
-            };
-            msg_out.set_message_box(res);
-            msg_out
-        };
-
-        let toggle = move || privacy_mode::toggle_virtual_display(t.display, t.on);
-        if t.on {
-            if !virtual_display_manager::is_virtual_display_supported() {
-                self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))
-                    .await;
-            } else {
-                if let Err(e) = virtual_display_manager::run_display_operation(toggle).await {
-                    log::error!("Failed to plug in virtual display: {}", e);
-                    self.send(make_msg(format!(
-                        "Failed to plug in virtual display: {}",
-                        e
-                    )))
-                    .await;
-                }
+    fn toggle_virtual_display(&mut self, t: ToggleVirtualDisplay) {
+        let anonymous = t.display == 0
+            && t.on
+            && !self.anonymous_display_controls
+            && !virtual_display_manager::is_amyuni_idd();
+        self.anonymous_display_controls |= anonymous;
+        let mut peer = self.inner.clone();
+        self.dispatch_display(move || {
+            if anonymous {
+                peer.send(
+                    display_service::displays_to_msg(display_service::get_sync_displays()).into(),
+                );
             }
-        } else {
-            if let Err(e) = virtual_display_manager::run_display_operation(toggle).await {
-                log::error!("Failed to plug out virtual display {}: {}", t.display, e);
-                self.send(make_msg(format!(
-                    "Failed to plug out virtual displays: {}",
-                    e
-                )))
-                .await;
+            if t.on && !virtual_display_manager::is_virtual_display_supported() {
+                bail!("idd_not_support_under_win10_2004_tip");
             }
-        }
+            privacy_mode::toggle_virtual_display(t.display, t.on).map_err(|error| {
+                let action = if t.on { "plug in" } else { "plug out" };
+                error.context(format!("Failed to {action} virtual display {}", t.display))
+            })
+        });
     }
 
     async fn toggle_privacy_mode(&mut self, t: TogglePrivacyMode) {
@@ -4911,37 +4892,50 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    async fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+    fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
         if !self.keyboard {
             return;
         }
         let display_idx = d.unwrap_or(self.display_idx);
         let size = (r.width, r.height);
         #[cfg(windows)]
-        let result = virtual_display_manager::run_display_operation(move || {
-            Self::apply_display_resolution(display_idx, size)
-        })
-        .await;
-        #[cfg(not(windows))]
-        let result = Self::apply_display_resolution(display_idx, size);
-        if let Err(error) = result {
-            let mut msg = Message::new();
-            msg.set_message_box(MessageBox {
-                msgtype: "nook-nocancel-hasclose".into(),
-                title: "Virtual display".into(),
-                text: format!("Failed to set {}x{}: {error:#}", r.width, r.height),
-                ..Default::default()
+        {
+            let name = if virtual_display_manager::is_amyuni_idd() {
+                None
+            } else {
+                let Some(display) = display_service::get_display_info(display_idx) else {
+                    return;
+                };
+                Some(display.name)
+            };
+            self.dispatch_display(move || {
+                Self::apply_display_resolution(display_idx, size, name.as_deref())
+                    .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
             });
-            self.inner.send(msg.into());
         }
+        #[cfg(not(windows))]
+        hbb_common::allow_err!(Self::apply_display_resolution(display_idx, size));
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn apply_display_resolution(display_idx: usize, (width, height): (i32, i32)) -> ResultType<()> {
+    fn apply_display_resolution(
+        display_idx: usize,
+        (width, height): (i32, i32),
+        #[cfg(windows)] requested_name: Option<&str>,
+    ) -> ResultType<()> {
         let Ok(displays) = display_service::try_get_displays() else {
             return Ok(());
         };
-        let Some(display) = displays.get(display_idx) else {
+        let display = displays.get(display_idx);
+        #[cfg(windows)]
+        let display = if let Some(name) = requested_name {
+            Some(displays.iter().find(|d| d.name() == name).ok_or_else(|| {
+                hbb_common::anyhow::anyhow!("Requested display is no longer connected")
+            })?)
+        } else {
+            display
+        };
+        let Some(display) = display else {
             return Ok(());
         };
         let name = display.name();
@@ -5284,7 +5278,10 @@ impl Connection {
             self.privacy_preparation = None;
             return result.map(Poll::Ready);
         }
-        self.privacy_preparation = privacy_mode::prepare_virtual_display(impl_key, self.inner.id)?
+        self.privacy_preparation =
+            privacy_mode::prepare_virtual_display(impl_key, self.inner.id, |job| {
+                self.display_jobs.submit(job)
+            })?
             .map(|receiver| (impl_key.to_owned(), receiver));
         Ok(if self.privacy_preparation.is_some() {
             Poll::Pending
@@ -5476,7 +5473,10 @@ impl Connection {
         }
         self.closed = true;
         #[cfg(windows)]
-        self.privacy_preparation.take();
+        {
+            self.privacy_preparation.take();
+            self.display_jobs.stop();
+        }
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5511,6 +5511,8 @@ impl Connection {
         if let Some(mut mux) = self.port_forward_mux.take() {
             mux.close_all();
         }
+        #[cfg(windows)]
+        self.display_jobs.finish().await;
     }
 
     // The `reason` should be consistent with `check_if_retry` if not empty

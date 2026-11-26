@@ -234,37 +234,48 @@ pub(crate) type Preparation = oneshot::Receiver<ResultType<Option<PreparedDispla
 pub(crate) fn prepare_virtual_display(
     impl_key: &str,
     conn_id: i32,
+    submit: impl FnOnce(Box<dyn FnOnce() + Send>) -> ResultType<()>,
 ) -> ResultType<Option<Preparation>> {
     const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     if get_supported_impl(impl_key) != PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
         || !crate::virtual_display_manager::is_virtual_display_supported()
-        || get_privacy_mode_conn_id()
-            .is_some_and(|owner| owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id)
     {
         return Ok(None);
     }
+    if get_privacy_mode_conn_id()
+        .is_some_and(|owner| owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id)
+    {
+        if crate::virtual_display_manager::is_amyuni_idd() {
+            return Ok(None);
+        }
+        bail!(OCCUPIED);
+    }
     let (tx, rx) = oneshot::channel();
-    std::thread::Builder::new()
-        .name("privacy-prepare".to_owned())
-        .spawn(move || {
-            use crate::virtual_display_manager::{amyuni_idd, is_amyuni_idd, rustdesk_idd};
-            let cancelled = || tx.is_closed();
-            let result = if is_amyuni_idd() {
-                amyuni_idd::prepare_privacy_monitor(cancelled)
-                    .map(|m| m.map(PreparedDisplay::Amyuni))
-            } else {
-                rustdesk_idd::privacy::PreparedMonitor::prepare(cancelled)
-                    .map(|m| Some(PreparedDisplay::RustDesk(m)))
-            };
-            if let Err(Err(error)) = tx.send(result) {
-                hbb_common::throttled_log!(
-                    LOG_INTERVAL,
-                    debug,
-                    "Privacy mode preparation ended after cancellation: {}",
-                    error
-                );
-            }
-        })?;
+    let prepare = move || {
+        use crate::virtual_display_manager::{amyuni_idd, is_amyuni_idd, rustdesk_idd};
+        let cancelled = || tx.is_closed();
+        let result = if is_amyuni_idd() {
+            amyuni_idd::prepare_privacy_monitor(cancelled).map(|m| m.map(PreparedDisplay::Amyuni))
+        } else {
+            rustdesk_idd::privacy::PreparedMonitor::prepare(cancelled)
+                .map(|m| Some(PreparedDisplay::RustDesk(m)))
+        };
+        if let Err(Err(error)) = tx.send(result) {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                debug,
+                "Privacy mode preparation ended after cancellation: {}",
+                error
+            );
+        }
+    };
+    if crate::virtual_display_manager::is_amyuni_idd() {
+        std::thread::Builder::new()
+            .name("privacy-prepare".into())
+            .spawn(prepare)?;
+    } else {
+        submit(Box::new(prepare))?;
+    }
     Ok(Some(rx))
 }
 
