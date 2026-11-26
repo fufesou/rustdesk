@@ -9,7 +9,7 @@ mod ipc_windows;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "ipc/fs.rs"]
 mod ipc_fs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[path = "ipc/unix_unlock_pin.rs"]
 pub(crate) mod unix_unlock_pin;
 // The DRM/KMS capture producer, the `_drm` channel and its SCM_RIGHTS framing live in their own
@@ -394,14 +394,14 @@ pub enum Data {
     Test,
     SyncConfig(
         #[cfg_attr(
-            any(target_os = "linux", target_os = "macos"),
+            any(windows, target_os = "linux", target_os = "macos"),
             serde(with = "unix_unlock_pin::sync_config")
         )]
         Option<Box<(Config, Config2)>>,
     ),
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     UnlockPin(unix_unlock_pin::Request),
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     UnlockPinResult(Result<bool, String>),
     #[cfg(target_os = "windows")]
     ClipboardFile(ClipboardFile),
@@ -880,13 +880,13 @@ impl Drop for CheckIfRestart {
 }
 
 async fn handle(data: Data, stream: &mut Connection) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     if matches!(&data, Data::Config((name, _)) if name == "unlock-pin")
         && crate::platform::is_installed()
     {
         allow_err!(
             stream
-                .send(&Data::SecurityConfigError("Unlock PIN is managed by the root service".into()))
+                .send(&Data::SecurityConfigError("Unlock PIN is managed by the system service".into()))
                 .await
         );
         return;
@@ -1173,6 +1173,10 @@ async fn handle(data: Data, stream: &mut Connection) {
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
+                    #[cfg(windows)]
+                    if crate::platform::is_installed() && unix_unlock_pin::is_service_account() {
+                        unix_unlock_pin::preserve_legacy_root_pin()?;
+                    }
                     crate::trusted_devices::config::set_config(config)
                         .and_then(|_| crate::trusted_devices::config::set_config2(config2))
                 }
@@ -1981,7 +1985,7 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
 pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
     let v = v.trim().to_owned();
     validate_unlock_pin(&v, translate)?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     if crate::platform::is_installed() {
         return unix_unlock_pin::set(v);
     }
@@ -1990,6 +1994,7 @@ pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
 }
 
 #[cfg(any(
+    windows,
     target_os = "linux",
     target_os = "macos",
     all(feature = "flutter", not(any(target_os = "android", target_os = "ios")))
@@ -2020,7 +2025,7 @@ fn validate_unlock_pin(v: &str, translate: bool) -> ResultType<()> {
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_unlock_pin() -> String {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     if crate::platform::is_installed() {
         return String::new();
     }

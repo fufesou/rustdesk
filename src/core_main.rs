@@ -161,11 +161,11 @@ pub fn core_main() -> Option<CoreMainAction> {
         flutter_args.retain(|arg| arg != "--install");
     }
     if args.len() > 0 {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         if args[0] == "--approve-unlock-pin" {
             let result = match args.as_slice() {
                 [_, uid, digest] => crate::ipc::unix_unlock_pin::admin_approve(uid, digest),
-                _ => Err(hbb_common::anyhow::anyhow!("Expected a target UID and approval digest")),
+                _ => Err(hbb_common::anyhow::anyhow!("Expected a target ID and approval digest")),
             };
             return result.err().map(CoreMainAction::ExitFailure);
         }
@@ -200,6 +200,12 @@ pub fn core_main() -> Option<CoreMainAction> {
         }
     }
     hbb_common::init_log(false, &log_name);
+    #[cfg(windows)]
+    if crate::platform::is_installed() && !crate::ipc::unix_unlock_pin::is_service_account() {
+        if let Err(err) = config::Config2::migrate_unlock_pin(|_| Ok(())) {
+            log::warn!("Could not remove the legacy user unlock PIN: {err}");
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if crate::platform::is_installed() && unsafe { hbb_common::libc::geteuid() } != 0 {
         if let Err(err) = config::unix_unlock_pin::discard_user_copy() {
@@ -476,9 +482,9 @@ pub fn core_main() -> Option<CoreMainAction> {
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
                     set_unix_pin_cli(|| crate::ipc::set_unlock_pin(args[1].to_owned(), false));
-                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
                     if let Err(err) = crate::ipc::set_unlock_pin(args[1].to_owned(), false) {
                         println!("{err}");
                     } else {
@@ -776,10 +782,10 @@ fn import_config(path: &str) {
     }
     let config2: Config2 = load_path(path2.into());
     if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         let config2 = if crate::platform::is_installed() {
-            if unsafe { hbb_common::libc::geteuid() } == 0 {
-                if let Err(err) = unix_unlock_pin::RootPin::load() {
+            if crate::ipc::unix_unlock_pin::is_service_account() {
+                if let Err(err) = crate::ipc::unix_unlock_pin::preserve_legacy_root_pin() {
                     log::error!("Cannot preserve the root PIN during config import: {err}");
                     return;
                 }
@@ -959,7 +965,7 @@ fn is_quick_support_exe(exe: &str) -> bool {
 
 #[cfg(all(
     any(feature = "flutter", test),
-    any(target_os = "linux", target_os = "macos")
+    any(windows, target_os = "linux", target_os = "macos")
 ))]
 fn set_unix_pin_cli(write_pin: impl FnOnce() -> hbb_common::ResultType<()>) {
     if let Err(err) = write_pin() {

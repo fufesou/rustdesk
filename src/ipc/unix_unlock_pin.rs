@@ -1,12 +1,18 @@
-use super::{connect_root_service, Connection, Data};
+#[cfg(not(windows))]
+use super::connect_root_service;
+#[cfg(windows)]
+use super::connect_service as connect_root_service;
+use super::{ConnClient, Connection, ConnectionTmpl, Data};
+#[cfg(windows)]
+use crate::platform::windows::unlock_pin::ServicePin as RootPin;
 use hbb_common::{
     anyhow::{anyhow, ensure},
-    config::{unix_unlock_pin::RootPin, Config, Config2},
-    libc,
-    rand::{rngs::OsRng, RngCore},
+    config::{Config, Config2},
     sha2::{Digest, Sha256},
     tokio, ResultType,
 };
+#[cfg(not(windows))]
+use hbb_common::{config::unix_unlock_pin::RootPin, libc};
 use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -15,7 +21,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "flutter")]
+#[path = "unix_unlock_pin/gui.rs"]
+mod gui;
+#[cfg(feature = "flutter")]
+pub(crate) use gui::gui_request;
+
 type Token = [u8; 32];
+type ClientConnection = ConnectionTmpl<ConnClient>;
 const TIMEOUT_MS: u64 = 1000;
 const IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_GRANTS: usize = 16;
@@ -34,6 +47,7 @@ pub enum Request {
     Set(Option<Token>, String),
 }
 
+#[cfg(not(windows))]
 impl Request {
     fn check_active_user(
         &self,
@@ -50,6 +64,7 @@ impl Request {
     }
 }
 
+#[cfg(not(windows))]
 fn current_console_uid() -> Option<u32> {
     #[cfg(target_os = "linux")]
     return crate::platform::linux::get_active_userid_fresh()
@@ -118,7 +133,14 @@ impl Grants {
     }
 }
 
-pub(super) fn preserve_legacy_root_pin() -> ResultType<()> {
+pub(crate) fn is_service_account() -> bool {
+    #[cfg(windows)]
+    return crate::platform::is_root();
+    #[cfg(not(windows))]
+    return unsafe { libc::geteuid() } == 0;
+}
+
+pub(crate) fn preserve_legacy_root_pin() -> ResultType<()> {
     // Serialize first-use migration with an administrator setting a new PIN.
     let _grants = GRANTS.get_or_init(Default::default).lock().unwrap();
     RootPin::load()?;
@@ -127,9 +149,10 @@ pub(super) fn preserve_legacy_root_pin() -> ResultType<()> {
 
 fn perform(peer: u32, request: Request) -> ResultType<bool> {
     ensure!(
-        unsafe { libc::geteuid() } == 0 && crate::platform::is_installed(),
+        is_service_account() && crate::platform::is_installed(),
         "{REQUIRED}"
     );
+    #[cfg(not(windows))]
     request.check_active_user(peer, current_console_uid)?;
     let mut grants = GRANTS.get_or_init(Default::default).lock().unwrap();
     match request {
@@ -158,10 +181,23 @@ fn perform(peer: u32, request: Request) -> ResultType<bool> {
     }
 }
 
-pub(super) async fn reply(request: Request, stream: &mut Connection) -> ResultType<()> {
+pub(crate) async fn reply(request: Request, stream: &mut Connection) -> ResultType<()> {
+    #[cfg(not(windows))]
     let peer = stream
         .peer_uid()
         .ok_or_else(|| anyhow!("Missing unlock PIN peer UID"))?;
+    #[cfg(windows)]
+    let peer = {
+        let pid = stream
+            .peer_pid()
+            .ok_or_else(|| anyhow!("Missing unlock PIN peer PID"))?;
+        // Zero denotes administrative authority. Every other grant belongs to its GUI process.
+        if crate::platform::is_elevated(Some(pid))? {
+            0
+        } else {
+            pid
+        }
+    };
     let result = tokio::task::spawn_blocking(move || perform(peer, request)).await?;
     stream
         .send(&Data::UnlockPinResult(
@@ -170,7 +206,7 @@ pub(super) async fn reply(request: Request, stream: &mut Connection) -> ResultTy
         .await
 }
 
-async fn exchange(stream: &mut Connection, request: Request) -> ResultType<bool> {
+async fn exchange(stream: &mut ClientConnection, request: Request) -> ResultType<bool> {
     stream.send(&Data::UnlockPin(request)).await?;
     match stream.next_timeout(TIMEOUT_MS).await? {
         Some(Data::UnlockPinResult(result)) => result.map_err(|err| anyhow!(err)),
@@ -180,35 +216,13 @@ async fn exchange(stream: &mut Connection, request: Request) -> ResultType<bool>
     }
 }
 
-async fn unlock(stream: &mut Connection, candidate: Option<String>) -> ResultType<bool> {
-    let mut token = Token::default();
-    OsRng
-        .try_fill_bytes(&mut token)
-        .map_err(|err| anyhow!("Failed to generate PIN grant: {err}"))?;
-    let key = digest(&token);
-    let ok = match candidate {
-        Some(pin) => exchange(stream, Request::Verify(pin, Some(key))).await?,
-        None => {
-            let uid = unsafe { libc::geteuid() };
-            tokio::task::spawn_blocking(move || {
-                crate::platform::unix_approval::request("--approve-unlock-pin", uid, &key)
-            })
-            .await??;
-            exchange(stream, Request::Authorized(token)).await?
-        }
-    };
-    if ok {
-        *CLIENT.lock().unwrap() = Some(token);
-    }
-    Ok(ok)
-}
-
 #[tokio::main(flavor = "current_thread")]
 pub(crate) async fn admin_approve(uid: &str, encoded: &str) -> ResultType<()> {
-    ensure!(
-        unsafe { libc::geteuid() } == 0 && crate::platform::is_installed(),
-        "{REQUIRED}"
-    );
+    ensure!(crate::platform::is_installed(), "{REQUIRED}");
+    #[cfg(not(windows))]
+    ensure!(is_service_account(), "{REQUIRED}");
+    #[cfg(windows)]
+    ensure!(crate::platform::is_elevated(None)?, "{REQUIRED}");
     let mut key = Token::default();
     hex::decode_to_slice(encoded, &mut key)?;
     let mut stream = connect_root_service(TIMEOUT_MS).await?;
@@ -228,44 +242,6 @@ pub(super) async fn set(pin: String) -> ResultType<()> {
         "{REQUIRED}"
     );
     Ok(())
-}
-
-#[cfg(feature = "flutter")]
-#[tokio::main(flavor = "current_thread")]
-pub(crate) async fn gui_request(action: &str) -> ResultType<String> {
-    use std::io::ErrorKind::{ConnectionRefused, NotFound};
-    let mut stream = match connect_root_service(TIMEOUT_MS).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            let io = err
-                .downcast_ref::<crate::trusted_devices::authority::Unavailable>()
-                .and_then(|error| error.0.downcast_ref::<std::io::Error>());
-            if action == "unlock-method"
-                && io.is_some_and(|e| matches!(e.kind(), NotFound | ConnectionRefused))
-            {
-                return Ok("offline".into());
-            }
-            return Err(err);
-        }
-    };
-    let root = unsafe { libc::geteuid() } == 0;
-    let ok = match action {
-        "unlock-method" if root => return Ok("root".into()),
-        "unlock-method" => {
-            let configured = exchange(&mut stream, Request::Configured).await?;
-            return Ok(if configured { "pin" } else { "admin" }.into());
-        }
-        "pin-set" => exchange(&mut stream, Request::Configured).await?,
-        "admin" => root || unlock(&mut stream, None).await?,
-        _ => match action.split_once(':') {
-            Some(("pin", pin)) => unlock(&mut stream, Some(pin.to_owned())).await?,
-            Some(("check-pin", pin)) => {
-                exchange(&mut stream, Request::Verify(pin.to_owned(), None)).await?
-            }
-            _ => return Err(anyhow!("Unknown unlock PIN request")),
-        },
-    };
-    Ok(ok.to_string())
 }
 
 pub(super) mod sync_config {

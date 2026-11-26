@@ -42,6 +42,7 @@ fn pin_management_requires_the_users_own_approved_token() {
     assert!(grants.authorized(owner, &token));
 }
 
+#[cfg(not(windows))]
 #[test]
 fn pin_changes_require_the_current_console_user_or_root() {
     let uid = 1000;

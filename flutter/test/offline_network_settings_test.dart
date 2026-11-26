@@ -74,7 +74,7 @@ void main() {
     expect(await authorizeUnixSettings(networkSettings: true), isFalse);
     binding.approved = true;
     expect(await authorizeUnixSettings(networkSettings: true), isTrue);
-  }, skip: !(Platform.isLinux || Platform.isMacOS));
+  }, skip: !(Platform.isLinux || Platform.isMacOS || Platform.isWindows));
 
   test('Network approval does not unlock a locked Security page', () async {
     final binding = _SettingsBinding()
@@ -89,7 +89,7 @@ void main() {
     expect(await authorizeUnixSettings(), isTrue);
     binding.securityApproved = false;
     expect(await authorizeUnixSettings(), isFalse);
-  }, skip: !(Platform.isLinux || Platform.isMacOS));
+  }, skip: !(Platform.isLinux || Platform.isMacOS || Platform.isWindows));
 
   testWidgets(
       'offline Security settings stay locked and show the service action',
@@ -106,7 +106,7 @@ void main() {
     final action = Platform.isMacOS ? 'install_daemon_tip' : 'Start service';
     expect(find.text('Service is not running. $action'), findsOneWidget);
     await tester.pump(const Duration(seconds: 3));
-  }, skip: !(Platform.isLinux || Platform.isMacOS));
+  }, skip: !(Platform.isLinux || Platform.isMacOS || Platform.isWindows));
 
   Future<void> pumpPinDialog(
       WidgetTester tester, _SettingsBinding binding) async {

@@ -103,6 +103,7 @@ mod acl;
 pub(crate) mod installer_files;
 mod installer_handoff;
 mod installer_shell;
+pub(crate) mod unlock_pin;
 mod verified_update;
 mod msi_registry;
 pub(crate) use acl::current_process_user_sid_string;
@@ -626,10 +627,12 @@ fn resolve_expected_active_session_id_for_service(session_id: u32) -> Option<u32
 fn authorize_service_scoped_ipc_connection(
     stream: &ipc::Connection,
     expected_active_session_id: Option<u32>,
-) -> bool {
+) -> Option<unlock_pin::ServicePeer> {
     let (authorized, peer_pid, peer_session_id, peer_is_system) =
         stream.service_authorization_status_for_session(expected_active_session_id);
-    if !authorized {
+    let Some(peer) = unlock_pin::ServicePeer::authorize(authorized, || {
+        peer_pid.is_some_and(|pid| matches!(is_elevated(Some(pid)), Ok(true)))
+    }) else {
         ipc::log_rejected_windows_ipc_connection(
             crate::POSTFIX_SERVICE,
             peer_pid,
@@ -638,8 +641,8 @@ fn authorize_service_scoped_ipc_connection(
             peer_is_system,
             None,
         );
-        return false;
-    }
+        return None;
+    };
     if let Err(err) =
         ipc::ensure_peer_executable_matches_current_by_pid_opt(peer_pid, crate::POSTFIX_SERVICE)
     {
@@ -649,9 +652,9 @@ fn authorize_service_scoped_ipc_connection(
                 peer_pid,
                 err
             );
-        return false;
+        return None;
     }
-    true
+    Some(peer)
 }
 
 extern "system" {
@@ -694,6 +697,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
 
+    unlock_pin::initialize().await;
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
@@ -725,12 +729,25 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     // session_id after awaiting incoming.next().
                     let expected_active_session_id =
                         resolve_expected_active_session_id_for_service(session_id);
-                    if !authorize_service_scoped_ipc_connection(&stream, expected_active_session_id)
-                    {
+                    let Some(peer) =
+                        authorize_service_scoped_ipc_connection(&stream, expected_active_session_id)
+                    else {
                         continue;
-                    }
+                    };
                     if let Ok(Some(data)) = stream.next_timeout(1000).await {
+                        if !peer.permits(&data) {
+                            continue;
+                        }
                         match data {
+                            ipc::Data::UnlockPin(request) => {
+                                tokio::spawn(async move {
+                                    if let Err(err) =
+                                        ipc::unix_unlock_pin::reply(request, &mut stream).await
+                                    {
+                                        log::trace!("Could not reply to the service PIN request: {err}");
+                                    }
+                                });
+                            }
                             ipc::Data::Close => {
                                 log::info!("close received");
                                 break;

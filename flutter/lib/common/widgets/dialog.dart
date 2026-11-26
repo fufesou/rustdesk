@@ -2780,8 +2780,7 @@ void changeUnlockPinDialog(String? oldPin, ValueChanged<String> onSaved,
   });
 }
 
-bool get usesRootUnlockPin =>
-    !isWeb && (isLinux || isMacOS) && bind.mainIsInstalled();
+bool get usesRootUnlockPin => isDesktop && bind.mainIsInstalled();
 
 Future<String> _unixUnlockRequest(String action) async {
   final result = await bind.mainGetCommon(key: 'unix-unlock-pin:$action');
