@@ -130,12 +130,6 @@ BOOL Uninstall(LPCWSTR fullInfPath, PBOOL rebootRequired)
     ))
     {
         DWORD error = GetLastError();
-        // An installation that never used a virtual display has no staged package.
-        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_NOT_FOUND ||
-            error == ERROR_NOT_AN_INSTALLED_OEM_INF || error == ERROR_NOT_INSTALLED)
-        {
-            return TRUE;
-        }
         if (error != 0)
         {
             LPSTR errorString = formatErrorString(error);

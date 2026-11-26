@@ -1,5 +1,5 @@
 use super::installer_shell::{get_known_folder, get_system_executable};
-use hbb_common::{anyhow::Context, bail, ResultType};
+use hbb_common::{bail, ResultType};
 use sha2::{Digest, Sha256};
 use std::{fs, os::windows::process::CommandExt, path::Path, process::Command};
 use windows::Win32::{
@@ -15,14 +15,6 @@ const INF_DIGESTS: &[&str] = &[
 ];
 
 pub(crate) fn uninstall(reboot: &mut bool) -> ResultType<()> {
-    let exe = std::env::current_exe()?;
-    let source = exe
-        .parent()
-        .context("Missing executable directory")?
-        .join(r"RustDeskIddDriver\RustDeskIddDriver.inf");
-    if source.try_exists()? {
-        return virtual_display::uninstall_driver(reboot);
-    }
     let inf_dir = get_known_folder(&FOLDERID_Windows)?.join("INF");
     for package in published_packages(&inf_dir, INF_BYTES, INF_DIGESTS)? {
         let output = Command::new(get_system_executable("pnputil.exe")?)
