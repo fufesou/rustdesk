@@ -353,9 +353,10 @@ pub unsafe fn device_io_control(
         &mut bytes_returned,
         null_mut(),
     );
+    let error = (result == FALSE).then(|| DeviceError::new_api_last_err("DeviceIoControl"));
     CloseHandle(h_device);
-    if result == FALSE {
-        return Err(DeviceError::new_api_last_err("DeviceIoControl"));
+    if let Some(error) = error {
+        return Err(error);
     }
     if outbuf_max_len > 0 {
         outbuf.set_len(bytes_returned as _);

@@ -58,12 +58,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   char** c_args = rustdesk_core_main(&args_len);
   if (!c_args)
   {
-    std::string args_str = "";
-    for (const auto& argument : command_line_arguments) {
-      args_str += (argument + " ");
-    }
-    // std::cout << "RustDesk [" << args_str << "], core returns false, exiting without launching Flutter app." << std::endl;
-    return EXIT_SUCCESS;
+    // A negative argument count carries a command failure from the Rust entry point.
+    return args_len < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
   }
   std::vector<std::string> rust_args(c_args, c_args + args_len);
   free_c_args(c_args, args_len);

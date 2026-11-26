@@ -107,6 +107,27 @@ set(RUSTDESK_LIB "../../target/${RUSTDESK_LIB_BUILD_TYPE}/librustdesk.dll")
 install(FILES "${RUSTDESK_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 COMPONENT Runtime RENAME librustdesk.dll)
 
+string(TOLOWER "${CMAKE_VS_PLATFORM_NAME}" IDD_ARCH)
+if(IDD_ARCH MATCHES "^(x64|arm64)$")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(IDD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../../res/windows_idd.py")
+  set(IDD_STAGE "${CMAKE_CURRENT_BINARY_DIR}/idd-${IDD_ARCH}")
+  set(IDD_READY "${IDD_STAGE}/ready")
+  set(IDD_PAYLOAD RustDeskIddDriver.inf RustDeskIddDriver.dll rustdeskidddriver.cat
+    RustDeskIddDriver.cer vc_redist.${IDD_ARCH}.exe README.md)
+  list(TRANSFORM IDD_PAYLOAD PREPEND "${IDD_STAGE}/RustDeskIddDriver/")
+  add_custom_command(OUTPUT "${IDD_READY}" ${IDD_PAYLOAD}
+    COMMAND "${Python3_EXECUTABLE}" "${IDD_SCRIPT}" "${IDD_ARCH}" "${IDD_STAGE}"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${IDD_READY}"
+    DEPENDS "${IDD_SCRIPT}" VERBATIM)
+  add_custom_target(rustdesk_idd_package DEPENDS "${IDD_READY}" ${IDD_PAYLOAD})
+  add_dependencies(${BINARY_NAME} rustdesk_idd_package)
+  install(FILES ${IDD_PAYLOAD}
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}/RustDeskIddDriver" COMPONENT Runtime)
+  install(FILES "../../target/${RUSTDESK_LIB_BUILD_TYPE}/deps/dylib_virtual_display.dll"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+endif()
+
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.
 set(FLUTTER_ASSET_DIR_NAME "flutter_assets")

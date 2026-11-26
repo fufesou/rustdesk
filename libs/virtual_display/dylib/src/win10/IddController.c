@@ -130,6 +130,12 @@ BOOL Uninstall(LPCWSTR fullInfPath, PBOOL rebootRequired)
     ))
     {
         DWORD error = GetLastError();
+        // An installation that never used a virtual display has no staged package.
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_NOT_FOUND ||
+            error == ERROR_NOT_AN_INSTALLED_OEM_INF || error == ERROR_NOT_INSTALLED)
+        {
+            return TRUE;
+        }
         if (error != 0)
         {
             LPSTR errorString = formatErrorString(error);
@@ -295,6 +301,7 @@ BOOL DeviceCreateWithLifetime(SW_DEVICE_LIFETIME *lifetime, PHSWDEVICE hSwDevice
     {
         LPSTR errorString = formatErrorString((DWORD)hr);
         SetLastMsg("Failed DeviceCreate SwDeviceCreate, hresult 0x%lx, %s", hr, errorString == NULL ? "(NULL)\n" : errorString);
+        CloseHandle(hEvent);
         if (errorString != NULL)
         {
             LocalFree(errorString);
@@ -310,6 +317,13 @@ BOOL DeviceCreateWithLifetime(SW_DEVICE_LIFETIME *lifetime, PHSWDEVICE hSwDevice
     // Wait for callback to signal that the device has been created
     printf("Waiting for device to be created....\n");
     DWORD waitResult = WaitForSingleObject(hEvent, 10 * 1000);
+    DWORD waitError = waitResult == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    if (waitResult != WAIT_OBJECT_0 || FAILED(callbackContext.hrCreateResult))
+    {
+        // SwDeviceClose drains creation callbacks before their context and event go away.
+        SwDeviceClose(*hSwDevice);
+        *hSwDevice = NULL;
+    }
     CloseHandle(hEvent);
     if (waitResult != WAIT_OBJECT_0)
     {
@@ -324,7 +338,7 @@ BOOL DeviceCreateWithLifetime(SW_DEVICE_LIFETIME *lifetime, PHSWDEVICE hSwDevice
                 SetLastMsg("Failed DeviceCreate wait for device creation 0x%d, WAIT_TIMEOUT\n", waitResult);
                 break;
             default:
-                error = GetLastError();
+                error = waitError;
                 if (error != 0)
                 {
                     errorString = formatErrorString(error);

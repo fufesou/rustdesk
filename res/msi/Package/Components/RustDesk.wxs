@@ -30,6 +30,7 @@
 		<CustomAction Id="SetPropertyServiceStop.SetParam.PropertyName" Return="check" Property="PropertyName" Value="STOP_SERVICE" />
 		<CustomAction Id="TryDeleteStartupShortcut.SetParam" Return="check" Property="ShortcutName" Value="$(var.Product) Tray" />
 		<CustomAction Id="RemoveAmyuniIdd.SetParam" Return="check" Property="RemoveAmyuniIdd" Value="[INSTALLFOLDER_INNER]" />
+		<CustomAction Id="RemoveRustDeskIdd" FileRef="App.exe" ExeCommand="--uninstall-rustdesk-idd" Execute="deferred" Impersonate="no" Return="check" />
 		<!-- The app name comes first and is separated by '|', which cannot occur in a
 		     Windows path nor in a validated app name. wcautil's own delimiter is a
 		     literal wide char 128 that a Formatted value cannot carry, and [~] is
@@ -86,7 +87,7 @@
 
 			<Custom Action="RemoveRuntimeGeneratedFiles" Before="RemoveFiles" Condition="Installed AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)"/>
 			<Custom Action="RemoveRuntimeGeneratedFiles.SetParam" Before="RemoveRuntimeGeneratedFiles" Condition="Installed AND (REMOVE=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE)"/>
-			<Custom Action="TryStopDeleteService" Before="RemoveRuntimeGeneratedFiles.SetParam" />
+			<Custom Action="TryStopDeleteService" Before="RemoveRustDeskIdd" />
 			<Custom Action="TryStopDeleteService.SetParam" Before="TryStopDeleteService" />
 
 			<Custom Action="RemoveFirewallRules" Before="RemoveFiles"/>
@@ -100,6 +101,7 @@
 			<Custom Action="TerminateBrokers" Before="RemoveRuntimeGeneratedFiles"/>
 			<Custom Action="TerminateBrokers.SetParam" Before="TerminateBrokers"/>
 			<Custom Action="RemoveAmyuniIdd" Before="RemoveRuntimeGeneratedFiles"/>
+			<Custom Action="RemoveRustDeskIdd" Before="RemoveRuntimeGeneratedFiles.SetParam" Condition="Installed AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
 			<Custom Action="RemoveAmyuniIdd.SetParam" Before="RemoveAmyuniIdd"/>
 		</InstallExecuteSequence>
 

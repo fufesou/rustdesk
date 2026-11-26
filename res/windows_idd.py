@@ -1,6 +1,7 @@
 import hashlib
 import io
 import shutil
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -23,12 +24,16 @@ def stage_rustdesk_idd(arch, output_dir):
         raise ValueError(f'SHA-256 mismatch for {filename}')
 
     driver_dir = Path(output_dir) / 'RustDeskIddDriver'
-    driver_dir.mkdir(exist_ok=True)
+    driver_dir.mkdir(parents=True, exist_ok=True)
     members = ('RustDeskIddDriver/RustDeskIddDriver.inf',
                'RustDeskIddDriver/RustDeskIddDriver.dll',
                'RustDeskIddDriver/rustdeskidddriver.cat',
-               'RustDeskIddDriver.cer', f'vc_redist.{arch}.exe')
+               'RustDeskIddDriver.cer', f'vc_redist.{arch}.exe', 'README.md')
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         for member in members:
             with archive.open(member) as source, (driver_dir / Path(member).name).open('wb') as dest:
                 shutil.copyfileobj(source, dest)
+
+
+if __name__ == '__main__':
+    stage_rustdesk_idd(*sys.argv[1:])

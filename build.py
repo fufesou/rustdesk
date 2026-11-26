@@ -864,8 +864,6 @@ def build_flutter_arch_manjaro(version, features):
 
 
 def build_flutter_windows(version, features, skip_portable_pack):
-    from res.windows_idd import stage_rustdesk_idd
-
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
         if not os.path.exists("target/release/librustdesk.dll"):
@@ -874,9 +872,6 @@ def build_flutter_windows(version, features, skip_portable_pack):
     os.chdir('flutter')
     system2('flutter build windows --release')
     os.chdir('..')
-    shutil.copy2('target/release/deps/dylib_virtual_display.dll',
-                 flutter_build_dir_2)
-    stage_rustdesk_idd(win_arch, flutter_build_dir_2)
     if skip_portable_pack:
         return
     os.chdir('libs/portable')
@@ -935,11 +930,9 @@ def main():
     res_dir = 'resources'
     external_resources(flutter, args, res_dir)
     if windows:
-        # build virtual display dynamic library
-        os.chdir('libs/virtual_display/dylib')
-        system2('cargo build --locked --release')
-        os.chdir('../../..')
-
+        if not flutter or skip_cargo:
+            # A Flutter core build already produces the matching controller DLL.
+            system2('cargo build --locked --release -p dylib_virtual_display')
         if flutter:
             build_flutter_windows(version, features, args.skip_portable_pack)
             return

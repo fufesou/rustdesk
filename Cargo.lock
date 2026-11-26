@@ -7089,6 +7089,7 @@ dependencies = [
  "default-net",
  "dispatch",
  "docopt",
+ "dylib_virtual_display",
  "enigo",
  "errno",
  "evdev",

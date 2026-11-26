@@ -249,13 +249,12 @@ impl PrivacyModeImpl {
         }
     }
 
-    fn restore_plug_out_monitor(&mut self) {
-        let _ = virtual_display_manager::plug_out_monitor_indices(
-            &self.virtual_displays_added,
+    fn restore_plug_out_monitor(&mut self) -> ResultType<()> {
+        virtual_display_manager::plug_out_monitor_indices(
+            &std::mem::take(&mut self.virtual_displays_added),
             true,
             false,
-        );
-        self.virtual_displays_added.clear();
+        )
     }
 
     #[inline]
@@ -508,7 +507,11 @@ impl PrivacyModeImpl {
         self.virtual_displays.clear();
         let is_virtual_display_added = self.virtual_displays_added.len() > 0;
         if is_virtual_display_added {
-            self.restore_plug_out_monitor();
+            if let Err(error) = self.restore_plug_out_monitor() {
+                log::error!(
+                    "Privacy mode restored displays but failed to unplug its monitor: {error:#}"
+                );
+            }
         } else if virtual_display_manager::is_amyuni_idd() {
             // https://github.com/rustdesk/rustdesk/pull/12114#issuecomment-2983054370
             // No virtual displays added, we need to change the display combination to force the display settings to be reloaded.

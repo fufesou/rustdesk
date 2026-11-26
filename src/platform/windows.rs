@@ -1905,14 +1905,9 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
 /// - `kill_self`: The command will kill the process of current app name. If `true`, it will kill
 ///   the current process as well. If `false`, it will exclude the current process from the kill
 ///   command.
-/// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
-///
-/// # Details
-/// The `uninstall_printer` parameter determines whether the command to uninstall the remote printer
-/// is included in the generated uninstall script. If `uninstall_printer` is `false`, the printer
-/// related command is omitted from the script.
-fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String> {
-    let (subkey, path, start_menu, _) = get_install_info();
+/// - `uninstall_drivers`: Remove the printer and bundled RustDesk IDD on full uninstall.
+fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String> {
+    let (subkey, path, start_menu, installed_exe) = get_install_info();
     let installer_state = get_windows_installer_state(&subkey)?;
     if let Some(product_code) = get_msi_product_code(&subkey, installer_state)? {
         return Ok(build_msi_uninstall_command(&product_code));
@@ -1926,14 +1921,25 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String>
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_path) = exe.to_str() {
             uninstall_cert_cmd = format!("\"{}\" --uninstall-cert", exe_path);
-            if uninstall_printer {
+            if uninstall_drivers {
                 uninstall_printer_cmd = format!("\"{}\" --uninstall-remote-printer", &exe_path);
             }
         }
     }
+    let uninstall_idd = if uninstall_drivers && !crate::virtual_display_manager::is_amyuni_idd() {
+        format!(
+            r#"if exist "{path}\RustDeskIddDriver\RustDeskIddDriver.inf" (
+        "{installed_exe}" --uninstall-rustdesk-idd
+        if errorlevel 1 exit /b 1
+    )"#
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
         "
     {before_uninstall}
+    {uninstall_idd}
     {uninstall_printer_cmd}
     {uninstall_cert_cmd}
     reg delete {subkey} /f
@@ -3131,6 +3137,7 @@ fn str_to_device_name(name: &str) -> [u16; 32] {
 pub fn resolutions(name: &str) -> Vec<Resolution> {
     unsafe {
         let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as _;
         let mut v = vec![];
         let mut num = 0;
         let device_name = str_to_device_name(name);

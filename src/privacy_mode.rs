@@ -255,15 +255,61 @@ pub fn prepare_virtual_display(
     Ok(Some(rx))
 }
 
+#[cfg(windows)]
+fn with_virtual_display_privacy<T>(operation: impl FnOnce(bool) -> T) -> T {
+    if crate::virtual_display_manager::is_amyuni_idd() {
+        return operation(false);
+    }
+    // Keep the privacy topology stable until the requested display operation finishes.
+    let mode = PRIVACY_MODE.lock().unwrap();
+    let private = mode.as_ref().is_some_and(|m| {
+        m.get_impl_key() == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
+            && m.pre_conn_id() != INVALID_PRIVACY_MODE_CONN_ID
+    });
+    operation(private)
+}
+
+#[cfg(windows)]
+pub(crate) fn change_virtual_display_resolution(name: &str, size: (u32, u32)) -> ResultType<bool> {
+    with_virtual_display_privacy(|private| {
+        crate::virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
+            name, size, private,
+        )
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn toggle_virtual_display(index: i32, on: bool) -> ResultType<()> {
+    with_virtual_display_privacy(|private| {
+        if private {
+            bail!("Turn off privacy mode before adding or removing virtual displays");
+        }
+        if on {
+            crate::virtual_display_manager::plug_in_monitor(index as _, Vec::new())
+        } else {
+            crate::virtual_display_manager::plug_out_monitor(index, false, true)
+        }
+    })
+}
+
 pub async fn turn_on_privacy(
     impl_key: &str,
     conn_id: i32,
     #[cfg(windows)] prepared_display: Option<u32>,
 ) -> Option<ResultType<bool>> {
     #[cfg(windows)]
-    if get_supported_impl(impl_key) == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
-        && crate::virtual_display_manager::is_amyuni_idd()
-    {
+    if get_supported_impl(impl_key) == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY {
+        if !crate::virtual_display_manager::is_amyuni_idd() {
+            let impl_key = impl_key.to_owned();
+            return match hbb_common::tokio::task::spawn_blocking(move || {
+                turn_on_privacy_sync(&impl_key, conn_id, prepared_display)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Some(Err(error.into())),
+            };
+        }
         return turn_on_privacy_async(impl_key.to_string(), conn_id, prepared_display).await;
     }
     if is_async_privacy_mode() {

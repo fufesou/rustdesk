@@ -333,6 +333,22 @@ pub fn core_main() -> Option<CoreMainAction> {
                     _is_run_as_system,
                 );
                 return None;
+            } else if args[0] == "--uninstall-rustdesk-idd" {
+                #[cfg(windows)]
+                if !crate::virtual_display_manager::is_amyuni_idd()
+                    && crate::virtual_display_manager::is_virtual_display_supported()
+                {
+                    let mut reboot = false;
+                    if let Err(error) = virtual_display::uninstall_driver(&mut reboot) {
+                        return Some(CoreMainAction::ExitFailure(error));
+                    }
+                    if reboot {
+                        hbb_common::log::warn!(
+                            "Restart Windows to finish uninstalling RustDesk IDD"
+                        );
+                    }
+                }
+                return None;
             } else if args[0] == "--uninstall-amyuni-idd" {
                 #[cfg(windows)]
                 hbb_common::allow_err!(
