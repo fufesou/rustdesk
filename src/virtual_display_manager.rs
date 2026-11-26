@@ -22,15 +22,6 @@ pub fn is_amyuni_idd() -> bool {
     IDD_IMPL == IDD_IMPL_AMYUNI
 }
 
-pub(crate) async fn run_display_operation<T: Send + 'static>(
-    operation: impl FnOnce() -> ResultType<T> + Send + 'static,
-) -> ResultType<T> {
-    if is_amyuni_idd() {
-        return operation();
-    }
-    hbb_common::tokio::task::spawn_blocking(operation).await?
-}
-
 pub fn get_cur_device_string() -> &'static str {
     match IDD_IMPL {
         IDD_IMPL_RUSTDESK => RUSTDESK_IDD_DEVICE_STRING,
@@ -89,7 +80,8 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
 pub(crate) fn use_anonymous_display_controls(additions: &mut String) -> ResultType<()> {
     let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(additions)?;
     if map.get("idd_impl").and_then(|v| v.as_str()) == Some(IDD_IMPL_RUSTDESK) {
-        let count = map.remove("rustdesk_virtual_displays")
+        let count = map
+            .remove("rustdesk_virtual_displays")
             .and_then(|v| v.as_array().map(Vec::len))
             .unwrap_or_default();
         map.insert("idd_impl".into(), serde_json::json!(IDD_IMPL_AMYUNI));
