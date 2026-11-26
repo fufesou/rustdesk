@@ -123,6 +123,45 @@ impl ParsedPeerInfo {
     }
 }
 
+fn migrate_virtual_displays(saved: &str) -> Option<String> {
+    let mut indices: Vec<i32> = saved.split(',').filter_map(|s| s.parse().ok()).collect();
+    let anonymous = indices.iter().filter(|&&i| i == 0).count();
+    if anonymous == 0 {
+        return None;
+    }
+    indices.retain(|&i| i != 0);
+    const PEER_CONNECTORS: std::ops::RangeInclusive<i32> = 1..=4;
+    let available: Vec<_> = PEER_CONNECTORS
+        .filter(|i| !indices.contains(i))
+        .take(anonymous)
+        .collect();
+    indices.extend(available);
+    indices.sort_unstable();
+    Some(
+        indices
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+#[cfg(test)]
+mod virtual_display_tests {
+    #[test]
+    fn reconnect_assigns_legacy_displays_around_saved_connectors() {
+        assert_eq!(
+            super::migrate_virtual_displays(",0,2,0").as_deref(),
+            Some("1,2,3")
+        );
+        assert_eq!(
+            super::migrate_virtual_displays(",0,0").as_deref(),
+            Some("1,2")
+        );
+        assert_eq!(super::migrate_virtual_displays("1,2"), None);
+    }
+}
+
 impl<T: InvokeUiSession> Remote<T> {
     pub fn new(
         handler: Session<T>,
@@ -1483,8 +1522,19 @@ impl<T: InvokeUiSession> Remote<T> {
         if !self.peer_info.is_support_virtual_display() {
             return;
         }
-        let lc = self.handler.lc.read().unwrap();
-        let displays = lc.get_option("virtual-display");
+        let displays = {
+            let mut lc = self.handler.lc.write().unwrap();
+            let saved = lc.get_option("virtual-display");
+            let migrated = (self.peer_info.idd_impl == "rustdesk_idd")
+                .then(|| migrate_virtual_displays(&saved))
+                .flatten();
+            if let Some(displays) = migrated {
+                lc.set_option("virtual-display".into(), displays.clone());
+                displays
+            } else {
+                saved
+            }
+        };
         for d in displays.split(',') {
             if let Ok(index) = d.parse::<i32>() {
                 let mut misc = Misc::new();
