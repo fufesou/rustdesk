@@ -6,7 +6,14 @@ use hbb_common::{bail, ResultType};
 pub const RUSTDESK_IDD_DEVICE_STRING: &'static str = "RustDeskIddDriver Device\0";
 pub const AMYUNI_IDD_DEVICE_STRING: &'static str = "USB Mobile Monitor Virtual Display\0";
 
-const IDD_IMPL: &str = IDD_IMPL_AMYUNI;
+const IDD_IMPL: &str = if cfg!(all(
+    feature = "flutter",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)) {
+    IDD_IMPL_RUSTDESK
+} else {
+    IDD_IMPL_AMYUNI
+};
 const IDD_IMPL_RUSTDESK: &str = "rustdesk_idd";
 const IDD_IMPL_AMYUNI: &str = "amyuni_idd";
 const IDD_PLUG_OUT_ALL_INDEX: i32 = -1;
@@ -284,7 +291,7 @@ pub mod rustdesk_idd {
     }
 
     pub fn reset_all() -> ResultType<()> {
-        if super::is_virtual_display_supported() {
+        if !super::is_virtual_display_supported() {
             return Ok(());
         }
 
@@ -350,13 +357,16 @@ pub mod rustdesk_idd {
         false
     }
 
-    fn change_resolution(index: u32, w: u32, h: u32) -> bool {
+    fn change_resolution(index: u32, name: &str, (w, h): (u32, u32)) -> bool {
         let modes = [virtual_display::MonitorMode {
             width: w,
             height: h,
             sync: 60,
         }];
-        match virtual_display::update_monitor_modes(index, &modes) {
+        // The IDD publishes the target timings in place. Windows selects the desktop mode.
+        match virtual_display::update_monitor_modes(index, &modes)
+            .and_then(|()| crate::platform::change_resolution(name, w as _, h as _))
+        {
             Ok(_) => true,
             Err(e) => {
                 log::error!("Update monitor {} modes {:?} failed: {}", index, &modes, e);
@@ -369,13 +379,13 @@ pub mod rustdesk_idd {
         let lock = VIRTUAL_DISPLAY_MANAGER.lock().unwrap();
         if let Some((index, device_name)) = &lock.headless_index_name {
             if windows::is_device_name(device_name, name) {
-                return Some(change_resolution(*index, w, h));
+                return Some(change_resolution(*index, name, (w, h)));
             }
         }
 
         for (k, v) in lock.peer_index_name.iter() {
             if windows::is_device_name(v, name) {
-                return Some(change_resolution(*k, w, h));
+                return Some(change_resolution(*k, name, (w, h)));
             }
         }
         None

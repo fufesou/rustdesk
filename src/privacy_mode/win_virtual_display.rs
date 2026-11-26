@@ -509,7 +509,7 @@ impl PrivacyModeImpl {
         let is_virtual_display_added = self.virtual_displays_added.len() > 0;
         if is_virtual_display_added {
             self.restore_plug_out_monitor();
-        } else {
+        } else if virtual_display_manager::is_amyuni_idd() {
             // https://github.com/rustdesk/rustdesk/pull/12114#issuecomment-2983054370
             // No virtual displays added, we need to change the display combination to force the display settings to be reloaded.
             // This function changes the user behavior of the virtual displays.
@@ -700,7 +700,14 @@ mod tests {
 
     #[test]
     fn privacy_mode_checks_active_displays() {
-        let virtual_name = virtual_display_manager::get_cur_device_string();
+        let virtual_name = if cfg!(all(
+            feature = "flutter",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
+            virtual_display_manager::RUSTDESK_IDD_DEVICE_STRING
+        } else {
+            virtual_display_manager::AMYUNI_IDD_DEVICE_STRING
+        };
         let active = DISPLAY_DEVICE_ACTIVE;
         let mirror = active | DISPLAY_DEVICE_MIRRORING_DRIVER;
         for (devices, expected) in [

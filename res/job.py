@@ -257,6 +257,11 @@ def sign_files(dir_path, only_ext=None):
     for root, dirs, files in os.walk(dir_path):
         is_signed_dir = "RustDeskPrinterDriver" in root or "usbmmidd_v2" in root
         for file in files:
+            # Keep the catalog-covered display driver and Microsoft's redistributable intact.
+            if os.path.basename(root) == "RustDeskIddDriver" and file in (
+                "RustDeskIddDriver.dll", "vc_redist.x64.exe", "vc_redist.arm64.exe"
+            ):
+                continue
             file_path = os.path.join(root, file)
             _, ext = os.path.splitext(file_path)
             # only sign the exe files in signed dirs

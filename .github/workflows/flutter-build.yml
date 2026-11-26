@@ -336,14 +336,8 @@ jobs:
           # Windows: build RustDesk
           # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
           python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
-
-          # Download usbmmidd_v2.zip and extract it to ./rustdesk
-          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
-          Expand-Archive usbmmidd_v2.zip -DestinationPath .
-          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
-          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
-          mv -Force .\usbmmidd_v2 ./rustdesk
 
           # Download printer driver files and extract them to ./rustdesk
           try {
@@ -437,7 +431,7 @@ jobs:
         shell: powershell
         run: |
           Get-ChildItem ./rustdesk -Recurse -File -ErrorAction Stop |
-            Where-Object { $_.Extension -eq '.exe' -or ($_.Extension -eq '.dll' -and $_.FullName -notmatch 'RustDeskPrinterDriver|usbmmidd_v2') } |
+            Where-Object { $_.Extension -eq '.exe' -or ($_.Extension -eq '.dll' -and $_.FullName -notmatch 'RustDeskPrinterDriver|\\RustDeskIddDriver\\RustDeskIddDriver\.dll$') } |
             ForEach-Object {
               $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName -ErrorAction Stop
               if ($signature.Status -ne 'Valid') { throw "Invalid template payload signature: $($_.FullName) ($($signature.Status))" }
