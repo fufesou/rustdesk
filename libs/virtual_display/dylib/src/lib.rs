@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod msi;
+#[cfg(windows)]
 pub mod win10;
 use hbb_common::ResultType;
 #[cfg(windows)]
