@@ -507,7 +507,12 @@ mod tests {
     #[test]
     fn rustdesk_idd_control_can_open_an_interface_already_open_for_query() {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let held = std::fs::File::create_new(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
         let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         // A regular file rejects this command after the second open succeeds.
         let result = unsafe { device_io_control_by_path(&wide, 0, &[], 0) };
