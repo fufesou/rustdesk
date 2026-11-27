@@ -3,6 +3,7 @@ use crate::virtual_display_manager::rustdesk_idd::display_target::{
     configuration, path_target, source_name, Configuration, Target,
 };
 use hbb_common::{anyhow::Context, bail, ResultType};
+use winapi::um::wingdi::DISPLAYCONFIG_PATH_ACTIVE;
 use windows::Win32::Devices::Display::{
     SetDisplayConfig, DISPLAYCONFIG_PATH_INFO, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
     SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
@@ -56,13 +57,11 @@ impl RestoreLayout {
             bail!("No physical display is connected; keeping the privacy display");
         }
         self.apply(&available)?;
-        let (active, _) = configuration(QDC_ONLY_ACTIVE_PATHS)?
+        let (current, _) = configuration(QDC_ALL_PATHS)?
             .context("Display topology changed after restoring privacy mode")?;
-        let missing = self.physical.iter().any(|t| {
-            available.iter().any(|p| path_target(p) == *t)
-                && !active.iter().any(|p| path_target(p) == *t)
-        });
-        if missing || !super::has_active_physical_display() {
+        if !connected_targets_restored(&self.physical, &current)
+            || !super::has_active_physical_display()
+        {
             bail!("Windows has not restored the connected physical desktop");
         }
         Ok(())
@@ -98,6 +97,16 @@ impl RestoreLayout {
     }
 }
 
+fn connected_targets_restored(saved: &[Target], current: &[DISPLAYCONFIG_PATH_INFO]) -> bool {
+    saved.iter().all(|target| {
+        let mut paths = current.iter().filter(|p| path_target(p) == *target);
+        !paths
+            .clone()
+            .any(|p| p.targetInfo.targetAvailable.as_bool())
+            || paths.any(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+    })
+}
+
 fn connected_topology(available: &[DISPLAYCONFIG_PATH_INFO]) -> SET_DISPLAY_CONFIG_FLAGS {
     if available
         .windows(2)
@@ -125,6 +134,20 @@ fn paths_still_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_restore_accepts_an_unplugged_monitor_but_requires_a_connected_one() {
+        let mut laptop = DISPLAYCONFIG_PATH_INFO::default();
+        laptop.flags = DISPLAYCONFIG_PATH_ACTIVE;
+        laptop.targetInfo.targetAvailable = true.into();
+        let mut dock = DISPLAYCONFIG_PATH_INFO::default();
+        dock.targetInfo.id = 1;
+        let saved = [path_target(&laptop), path_target(&dock)];
+
+        assert!(connected_targets_restored(&saved, &[laptop, dock]));
+        dock.targetInfo.targetAvailable = true.into();
+        assert!(!connected_targets_restored(&saved, &[laptop, dock]));
+    }
 
     #[test]
     fn restore_layout_selects_windows_extend_after_undocking_or_reassigning_a_source() {
