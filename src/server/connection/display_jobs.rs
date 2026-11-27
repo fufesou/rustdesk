@@ -1,4 +1,5 @@
 use super::{display_service, ConnInner, Connection, Subscriber};
+use crate::virtual_display_manager::rustdesk_idd::ResolutionControl;
 use base::message_proto::{DisplayInfo, Message, MessageBox};
 use hbb_common::{
     anyhow::anyhow,
@@ -70,15 +71,19 @@ impl DisplayJobs {
 
     pub(super) fn resolution_request(
         &mut self,
-        change: impl FnOnce(bool) -> ResultType<()> + Send + 'static,
+        change: impl FnOnce(&ResolutionControl) -> ResultType<()> + Send + 'static,
     ) -> impl FnOnce() -> ResultType<()> + Send + 'static {
         let permission = Arc::downgrade(self.resolutions.get_or_insert_with(Arc::default));
         move || {
-            crate::privacy_mode::with_virtual_display_privacy(|private| {
-                if permission.strong_count() == 0 {
+            crate::privacy_mode::with_virtual_display_privacy(|privacy_active| {
+                let control = ResolutionControl {
+                    keyboard: permission,
+                    privacy_active,
+                };
+                if !control.is_allowed() {
                     return Ok(());
                 }
-                change(private)
+                change(&control)
             })
         }
     }

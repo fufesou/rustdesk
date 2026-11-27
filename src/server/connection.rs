@@ -4952,8 +4952,8 @@ impl Connection {
             let Some(display) = display_service::get_display_info(display_idx) else {
                 return;
             };
-            let change = self.display_jobs.resolution_request(move |private| {
-                Self::apply_display_resolution(display_idx, size, Some((&display.name, private)))
+            let change = self.display_jobs.resolution_request(move |control| {
+                Self::apply_display_resolution(display_idx, size, Some((&display.name, control)))
                     .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
             });
             self.dispatch_display(change);
@@ -4966,9 +4966,19 @@ impl Connection {
     fn apply_display_resolution(
         display_idx: usize,
         (width, height): (i32, i32),
-        #[cfg(windows)] requested_display: Option<(&str, bool)>,
+        #[cfg(windows)] requested_display: Option<(
+            &str,
+            &virtual_display_manager::rustdesk_idd::ResolutionControl,
+        )>,
     ) -> ResultType<()> {
-        let Ok(displays) = display_service::try_get_displays() else {
+        #[cfg(windows)]
+        let displays = match requested_display {
+            Some(_) => Ok(scrap::Display::all()?),
+            None => display_service::try_get_displays(),
+        };
+        #[cfg(not(windows))]
+        let displays = display_service::try_get_displays();
+        let Ok(displays) = displays else {
             return Ok(());
         };
         let display = displays.get(display_idx);
@@ -4985,12 +4995,13 @@ impl Connection {
         };
         let name = display.name();
         #[cfg(windows)]
-        if let Some((_, private)) = requested_display {
+        if let Some((_, control)) = requested_display {
             if virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
                 &name,
                 (width as _, height as _),
-                private,
-            )? {
+                control,
+            )? || !control.is_allowed()
+            {
                 return Ok(());
             }
         }

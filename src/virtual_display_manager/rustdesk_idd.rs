@@ -13,7 +13,7 @@ use hbb_common::{
 use profile::Profile;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use virtual_display::MonitorMode;
 
@@ -222,13 +222,27 @@ pub fn is_virtual_display(name: &str) -> bool {
         .any(|m| m.matches_source(name, false))
 }
 
+pub(crate) struct ResolutionControl {
+    pub(crate) keyboard: Weak<()>,
+    pub(crate) privacy_active: bool,
+}
+
+impl ResolutionControl {
+    pub(crate) fn is_allowed(&self) -> bool {
+        self.keyboard.strong_count() != 0
+    }
+}
+
 pub(crate) fn change_resolution_if_is_virtual_display(
     name: &str,
     (w, h): (u32, u32),
-    privacy_active: bool,
+    control: &ResolutionControl,
 ) -> ResultType<bool> {
     let requested_name = name.trim_end_matches('\0');
     update(|manager| {
+        if !control.is_allowed() {
+            return Ok(true);
+        }
         let Some((index, monitor)) = manager
             .monitors
             .iter_mut()
@@ -247,11 +261,15 @@ pub(crate) fn change_resolution_if_is_virtual_display(
         if (current.width as u32, current.height as u32) == (w, h) {
             return Ok(true);
         }
-        if profile::supports_resolution(&current_name, (w, h)) {
+        let supported = profile::supports_resolution(&current_name, (w, h));
+        if !control.is_allowed() {
+            return Ok(true);
+        }
+        if supported {
             crate::platform::change_resolution(&current_name, w as _, h as _)?;
             return Ok(true);
         }
-        if privacy_active {
+        if control.privacy_active {
             bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
         }
         // Even a failed replacement can recreate the old mode under a new GDI name.
@@ -268,7 +286,9 @@ pub(crate) fn change_resolution_if_is_virtual_display(
         }
         let active = monitor.profile.wait_for_source(Some((w, h)))?;
         monitor.name = Some(active.clone());
-        crate::platform::change_resolution(&active, w as _, h as _)?;
+        if control.is_allowed() {
+            crate::platform::change_resolution(&active, w as _, h as _)?;
+        }
         Ok(true)
     })
 }
