@@ -207,7 +207,7 @@ impl Connection {
             self.on_close("privacy mode", false).await;
             return false;
         }
-        if !self.send_authorized_login_response().await {
+        if !self.check_trusted_device().await || !self.send_authorized_login_response().await {
             return false;
         }
         for msg in self.display_jobs.take_before_login() {
