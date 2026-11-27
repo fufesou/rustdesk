@@ -89,7 +89,11 @@ fn has_active_physical_display() -> bool {
 fn notify_privacy_mode_exit<'a>(
     connections: impl IntoIterator<Item = (i32, &'a UnboundedSender<crate::ipc::Data>)>,
     owner_id: i32,
+    notified: &mut bool,
 ) -> ResultType<()> {
+    if *notified {
+        return Ok(());
+    }
     let Some((_, sender)) = connections
         .into_iter()
         .find(|(conn_id, _)| *conn_id == owner_id)
@@ -101,6 +105,7 @@ fn notify_privacy_mode_exit<'a>(
         PrivacyModeState::OffUnknown,
         PRIVACY_MODE_IMPL.to_owned(),
     )))?;
+    *notified = true;
     Ok(())
 }
 
@@ -130,7 +135,7 @@ pub fn check_privacy_mode() {
         return;
     };
 
-    let cleanup = privacy_mode.turn_off_privacy(conn_id, None);
+    let cleanup = privacy_mode.turn_off_privacy(conn_id, Some(PrivacyModeState::OffUnknown));
     if !virtual_display_manager::is_amyuni_idd()
         && cleanup
             .as_ref()
@@ -145,22 +150,10 @@ pub fn check_privacy_mode() {
             );
         }
     }
-    // The connection manager may be absent; notify the owner through its server channel.
-    let notification = {
-        let connections = crate::server::AUTHED_CONNS.lock().unwrap();
-        notify_privacy_mode_exit(
-            connections.iter().map(|conn| (conn.conn_id, &conn.sender)),
-            conn_id,
-        )
-    };
     hbb_common::throttled_log!(
         STATE_CHECK_LOG_INTERVAL,
         error,
-        "Privacy mode is no longer active: {}; conn_id: {}; cleanup: {:?}; notification: {:?}",
-        error,
-        conn_id,
-        cleanup,
-        notification
+        "Privacy mode is no longer active: {error}; conn_id: {conn_id}; cleanup: {cleanup:?}"
     );
 }
 
@@ -182,6 +175,7 @@ impl std::fmt::Display for PrivacyDisplayCleanup {
 pub struct PrivacyModeImpl {
     impl_key: String,
     session: Session,
+    loss_notified: bool,
     displays: Vec<Display>,
     virtual_displays: Vec<Display>,
     virtual_displays_added: Vec<u32>,
@@ -222,10 +216,27 @@ impl PrivacyModeImpl {
         Self {
             impl_key: impl_key.to_owned(),
             session: Session::Off,
+            loss_notified: false,
             displays: Vec::new(),
             virtual_displays: Vec::new(),
             virtual_displays_added: Vec::new(),
             saved_layout: None,
+        }
+    }
+
+    fn notify_owner_of_loss(&mut self, owner: i32) {
+        // The connection manager may be absent. Send directly to the owner.
+        let connections = crate::server::AUTHED_CONNS.lock().unwrap();
+        if let Err(error) = notify_privacy_mode_exit(
+            connections.iter().map(|conn| (conn.conn_id, &conn.sender)),
+            owner,
+            &mut self.loss_notified,
+        ) {
+            hbb_common::throttled_log!(
+                STATE_CHECK_LOG_INTERVAL,
+                error,
+                "Cannot notify privacy mode owner: {error:#}"
+            );
         }
     }
 
@@ -647,6 +658,7 @@ impl PrivacyMode for PrivacyModeImpl {
             log::debug!("Privacy mode of conn {} is already on", conn_id);
             return Ok(true);
         }
+        self.loss_notified = false;
         self.set_displays();
         if self.displays.is_empty() {
             if !virtual_display_manager::is_amyuni_idd() {
@@ -717,6 +729,13 @@ impl PrivacyMode for PrivacyModeImpl {
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
         let owner = self.session.owner();
+        let state = match state {
+            Some(PrivacyModeState::OffUnknown) => {
+                self.notify_owner_of_loss(owner);
+                None
+            }
+            state => state,
+        };
         if !virtual_display_manager::is_amyuni_idd() && owner != INVALID_PRIVACY_MODE_CONN_ID {
             self.session = Session::Restoring(owner);
         }
@@ -731,11 +750,7 @@ impl PrivacyMode for PrivacyModeImpl {
         if let Err(error) = &cleanup {
             if !error.is::<PrivacyDisplayCleanup>() {
                 if local_override && owner != INVALID_PRIVACY_MODE_CONN_ID {
-                    let connections = crate::server::AUTHED_CONNS.lock().unwrap();
-                    allow_err!(notify_privacy_mode_exit(
-                        connections.iter().map(|c| (c.conn_id, &c.sender)),
-                        owner
-                    ));
+                    self.notify_owner_of_loss(owner);
                 }
                 return cleanup;
             }
@@ -863,15 +878,19 @@ mod tests {
             (OTHER_CONN_ID, &other_sender),
         ];
 
-        assert!(notify_privacy_mode_exit([], OWNER_CONN_ID).is_err());
-        notify_privacy_mode_exit(connections, OWNER_CONN_ID).unwrap();
+        let mut notified = false;
+        assert!(notify_privacy_mode_exit([], OWNER_CONN_ID, &mut notified).is_err());
+        notify_privacy_mode_exit(connections, OWNER_CONN_ID, &mut notified).unwrap();
+        notify_privacy_mode_exit(connections, OWNER_CONN_ID, &mut notified).unwrap();
         assert!(matches!(
             owner_receiver.try_recv().unwrap(),
             crate::ipc::Data::PrivacyModeState((OWNER_CONN_ID, PrivacyModeState::OffUnknown, impl_key))
                 if impl_key == PRIVACY_MODE_IMPL
         ));
+        assert_eq!(owner_receiver.try_recv().err(), Some(TryRecvError::Empty));
         assert_eq!(other_receiver.try_recv().err(), Some(TryRecvError::Empty));
         drop(owner_receiver);
-        assert!(notify_privacy_mode_exit(connections, OWNER_CONN_ID).is_err());
+        let mut next_loss = false;
+        assert!(notify_privacy_mode_exit(connections, OWNER_CONN_ID, &mut next_loss).is_err());
     }
 }
