@@ -240,7 +240,7 @@ impl PrivacyModeImpl {
 
             let ds = virtual_display_manager::get_cur_device_string();
             if let Ok(s) = String::from_utf16(&dd.DeviceString) {
-                if s.len() >= ds.len() && &s[..ds.len()] == ds {
+                if s.starts_with(ds) {
                     self.virtual_displays.push(display);
                     continue;
                 }

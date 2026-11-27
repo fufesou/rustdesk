@@ -835,7 +835,7 @@ mod windows {
                 String::from_utf16(&dd.DeviceString),
             ) {
                 if let Some(s) = device_string {
-                    if ds.len() >= s.len() && &ds[..s.len()] == s {
+                    if ds.starts_with(s) {
                         device_names.push(device_name);
                     }
                 } else {
