@@ -929,6 +929,28 @@ pub(super) fn existing_login_displays() -> ResultType<Option<(Vec<DisplayInfo>, 
     Ok((!no_displays(&displays)).then(|| login_snapshot(&displays)))
 }
 
+#[cfg(windows)]
+pub(super) fn current_login_displays(
+    prepared: ResultType<()>,
+) -> ResultType<(Vec<DisplayInfo>, usize)> {
+    let displays = Display::all();
+    if let Err(error) = prepared {
+        if displays.as_ref().map_or(true, |d| d.is_empty()) {
+            return Err(error);
+        }
+        hbb_common::throttled_log!(
+            std::time::Duration::from_secs(1),
+            warn,
+            "Headless display setup failed, using the connected display: {error:#}"
+        );
+    }
+    let displays = displays?;
+    if displays.is_empty() {
+        bail!("No active display after headless display setup");
+    }
+    Ok(login_snapshot(&displays))
+}
+
 fn login_snapshot(displays: &Vec<Display>) -> (Vec<DisplayInfo>, usize) {
     let primary_display_idx = get_primary_2(displays);
     let sync_displays = update_sync_displays(displays);
@@ -1039,7 +1061,8 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     if no_displays_v {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
-            if add_amyuni_headless && !virtual_display_manager::is_amyuni_idd() {
+            if add_amyuni_headless && !virtual_display_manager::is_amyuni_idd() && displays.is_empty()
+            {
                 bail!("Failed to create the headless RustDesk display: {e:#}");
             }
             log::error!("plug in headless failed {}", e);

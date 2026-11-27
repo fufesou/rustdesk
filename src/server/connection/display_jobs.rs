@@ -16,7 +16,7 @@ pub(super) type Job = Box<dyn FnOnce() + Send>;
 type Snapshot = ResultType<(Vec<DisplayInfo>, usize)>;
 
 enum LoginDisplays {
-    Waiting(oneshot::Receiver<Snapshot>),
+    Waiting(oneshot::Receiver<ResultType<()>>),
     Ready(Snapshot),
 }
 
@@ -140,7 +140,9 @@ impl DisplayJobs {
         super::try_activate_screen();
         self.login = Some(match display_service::existing_login_displays() {
             Ok(Some(displays)) => LoginDisplays::Ready(Ok(displays)),
-            Ok(None) => self.queue_headless_login(display_service::get_sync_displays_on_login),
+            Ok(None) => self.queue_headless_login(|| {
+                display_service::try_get_displays_add_amyuni_headless().map(|_| ())
+            }),
             Err(error) => LoginDisplays::Ready(Err(error)),
         });
         self.login_pending()
@@ -148,7 +150,7 @@ impl DisplayJobs {
 
     fn queue_headless_login(
         &mut self,
-        prepare: impl FnOnce() -> Snapshot + Send + 'static,
+        prepare: impl FnOnce() -> ResultType<()> + Send + 'static,
     ) -> LoginDisplays {
         let (sender, ready) = oneshot::channel();
         match self.submit(Box::new(move || {
@@ -170,7 +172,7 @@ impl DisplayJobs {
             return false;
         };
         let result = match receiver.try_recv() {
-            Ok(result) => result,
+            Ok(result) => display_service::current_login_displays(result),
             Err(oneshot::error::TryRecvError::Empty) => return false,
             Err(error) => Err(error.into()),
         };
@@ -261,7 +263,7 @@ mod tests {
             started.send(()).unwrap();
             wait.recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
-            Ok((vec![DisplayInfo::default()], 0))
+            Ok(())
         }));
         ready.await.unwrap();
         assert!(jobs.login_pending());
