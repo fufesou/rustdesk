@@ -294,22 +294,4 @@ pub(crate) fn change_resolution_if_is_virtual_display(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disconnect_retries_failed_monitors_and_releases_the_others() {
-        let mut monitors = BTreeMap::from([(0, false), (1, true), (2, false)]);
-        let result = detach_monitors(&mut monitors, &[0, 1, 2], |fails| {
-            if *fails {
-                bail!("driver busy")
-            } else {
-                Ok(())
-            }
-        });
-        assert!(result.is_err());
-        assert_eq!(monitors.keys().copied().collect::<Vec<_>>(), [1]);
-        detach_monitors(&mut monitors, &[1], |_| Ok(())).unwrap();
-        assert!(monitors.is_empty());
-    }
-}
+mod tests;
