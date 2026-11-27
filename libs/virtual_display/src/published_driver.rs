@@ -1,19 +1,20 @@
 use hbb_common::{
-    bail,
+    bail, log,
     sha2::{Digest, Sha256},
     ResultType,
 };
 use std::{
     fs,
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
 };
-use windows::core::GUID;
-use windows::Win32::{
-    Foundation::ERROR_SUCCESS_REBOOT_REQUIRED,
-    System::{Com::CoTaskMemFree, Threading::CREATE_NO_WINDOW},
-    UI::Shell::{FOLDERID_System, FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+use windows::{
+    core::{GUID, HSTRING},
+    Win32::{
+        Devices::DeviceAndDriverInstallation::SetupUninstallOEMInfW,
+        Foundation::{GetLastError, ERROR_INF_IN_USE_BY_DEVICES, ERROR_SUCCESS_REBOOT_REQUIRED},
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+    },
 };
 
 // Exact INF files from the two build_github_ci_test_sign archives pinned in res/windows_idd.py.
@@ -33,22 +34,28 @@ fn known_folder(id: &GUID) -> ResultType<PathBuf> {
 pub fn uninstall_test_driver(reboot: &mut bool) -> ResultType<()> {
     let inf_dir = known_folder(&FOLDERID_Windows)?.join("INF");
     for package in published_packages(&inf_dir, INF_BYTES, INF_DIGESTS)? {
-        let output = Command::new(known_folder(&FOLDERID_System)?.join("pnputil.exe"))
-            .args(["/delete-driver", &package, "/uninstall"])
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .output()?;
-        match output.status.code() {
-            Some(0) => {}
-            Some(code) if code == ERROR_SUCCESS_REBOOT_REQUIRED.0 as i32 => *reboot = true,
-            _ => bail!(
-                "Failed to uninstall {package} ({}): {} {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        }
+        *reboot |= remove_unused_package(&package)?;
     }
     Ok(())
+}
+
+fn remove_unused_package(name: &str) -> ResultType<bool> {
+    let package = HSTRING::from(name);
+    if unsafe { SetupUninstallOEMInfW(&package, 0, None) }.as_bool() {
+        return Ok(false);
+    }
+    let error = unsafe { GetLastError() };
+    match error {
+        ERROR_INF_IN_USE_BY_DEVICES => {
+            log::info!("Keeping display driver {name} in use by another device");
+            Ok(false)
+        }
+        ERROR_SUCCESS_REBOOT_REQUIRED => Ok(true),
+        _ => bail!(
+            "Cannot remove {name}: {}",
+            std::io::Error::from_raw_os_error(error.0 as i32)
+        ),
+    }
 }
 
 fn published_packages(dir: &Path, size: u64, digests: &[&str]) -> ResultType<Vec<String>> {

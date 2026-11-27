@@ -9211,6 +9211,7 @@ dependencies = [
  "hbb_common",
  "lazy_static",
  "windows 0.61.1",
+ "winreg 0.11.0",
 ]
 
 [[package]]
