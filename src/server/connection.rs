@@ -823,6 +823,10 @@ impl Connection {
                             }
                             if &name == "keyboard" {
                                 conn.keyboard = enabled;
+                                #[cfg(windows)]
+                                if !enabled {
+                                    conn.display_jobs.revoke_resolutions();
+                                }
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 // Until authorized, only record the value; try_sub_monitor_services subscribes from it.
                                 if let Some(s) = conn.server.upgrade().filter(|_| conn.authorized) {
@@ -4919,10 +4923,16 @@ impl Connection {
                 };
                 Some(display.name)
             };
-            self.dispatch_display(move || {
+            let change = move || {
                 Self::apply_display_resolution(display_idx, size, name.as_deref())
                     .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
-            });
+            };
+            if virtual_display_manager::is_amyuni_idd() {
+                self.dispatch_display(change);
+            } else {
+                let change = self.display_jobs.resolution_request(change);
+                self.dispatch_display(change);
+            }
         }
         #[cfg(not(windows))]
         hbb_common::allow_err!(Self::apply_display_resolution(display_idx, size));

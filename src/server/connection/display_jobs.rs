@@ -10,13 +10,17 @@ use hbb_common::{
     },
     ResultType,
 };
-use std::thread::{Builder, JoinHandle};
+use std::{
+    sync::Arc,
+    thread::{Builder, JoinHandle},
+};
 
 pub(super) type Job = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 pub(super) struct DisplayJobs {
     pub(super) login_heartbeat: Option<Instant>,
+    resolutions: Option<Arc<()>>,
     sender: Option<mpsc::Sender<Job>>,
     worker: Option<(JoinHandle<()>, oneshot::Receiver<()>)>,
 }
@@ -53,7 +57,25 @@ impl DisplayJobs {
     }
 
     pub(super) fn stop(&mut self) {
+        self.revoke_resolutions();
         self.sender.take();
+    }
+
+    pub(super) fn resolution_request(
+        &mut self,
+        change: impl FnOnce() -> ResultType<()> + Send + 'static,
+    ) -> impl FnOnce() -> ResultType<()> + Send + 'static {
+        let permission = Arc::downgrade(self.resolutions.get_or_insert_with(Arc::default));
+        move || {
+            if permission.strong_count() == 0 {
+                return Ok(());
+            }
+            change()
+        }
+    }
+
+    pub(super) fn revoke_resolutions(&mut self) {
+        self.resolutions.take();
     }
 
     pub(super) async fn finish(&mut self) {
@@ -147,6 +169,19 @@ fn report(peer: &mut ConnInner, error: hbb_common::anyhow::Error) {
 mod tests {
     use super::*;
     use hbb_common::tokio;
+
+    #[test]
+    fn virtual_display_resolution_revocation_only_cancels_earlier_requests() {
+        let mut jobs = DisplayJobs::default();
+        let (sent, received) = std::sync::mpsc::channel();
+        let first = sent.clone();
+        let old = jobs.resolution_request(move || Ok(first.send(1)?));
+        jobs.revoke_resolutions();
+        let new = jobs.resolution_request(move || Ok(sent.send(2)?));
+        old().unwrap();
+        new().unwrap();
+        assert_eq!(received.into_iter().collect::<Vec<_>>(), [2]);
+    }
 
     #[tokio::test]
     async fn virtual_display_requests_return_while_the_driver_is_waiting_and_run_in_order() {
