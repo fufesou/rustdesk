@@ -30,8 +30,8 @@
 		<CustomAction Id="SetPropertyServiceStop.SetParam.PropertyName" Return="check" Property="PropertyName" Value="STOP_SERVICE" />
 		<CustomAction Id="TryDeleteStartupShortcut.SetParam" Return="check" Property="ShortcutName" Value="$(var.Product) Tray" />
 		<CustomAction Id="RemoveAmyuniIdd.SetParam" Return="check" Property="RemoveAmyuniIdd" Value="[INSTALLFOLDER_INNER]" />
-		<Binary Id="RustDeskIddController" SourceFile="$(var.BuildDir)\dylib_virtual_display.dll" />
-		<CustomAction Id="RemoveRustDeskIdd" BinaryRef="RustDeskIddController" DllEntry="RemoveRustDeskIdd" Execute="deferred" Impersonate="no" Return="check" />
+		<Binary Id="RustDeskIddDll" SourceFile="$(var.BuildDir)\dylib_virtual_display.dll" />
+		<CustomAction Id="RemoveRustDeskIdd" BinaryRef="RustDeskIddDll" DllEntry="RemoveRustDeskIdd" Execute="deferred" Impersonate="no" Return="check" />
 		<!-- The app name comes first and is separated by '|', which cannot occur in a
 		     Windows path nor in a validated app name. wcautil's own delimiter is a
 		     literal wide char 128 that a Formatted value cannot carry, and [~] is
