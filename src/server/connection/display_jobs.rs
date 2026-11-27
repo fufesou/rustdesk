@@ -154,6 +154,10 @@ impl DisplayJobs {
         matches!(self.login, Some(LoginDisplays::Waiting(_)))
     }
 
+    pub(super) fn headless_login_ready(&self) -> bool {
+        matches!(self.login, Some(LoginDisplays::Ready(_)))
+    }
+
     pub(super) fn poll_login(&mut self) -> bool {
         let Some(LoginDisplays::Waiting(receiver)) = &mut self.login else {
             return false;

@@ -34,6 +34,7 @@ async fn virtual_display_close_cancels_a_pending_headless_login() {
     }));
     ready.await.unwrap();
     assert!(jobs.login_pending());
+    assert!(jobs.login_displays().is_none());
     assert!(!jobs.poll_login());
     jobs.stop();
     release.send(()).unwrap();

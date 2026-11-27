@@ -2011,6 +2011,8 @@ impl Connection {
     }
 
     async fn send_authorized_login_response(&mut self) -> bool {
+        #[cfg(windows)]
+        let deferred_display_login = self.display_jobs.headless_login_ready();
         self.authorized = true;
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
@@ -2299,6 +2301,13 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         let sent = self.stream.send(&msg_out).await;
+        #[cfg(windows)]
+        if let (true, Err(error)) = (deferred_display_login, &sent) {
+            self.authorized = false;
+            self.on_close(&format!("Failed to send headless login response: {error}"), false)
+                .await;
+            return false;
+        }
         #[cfg(all(windows, feature = "flutter"))]
         super::printer_service::enable_for_login(
             self.inner.id(),
