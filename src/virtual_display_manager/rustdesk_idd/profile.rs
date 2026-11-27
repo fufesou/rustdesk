@@ -33,6 +33,8 @@ const PROFILE_VERSION: u32 = 1;
 const ENABLED: u32 = 1;
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Windows remembers the monitor by container ID. The attachment ID belongs to one lease.
+const CONNECTOR_UUID_PREFIX: u128 = 0xe3e14b42_a3ca_82ec_ad45_602c00000000;
 
 pub(super) struct Profile {
     device_path: Vec<u16>,
@@ -46,7 +48,7 @@ impl Profile {
         Self {
             device_path: Vec::new(),
             index,
-            id: Uuid::new_v4(),
+            id: Uuid::from_u128(CONNECTOR_UUID_PREFIX | u128::from(index)),
             attachment: Uuid::new_v4(),
         }
     }
@@ -215,6 +217,16 @@ fn device_starting(error: &DeviceError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_display_reconnect_keeps_the_windows_monitor_identity() {
+        let first = Profile::new(1).packet(&[]).unwrap();
+        let reconnect = Profile::new(1).packet(&[]).unwrap();
+        let other = Profile::new(2).packet(&[]).unwrap();
+        assert_eq!(&first[24..40], &reconnect[24..40]);
+        assert_ne!(&first[24..40], &other[24..40]);
+        assert_ne!(&first[..16], &reconnect[..16]);
+    }
 
     #[test]
     fn waits_for_a_monitor_that_activates_after_three_enumerations() {
