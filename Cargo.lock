@@ -2433,6 +2433,8 @@ dependencies = [
  "serde 1.0.228",
  "serde_derive",
  "thiserror 1.0.61",
+ "virtual_display",
+ "windows 0.61.1",
 ]
 
 [[package]]
@@ -9208,6 +9210,7 @@ version = "0.1.0"
 dependencies = [
  "hbb_common",
  "lazy_static",
+ "windows 0.61.1",
 ]
 
 [[package]]
