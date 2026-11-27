@@ -39,6 +39,27 @@ const INF_DIGESTS: &[&str] = &[
 ];
 const OWNED_PACKAGES: &str = r"SOFTWARE\RustDesk\TestIddPackages";
 
+fn receipt_key(installed_exe: &Path) -> ResultType<String> {
+    if !installed_exe.is_absolute() {
+        bail!("Expected an absolute installed executable path");
+    }
+    let path = installed_exe
+        .to_str()
+        .context("Invalid installed executable path")?
+        .replace('/', r"\")
+        .to_lowercase();
+    // The installer and current_exe can use different spellings of the same Windows path.
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+    };
+    Ok(format!(
+        r"{OWNED_PACKAGES}\{:x}",
+        Sha256::digest(path.as_bytes())
+    ))
+}
+
 fn known_folder(id: &GUID) -> ResultType<PathBuf> {
     let value = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }?;
     let path = unsafe { value.to_string() };
@@ -50,6 +71,7 @@ pub fn stage_test_driver(source: &Path) -> ResultType<()> {
     if !matches_inf(&File::open(source)?, INF_DIGESTS)? {
         return Ok(());
     }
+    let owner_key = receipt_key(&std::env::current_exe()?)?;
     let mut published = [0u16; MAX_PATH as usize];
     let copied = unsafe {
         SetupCopyOEMInfW(
@@ -75,7 +97,7 @@ pub fn stage_test_driver(source: &Path) -> ResultType<()> {
         .context("Missing published INF name")?;
     let name = name.to_ascii_lowercase();
     check_published_name(&name)?;
-    if let Err(error) = record_package(&path, &name) {
+    if let Err(error) = record_package(&path, &name, &owner_key) {
         match remove_unused_package(&name) {
             Ok(PackageRemoval::Removed { .. }) => {}
             Ok(PackageRemoval::InUse) => {
@@ -90,17 +112,22 @@ pub fn stage_test_driver(source: &Path) -> ResultType<()> {
     Ok(())
 }
 
-fn record_package(path: &Path, name: &str) -> ResultType<()> {
+fn record_package(path: &Path, name: &str, owner_key: &str) -> ResultType<()> {
     let identity = file_identity(&File::open(path)?)?;
     let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey_with_flags(OWNED_PACKAGES, KEY_SET_VALUE | KEY_WOW64_64KEY)?;
+        .create_subkey_with_flags(owner_key, KEY_SET_VALUE | KEY_WOW64_64KEY)?;
     key.set_value(identity, &name)?;
     Ok(())
 }
 
 pub fn uninstall_test_driver(reboot: &mut bool) -> ResultType<()> {
+    uninstall_test_driver_for(&std::env::current_exe()?, reboot)
+}
+
+pub fn uninstall_test_driver_for(installed_exe: &Path, reboot: &mut bool) -> ResultType<()> {
+    // Flat values from older builds have no recorded product owner.
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
-        OWNED_PACKAGES,
+        receipt_key(installed_exe)?,
         KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
     ) {
         Ok(key) => key,
@@ -205,6 +232,23 @@ fn owns_package(path: &Path, identity: &str, digests: &[&str]) -> ResultType<boo
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn product_uninstall_uses_the_same_receipts_only_for_the_same_installed_executable() {
+        let app = receipt_key(Path::new(r"C:\Custom Clients\Alpha.exe")).unwrap();
+        assert_eq!(
+            app,
+            receipt_key(Path::new(r"\\?\C:\custom clients\ALPHA.EXE")).unwrap()
+        );
+        for other in [
+            r"C:\Custom Clients\Beta.exe",
+            r"D:\Custom Clients\Alpha.exe",
+        ] {
+            assert_ne!(app, receipt_key(Path::new(other)).unwrap());
+        }
+        assert_ne!(app, OWNED_PACKAGES);
+        assert!(receipt_key(Path::new("Alpha.exe")).is_err());
+    }
 
     #[test]
     fn missing_source_only_removes_the_test_package_staged_by_rustdesk() {

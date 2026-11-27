@@ -2,7 +2,7 @@ use hbb_common::{anyhow, dlopen::symbor::Library, log, ResultType};
 #[cfg(windows)]
 mod published_driver;
 #[cfg(windows)]
-pub use published_driver::{stage_test_driver, uninstall_test_driver};
+pub use published_driver::{stage_test_driver, uninstall_test_driver, uninstall_test_driver_for};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
