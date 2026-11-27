@@ -40,7 +40,6 @@ impl PreparedMonitor {
         let prepared = Self {
             monitor: Some(Monitor {
                 profile: profile.into(),
-                name: name.as_ref().ok().cloned(),
             }),
             _reservation: reservation,
         };

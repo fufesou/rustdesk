@@ -6,10 +6,7 @@ mod profile;
 pub(crate) use peer::plug_out_monitor;
 pub use peer::{plug_in_index_modes, plug_in_peer_request};
 
-use hbb_common::{
-    anyhow::{anyhow, Context},
-    bail, lazy_static, ResultType,
-};
+use hbb_common::{anyhow::Context, bail, lazy_static, ResultType};
 use profile::Profile;
 use std::{
     collections::BTreeMap,
@@ -31,32 +28,8 @@ lazy_static::lazy_static! {
 static INSTALLED: Mutex<bool> = Mutex::new(false);
 
 #[derive(Clone)]
-struct Monitor {
+pub(crate) struct Monitor {
     profile: Arc<Profile>,
-    name: Option<String>,
-}
-
-impl Monitor {
-    fn refresh_source(&mut self) -> bool {
-        match self.profile.source() {
-            Ok(name) => self.name = name,
-            Err(error) if profile::target_is_gone(&error) => {
-                self.name = None;
-                return false;
-            }
-            Err(error) => {
-                hbb_common::log::trace!("Virtual display source is unavailable: {error:#}")
-            }
-        }
-        true
-    }
-
-    fn matches_source(&mut self, name: &str, refresh_on_mismatch: bool) -> bool {
-        if self.name.is_none() || (refresh_on_mismatch && self.name.as_deref() != Some(name)) {
-            self.refresh_source();
-        }
-        self.name.as_deref() == Some(name)
-    }
 }
 
 #[derive(Clone, Default)]
@@ -93,10 +66,7 @@ impl Manager {
         install_driver(false)?;
         if let Some(monitor) = self.monitors.get_mut(&index) {
             match monitor.profile.wait_for_source(None) {
-                Ok(name) => {
-                    monitor.name = Some(name);
-                    return Ok(());
-                }
+                Ok(_) => return Ok(()),
                 Err(error) if profile::target_is_gone(&error) => {
                     self.monitors.remove(&index);
                 }
@@ -109,19 +79,15 @@ impl Manager {
             modes
         };
         let profile = Profile::new(index).attach(modes, || false)?;
-        let mut monitor = Monitor {
+        let monitor = Monitor {
             profile: Arc::new(profile),
-            name: None,
         };
-        match monitor.profile.wait_for_source(None) {
-            Ok(name) => monitor.name = Some(name),
-            Err(error) => {
-                if let Err(cleanup) = monitor.profile.detach() {
-                    self.monitors.insert(index, monitor);
-                    bail!("{error:#}; detach connector {index}: {cleanup:#}");
-                }
-                return Err(error);
+        if let Err(error) = monitor.profile.wait_for_source(None) {
+            if let Err(cleanup) = monitor.profile.detach() {
+                self.monitors.insert(index, monitor);
+                bail!("{error:#}; detach connector {index}: {cleanup:#}");
             }
+            return Err(error);
         }
         self.monitors.insert(index, monitor);
         Ok(())
@@ -190,8 +156,10 @@ pub fn get_virtual_displays() -> Vec<u32> {
         .lock()
         .unwrap()
         .monitors
-        .iter_mut()
-        .filter_map(|(&i, m)| (m.refresh_source() && PEER_INDICES.contains(&i)).then_some(i))
+        .iter()
+        .filter_map(|(&i, m)| {
+            (PEER_INDICES.contains(&i) && !m.profile.no_longer_attached()).then_some(i)
+        })
         .collect()
 }
 
@@ -212,14 +180,35 @@ pub fn reset_all() -> ResultType<()> {
     })
 }
 
+pub(crate) fn resolution_targets() -> BTreeMap<String, Monitor> {
+    let monitors = MANAGER.lock().unwrap().monitors.clone();
+    monitors
+        .into_values()
+        .filter_map(|monitor| match monitor.profile.source() {
+            Ok(Some(name)) => Some((name, monitor)),
+            Ok(None) => None,
+            Err(error) => {
+                hbb_common::log::trace!("Virtual display source is unavailable: {error:#}");
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn is_virtual_display(name: &str) -> bool {
-    let name = name.trim_end_matches('\0');
-    MANAGER
-        .lock()
-        .unwrap()
-        .monitors
-        .values_mut()
-        .any(|m| m.matches_source(name, false))
+    resolution_targets().contains_key(name.trim_end_matches('\0'))
+}
+
+pub(crate) fn change_resolution_if_is_virtual_display(
+    name: &str,
+    size: (u32, u32),
+    control: &ResolutionControl,
+) -> ResultType<bool> {
+    let Some(target) = resolution_targets().remove(name.trim_end_matches('\0')) else {
+        return Ok(false);
+    };
+    change_resolution(target, size, control)?;
+    Ok(true)
 }
 
 pub(crate) struct ResolutionControl {
@@ -233,47 +222,38 @@ impl ResolutionControl {
     }
 }
 
-pub(crate) fn change_resolution_if_is_virtual_display(
-    name: &str,
+pub(crate) fn change_resolution(
+    target: Monitor,
     (w, h): (u32, u32),
     control: &ResolutionControl,
-) -> ResultType<bool> {
-    let requested_name = name.trim_end_matches('\0');
+) -> ResultType<()> {
     update(|manager| {
         if !control.is_allowed() {
-            return Ok(true);
+            return Ok(());
         }
         let Some((index, monitor)) = manager
             .monitors
-            .iter_mut()
-            .find_map(|(&i, m)| m.matches_source(requested_name, true).then_some((i, m)))
+            .iter()
+            .find_map(|(&i, m)| Arc::ptr_eq(&m.profile, &target.profile).then_some((i, m)))
         else {
-            return Ok(false);
+            bail!("Requested virtual display is no longer connected");
         };
         let current_name = monitor.profile.wait_for_source(None)?;
-        if current_name != requested_name {
-            monitor.name = Some(current_name);
-            return Err(anyhow!(
-                "The virtual display changed before applying its resolution"
-            ));
-        }
         let current = crate::platform::current_resolution(&current_name)?;
         if (current.width as u32, current.height as u32) == (w, h) {
-            return Ok(true);
+            return Ok(());
         }
         let supported = profile::supports_resolution(&current_name, (w, h));
         if !control.is_allowed() {
-            return Ok(true);
+            return Ok(());
         }
         if supported {
             crate::platform::change_resolution(&current_name, w as _, h as _)?;
-            return Ok(true);
+            return Ok(());
         }
         if control.privacy_active {
             bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
         }
-        // Even a failed replacement can recreate the old mode under a new GDI name.
-        monitor.name = None;
         if let Err(error) = monitor.profile.set_mode(MonitorMode {
             width: w,
             height: h,
@@ -285,11 +265,10 @@ pub(crate) fn change_resolution_if_is_virtual_display(
             return Err(error);
         }
         let active = monitor.profile.wait_for_source(Some((w, h)))?;
-        monitor.name = Some(active.clone());
         if control.is_allowed() {
             crate::platform::change_resolution(&active, w as _, h as _)?;
         }
-        Ok(true)
+        Ok(())
     })
 }
 
