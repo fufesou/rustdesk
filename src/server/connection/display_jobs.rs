@@ -1,9 +1,13 @@
-use super::{ConnInner, Connection, Subscriber};
-use base::message_proto::{Message, MessageBox};
+use super::{display_service, ConnInner, Connection, Subscriber, SEC30};
+use base::message_proto::{DisplayInfo, Message, MessageBox, TestDelay};
 use hbb_common::{
     anyhow::anyhow,
     log,
-    tokio::sync::{mpsc, oneshot},
+    tokio::{
+        self,
+        sync::{mpsc, oneshot},
+        time::Instant,
+    },
     ResultType,
 };
 use std::thread::{Builder, JoinHandle};
@@ -12,6 +16,7 @@ pub(super) type Job = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 pub(super) struct DisplayJobs {
+    pub(super) login_heartbeat: Option<Instant>,
     sender: Option<mpsc::Sender<Job>>,
     worker: Option<(JoinHandle<()>, oneshot::Receiver<()>)>,
 }
@@ -76,6 +81,34 @@ impl Drop for DisplayJobs {
 }
 
 impl Connection {
+    pub(super) async fn login_displays(&mut self) -> ResultType<(Vec<DisplayInfo>, usize)> {
+        if crate::virtual_display_manager::is_amyuni_idd()
+            || !crate::virtual_display_manager::is_virtual_display_supported()
+            || !crate::platform::is_installed()
+        {
+            return display_service::update_get_sync_displays_on_login().await;
+        }
+        if let Some(displays) = display_service::existing_login_displays()? {
+            return Ok(displays);
+        }
+        let (sender, mut ready) = oneshot::channel();
+        self.display_jobs.submit(Box::new(move || {
+            let _ = sender.send(display_service::get_sync_displays_on_login());
+        }))?;
+        let mut heartbeat = Message::new();
+        heartbeat.set_test_delay(TestDelay::default());
+        loop {
+            tokio::select! {
+                result = &mut ready => return result?,
+                _ = tokio::time::sleep(SEC30 / 2) => {
+                    self.stream.send(&heartbeat).await?;
+                    self.display_jobs.login_heartbeat = Some(Instant::now());
+                    self.last_test_delay = None;
+                }
+            }
+        }
+    }
+
     pub(super) fn dispatch_display(
         &mut self,
         operation: impl FnOnce() -> ResultType<()> + Send + 'static,

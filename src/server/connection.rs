@@ -1233,6 +1233,11 @@ impl Connection {
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
+                    #[cfg(windows)]
+                    if let Some(probe) = conn.display_jobs.login_heartbeat.take() {
+                        // The peer could only queue its reply while this connection prepared its screen.
+                        last_recv_time = last_recv_time.max(probe);
+                    }
                     if last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
@@ -2219,7 +2224,11 @@ impl Connection {
 
             try_activate_screen();
 
-            match super::display_service::update_get_sync_displays_on_login().await {
+            #[cfg(windows)]
+            let displays = self.login_displays().await;
+            #[cfg(not(windows))]
+            let displays = super::display_service::update_get_sync_displays_on_login().await;
+            match displays {
                 Err(err) => {
                     res.set_error(format!("{}", err));
                 }

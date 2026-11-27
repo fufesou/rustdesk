@@ -912,16 +912,29 @@ pub async fn update_get_sync_displays_on_login() -> ResultType<(Vec<DisplayInfo>
             return Ok((displays, primary_display_idx));
         }
     }
+    get_sync_displays_on_login()
+}
+
+pub(super) fn get_sync_displays_on_login() -> ResultType<(Vec<DisplayInfo>, usize)> {
     #[cfg(not(windows))]
     let displays = display_service::try_get_displays();
     #[cfg(windows)]
     let displays = display_service::try_get_displays_add_amyuni_headless();
-    let displays = displays?;
-    let primary_display_idx = get_primary_2(&displays);
-    let sync_displays = update_sync_displays(&displays);
+    Ok(login_snapshot(&displays?))
+}
+
+#[cfg(windows)]
+pub(super) fn existing_login_displays() -> ResultType<Option<(Vec<DisplayInfo>, usize)>> {
+    let displays = Display::all()?;
+    Ok((!no_displays(&displays)).then(|| login_snapshot(&displays)))
+}
+
+fn login_snapshot(displays: &Vec<Display>) -> (Vec<DisplayInfo>, usize) {
+    let primary_display_idx = get_primary_2(displays);
+    let sync_displays = update_sync_displays(displays);
     let primary_display_idx =
         normalize_primary_display_idx(primary_display_idx, sync_displays.len());
-    Ok((sync_displays, primary_display_idx))
+    (sync_displays, primary_display_idx)
 }
 
 #[inline]
@@ -1026,6 +1039,9 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     if no_displays_v {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
+            if add_amyuni_headless && !virtual_display_manager::is_amyuni_idd() {
+                bail!("Failed to create the headless RustDesk display: {e:#}");
+            }
             log::error!("plug in headless failed {}", e);
         } else {
             displays = Display::all()?;
