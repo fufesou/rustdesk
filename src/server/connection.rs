@@ -2251,6 +2251,14 @@ impl Connection {
             };
             match displays {
                 Err(err) => {
+                    #[cfg(windows)]
+                    if !virtual_display_manager::is_amyuni_idd() {
+                        self.authorized = false;
+                        let reason = format!("{err:#}");
+                        self.send_login_error(&reason).await;
+                        self.on_close(&reason, false).await;
+                        return false;
+                    }
                     res.set_error(format!("{}", err));
                 }
                 Ok((displays, primary_display_idx)) => {
@@ -4909,13 +4917,12 @@ impl Connection {
             && !self.anonymous_display_controls
             && !virtual_display_manager::is_amyuni_idd();
         self.anonymous_display_controls |= anonymous;
-        let mut peer = self.inner.clone();
+        if anonymous {
+            self.inner.send(
+                display_service::displays_to_msg(display_service::get_sync_displays()).into(),
+            );
+        }
         self.dispatch_display(move || {
-            if anonymous {
-                peer.send(
-                    display_service::displays_to_msg(display_service::get_sync_displays()).into(),
-                );
-            }
             if t.on && !virtual_display_manager::is_virtual_display_supported() {
                 bail!("idd_not_support_under_win10_2004_tip");
             }

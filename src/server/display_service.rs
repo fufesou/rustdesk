@@ -1061,7 +1061,9 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     if no_displays_v {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
-            if add_amyuni_headless && !virtual_display_manager::is_amyuni_idd() && displays.is_empty()
+            if add_amyuni_headless
+                && !virtual_display_manager::is_amyuni_idd()
+                && displays.is_empty()
             {
                 bail!("Failed to create the headless RustDesk display: {e:#}");
             }
