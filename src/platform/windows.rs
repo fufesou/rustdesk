@@ -1873,10 +1873,10 @@ pub fn run_after_install() -> ResultType<()> {
 }
 
 pub fn run_before_uninstall() -> ResultType<()> {
-    run_cmds(get_before_uninstall(true)?, true, "before_install")
+    run_cmds(get_before_uninstall(true, false)?, true, "before_install")
 }
 
-fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
+fn get_before_uninstall(kill_self: bool, uninstall_rustdesk_idd: bool) -> ResultType<String> {
     let app_name = crate::get_app_name();
     let (_, _, _, exe) = get_install_info();
     let remove_service = service_control_command("remove", &exe, false)?;
@@ -1886,17 +1886,23 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
     } else {
         format!(" /FI \"PID ne {}\"", get_current_pid())
     };
+    let stop_processes = format!(
+        "taskkill /F /IM {WIN_TOPMOST_INJECTED_PROCESS_EXE}\r\ntaskkill /F /IM {app_name}.exe{filter}"
+    );
+    let service_commands = if uninstall_rustdesk_idd {
+        let cleanup = idd_uninstall::before_service_removal(&app_name, &stop_processes)?;
+        format!("{cleanup}\r\n{remove_service}")
+    } else {
+        format!("{remove_service}\r\n{stop_processes}")
+    };
     Ok(format!(
         "
     chcp 65001
-    {remove_service}
-    taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
+    {service_commands}
     reg delete HKEY_CLASSES_ROOT\\.{ext} /f
     reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
-    ",
-        broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+    "
     ))
 }
 
@@ -1927,20 +1933,12 @@ fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String>
             }
         }
     }
-    let uninstall_idd = if uninstall_drivers && !crate::virtual_display_manager::is_amyuni_idd() {
-        let current = std::env::current_exe()?;
-        let current = installer_shell::path_for_cmd_environment(&current)?;
-        format!(
-            r#""{current}" --uninstall-rustdesk-idd
-    if errorlevel 1 exit /b 1"#
-        )
-    } else {
-        String::new()
-    };
+    let uninstall_idd = uninstall_drivers
+        && !crate::virtual_display_manager::is_amyuni_idd()
+        && crate::virtual_display_manager::is_virtual_display_supported();
     Ok(format!(
         "
     {before_uninstall}
-    {uninstall_idd}
     {uninstall_printer_cmd}
     {uninstall_cert_cmd}
     reg delete {subkey} /f
@@ -1950,7 +1948,7 @@ fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String>
     if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     ",
-        before_uninstall=get_before_uninstall(kill_self)?,
+        before_uninstall=get_before_uninstall(kill_self, uninstall_idd)?,
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
         app_name = crate::get_app_name(),
     ))
