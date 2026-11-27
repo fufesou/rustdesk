@@ -1,20 +1,34 @@
 use hbb_common::{
+    anyhow::Context,
     bail, log,
     sha2::{Digest, Sha256},
     ResultType,
 };
 use std::{
-    fs,
+    fs::File,
+    io::{self, Read},
+    os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
 };
 use windows::{
-    core::{GUID, HSTRING},
+    core::{GUID, HRESULT, HSTRING, PCWSTR},
     Win32::{
-        Devices::DeviceAndDriverInstallation::SetupUninstallOEMInfW,
-        Foundation::{GetLastError, ERROR_INF_IN_USE_BY_DEVICES, ERROR_SUCCESS_REBOOT_REQUIRED},
+        Devices::DeviceAndDriverInstallation::{
+            SetupCopyOEMInfW, SetupUninstallOEMInfW, SPOST_PATH, SP_COPY_NOOVERWRITE,
+        },
+        Foundation::{
+            GetLastError, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INF_IN_USE_BY_DEVICES,
+            ERROR_SUCCESS_REBOOT_REQUIRED, HANDLE, MAX_PATH,
+        },
+        Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO},
         System::Com::CoTaskMemFree,
         UI::Shell::{FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
     },
+};
+use winreg::{
+    enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY},
+    types::FromRegValue,
+    RegKey,
 };
 
 // Exact INF files from the two build_github_ci_test_sign archives pinned in res/windows_idd.py.
@@ -23,6 +37,7 @@ const INF_DIGESTS: &[&str] = &[
     "30e72e61a99204b651f2209012774c0ce83949146e5a984c16f21a585a74578e",
     "60208d8609d0735fa4a50f3fba113ece526d1db81900c31c50b9d26c7816e496",
 ];
+const OWNED_PACKAGES: &str = r"SOFTWARE\RustDesk\TestIddPackages";
 
 fn known_folder(id: &GUID) -> ResultType<PathBuf> {
     let value = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }?;
@@ -31,10 +46,73 @@ fn known_folder(id: &GUID) -> ResultType<PathBuf> {
     Ok(PathBuf::from(path?))
 }
 
+pub fn stage_test_driver(source: &Path) -> ResultType<()> {
+    if !matches_inf(&File::open(source)?, INF_DIGESTS)? {
+        return Ok(());
+    }
+    let mut published = [0u16; MAX_PATH as usize];
+    let copied = unsafe {
+        SetupCopyOEMInfW(
+            &HSTRING::from(source.as_os_str()),
+            PCWSTR::null(),
+            SPOST_PATH,
+            SP_COPY_NOOVERWRITE,
+            Some(&mut published),
+            None,
+            None,
+        )
+    };
+    if let Err(error) = copied {
+        if error.code() == HRESULT::from_win32(ERROR_FILE_EXISTS.0) {
+            return Ok(());
+        }
+        return Err(error).context("Stage RustDesk IDD package");
+    }
+    let path = PathBuf::from(unsafe { PCWSTR(published.as_ptr()).to_string()? });
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Missing published INF name")?;
+    let name = name.to_ascii_lowercase();
+    check_published_name(&name)?;
+    if let Err(error) = record_package(&path, &name) {
+        if let Err(cleanup) = remove_unused_package(&name) {
+            bail!("Cannot record newly staged {name}: {error:#}. Cleanup failed: {cleanup:#}");
+        }
+        return Err(error).with_context(|| format!("Cannot record newly staged {name}"));
+    }
+    Ok(())
+}
+
+fn record_package(path: &Path, name: &str) -> ResultType<()> {
+    let identity = file_identity(&File::open(path)?)?;
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .create_subkey_with_flags(OWNED_PACKAGES, KEY_SET_VALUE | KEY_WOW64_64KEY)?;
+    key.set_value(identity, &name)?;
+    Ok(())
+}
+
 pub fn uninstall_test_driver(reboot: &mut bool) -> ResultType<()> {
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        OWNED_PACKAGES,
+        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+    ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let inf_dir = known_folder(&FOLDERID_Windows)?.join("INF");
-    for package in published_packages(&inf_dir, INF_BYTES, INF_DIGESTS)? {
-        *reboot |= remove_unused_package(&package)?;
+    let receipts = key.enum_values().collect::<io::Result<Vec<_>>>()?;
+    for (identity, value) in receipts {
+        let name = String::from_reg_value(&value)?;
+        check_published_name(&name)?;
+        if owns_package(&inf_dir.join(&name), &identity, INF_DIGESTS)? {
+            *reboot |= remove_unused_package(&name)?;
+        }
+        match key.delete_value(identity) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -47,9 +125,10 @@ fn remove_unused_package(name: &str) -> ResultType<bool> {
     let error = unsafe { GetLastError() };
     match error {
         ERROR_INF_IN_USE_BY_DEVICES => {
-            log::info!("Keeping display driver {name} in use by another device");
+            log::info!("Keeping display driver {name} because a device still uses it");
             Ok(false)
         }
+        ERROR_FILE_NOT_FOUND => Ok(false),
         ERROR_SUCCESS_REBOOT_REQUIRED => Ok(true),
         _ => bail!(
             "Cannot remove {name}: {}",
@@ -58,47 +137,78 @@ fn remove_unused_package(name: &str) -> ResultType<bool> {
     }
 }
 
-fn published_packages(dir: &Path, size: u64, digests: &[&str]) -> ResultType<Vec<String>> {
-    let mut packages = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        let Some(number) = name
-            .strip_prefix("oem")
-            .and_then(|s| s.strip_suffix(".inf"))
-        else {
-            continue;
-        };
-        if number.is_empty()
-            || !number.bytes().all(|b| b.is_ascii_digit())
-            || entry.metadata()?.len() != size
-        {
-            continue;
-        }
-        let digest = format!("{:x}", Sha256::digest(fs::read(entry.path())?));
-        if digests.contains(&digest.as_str()) {
-            packages.push(name);
-        }
+fn check_published_name(name: &str) -> ResultType<()> {
+    if name
+        .strip_prefix("oem")
+        .and_then(|s| s.strip_suffix(".inf"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Ok(());
     }
-    Ok(packages)
+    bail!("Invalid published INF name {name}")
+}
+
+fn file_identity(file: &File) -> ResultType<String> {
+    let mut info = FILE_ID_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )?;
+    }
+    Ok(format!(
+        "{:016x}-{:032x}",
+        info.VolumeSerialNumber,
+        u128::from_le_bytes(info.FileId.Identifier)
+    ))
+}
+
+fn matches_inf(file: &File, digests: &[&str]) -> ResultType<bool> {
+    if file.metadata()?.len() != INF_BYTES {
+        return Ok(false);
+    }
+    let mut contents = Vec::new();
+    file.take(INF_BYTES + 1).read_to_end(&mut contents)?;
+    let digest = format!("{:x}", Sha256::digest(contents));
+    Ok(digests.contains(&digest.as_str()))
+}
+
+fn owns_package(path: &Path, identity: &str, digests: &[&str]) -> ResultType<bool> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(file_identity(&file)? == identity && matches_inf(&file, digests)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
-    fn missing_source_finds_only_the_published_test_package() {
+    fn missing_source_only_removes_the_test_package_staged_by_rustdesk() {
         let dir = std::env::temp_dir().join(hbb_common::uuid::Uuid::new_v4().to_string());
         fs::create_dir(&dir).unwrap();
-        let contents = b"package A";
-        let digest = format!("{:x}", Sha256::digest(contents));
-        let find = || published_packages(&dir, contents.len() as u64, &[&digest]).unwrap();
-        assert!(find().is_empty());
-        fs::write(dir.join("oem11.inf"), b"package B").unwrap();
-        fs::write(dir.join("other.inf"), contents).unwrap();
-        fs::write(dir.join("oem42.inf"), contents).unwrap();
-        assert_eq!(find(), ["oem42.inf"]);
+        let contents = vec![b'A'; INF_BYTES as usize];
+        let digest = format!("{:x}", Sha256::digest(&contents));
+        let owned = dir.join("oem42.inf");
+        let foreign = dir.join("oem73.inf");
+        fs::write(&owned, &contents).unwrap();
+        fs::write(&foreign, &contents).unwrap();
+        let identity = file_identity(&File::open(&owned).unwrap()).unwrap();
+        let eligible = |path: &Path| owns_package(path, &identity, &[&digest]).unwrap();
+        assert!(eligible(&owned));
+        assert!(!eligible(&foreign));
+        fs::write(&owned, vec![b'B'; contents.len()]).unwrap();
+        assert!(!eligible(&owned));
+        fs::rename(&owned, dir.join("original.inf")).unwrap();
+        assert!(!eligible(&owned));
+        fs::rename(&foreign, &owned).unwrap();
+        assert!(!eligible(&owned));
         fs::remove_dir_all(dir).unwrap();
     }
 }

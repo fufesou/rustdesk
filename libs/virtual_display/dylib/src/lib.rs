@@ -65,6 +65,8 @@ pub fn install_update_driver(_reboot_required: &mut bool) -> ResultType<()> {
             }
 
             let abs_path = get_driver_install_abs_path()?;
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            virtual_display::stage_test_driver(&abs_path)?;
             let full_install_path: Vec<u16> = abs_path
                 .to_string_lossy()
                 .as_ref()
