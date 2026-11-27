@@ -1988,7 +1988,6 @@ impl Connection {
             auth_conn_type,
             self.session_key(),
             self.tx_from_authed.clone(),
-            self.lr.clone(),
         ));
         self.session_last_recv_time = SESSIONS
             .lock()
@@ -2296,7 +2295,14 @@ impl Connection {
         }
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
-        self.send(msg_out).await;
+        let sent = self.stream.send(&msg_out).await;
+        #[cfg(all(windows, feature = "flutter"))]
+        super::printer_service::enable_for_login(
+            self.inner.id(),
+            &self.lr,
+            sub_service && sent.is_ok(),
+        );
+        allow_err!(sent);
         self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
@@ -7191,17 +7197,13 @@ mod raii {
             conn_type: AuthConnType,
             session_key: SessionKey,
             sender: mpsc::UnboundedSender<Data>,
-            lr: LoginRequest,
         ) -> Self {
-            let printer = conn_type == crate::server::AuthConnType::Remote
-                && crate::is_support_remote_print(&lr.version)
-                && lr.my_platform == hbb_common::whoami::Platform::Windows.to_string();
             AUTHED_CONNS.lock().unwrap().push(AuthedConn {
                 conn_id,
                 conn_type,
                 session_key,
                 sender,
-                printer,
+                printer: false,
             });
             Self::check_wake_lock();
             use std::sync::Once;

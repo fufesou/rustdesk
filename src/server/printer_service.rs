@@ -1,4 +1,5 @@
 use super::service::{EmptyExtraFieldService, GenericService, Service};
+use base::message_proto::LoginRequest;
 use hbb_common::{bail, dlopen::symbor::Library, log, ResultType};
 use std::{
     sync::{Arc, Mutex},
@@ -7,6 +8,26 @@ use std::{
 };
 
 pub const NAME: &'static str = "remote-printer";
+
+fn can_receive_print_jobs(request: &LoginRequest, desktop_login_sent: bool) -> bool {
+    desktop_login_sent
+        && crate::is_support_remote_print(&request.version)
+        && request.my_platform == hbb_common::whoami::Platform::Windows.to_string()
+}
+
+pub(super) fn enable_for_login(conn_id: i32, request: &LoginRequest, desktop_login_sent: bool) {
+    if !can_receive_print_jobs(request, desktop_login_sent) {
+        return;
+    }
+    if let Some(conn) = super::AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|conn| conn.conn_id == conn_id)
+    {
+        conn.printer = true;
+    }
+}
 
 const LIB_NAME_PRINTER_DRIVER_ADAPTER: &str = "printer_driver_adapter";
 
@@ -160,4 +181,22 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
         thread::sleep(Duration::from_millis(300));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_printer_requires_a_completed_desktop_login_and_a_compatible_peer() {
+        let mut request = LoginRequest {
+            my_platform: hbb_common::whoami::Platform::Windows.to_string(),
+            version: "1.3.9".into(),
+            ..Default::default()
+        };
+        assert!(!can_receive_print_jobs(&request, false));
+        assert!(can_receive_print_jobs(&request, true));
+        request.version = "1.3.8".into();
+        assert!(!can_receive_print_jobs(&request, true));
+    }
 }
