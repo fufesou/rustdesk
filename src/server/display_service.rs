@@ -950,9 +950,8 @@ pub(super) fn get_sync_displays_on_login() -> ResultType<(Vec<DisplayInfo>, usiz
 }
 
 #[cfg(windows)]
-pub(super) fn existing_login_displays() -> ResultType<Option<(Vec<DisplayInfo>, usize)>> {
-    let displays = Display::all()?;
-    Ok((!no_displays(&displays)).then(|| login_snapshot(&displays)))
+pub(super) fn has_login_displays() -> ResultType<bool> {
+    Ok(!no_displays(&Display::all()?))
 }
 
 #[cfg(windows)]

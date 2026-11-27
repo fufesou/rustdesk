@@ -18,7 +18,7 @@ type Snapshot = ResultType<(Vec<DisplayInfo>, usize)>;
 
 enum LoginDisplays {
     Waiting(oneshot::Receiver<ResultType<()>>),
-    Ready(Snapshot),
+    Ready(ResultType<()>),
 }
 
 #[derive(Default)]
@@ -143,9 +143,9 @@ impl DisplayJobs {
             return false;
         }
         super::try_activate_screen();
-        self.login = Some(match display_service::existing_login_displays() {
-            Ok(Some(displays)) => LoginDisplays::Ready(Ok(displays)),
-            Ok(None) => self.queue_headless_login(|| {
+        self.login = Some(match display_service::has_login_displays() {
+            Ok(true) => LoginDisplays::Ready(Ok(())),
+            Ok(false) => self.queue_headless_login(|| {
                 display_service::try_get_displays_add_amyuni_headless().map(|_| ())
             }),
             Err(error) => LoginDisplays::Ready(Err(error)),
@@ -177,7 +177,7 @@ impl DisplayJobs {
             return false;
         };
         let result = match receiver.try_recv() {
-            Ok(result) => display_service::current_login_displays(result),
+            Ok(result) => result,
             Err(oneshot::error::TryRecvError::Empty) => return false,
             Err(error) => Err(error.into()),
         };
@@ -187,7 +187,7 @@ impl DisplayJobs {
 
     pub(super) fn login_displays(&mut self) -> Snapshot {
         match self.login.take() {
-            Some(LoginDisplays::Ready(result)) => result,
+            Some(LoginDisplays::Ready(result)) => display_service::current_login_displays(result),
             Some(LoginDisplays::Waiting(_)) => {
                 Err(anyhow!("The login display is still being prepared"))
             }
