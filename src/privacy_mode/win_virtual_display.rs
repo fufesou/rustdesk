@@ -132,6 +132,13 @@ pub fn check_privacy_mode() {
         return;
     }
     let Err(error) = check_current_displays() else {
+        if let Err(error) = privacy_mode.retry_pending_display_restore() {
+            hbb_common::throttled_log!(
+                STATE_CHECK_LOG_INTERVAL,
+                error,
+                "Cannot restore the physical desktop: {error:#}"
+            );
+        }
         return;
     };
 
@@ -631,6 +638,17 @@ impl PrivacyModeImpl {
 }
 
 impl PrivacyMode for PrivacyModeImpl {
+    fn retry_pending_display_restore(&mut self) -> ResultType<()> {
+        let Session::Restoring(owner) = self.session else {
+            return Ok(());
+        };
+        let result = self.turn_off_privacy(owner, None);
+        if self.session.owner() == INVALID_PRIVACY_MODE_CONN_ID {
+            self.notify_owner_of_loss(owner);
+        }
+        result
+    }
+
     fn add_prepared_virtual_display(&mut self, index: u32) -> ResultType<()> {
         // Preparation created this monitor before ensure_virtual_display could record it.
         self.virtual_displays_added.push(index);

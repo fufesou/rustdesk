@@ -67,6 +67,11 @@ pub trait PrivacyMode: Sync + Send {
     fn get_impl_key(&self) -> &str;
 
     #[cfg(windows)]
+    fn retry_pending_display_restore(&mut self) -> ResultType<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn add_prepared_virtual_display(&mut self, _index: u32) -> ResultType<()> {
         bail!(
             "Prepared virtual displays are unsupported for {}",
