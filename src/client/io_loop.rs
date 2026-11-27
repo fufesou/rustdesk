@@ -2831,8 +2831,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 );
             }
             back_notification::PrivacyModeState::PrvOffUnknown => {
-                self.handler
-                    .msgbox("custom-error", "Privacy mode", "Turned off", "");
+                self.handler.msgbox(
+                    "custom-error",
+                    "Privacy mode",
+                    if details.is_empty() {
+                        "Turned off"
+                    } else {
+                        &details
+                    },
+                    "",
+                );
                 // log::error!("Privacy mode is turned off with unknown reason");
                 self.update_privacy_mode(impl_key, false);
             }

@@ -5460,6 +5460,15 @@ impl Connection {
                 back_notification::PrivacyModeState::PrvOffSucceeded,
                 impl_key,
             ),
+            #[cfg(windows)]
+            Some(Err(e)) if e.is::<privacy_mode::PrivacyDisplayCleanup>() => {
+                log::error!("{e:#}");
+                crate::common::make_privacy_mode_msg_with_details(
+                    back_notification::PrivacyModeState::PrvOffUnknown,
+                    format!("{e:#}"),
+                    impl_key,
+                )
+            }
             Some(Err(e)) => {
                 log::error!("Failed to turn off privacy mode {}", e);
                 crate::common::make_privacy_mode_msg_with_details(
@@ -7416,6 +7425,20 @@ mod test {
     // The registry is process-global and the harness runs tests in parallel threads, so every
     // test that admits connections holds this first; a poisoned lock is still a lock.
     static UNAUTHORIZED_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    #[test]
+    fn virtual_display_cleanup_error_tells_the_peer_privacy_is_off() {
+        let error =
+            hbb_common::anyhow::anyhow!("driver busy").context(privacy_mode::PrivacyDisplayCleanup);
+        let msg = Connection::turn_off_privacy_result_to_msg(Some(Err(error)), String::new());
+        let notice = msg.misc().back_notification();
+        assert_eq!(
+            notice.privacy_mode_state(),
+            back_notification::PrivacyModeState::PrvOffUnknown
+        );
+        assert!(notice.details.contains("driver busy"));
+    }
 
     fn unauthorized_count() -> usize {
         UNAUTHORIZED_CONNS.lock().unwrap().len()
