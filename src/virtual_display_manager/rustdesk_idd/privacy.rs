@@ -1,4 +1,4 @@
-use super::{install_driver, Monitor, Profile, DEFAULT_MODE, MANAGER};
+use super::{install_driver, update, Monitor, Profile, DEFAULT_MODE};
 use crate::virtual_display_manager::{windows::get_device_names, RUSTDESK_IDD_DEVICE_STRING};
 use hbb_common::{
     anyhow::Context,
@@ -39,7 +39,7 @@ impl PreparedMonitor {
         let name = profile.wait_for_source_while(None, cancelled);
         let prepared = Self {
             monitor: Some(Monitor {
-                profile,
+                profile: profile.into(),
                 name: name.as_ref().ok().cloned(),
             }),
             _reservation: reservation,
@@ -54,7 +54,7 @@ impl PreparedMonitor {
 
     pub(crate) fn adopt(mut self) {
         if let Some(monitor) = self.monitor.take() {
-            MANAGER.lock().unwrap().monitors.insert(CONNECTOR, monitor);
+            update(|m| m.monitors.insert(CONNECTOR, monitor));
         }
     }
 }
@@ -64,7 +64,7 @@ impl Drop for PreparedMonitor {
         if let Some(monitor) = self.monitor.take() {
             if let Err(error) = monitor.profile.detach() {
                 log::error!("Failed to detach the cancelled privacy display: {error:#}");
-                MANAGER.lock().unwrap().monitors.insert(CONNECTOR, monitor);
+                update(|m| m.monitors.insert(CONNECTOR, monitor));
             }
         }
     }

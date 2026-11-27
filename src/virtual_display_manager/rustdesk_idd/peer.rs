@@ -4,9 +4,9 @@ use virtual_display::MonitorMode;
 
 pub fn plug_in_peer_request(modes: Vec<Vec<MonitorMode>>) -> ResultType<Vec<u32>> {
     update(|manager| {
-        manager.monitors.retain(|i, m| {
-            !PEER_INDICES.contains(i) || !m.profile.no_longer_attached()
-        });
+        manager
+            .monitors
+            .retain(|i, m| !PEER_INDICES.contains(i) || !m.profile.no_longer_attached());
         let indices: Vec<_> = PEER_INDICES
             .filter(|i| !manager.monitors.contains_key(i))
             .take(modes.len())

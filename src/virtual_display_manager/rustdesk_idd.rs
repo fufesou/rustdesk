@@ -11,7 +11,10 @@ use hbb_common::{
     bail, lazy_static, ResultType,
 };
 use profile::Profile;
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use virtual_display::MonitorMode;
 
 const HEADLESS: u32 = 0;
@@ -27,8 +30,9 @@ lazy_static::lazy_static! {
 }
 static INSTALLED: Mutex<bool> = Mutex::new(false);
 
+#[derive(Clone)]
 struct Monitor {
-    profile: Profile,
+    profile: Arc<Profile>,
     name: Option<String>,
 }
 
@@ -46,7 +50,7 @@ impl Monitor {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Manager {
     monitors: BTreeMap<u32, Monitor>,
 }
@@ -66,8 +70,12 @@ fn install_driver(force: bool) -> ResultType<()> {
 }
 
 impl Manager {
-    fn peer_indices(&self) -> Vec<u32> {
-        self.monitors.range(PEER_INDICES).map(|(&i, _)| i).collect()
+    fn peer_slots_changed(&self, next: &Self) -> bool {
+        PEER_INDICES.any(|i| match (self.monitors.get(&i), next.monitors.get(&i)) {
+            (Some(old), Some(new)) => !Arc::ptr_eq(&old.profile, &new.profile),
+            (None, None) => false,
+            _ => true,
+        })
     }
 
     fn plug_in(&mut self, index: u32, modes: &[MonitorMode]) -> ResultType<()> {
@@ -91,7 +99,7 @@ impl Manager {
         };
         let profile = Profile::new(index).attach(modes, || false)?;
         let mut monitor = Monitor {
-            profile,
+            profile: Arc::new(profile),
             name: None,
         };
         match monitor.profile.wait_for_source(None) {
@@ -116,10 +124,18 @@ impl Manager {
 }
 
 fn update<R>(operation: impl FnOnce(&mut Manager) -> R) -> R {
-    let mut manager = MANAGER.lock().unwrap();
-    let before = manager.peer_indices();
-    let result = operation(&mut manager);
-    if before != manager.peer_indices() {
+    // Driver writes are serialized. Logins can read the last completed topology during activation.
+    static WRITER: Mutex<()> = Mutex::new(());
+    let _writer = WRITER.lock().unwrap();
+    let mut next = MANAGER.lock().unwrap().clone();
+    let result = operation(&mut next);
+    let changed = {
+        let mut current = MANAGER.lock().unwrap();
+        let changed = current.peer_slots_changed(&next);
+        *current = next;
+        changed
+    };
+    if changed {
         crate::server::display_service::virtual_display_slots_changed();
     }
     result
@@ -159,9 +175,8 @@ pub fn plug_in_headless() -> ResultType<()> {
 }
 
 pub fn get_virtual_displays() -> Vec<u32> {
-    MANAGER
-        .lock()
-        .unwrap()
+    let snapshot = MANAGER.lock().unwrap().clone();
+    snapshot
         .monitors
         .range(PEER_INDICES)
         .filter_map(|(&i, m)| (!m.profile.no_longer_attached()).then_some(i))
