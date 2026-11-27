@@ -131,6 +131,20 @@ pub fn check_privacy_mode() {
     };
 
     let cleanup = privacy_mode.turn_off_privacy(conn_id, None);
+    if !virtual_display_manager::is_amyuni_idd()
+        && cleanup
+            .as_ref()
+            .is_err_and(|e| !e.is::<PrivacyDisplayCleanup>())
+    {
+        // The desktop is already exposed even if Windows cannot restore its saved layout yet.
+        if let Err(error) = super::win_input::unhook() {
+            hbb_common::throttled_log!(
+                STATE_CHECK_LOG_INTERVAL,
+                error,
+                "Cannot release local input: {error:#}"
+            );
+        }
+    }
     // The connection manager may be absent; notify the owner through its server channel.
     let notification = {
         let connections = crate::server::AUTHED_CONNS.lock().unwrap();
