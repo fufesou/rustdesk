@@ -1220,15 +1220,8 @@ impl Connection {
                 }
                 _ = second_timer.tick() => {
                     #[cfg(windows)]
-                    if conn.display_jobs.poll_login() {
-                        if !conn.send_authorized_login_response().await {
-                            break;
-                        }
-                        for msg in conn.display_jobs.take_before_login() {
-                            if !conn.on_message(msg).await {
-                                break 'connection;
-                            }
-                        }
+                    if conn.display_jobs.poll_login() && !conn.complete_display_login().await {
+                        break;
                     }
                     #[cfg(windows)]
                     conn.portable_check();

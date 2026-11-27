@@ -200,6 +200,30 @@ impl DisplayJobs {
 }
 
 impl Connection {
+    pub(super) async fn complete_display_login(&mut self) -> bool {
+        use crate::privacy_mode::{get_privacy_mode_conn_id, INVALID_PRIVACY_MODE_CONN_ID};
+
+        if !self.check_privacy_mode_on().await {
+            self.on_close("privacy mode", false).await;
+            return false;
+        }
+        if !self.send_authorized_login_response().await {
+            return false;
+        }
+        for msg in self.display_jobs.take_before_login() {
+            if get_privacy_mode_conn_id().is_some_and(|owner| {
+                owner != INVALID_PRIVACY_MODE_CONN_ID && owner != self.inner.id()
+            }) {
+                self.on_close("privacy mode", false).await;
+                return false;
+            }
+            if !self.on_message(msg).await {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn dispatch_display(
         &mut self,
         operation: impl FnOnce() -> ResultType<()> + Send + 'static,
