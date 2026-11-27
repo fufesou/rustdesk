@@ -79,6 +79,17 @@ pub(super) fn active_source(target: Target) -> ResultType<Option<String>> {
     source.header.id = path.sourceInfo.id;
     let status = unsafe { DisplayConfigGetDeviceInfo(&mut source.header) };
     if status != ERROR_SUCCESS.0 as i32 {
+        // Windows can replace the source between enumerating the paths and reading its name.
+        let still_active = active_paths()?.is_some_and(|paths| {
+            paths.iter().any(|p| {
+                path_target(p) == target
+                    && p.sourceInfo.adapterId == source.header.adapterId
+                    && p.sourceInfo.id == source.header.id
+            })
+        });
+        if !still_active {
+            return Ok(None);
+        }
         return Err(io::Error::from_raw_os_error(status).into());
     }
     let name = &source.viewGdiDeviceName;

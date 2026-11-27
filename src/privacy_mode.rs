@@ -439,7 +439,11 @@ fn turn_on_privacy_sync(
                     return Some(Err(error));
                 }
             }
-            PreparedDisplay::RustDesk(monitor) => monitor.adopt(),
+            PreparedDisplay::RustDesk(monitor) => {
+                if privacy_mode.get_impl_key() == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY {
+                    monitor.adopt();
+                }
+            }
         }
     }
 
