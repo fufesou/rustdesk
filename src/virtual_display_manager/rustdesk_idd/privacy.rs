@@ -48,10 +48,6 @@ impl PreparedMonitor {
         Ok(prepared)
     }
 
-    pub(crate) fn created(&self) -> bool {
-        self.monitor.is_some()
-    }
-
     pub(crate) fn adopt(mut self) {
         if let Some(monitor) = self.monitor.take() {
             update(|m| m.monitors.insert(CONNECTOR, monitor));

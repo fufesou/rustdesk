@@ -1,7 +1,8 @@
 use super::{PrivacyMode, PrivacyModeState, INVALID_PRIVACY_MODE_CONN_ID, NO_PHYSICAL_DISPLAYS};
 use crate::{platform::windows::reg_display_settings, virtual_display_manager};
 use hbb_common::{
-    allow_err, bail, config::Config, log, tokio::sync::mpsc::UnboundedSender, ResultType,
+    allow_err, anyhow::Context, bail, config::Config, log, tokio::sync::mpsc::UnboundedSender,
+    ResultType,
 };
 use std::{
     io::Error,
@@ -137,6 +138,15 @@ struct Display {
     primary: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct PrivacyDisplayCleanup;
+
+impl std::fmt::Display for PrivacyDisplayCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Privacy mode is off, but its virtual display could not be unplugged")
+    }
+}
+
 pub struct PrivacyModeImpl {
     impl_key: String,
     conn_id: i32,
@@ -250,6 +260,14 @@ impl PrivacyModeImpl {
     }
 
     fn restore_plug_out_monitor(&mut self) -> ResultType<()> {
+        if !virtual_display_manager::is_amyuni_idd() {
+            // The IDD manager keeps this reserved connector until the driver confirms removal.
+            return virtual_display_manager::plug_out_monitor_indices(
+                &[virtual_display_manager::rustdesk_idd::privacy::CONNECTOR],
+                true,
+                false,
+            );
+        }
         virtual_display_manager::plug_out_monitor_indices(
             &std::mem::take(&mut self.virtual_displays_added),
             true,
@@ -499,20 +517,22 @@ impl PrivacyModeImpl {
         Ok(())
     }
 
-    fn restore(&mut self) {
+    fn restore(&mut self) -> ResultType<()> {
         Self::restore_displays(&self.displays);
         Self::restore_displays(&self.virtual_displays);
         allow_err!(Self::commit_change_display(0));
         self.displays.clear();
         self.virtual_displays.clear();
-        let is_virtual_display_added = self.virtual_displays_added.len() > 0;
-        if is_virtual_display_added {
+        if !virtual_display_manager::is_amyuni_idd() {
+            return self.restore_plug_out_monitor().context(PrivacyDisplayCleanup);
+        }
+        if !self.virtual_displays_added.is_empty() {
             if let Err(error) = self.restore_plug_out_monitor() {
                 log::error!(
                     "Privacy mode restored displays but failed to unplug its monitor: {error:#}"
                 );
             }
-        } else if virtual_display_manager::is_amyuni_idd() {
+        } else {
             // https://github.com/rustdesk/rustdesk/pull/12114#issuecomment-2983054370
             // No virtual displays added, we need to change the display combination to force the display settings to be reloaded.
             // This function changes the user behavior of the virtual displays.
@@ -523,6 +543,7 @@ impl PrivacyModeImpl {
             // We can't replug the virtual dislays here.
             // TODO: plug out + plug in the virtual displays (`IDD_IMPL_AMYUNI`) in a short time makes the server side crash.
         }
+        Ok(())
     }
 
     fn restore_displays(displays: &[Display]) {
@@ -639,7 +660,7 @@ impl PrivacyMode for PrivacyModeImpl {
         self.check_off_conn_id(conn_id)?;
         super::win_input::unhook()?;
         let _tmp_ignore_changed_holder = crate::display_service::temp_ignore_displays_changed();
-        self.restore();
+        let cleanup = self.restore();
         // We need to force restore the registry connectivity.
         // This is because the registry connection may be changed by `self.restore()`, but will not be fully restored.
         restore_reg_connectivity(false, true);
@@ -656,7 +677,7 @@ impl PrivacyMode for PrivacyModeImpl {
             self.conn_id = INVALID_PRIVACY_MODE_CONN_ID.to_owned();
         }
 
-        Ok(())
+        cleanup
     }
 
     #[inline]

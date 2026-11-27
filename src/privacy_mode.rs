@@ -29,6 +29,8 @@ pub mod macos;
 #[cfg(windows)]
 mod win_virtual_display;
 #[cfg(windows)]
+pub(crate) use win_virtual_display::PrivacyDisplayCleanup;
+#[cfg(windows)]
 pub use win_virtual_display::{check_privacy_mode, restore_reg_connectivity};
 
 pub const INVALID_PRIVACY_MODE_CONN_ID: i32 = 0;
@@ -440,19 +442,13 @@ fn turn_on_privacy_sync(
     let privacy_mode = privacy_mode_lock.as_mut()?;
     #[cfg(windows)]
     if let Some(display) = prepared_display {
-        let index = match &display {
-            PreparedDisplay::Amyuni(index) => Some(*index),
-            PreparedDisplay::RustDesk(monitor) => monitor
-                .created()
-                .then_some(crate::virtual_display_manager::rustdesk_idd::privacy::CONNECTOR),
-        };
-        if let Some(index) = index {
-            if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
-                return Some(Err(error));
+        match display {
+            PreparedDisplay::Amyuni(index) => {
+                if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
+                    return Some(Err(error));
+                }
             }
-        }
-        if let PreparedDisplay::RustDesk(monitor) = display {
-            monitor.adopt();
+            PreparedDisplay::RustDesk(monitor) => monitor.adopt(),
         }
     }
 
