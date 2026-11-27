@@ -750,11 +750,7 @@ impl Connection {
             (_tx_clip, rx_clip) = mpsc::unbounded_channel::<i32>();
         }
 
-        loop {
-            #[cfg(windows)]
-            let read_peer = conn.display_jobs.before_login.is_none();
-            #[cfg(not(windows))]
-            let read_peer = true;
+        'connection: loop {
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
 
@@ -763,7 +759,7 @@ impl Connection {
                 // fires once the connection has authorized.
                 _ = unauthorized_evicted(&conn.unauthorized_id) => {
                     conn.on_close("Timeout", true).await;
-                    break;
+                    break 'connection;
                 }
                 _ = login_deadline(conn.authed_conn_id.is_some(), started) => {
                     conn.on_close("Timeout", true).await;
@@ -1058,7 +1054,7 @@ impl Connection {
                         _ => {}
                     }
                 },
-                res = conn.stream.next(), if read_peer => {
+                res = conn.stream.next() => {
                     if let Some(res) = res {
                         match res {
                             Err(err) => {
@@ -1228,11 +1224,9 @@ impl Connection {
                         if !conn.send_authorized_login_response().await {
                             break;
                         }
-                        if let Some(msg) = conn.display_jobs.before_login.take() {
-                            // Resume reading the peer, including the heartbeat replies behind this message.
-                            last_recv_time = Instant::now();
+                        for msg in conn.display_jobs.take_before_login() {
                             if !conn.on_message(msg).await {
-                                break;
+                                break 'connection;
                             }
                         }
                     }
@@ -1256,13 +1250,12 @@ impl Connection {
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
-                    if read_peer && last_recv_time.elapsed() >= SEC30 {
+                    if last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
                     }
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
-                    let repeat_probe = !read_peer && conn.last_test_delay.is_some_and(|t| t.elapsed() >= SEC30 / 2);
-                    if (conn.last_test_delay.is_none() || repeat_probe) && !(conn.port_forward_socket.is_some() && conn.authorized) {
+                    if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
                         conn.last_test_delay = Some(Instant::now());
                         let mut msg_out = Message::new();
                         msg_out.set_test_delay(TestDelay{
@@ -1270,12 +1263,7 @@ impl Connection {
                             target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
                             ..Default::default()
                         });
-                        if read_peer {
-                            conn.send(msg_out.into()).await;
-                        } else if let Err(error) = conn.stream.send(&msg_out).await {
-                            conn.on_close(&error.to_string(), true).await;
-                            break;
-                        }
+                        conn.send(msg_out.into()).await;
                     }
                     if conn.is_authed_remote_conn() || conn.view_camera {
                         if let Some(last_test_delay) = conn.last_test_delay {
@@ -3016,8 +3004,11 @@ impl Connection {
         if self.display_jobs.login_pending()
             && !matches!(&msg.union, Some(message::Union::TestDelay(_)))
         {
-            // Leave subsequent frames in the transport until this one can be delivered in order.
-            self.display_jobs.before_login = Some(msg);
+            if let Err(error) = self.display_jobs.defer_until_login(msg) {
+                self.send_login_error(&error.to_string()).await;
+                self.on_close(&error.to_string(), true).await;
+                return false;
+            }
             return true;
         }
         if self.authorized {

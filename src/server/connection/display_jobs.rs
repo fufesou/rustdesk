@@ -2,7 +2,7 @@ use super::{display_service, ConnInner, Connection, Subscriber};
 use base::message_proto::{DisplayInfo, Message, MessageBox};
 use hbb_common::{
     anyhow::anyhow,
-    log,
+    bail, log, protobuf::Message as _,
     tokio::sync::{mpsc, oneshot},
     ResultType,
 };
@@ -22,7 +22,8 @@ enum LoginDisplays {
 #[derive(Default)]
 pub(super) struct DisplayJobs {
     login: Option<LoginDisplays>,
-    pub(super) before_login: Option<Message>,
+    before_login: Vec<Message>,
+    before_login_bytes: usize,
     resolutions: Option<Arc<()>>,
     sender: Option<mpsc::Sender<Job>>,
     worker: Option<(JoinHandle<()>, oneshot::Receiver<()>)>,
@@ -61,7 +62,7 @@ impl DisplayJobs {
 
     pub(super) fn stop(&mut self) {
         self.login.take();
-        self.before_login.take();
+        drop(self.take_before_login());
         self.revoke_resolutions();
         self.sender.take();
     }
@@ -108,6 +109,24 @@ impl Drop for DisplayJobs {
 }
 
 impl DisplayJobs {
+    pub(super) fn defer_until_login(&mut self, msg: Message) -> ResultType<()> {
+        // Only pre-response traffic is buffered. Keep the same budget as a login frame.
+        let size =
+            usize::try_from(msg.compute_size())?.saturating_add(std::mem::size_of::<Message>());
+        let total = self.before_login_bytes.saturating_add(size);
+        if total > super::MAX_UNAUTHORIZED_MESSAGE {
+            bail!("Too much data received before the login display was ready");
+        }
+        self.before_login.push(msg);
+        self.before_login_bytes = total;
+        Ok(())
+    }
+
+    pub(super) fn take_before_login(&mut self) -> Vec<Message> {
+        self.before_login_bytes = 0;
+        std::mem::take(&mut self.before_login)
+    }
+
     pub(super) fn prepare_login(&mut self) -> bool {
         if crate::virtual_display_manager::is_amyuni_idd()
             || !crate::virtual_display_manager::is_virtual_display_supported()
@@ -209,6 +228,26 @@ fn report(peer: &mut ConnInner, error: hbb_common::anyhow::Error) {
 mod tests {
     use super::*;
     use hbb_common::tokio;
+
+    #[test]
+    fn virtual_display_login_preserves_pipelined_messages_within_the_login_budget() {
+        let mut jobs = DisplayJobs::default();
+        let mut first = Message::new();
+        first.set_message_box(MessageBox {
+            text: "first".into(),
+            ..Default::default()
+        });
+        let second = Message::new();
+        jobs.defer_until_login(first.clone()).unwrap();
+        jobs.defer_until_login(second.clone()).unwrap();
+        let mut oversized = Message::new();
+        oversized.set_message_box(MessageBox {
+            text: "x".repeat(super::super::MAX_UNAUTHORIZED_MESSAGE),
+            ..Default::default()
+        });
+        assert!(jobs.defer_until_login(oversized).is_err());
+        assert_eq!(jobs.take_before_login(), [first, second]);
+    }
 
     #[tokio::test]
     async fn virtual_display_close_cancels_a_pending_headless_login() {
