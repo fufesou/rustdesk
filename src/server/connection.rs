@@ -1201,10 +1201,14 @@ impl Connection {
                         ipc::Data::PrivacyModeState((_, privacy_mode::PrivacyModeState::OffUnknown, impl_key)) => {
                             if privacy_mode::get_cur_impl_key().as_deref() == Some(impl_key.as_str()) {
                                 conn.privacy_preparation = None;
-                                conn.send(crate::common::make_privacy_mode_msg(
+                                let msg = crate::common::make_privacy_mode_msg(
                                     back_notification::PrivacyModeState::PrvOffUnknown,
                                     impl_key,
-                                )).await;
+                                );
+                                if let Err(error) = conn.stream.send(&msg).await {
+                                    conn.on_close(&error.to_string(), false).await;
+                                    break;
+                                }
                             }
                         }
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
