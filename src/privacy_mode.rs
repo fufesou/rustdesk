@@ -282,7 +282,7 @@ pub(crate) fn prepare_virtual_display(
 }
 
 #[cfg(windows)]
-fn with_virtual_display_privacy<T>(operation: impl FnOnce(bool) -> T) -> T {
+pub(crate) fn with_virtual_display_privacy<T>(operation: impl FnOnce(bool) -> T) -> T {
     if crate::virtual_display_manager::is_amyuni_idd() {
         return operation(false);
     }
@@ -294,15 +294,6 @@ fn with_virtual_display_privacy<T>(operation: impl FnOnce(bool) -> T) -> T {
     });
     drop(mode);
     operation(private)
-}
-
-#[cfg(windows)]
-pub(crate) fn change_virtual_display_resolution(name: &str, size: (u32, u32)) -> ResultType<bool> {
-    with_virtual_display_privacy(|private| {
-        crate::virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
-            name, size, private,
-        )
-    })
 }
 
 #[cfg(windows)]

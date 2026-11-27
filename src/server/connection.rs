@@ -4943,24 +4943,20 @@ impl Connection {
         let size = (r.width, r.height);
         #[cfg(windows)]
         {
-            let name = if virtual_display_manager::is_amyuni_idd() {
-                None
-            } else {
-                let Some(display) = display_service::get_display_info(display_idx) else {
-                    return;
-                };
-                Some(display.name)
-            };
-            let change = move || {
-                Self::apply_display_resolution(display_idx, size, name.as_deref())
-                    .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
-            };
             if virtual_display_manager::is_amyuni_idd() {
-                self.dispatch_display(change);
-            } else {
-                let change = self.display_jobs.resolution_request(change);
-                self.dispatch_display(change);
+                self.dispatch_display(move || {
+                    Self::apply_display_resolution(display_idx, size, None)
+                });
+                return;
             }
+            let Some(display) = display_service::get_display_info(display_idx) else {
+                return;
+            };
+            let change = self.display_jobs.resolution_request(move |private| {
+                Self::apply_display_resolution(display_idx, size, Some((&display.name, private)))
+                    .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
+            });
+            self.dispatch_display(change);
         }
         #[cfg(not(windows))]
         hbb_common::allow_err!(Self::apply_display_resolution(display_idx, size));
@@ -4970,14 +4966,14 @@ impl Connection {
     fn apply_display_resolution(
         display_idx: usize,
         (width, height): (i32, i32),
-        #[cfg(windows)] requested_name: Option<&str>,
+        #[cfg(windows)] requested_display: Option<(&str, bool)>,
     ) -> ResultType<()> {
         let Ok(displays) = display_service::try_get_displays() else {
             return Ok(());
         };
         let display = displays.get(display_idx);
         #[cfg(windows)]
-        let display = if let Some(name) = requested_name {
+        let display = if let Some((name, _)) = requested_display {
             Some(displays.iter().find(|d| d.name() == name).ok_or_else(|| {
                 hbb_common::anyhow::anyhow!("Requested display is no longer connected")
             })?)
@@ -4989,8 +4985,14 @@ impl Connection {
         };
         let name = display.name();
         #[cfg(windows)]
-        if privacy_mode::change_virtual_display_resolution(&name, (width as _, height as _))? {
-            return Ok(());
+        if let Some((_, private)) = requested_display {
+            if virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
+                &name,
+                (width as _, height as _),
+                private,
+            )? {
+                return Ok(());
+            }
         }
         #[allow(unused_mut)]
         let mut record_changed = true;

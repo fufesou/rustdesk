@@ -2,7 +2,8 @@ use super::{display_service, ConnInner, Connection, Subscriber};
 use base::message_proto::{DisplayInfo, Message, MessageBox};
 use hbb_common::{
     anyhow::anyhow,
-    bail, log, protobuf::Message as _,
+    bail, log,
+    protobuf::Message as _,
     tokio::sync::{mpsc, oneshot},
     ResultType,
 };
@@ -69,14 +70,16 @@ impl DisplayJobs {
 
     pub(super) fn resolution_request(
         &mut self,
-        change: impl FnOnce() -> ResultType<()> + Send + 'static,
+        change: impl FnOnce(bool) -> ResultType<()> + Send + 'static,
     ) -> impl FnOnce() -> ResultType<()> + Send + 'static {
         let permission = Arc::downgrade(self.resolutions.get_or_insert_with(Arc::default));
         move || {
-            if permission.strong_count() == 0 {
-                return Ok(());
-            }
-            change()
+            crate::privacy_mode::with_virtual_display_privacy(|private| {
+                if permission.strong_count() == 0 {
+                    return Ok(());
+                }
+                change(private)
+            })
         }
     }
 
@@ -275,9 +278,9 @@ mod tests {
         let mut jobs = DisplayJobs::default();
         let (sent, received) = std::sync::mpsc::channel();
         let first = sent.clone();
-        let old = jobs.resolution_request(move || Ok(first.send(1)?));
+        let old = jobs.resolution_request(move |_| Ok(first.send(1)?));
         jobs.revoke_resolutions();
-        let new = jobs.resolution_request(move || Ok(sent.send(2)?));
+        let new = jobs.resolution_request(move |_| Ok(sent.send(2)?));
         old().unwrap();
         new().unwrap();
         assert_eq!(received.into_iter().collect::<Vec<_>>(), [2]);
