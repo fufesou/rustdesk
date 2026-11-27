@@ -1206,7 +1206,7 @@ impl Connection {
                                     impl_key,
                                 );
                                 if let Err(error) = conn.stream.send(&msg).await {
-                                    conn.on_close(&error.to_string(), false).await;
+                                    conn.on_close(&error.to_string(), true).await;
                                     break;
                                 }
                             }
