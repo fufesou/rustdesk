@@ -7348,13 +7348,18 @@ mod raii {
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 display_service::restore_resolutions();
-                #[cfg(windows)]
-                if let Err(error) = privacy_mode::reset_after_disconnect(self.0) {
-                    log::error!("Failed to disconnect virtual displays: {error:#}");
-                }
                 #[cfg(target_os = "linux")]
                 if self.1 == AuthConnType::Remote || self.1 == AuthConnType::ViewCamera {
                     wayland::try_close_portal_session();
+                }
+            }
+            #[cfg(windows)]
+            if remote_count == 0
+                || (self.1 == AuthConnType::Remote
+                    && !crate::virtual_display_manager::is_amyuni_idd())
+            {
+                if let Err(error) = privacy_mode::reset_after_disconnect(self.0) {
+                    log::error!("Failed to disconnect virtual displays: {error:#}");
                 }
             }
             Self::check_wake_lock();

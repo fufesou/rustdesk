@@ -227,14 +227,58 @@ pub(crate) fn reset_after_disconnect(conn_id: i32) -> ResultType<()> {
     if crate::virtual_display_manager::is_amyuni_idd() {
         return crate::virtual_display_manager::reset_all();
     }
-    if let Some(mode) = PRIVACY_MODE.lock().unwrap().as_deref_mut() {
+    let result = reset_disconnected_displays(conn_id, false);
+    if result.is_err() && get_privacy_mode_conn_id() == Some(conn_id) {
+        // The display service stops polling when the last subscriber disconnects.
+        std::thread::Builder::new()
+            .name("privacy-display-restore".into())
+            .spawn(move || retry_disconnected_displays(conn_id))?;
+    }
+    result
+}
+
+#[cfg(windows)]
+fn retry_disconnected_displays(conn_id: i32) {
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    loop {
+        std::thread::sleep(RETRY_INTERVAL);
+        match reset_disconnected_displays(conn_id, true) {
+            Ok(()) => return,
+            Err(error) => hbb_common::throttled_log!(
+                std::time::Duration::from_secs(60),
+                error,
+                "Cannot restore disconnected privacy display: {error:#}"
+            ),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reset_disconnected_displays(conn_id: i32, retry_owner_only: bool) -> ResultType<()> {
+    let mut privacy = PRIVACY_MODE.lock().unwrap();
+    if retry_owner_only && privacy.as_ref().map(|mode| mode.pre_conn_id()) != Some(conn_id) {
+        return Ok(());
+    }
+    if let Some(mode) = privacy.as_deref_mut() {
         let owner = mode.pre_conn_id();
         if owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id {
             return Ok(());
         }
         if owner == conn_id {
-            if let Some(result) = restore_rustdesk_privacy(mode) {
-                result?;
+            if crate::server::AUTHED_CONNS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.conn_id == owner)
+            {
+                return Ok(());
+            }
+            if let Some(Err(error)) = restore_rustdesk_privacy(mode) {
+                // The remote owner is gone. Keep the local operator's keyboard available for recovery.
+                if let Err(unhook) = win_input::unhook() {
+                    return Err(error.context(format!("Cannot release local input: {unhook:#}")));
+                }
+                return Err(error);
             }
         }
     }
