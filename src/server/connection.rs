@@ -918,14 +918,16 @@ impl Connection {
                                                         turn_off_res,
                                                         impl_key,
                                                     );
+                                                    let turn_off_failed = msg_out.misc().back_notification().privacy_mode_state()
+                                                        == back_notification::PrivacyModeState::PrvOffFailed;
                                                     conn.send(msg_out).await;
-                                                    // Turn-off failed, so revert CM's optimistic toggle
-                                                    // and keep the previous permission value.
-                                                    conn.send_to_cm(ipc::Data::SwitchPermission {
-                                                        name: "privacy_mode".to_owned(),
-                                                        enabled: conn.privacy_mode,
-                                                    });
-                                                    continue;
+                                                    if turn_off_failed {
+                                                        conn.send_to_cm(ipc::Data::SwitchPermission {
+                                                            name: "privacy_mode".to_owned(),
+                                                            enabled: conn.privacy_mode,
+                                                        });
+                                                        continue;
+                                                    }
                                                 }
                                             }
                                         }
@@ -5462,7 +5464,6 @@ impl Connection {
             ),
             #[cfg(windows)]
             Some(Err(e)) if e.is::<privacy_mode::PrivacyDisplayCleanup>() => {
-                log::error!("{e:#}");
                 crate::common::make_privacy_mode_msg_with_details(
                     back_notification::PrivacyModeState::PrvOffUnknown,
                     format!("{e:#}"),

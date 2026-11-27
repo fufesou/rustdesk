@@ -1,8 +1,7 @@
 use super::{PrivacyMode, PrivacyModeState, INVALID_PRIVACY_MODE_CONN_ID, NO_PHYSICAL_DISPLAYS};
 use crate::{platform::windows::reg_display_settings, virtual_display_manager};
 use hbb_common::{
-    allow_err, anyhow::Context, bail, config::Config, log, tokio::sync::mpsc::UnboundedSender,
-    ResultType,
+    allow_err, bail, config::Config, log, tokio::sync::mpsc::UnboundedSender, ResultType,
 };
 use std::{
     io::Error,
@@ -524,7 +523,11 @@ impl PrivacyModeImpl {
         self.displays.clear();
         self.virtual_displays.clear();
         if !virtual_display_manager::is_amyuni_idd() {
-            return self.restore_plug_out_monitor().context(PrivacyDisplayCleanup);
+            return self.restore_plug_out_monitor().map_err(|error| {
+                let error = error.context(PrivacyDisplayCleanup);
+                hbb_common::throttled_log!(STATE_CHECK_LOG_INTERVAL, error, "{error:#}");
+                error
+            });
         }
         if !self.virtual_displays_added.is_empty() {
             if let Err(error) = self.restore_plug_out_monitor() {
