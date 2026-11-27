@@ -1908,7 +1908,7 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
 ///   command.
 /// - `uninstall_drivers`: Remove the printer and bundled RustDesk IDD on full uninstall.
 fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String> {
-    let (subkey, path, start_menu, installed_exe) = get_install_info();
+    let (subkey, path, start_menu, _) = get_install_info();
     let installer_state = get_windows_installer_state(&subkey)?;
     if let Some(product_code) = get_msi_product_code(&subkey, installer_state)? {
         return Ok(build_msi_uninstall_command(&product_code));
@@ -1928,8 +1928,10 @@ fn get_uninstall(kill_self: bool, uninstall_drivers: bool) -> ResultType<String>
         }
     }
     let uninstall_idd = if uninstall_drivers && !crate::virtual_display_manager::is_amyuni_idd() {
+        let current = std::env::current_exe()?;
+        let current = installer_shell::path_for_cmd_environment(&current)?;
         format!(
-            r#""{installed_exe}" --uninstall-rustdesk-idd
+            r#""{current}" --uninstall-rustdesk-idd
     if errorlevel 1 exit /b 1"#
         )
     } else {
