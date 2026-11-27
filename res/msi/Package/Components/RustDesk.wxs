@@ -32,6 +32,7 @@
 		<CustomAction Id="SetPropertyServiceStop.SetParam.PropertyName" Return="check" Property="PropertyName" Value="STOP_SERVICE" />
 		<CustomAction Id="TryDeleteStartupShortcut.SetParam" Return="check" Property="ShortcutName" Value="$(var.Product) Tray" />
 		<CustomAction Id="RemoveAmyuniIdd.SetParam" Return="check" Property="RemoveAmyuniIdd" Value="[INSTALLFOLDER_INNER]" />
+		<CustomAction Id="RemoveRustDeskIdd.SetParam" Return="check" Property="RemoveRustDeskIdd" Value="[INSTALLFOLDER_INNER][ProductName].exe" />
 		<Binary Id="RustDeskIddDll" SourceFile="$(var.BuildDir)\dylib_virtual_display.dll" />
 		<Property Id="RUSTDESK_IDD_WINDOWS_BUILD" Secure="yes">
 			<RegistrySearch Id="RustDeskIddWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
@@ -109,6 +110,7 @@
 			<Custom Action="TerminateBrokers.SetParam" Before="TerminateBrokers"/>
 			<Custom Action="RemoveAmyuniIdd" Before="RemoveRuntimeGeneratedFiles"/>
 			<Custom Action="RemoveRustDeskIdd" Before="RemoveRuntimeGeneratedFiles.SetParam" Condition="$(var.RustDeskIddUninstall)" />
+			<Custom Action="RemoveRustDeskIdd.SetParam" Before="RemoveRustDeskIdd" Condition="$(var.RustDeskIddUninstall)" />
 			<Custom Action="Wix4CheckRebootRequired_$(sys.BUILDARCHSHORT)" After="InstallFinalize" Condition="$(var.RustDeskIddUninstall)" />
 			<Custom Action="RemoveAmyuniIdd.SetParam" Before="RemoveAmyuniIdd"/>
 		</InstallExecuteSequence>
