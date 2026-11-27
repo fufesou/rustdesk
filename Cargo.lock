@@ -3712,6 +3712,7 @@ dependencies = [
  "socket2 0.3.19",
  "sodiumoxide",
  "sysinfo",
+ "tempfile",
  "thiserror 1.0.61",
  "tokio",
  "tokio-native-tls",
@@ -3727,6 +3728,7 @@ dependencies = [
  "webpki-roots 1.0.12",
  "webrtc",
  "whoami",
+ "windows-sys 0.52.0",
  "x11 2.21.0",
  "zstd",
 ]

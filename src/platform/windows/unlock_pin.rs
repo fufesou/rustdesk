@@ -15,6 +15,8 @@ use windows::{
     },
 };
 
+mod legacy;
+
 pub(crate) struct ServicePin(Vec<u8>);
 
 pub(super) enum ServicePeer {
@@ -56,6 +58,19 @@ impl ServicePin {
         let target = Self::target()?;
         if let Some(pin) = read(&target)? {
             return Ok(Self(pin));
+        }
+        // Read-only access by other accounts permits migration of the existing PIN.
+        let source = legacy::source(&Config2::file())?;
+        if source != legacy::Source::Protected {
+            write(&target, &[])?;
+            if source == legacy::Source::Untrusted {
+                hbb_common::log::warn!(
+                    "Skipping PIN migration from an unprotected service profile. \
+                     To use PIN unlock, an administrator must choose a different PIN. \
+                     The previous PIN may still be readable in the old configuration."
+                );
+            }
+            return Ok(Self(Vec::new()));
         }
         let mut migrated = Vec::new();
         Config2::migrate_unlock_pin(|pin| {
@@ -141,7 +156,10 @@ pub(crate) fn request_approval(key: &[u8]) -> ResultType<()> {
 pub(super) async fn initialize() {
     if let Err(err) = crate::trusted_devices::config::update(|| {
         crate::ipc::unix_unlock_pin::preserve_legacy_root_pin()?;
-        Config2::migrate_unlock_pin(|_| Ok(()))
+        if legacy::source(&Config2::file())? == legacy::Source::Protected {
+            Config2::migrate_unlock_pin(|_| Ok(()))?;
+        }
+        Ok(())
     })
     .await
     {

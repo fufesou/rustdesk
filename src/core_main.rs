@@ -969,6 +969,16 @@ fn is_quick_support_exe(exe: &str) -> bool {
 ))]
 fn set_unix_pin_cli(write_pin: impl FnOnce() -> hbb_common::ResultType<()>) {
     if let Err(err) = write_pin() {
+        #[cfg(windows)]
+        let err = match err.downcast_ref::<std::io::Error>() {
+            Some(io) if io.kind() == std::io::ErrorKind::NotFound && config::is_outgoing_only() => {
+                err.context(
+                    "Outgoing-only installations without the system service do not support an unlock PIN. \
+                     Use administrator approval to unlock Network settings.",
+                )
+            }
+            _ => err,
+        };
         println!("{err}");
         std::process::exit(hbb_common::libc::EXIT_FAILURE);
     } else {
@@ -976,34 +986,52 @@ fn set_unix_pin_cli(write_pin: impl FnOnce() -> hbb_common::ResultType<()>) {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
 mod tests {
     use hbb_common::libc::{EXIT_FAILURE, EXIT_SUCCESS};
-    use std::{env, os::unix::net::UnixStream, process::Command};
+    use std::{env, process::Command};
 
     #[test]
     fn unix_unlock_pin_command_exit_status() {
         const CASE: &str = "RUSTDESK_TEST_PIN_CLI_CASE";
         const TEST: &str = "core_main::tests::unix_unlock_pin_command_exit_status";
         if let Some(case) = env::var_os(CASE) {
+            #[cfg(windows)]
+            if case == "outgoing-offline" {
+                hbb_common::config::HARD_SETTINGS
+                    .write()
+                    .unwrap()
+                    .insert("conn-type".into(), "outgoing".into());
+            }
             return super::set_unix_pin_cli(|| match case.to_str() {
                 Some("confirmed") => Ok(()),
-                Some("offline") => {
-                    let path = env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-                    UnixStream::connect(path).map(drop).map_err(Into::into)
+                Some("offline" | "outgoing-offline") => {
+                    let name = uuid::Uuid::new_v4().to_string();
+                    #[cfg(unix)]
+                    let peer = std::os::unix::net::UnixStream::connect(env::temp_dir().join(name));
+                    #[cfg(windows)]
+                    let peer = std::fs::File::open(format!(r"\\.\pipe\rd-pin-{name}"));
+                    peer.map(drop).map_err(Into::into)
                 }
                 _ => panic!("Unknown PIN test case {case:?}"),
             });
         }
-        for (case, expected) in [("offline", EXIT_FAILURE), ("confirmed", EXIT_SUCCESS)] {
+        for (case, expected) in [
+            ("offline", EXIT_FAILURE),
+            ("confirmed", EXIT_SUCCESS),
+            #[cfg(windows)]
+            ("outgoing-offline", EXIT_FAILURE),
+        ] {
             let output = Command::new(env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
                 .env(CASE, case)
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(expected), "{output:?}");
-            let done = String::from_utf8_lossy(&output.stdout).contains("Done!");
-            assert_eq!(done, case == "confirmed", "{output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.contains("Done!"), case == "confirmed", "{output:?}");
+            let admin_hint = stdout.contains("administrator approval to unlock Network settings");
+            assert_eq!(admin_hint, case == "outgoing-offline", "{output:?}");
         }
     }
 }

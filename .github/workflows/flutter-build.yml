@@ -382,6 +382,7 @@ jobs:
           cargo test --locked --release --lib --features "$FEATURES"
           # Its Windows tests run nowhere else.
           cargo test --locked --release -p clipboard
+          cargo test --locked --release -p hbb_common --lib config::tests::unlock_pin_migration_keeps_the_source_until_the_service_saves_it -- --exact
 
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res

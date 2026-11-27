@@ -158,6 +158,8 @@ pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_c
             }
             Some(crate::core_main::CoreMainAction::ExitFailure(err)) => {
                 log::error!("Command failed: {err}");
+                // With no Flutter arguments, a negative length signals failure to the Windows runner.
+                unsafe { std::ptr::write(args_len, -1) };
             }
             None => {}
         }
