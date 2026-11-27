@@ -21,7 +21,7 @@ use winapi::{
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         ioapiset::DeviceIoControl,
         setupapi::*,
-        winnt::{GENERIC_READ, GENERIC_WRITE},
+        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE},
     },
 };
 
@@ -339,7 +339,8 @@ pub unsafe fn device_io_control(
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
     )?;
     let path = get_device_path(interface_guid, devices)?;
-    device_io_control_by_path(&path, control_code, inbuf, outbuf_max_len)
+    let device = open_device_handle(&path, 0)?;
+    submit_device_control(device, control_code, (inbuf, outbuf_max_len))
 }
 
 pub(crate) unsafe fn device_io_control_by_path(
@@ -348,7 +349,15 @@ pub(crate) unsafe fn device_io_control_by_path(
     inbuf: &[u8],
     outbuf_max_len: usize,
 ) -> Result<Vec<u8>, DeviceError> {
-    let h_device = open_device_handle(path)?;
+    let device = open_device_handle(path, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+    submit_device_control(device, control_code, (inbuf, outbuf_max_len))
+}
+
+unsafe fn submit_device_control(
+    h_device: HANDLE,
+    control_code: u32,
+    (inbuf, outbuf_max_len): (&[u8], usize),
+) -> Result<Vec<u8>, DeviceError> {
     let mut bytes_returned = 0;
     let mut outbuf: Vec<u8> = vec![];
     let outbuf_ptr = if outbuf_max_len > 0 {
@@ -472,11 +481,14 @@ unsafe fn get_device_path(
     Ok(path)
 }
 
-unsafe fn open_device_handle(device_path: &[u16]) -> Result<HANDLE, DeviceError> {
+unsafe fn open_device_handle(
+    device_path: &[u16],
+    share_mode: DWORD,
+) -> Result<HANDLE, DeviceError> {
     let h_device = CreateFileW(
         device_path.as_ptr(),
         GENERIC_READ | GENERIC_WRITE,
-        0,
+        share_mode,
         null_mut(),
         OPEN_EXISTING,
         0,
@@ -486,4 +498,25 @@ unsafe fn open_device_handle(device_path: &[u16]) -> Result<HANDLE, DeviceError>
         return Err(DeviceError::new_api_last_err("CreateFileW"));
     }
     Ok(h_device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rustdesk_idd_control_can_open_an_interface_already_open_for_query() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let held = std::fs::File::create_new(&path).unwrap();
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // A regular file rejects this command after the second open succeeds.
+        let result = unsafe { device_io_control_by_path(&wide, 0, &[], 0) };
+        drop(held);
+        std::fs::remove_file(path).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, DeviceError::WinApiLastErr(api, _) if api == "DeviceIoControl"),
+            "{error}"
+        );
+    }
 }
