@@ -76,8 +76,14 @@ pub fn stage_test_driver(source: &Path) -> ResultType<()> {
     let name = name.to_ascii_lowercase();
     check_published_name(&name)?;
     if let Err(error) = record_package(&path, &name) {
-        if let Err(cleanup) = remove_unused_package(&name) {
-            bail!("Cannot record newly staged {name}: {error:#}. Cleanup failed: {cleanup:#}");
+        match remove_unused_package(&name) {
+            Ok(PackageRemoval::Removed { .. }) => {}
+            Ok(PackageRemoval::InUse) => {
+                return Err(error).with_context(|| format!("Cannot record in-use package {name}"));
+            }
+            Err(cleanup) => {
+                bail!("Cannot record newly staged {name}: {error:#}. Cleanup failed: {cleanup:#}");
+            }
         }
         return Err(error).with_context(|| format!("Cannot record newly staged {name}"));
     }
@@ -107,7 +113,10 @@ pub fn uninstall_test_driver(reboot: &mut bool) -> ResultType<()> {
         let name = String::from_reg_value(&value)?;
         check_published_name(&name)?;
         if owns_package(&inf_dir.join(&name), &identity, INF_DIGESTS)? {
-            *reboot |= remove_unused_package(&name)?;
+            match remove_unused_package(&name)? {
+                PackageRemoval::InUse => continue,
+                PackageRemoval::Removed { reboot_required } => *reboot |= reboot_required,
+            }
         }
         match key.delete_value(identity) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
@@ -117,19 +126,27 @@ pub fn uninstall_test_driver(reboot: &mut bool) -> ResultType<()> {
     Ok(())
 }
 
-fn remove_unused_package(name: &str) -> ResultType<bool> {
+enum PackageRemoval {
+    InUse,
+    Removed { reboot_required: bool },
+}
+
+fn remove_unused_package(name: &str) -> ResultType<PackageRemoval> {
     let package = HSTRING::from(name);
     if unsafe { SetupUninstallOEMInfW(&package, 0, None) }.as_bool() {
-        return Ok(false);
+        return Ok(PackageRemoval::Removed {
+            reboot_required: false,
+        });
     }
     let error = unsafe { GetLastError() };
     match error {
         ERROR_INF_IN_USE_BY_DEVICES => {
             log::info!("Keeping display driver {name} because a device still uses it");
-            Ok(false)
+            Ok(PackageRemoval::InUse)
         }
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        ERROR_SUCCESS_REBOOT_REQUIRED => Ok(true),
+        ERROR_FILE_NOT_FOUND | ERROR_SUCCESS_REBOOT_REQUIRED => Ok(PackageRemoval::Removed {
+            reboot_required: error == ERROR_SUCCESS_REBOOT_REQUIRED,
+        }),
         _ => bail!(
             "Cannot remove {name}: {}",
             std::io::Error::from_raw_os_error(error.0 as i32)
