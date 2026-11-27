@@ -29,6 +29,8 @@ use winapi::{
     },
 };
 
+mod restore_layout;
+
 pub(super) const PRIVACY_MODE_IMPL: &str = super::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY;
 
 const CONFIG_KEY_REG_RECOVERY: &str = "reg_recovery";
@@ -59,12 +61,27 @@ fn check_active_displays(displays: impl Iterator<Item = DISPLAY_DEVICEW>) -> Res
 }
 
 fn check_current_displays() -> ResultType<()> {
-    check_active_displays((0..).map_while(|index| {
+    check_active_displays(display_devices())
+}
+
+fn display_devices() -> impl Iterator<Item = DISPLAY_DEVICEW> {
+    (0..).map_while(|index| {
         let mut display: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
         display.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as _;
         let result = unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut display, 0) };
         (result != FALSE).then_some(display)
-    }))
+    })
+}
+
+fn has_active_physical_display() -> bool {
+    let driver: Vec<_> = virtual_display_manager::get_cur_device_string()
+        .encode_utf16()
+        .collect();
+    display_devices().any(|d| {
+        d.StateFlags & DISPLAY_DEVICE_ACTIVE != 0
+            && d.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER == 0
+            && !d.DeviceString.starts_with(&driver)
+    })
 }
 
 fn notify_privacy_mode_exit<'a>(
@@ -152,6 +169,7 @@ pub struct PrivacyModeImpl {
     displays: Vec<Display>,
     virtual_displays: Vec<Display>,
     virtual_displays_added: Vec<u32>,
+    saved_layout: Option<restore_layout::RestoreLayout>,
 }
 
 struct TurnOnGuard<'a> {
@@ -191,6 +209,7 @@ impl PrivacyModeImpl {
             displays: Vec::new(),
             virtual_displays: Vec::new(),
             virtual_displays_added: Vec::new(),
+            saved_layout: None,
         }
     }
 
@@ -521,11 +540,9 @@ impl PrivacyModeImpl {
             allow_err!(Self::restore_displays(&self.displays));
             allow_err!(Self::restore_displays(&self.virtual_displays));
             allow_err!(Self::commit_change_display(0));
-        } else if !self.displays.is_empty() || !self.virtual_displays.is_empty() {
-            // CDS_NORESET stages these changes. Commit only after every physical output accepted them.
-            Self::restore_displays(&self.displays)?;
-            allow_err!(Self::restore_displays(&self.virtual_displays));
-            Self::commit_change_display(0)?;
+        } else if let Some(layout) = self.saved_layout.as_ref() {
+            layout.restore()?;
+            self.saved_layout = None;
         }
         self.displays.clear();
         self.virtual_displays.clear();
@@ -614,6 +631,9 @@ impl PrivacyMode for PrivacyModeImpl {
             log::debug!("Privacy mode of conn {} is already on", conn_id);
             return Ok(true);
         }
+        if self.saved_layout.is_some() {
+            self.restore()?;
+        }
         self.set_displays();
         if self.displays.is_empty() {
             if !virtual_display_manager::is_amyuni_idd() {
@@ -638,6 +658,9 @@ impl PrivacyMode for PrivacyModeImpl {
         }
 
         let reg_connectivity_1 = reg_display_settings::read_reg_connectivity()?;
+        if !virtual_display_manager::is_amyuni_idd() {
+            guard.saved_layout = Some(restore_layout::RestoreLayout::capture(&guard.displays)?);
+        }
         let primary_display_name = guard.set_primary_display()?;
         guard.disable_physical_displays()?;
         Self::commit_change_display(CDS_RESET)?;
@@ -677,13 +700,28 @@ impl PrivacyMode for PrivacyModeImpl {
         state: Option<PrivacyModeState>,
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
-        super::win_input::unhook()?;
+        let local_override = conn_id == INVALID_PRIVACY_MODE_CONN_ID
+            && matches!(state, Some(PrivacyModeState::OffByPeer));
+        let release_input_first = virtual_display_manager::is_amyuni_idd() || local_override;
+        if release_input_first {
+            super::win_input::unhook()?;
+        }
         let _tmp_ignore_changed_holder = crate::display_service::temp_ignore_displays_changed();
         let cleanup = self.restore();
         if let Err(error) = &cleanup {
             if !error.is::<PrivacyDisplayCleanup>() {
+                if local_override && self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
+                    let connections = crate::server::AUTHED_CONNS.lock().unwrap();
+                    allow_err!(notify_privacy_mode_exit(
+                        connections.iter().map(|c| (c.conn_id, &c.sender)),
+                        self.conn_id
+                    ));
+                }
                 return cleanup;
             }
+        }
+        if !release_input_first {
+            super::win_input::unhook()?;
         }
         // We need to force restore the registry connectivity.
         // This is because the registry connection may be changed by `self.restore()`, but will not be fully restored.
