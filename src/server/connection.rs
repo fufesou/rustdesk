@@ -2007,10 +2007,6 @@ impl Connection {
             audit["two_factor"] = json!(self.conn_audit_two_factor.as_i64());
         }
         self.post_conn_audit(audit);
-        #[cfg(windows)]
-        if self.is_remote() && self.display_jobs.prepare_login() {
-            return true;
-        }
         self.send_authorized_login_response().await
     }
 
@@ -2239,7 +2235,10 @@ impl Connection {
             }
 
             #[cfg(windows)]
-            let displays = self.display_jobs.login_displays();
+            let Some(displays) = self.display_jobs.login_displays() else {
+                self.authorized = false;
+                return true;
+            };
             #[cfg(not(windows))]
             let displays = {
                 try_activate_screen();

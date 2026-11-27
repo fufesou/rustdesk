@@ -135,24 +135,6 @@ impl DisplayJobs {
         std::mem::take(&mut self.before_login)
     }
 
-    pub(super) fn prepare_login(&mut self) -> bool {
-        if crate::virtual_display_manager::is_amyuni_idd()
-            || !crate::virtual_display_manager::is_virtual_display_supported()
-            || !crate::platform::is_installed()
-        {
-            return false;
-        }
-        super::try_activate_screen();
-        self.login = Some(match display_service::has_login_displays() {
-            Ok(true) => LoginDisplays::Ready(Ok(())),
-            Ok(false) => self.queue_headless_login(|| {
-                display_service::try_get_displays_add_amyuni_headless().map(|_| ())
-            }),
-            Err(error) => LoginDisplays::Ready(Err(error)),
-        });
-        self.login_pending()
-    }
-
     fn queue_headless_login(
         &mut self,
         prepare: impl FnOnce() -> ResultType<()> + Send + 'static,
@@ -185,15 +167,30 @@ impl DisplayJobs {
         true
     }
 
-    pub(super) fn login_displays(&mut self) -> Snapshot {
-        match self.login.take() {
-            Some(LoginDisplays::Ready(result)) => display_service::current_login_displays(result),
-            Some(LoginDisplays::Waiting(_)) => {
-                Err(anyhow!("The login display is still being prepared"))
+    pub(super) fn login_displays(&mut self) -> Option<Snapshot> {
+        let preparation = if let Some(preparation) = self.login.take() {
+            preparation
+        } else {
+            super::try_activate_screen();
+            if crate::virtual_display_manager::is_amyuni_idd()
+                || !crate::virtual_display_manager::is_virtual_display_supported()
+                || !crate::platform::is_installed()
+            {
+                return Some(display_service::get_sync_displays_on_login());
             }
-            None => {
-                super::try_activate_screen();
-                display_service::get_sync_displays_on_login()
+            match display_service::connected_login_displays() {
+                Ok(Some(snapshot)) => return Some(Ok(snapshot)),
+                Ok(None) => self.queue_headless_login(|| {
+                    display_service::try_get_displays_add_amyuni_headless().map(|_| ())
+                }),
+                Err(error) => LoginDisplays::Ready(Err(error)),
+            }
+        };
+        match preparation {
+            LoginDisplays::Ready(result) => Some(display_service::current_login_displays(result)),
+            waiting @ LoginDisplays::Waiting(_) => {
+                self.login = Some(waiting);
+                None
             }
         }
     }
