@@ -87,6 +87,70 @@ pub(crate) fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> io::Result<[u16; 32
     Ok(source.viewGdiDeviceName)
 }
 
+pub(crate) struct PhysicalDisplay {
+    pub(crate) name: String,
+    monitors: Vec<Vec<u16>>,
+}
+
+impl PhysicalDisplay {
+    pub(crate) fn capture(name: String) -> ResultType<Self> {
+        let monitors = monitor_interfaces(&name)?;
+        Ok(Self { name, monitors })
+    }
+
+    pub(crate) fn check_connected(&self) -> ResultType<()> {
+        if self.monitors != monitor_interfaces(&self.name)? {
+            bail!("The physical monitor changed before applying its resolution");
+        }
+        Ok(())
+    }
+}
+
+fn monitor_interfaces(name: &str) -> ResultType<Vec<Vec<u16>>> {
+    use winapi::um::{
+        wingdi::{DISPLAY_DEVICEW, DISPLAY_DEVICE_ACTIVE},
+        winuser::{EnumDisplayDevicesW, EDD_GET_DEVICE_INTERFACE_NAME},
+    };
+    let source: Vec<_> = name
+        .trim_end_matches('\0')
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut monitors = Vec::new();
+    for index in 0.. {
+        let mut device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        device.cb = size_of::<DISPLAY_DEVICEW>() as _;
+        if unsafe {
+            EnumDisplayDevicesW(
+                source.as_ptr(),
+                index,
+                &mut device,
+                EDD_GET_DEVICE_INTERFACE_NAME,
+            )
+        } == 0
+        {
+            break;
+        }
+        if device.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
+            let id = device
+                .DeviceID
+                .split(|c| *c == 0)
+                .next()
+                .unwrap_or_default();
+            if id.is_empty() {
+                bail!("Windows did not identify the monitor on {name}");
+            }
+            monitors.push(id.to_vec());
+        }
+    }
+    if monitors.is_empty() {
+        bail!("No active monitor on {name}");
+    }
+    // Cloned monitors share a GDI source, and their enumeration order can change.
+    monitors.sort_unstable();
+    Ok(monitors)
+}
+
 pub(super) fn active_source(target: Target) -> ResultType<Option<String>> {
     let Some(paths) = active_paths()? else {
         return Ok(None);

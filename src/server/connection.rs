@@ -4954,7 +4954,7 @@ impl Connection {
                 return;
             };
             let change = self.display_jobs.resolution_request(move |control| {
-                let result = match target {
+                let result = match target? {
                     ResolutionTarget::Virtual(target) => {
                         virtual_display_manager::rustdesk_idd::change_resolution(
                             target,
@@ -4962,8 +4962,8 @@ impl Connection {
                             control,
                         )
                     }
-                    ResolutionTarget::Physical(name) => {
-                        Self::apply_display_resolution(display_idx, size, Some((&name, control)))
+                    ResolutionTarget::Physical(display) => {
+                        Self::apply_display_resolution(display_idx, size, Some((&display, control)))
                     }
                 };
                 result
@@ -4980,7 +4980,7 @@ impl Connection {
         display_idx: usize,
         (width, height): (i32, i32),
         #[cfg(windows)] requested_display: Option<(
-            &str,
+            &display_service::PhysicalDisplay,
             &virtual_display_manager::rustdesk_idd::ResolutionControl,
         )>,
     ) -> ResultType<()> {
@@ -4996,7 +4996,8 @@ impl Connection {
         };
         let display = displays.get(display_idx);
         #[cfg(windows)]
-        let display = if let Some((name, _)) = requested_display {
+        let display = if let Some((target, _)) = requested_display {
+            let name = target.name.as_str();
             Some(displays.iter().find(|d| d.name() == name).ok_or_else(|| {
                 hbb_common::anyhow::anyhow!("Requested display is no longer connected")
             })?)
@@ -5007,15 +5008,6 @@ impl Connection {
             return Ok(());
         };
         let name = display.name();
-        #[cfg(windows)]
-        if let Some((_, control)) = requested_display {
-            if !control.is_allowed() {
-                return Ok(());
-            }
-            if virtual_display_manager::rustdesk_idd::is_driver_display(&name) {
-                bail!("The virtual display changed before applying its resolution");
-            }
-        }
         #[allow(unused_mut)]
         let mut record_changed = true;
         #[cfg(windows)]
@@ -5030,6 +5022,16 @@ impl Connection {
             ((display.width() as f64) / scale).round() as _,
             ((display.height() as f64) / scale).round() as _,
         );
+        #[cfg(windows)]
+        if let Some((target, control)) = requested_display {
+            if virtual_display_manager::rustdesk_idd::is_driver_display(&name) {
+                bail!("The virtual display changed before applying its resolution");
+            }
+            target.check_connected()?;
+            if !control.is_allowed() {
+                return Ok(());
+            }
+        }
         if record_changed {
             display_service::set_last_changed_resolution(&name, original, (width, height));
         }

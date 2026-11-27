@@ -785,21 +785,24 @@ pub(super) fn get_display_info(idx: usize) -> Option<DisplayInfo> {
 }
 
 #[cfg(windows)]
+pub(super) use rustdesk_idd::display_target::PhysicalDisplay;
+
+#[cfg(windows)]
 pub(super) enum ResolutionTarget {
     Virtual(rustdesk_idd::Monitor),
-    Physical(String),
+    Physical(PhysicalDisplay),
 }
 
 #[cfg(windows)]
-pub(super) fn resolution_target(idx: usize) -> Option<ResolutionTarget> {
+pub(super) fn resolution_target(idx: usize) -> Option<ResultType<ResolutionTarget>> {
     let sync = SYNC_DISPLAYS.lock().unwrap();
     let name = &sync.displays.get(idx)?.name;
-    Some(
-        match sync.resolution_targets.get(name.trim_end_matches('\0')) {
-            Some(monitor) => ResolutionTarget::Virtual(monitor.clone()),
-            None => ResolutionTarget::Physical(name.clone()),
-        },
-    )
+    if let Some(monitor) = sync.resolution_targets.get(name.trim_end_matches('\0')) {
+        return Some(Ok(ResolutionTarget::Virtual(monitor.clone())));
+    }
+    let name = name.clone();
+    drop(sync);
+    Some(PhysicalDisplay::capture(name).map(ResolutionTarget::Physical))
 }
 
 // True when at least one advertised (synced) display is NOT served by the DRM/KMS capture path,
