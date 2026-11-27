@@ -1,4 +1,4 @@
-mod display_target;
+pub(crate) mod display_target;
 mod peer;
 pub(crate) mod privacy;
 mod profile;
