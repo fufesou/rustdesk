@@ -10,6 +10,9 @@ use hbb_common::protobuf::MessageField;
 use scrap::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(windows)]
+mod headless;
+
 // https://github.com/rustdesk/rustdesk/discussions/6042, avoiding dbus call
 
 pub const NAME: &'static str = "display";
@@ -1061,7 +1064,10 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     }
 
     // Login may try an IDD for a low-resolution output. Polling can keep using that output.
-    if !add_amyuni_headless && (!displays.is_empty() || virtual_display_manager::is_amyuni_idd()) {
+    if !add_amyuni_headless {
+        if displays.is_empty() && !virtual_display_manager::is_amyuni_idd() && headless::poll() {
+            return Ok(Display::all()?);
+        }
         return Ok(displays);
     }
 
@@ -1087,10 +1093,7 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     if no_displays_v {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
-            if add_amyuni_headless
-                && !virtual_display_manager::is_amyuni_idd()
-                && displays.is_empty()
-            {
+            if !virtual_display_manager::is_amyuni_idd() && displays.is_empty() {
                 bail!("Failed to create the headless RustDesk display: {e:#}");
             }
             log::error!("plug in headless failed {}", e);
