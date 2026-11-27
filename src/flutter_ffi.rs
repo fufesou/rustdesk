@@ -2754,6 +2754,17 @@ pub fn main_get_printer_names() -> SyncReturn<String> {
 }
 
 pub fn main_get_common(key: String) -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(action) = key.strip_prefix("unix-unlock-pin:") {
+        #[cfg(target_os = "macos")]
+        if action == "offline-admin" {
+            return crate::platform::unix_approval::approve_offline_security_settings()
+                .map(|approved| approved.to_string())
+                .unwrap_or_else(|err| format!("error:{err}"));
+        }
+        return crate::ipc::unix_unlock_pin::gui_request(action)
+            .unwrap_or_else(|err| format!("error:{err}"));
+    }
     if key == "is-printer-installed" {
         #[cfg(target_os = "windows")]
         {

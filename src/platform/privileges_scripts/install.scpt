@@ -10,11 +10,12 @@ on run {daemon_file, agent_file, user}
 
   set sh3 to "cp -rf " & prefs_toml & " /var/root/Library/Preferences/com.carriez.RustDesk/;"
 
-  set sh4 to "cp -rf " & prefs2_toml & " /var/root/Library/Preferences/com.carriez.RustDesk/;"
+  set service_bin to quoted form of "/Applications/RustDesk.app/Contents/MacOS/service"
+  set sh4 to "/usr/bin/env -u HOME " & service_bin & " --install-daemon-config " & quoted form of user & " " & prefs2_toml & " || /usr/bin/logger " & quoted form of "RustDesk could not import settings during daemon installation" & ";"
 
   set sh5 to "launchctl bootout system/com.carriez.RustDesk_service 2>/dev/null || launchctl unload -w /Library/LaunchDaemons/com.carriez.RustDesk_service.plist 2>/dev/null || true; launchctl bootstrap system /Library/LaunchDaemons/com.carriez.RustDesk_service.plist 2>/dev/null || launchctl load -w /Library/LaunchDaemons/com.carriez.RustDesk_service.plist;"
 
-  set sh to sh1 & sh2 & sh3 & sh4 & sh5
+  set sh to sh1 & sh2 & sh4 & sh3 & sh5
 
   do shell script sh with prompt "RustDesk wants to install daemon and agent" with administrator privileges
 end run
