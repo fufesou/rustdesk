@@ -201,8 +201,40 @@ pub fn switch(impl_key: &str) {
     }
 
     if let Some(creator) = PRIVACY_MODE_CREATOR.lock().unwrap().get(impl_key) {
+        #[cfg(windows)]
+        if let Some(mode) = privacy_mode_lock.as_deref_mut() {
+            if let Some(Err(error)) = restore_rustdesk_privacy(mode) {
+                hbb_common::log::error!("Cannot switch privacy implementations: {error:#}");
+                return;
+            }
+        }
         *privacy_mode_lock = Some(creator(impl_key));
     }
+}
+
+#[cfg(windows)]
+fn restore_rustdesk_privacy(mode: &mut dyn PrivacyMode) -> Option<ResultType<()>> {
+    (mode.get_impl_key() == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
+        && !crate::virtual_display_manager::is_amyuni_idd())
+    .then(|| match mode.turn_off_privacy(mode.pre_conn_id(), None) {
+        Err(error) if error.is::<PrivacyDisplayCleanup>() => Ok(()),
+        result => result,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn reset_after_disconnect() -> ResultType<()> {
+    if crate::virtual_display_manager::is_amyuni_idd() {
+        return crate::virtual_display_manager::reset_all();
+    }
+    if let Some(mode) = PRIVACY_MODE.lock().unwrap().as_deref_mut() {
+        if mode.pre_conn_id() != INVALID_PRIVACY_MODE_CONN_ID {
+            if let Some(result) = restore_rustdesk_privacy(mode) {
+                result?;
+            }
+        }
+    }
+    crate::virtual_display_manager::reset_all()
 }
 
 fn get_supported_impl(impl_key: &str) -> String {
@@ -421,6 +453,13 @@ fn turn_on_privacy_sync(
             .get(&(&impl_key as &str))
         {
             if let Some(privacy_mode) = privacy_mode_lock.as_mut() {
+                #[cfg(windows)]
+                match restore_rustdesk_privacy(privacy_mode.as_mut()) {
+                    Some(Err(error)) => return Some(Err(error)),
+                    Some(Ok(())) => {}
+                    None => privacy_mode.clear(),
+                }
+                #[cfg(not(windows))]
                 privacy_mode.clear();
             }
 

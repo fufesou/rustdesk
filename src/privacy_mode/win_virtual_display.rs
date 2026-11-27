@@ -517,17 +517,16 @@ impl PrivacyModeImpl {
     }
 
     fn restore(&mut self) -> ResultType<()> {
-        let physical = Self::restore_displays(&self.displays);
-        let virtuals = Self::restore_displays(&self.virtual_displays);
-        let commit = Self::commit_change_display(0);
-        if !virtual_display_manager::is_amyuni_idd() {
-            physical?;
-            commit?;
-        } else {
-            allow_err!(physical);
-            allow_err!(commit);
+        if virtual_display_manager::is_amyuni_idd() {
+            allow_err!(Self::restore_displays(&self.displays));
+            allow_err!(Self::restore_displays(&self.virtual_displays));
+            allow_err!(Self::commit_change_display(0));
+        } else if !self.displays.is_empty() || !self.virtual_displays.is_empty() {
+            // CDS_NORESET stages these changes. Commit only after every physical output accepted them.
+            Self::restore_displays(&self.displays)?;
+            allow_err!(Self::restore_displays(&self.virtual_displays));
+            Self::commit_change_display(0)?;
         }
-        allow_err!(virtuals);
         self.displays.clear();
         self.virtual_displays.clear();
         if !virtual_display_manager::is_amyuni_idd() {
