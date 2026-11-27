@@ -1032,10 +1032,8 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
         return Ok(displays);
     }
 
-    // Enable headless virtual display when
-    // 1. `amyuni` idd is not used.
-    // 2. `amyuni` idd is used and `add_amyuni_headless` is true.
-    if virtual_display_manager::is_amyuni_idd() && !add_amyuni_headless {
+    // Login may try an IDD for a low-resolution output. Polling can keep using that output.
+    if !add_amyuni_headless && (!displays.is_empty() || virtual_display_manager::is_amyuni_idd()) {
         return Ok(displays);
     }
 
