@@ -375,7 +375,7 @@ jobs:
           FEATURES=$(python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} --print-features)
           cargo test --locked --release --lib --features "$FEATURES"
           # Its Windows tests run nowhere else.
-          cargo test --locked --release -p clipboard
+          cargo test --locked --release -p clipboard -p virtual_display
 
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
