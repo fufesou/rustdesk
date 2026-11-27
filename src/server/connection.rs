@@ -751,6 +751,10 @@ impl Connection {
         }
 
         loop {
+            #[cfg(windows)]
+            let read_peer = conn.display_jobs.before_login.is_none();
+            #[cfg(not(windows))]
+            let read_peer = true;
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
 
@@ -761,7 +765,7 @@ impl Connection {
                     conn.on_close("Timeout", true).await;
                     break;
                 }
-                _ = login_deadline(conn.authorized, started) => {
+                _ = login_deadline(conn.authed_conn_id.is_some(), started) => {
                     conn.on_close("Timeout", true).await;
                     break;
                 }
@@ -1054,7 +1058,7 @@ impl Connection {
                         _ => {}
                     }
                 },
-                res = conn.stream.next() => {
+                res = conn.stream.next(), if read_peer => {
                     if let Some(res) = res {
                         match res {
                             Err(err) => {
@@ -1220,6 +1224,19 @@ impl Connection {
                 }
                 _ = second_timer.tick() => {
                     #[cfg(windows)]
+                    if conn.display_jobs.poll_login() {
+                        if !conn.send_authorized_login_response().await {
+                            break;
+                        }
+                        if let Some(msg) = conn.display_jobs.before_login.take() {
+                            // Resume reading the peer, including the heartbeat replies behind this message.
+                            last_recv_time = Instant::now();
+                            if !conn.on_message(msg).await {
+                                break;
+                            }
+                        }
+                    }
+                    #[cfg(windows)]
                     conn.portable_check();
                     #[cfg(windows)]
                     if let Some((impl_key, _)) = conn.privacy_preparation.as_ref() {
@@ -1239,17 +1256,13 @@ impl Connection {
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
-                    #[cfg(windows)]
-                    if let Some(probe) = conn.display_jobs.login_heartbeat.take() {
-                        // The peer could only queue its reply while this connection prepared its screen.
-                        last_recv_time = last_recv_time.max(probe);
-                    }
-                    if last_recv_time.elapsed() >= SEC30 {
+                    if read_peer && last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
                     }
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
-                    if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
+                    let repeat_probe = !read_peer && conn.last_test_delay.is_some_and(|t| t.elapsed() >= SEC30 / 2);
+                    if (conn.last_test_delay.is_none() || repeat_probe) && !(conn.port_forward_socket.is_some() && conn.authorized) {
                         conn.last_test_delay = Some(Instant::now());
                         let mut msg_out = Message::new();
                         msg_out.set_test_delay(TestDelay{
@@ -1257,7 +1270,12 @@ impl Connection {
                             target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
                             ..Default::default()
                         });
-                        conn.send(msg_out.into()).await;
+                        if read_peer {
+                            conn.send(msg_out.into()).await;
+                        } else if let Err(error) = conn.stream.send(&msg_out).await {
+                            conn.on_close(&error.to_string(), true).await;
+                            break;
+                        }
                     }
                     if conn.is_authed_remote_conn() || conn.view_camera {
                         if let Some(last_test_delay) = conn.last_test_delay {
@@ -1910,7 +1928,7 @@ impl Connection {
     // Returns whether this connection should be kept alive.
     // `true` does not necessarily mean authorization succeeded (e.g. REQUIRE_2FA case).
     async fn send_logon_response_and_keep_alive(&mut self) -> bool {
-        if self.authorized {
+        if self.authed_conn_id.is_some() {
             return true;
         }
         if self.require_2fa.is_some() && !self.is_recent_session(true) && !self.from_switch {
@@ -1965,7 +1983,6 @@ impl Connection {
             return false;
         }
         self.lr.trusted_device_v2_token.clear();
-        self.authorized = true;
         self.unauthorized_id = None;
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
@@ -2006,6 +2023,15 @@ impl Connection {
             audit["two_factor"] = json!(self.conn_audit_two_factor.as_i64());
         }
         self.post_conn_audit(audit);
+        #[cfg(windows)]
+        if self.is_remote() && self.display_jobs.prepare_login() {
+            return true;
+        }
+        self.send_authorized_login_response().await
+    }
+
+    async fn send_authorized_login_response(&mut self) -> bool {
+        self.authorized = true;
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
@@ -2228,12 +2254,13 @@ impl Connection {
                 self.send(msg_out).await;
             }
 
-            try_activate_screen();
-
             #[cfg(windows)]
-            let displays = self.login_displays().await;
+            let displays = self.display_jobs.login_displays();
             #[cfg(not(windows))]
-            let displays = super::display_service::update_get_sync_displays_on_login().await;
+            let displays = {
+                try_activate_screen();
+                super::display_service::update_get_sync_displays_on_login().await
+            };
             match displays {
                 Err(err) => {
                     res.set_error(format!("{}", err));
@@ -2461,6 +2488,8 @@ impl Connection {
     }
 
     fn try_start_cm(&mut self, peer_id: String, name: String, authorized: bool) {
+        #[cfg(windows)]
+        let authorized = authorized || self.display_jobs.login_pending();
         self.send_to_cm(ipc::Data::Login {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
@@ -2982,6 +3011,14 @@ impl Connection {
                 raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
                 return false;
             }
+        }
+        #[cfg(windows)]
+        if self.display_jobs.login_pending()
+            && !matches!(&msg.union, Some(message::Union::TestDelay(_)))
+        {
+            // Leave subsequent frames in the transport until this one can be delivered in order.
+            self.display_jobs.before_login = Some(msg);
+            return true;
         }
         if self.authorized {
             if matches!(msg.union.as_ref(), Some(message::Union::LoginRequest(_))) {

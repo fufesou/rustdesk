@@ -1,13 +1,9 @@
-use super::{display_service, ConnInner, Connection, Subscriber, SEC30};
-use base::message_proto::{DisplayInfo, Message, MessageBox, TestDelay};
+use super::{display_service, ConnInner, Connection, Subscriber};
+use base::message_proto::{DisplayInfo, Message, MessageBox};
 use hbb_common::{
     anyhow::anyhow,
     log,
-    tokio::{
-        self,
-        sync::{mpsc, oneshot},
-        time::Instant,
-    },
+    tokio::sync::{mpsc, oneshot},
     ResultType,
 };
 use std::{
@@ -16,10 +12,17 @@ use std::{
 };
 
 pub(super) type Job = Box<dyn FnOnce() + Send>;
+type Snapshot = ResultType<(Vec<DisplayInfo>, usize)>;
+
+enum LoginDisplays {
+    Waiting(oneshot::Receiver<Snapshot>),
+    Ready(Snapshot),
+}
 
 #[derive(Default)]
 pub(super) struct DisplayJobs {
-    pub(super) login_heartbeat: Option<Instant>,
+    login: Option<LoginDisplays>,
+    pub(super) before_login: Option<Message>,
     resolutions: Option<Arc<()>>,
     sender: Option<mpsc::Sender<Job>>,
     worker: Option<(JoinHandle<()>, oneshot::Receiver<()>)>,
@@ -57,6 +60,8 @@ impl DisplayJobs {
     }
 
     pub(super) fn stop(&mut self) {
+        self.login.take();
+        self.before_login.take();
         self.revoke_resolutions();
         self.sender.take();
     }
@@ -102,35 +107,70 @@ impl Drop for DisplayJobs {
     }
 }
 
-impl Connection {
-    pub(super) async fn login_displays(&mut self) -> ResultType<(Vec<DisplayInfo>, usize)> {
+impl DisplayJobs {
+    pub(super) fn prepare_login(&mut self) -> bool {
         if crate::virtual_display_manager::is_amyuni_idd()
             || !crate::virtual_display_manager::is_virtual_display_supported()
             || !crate::platform::is_installed()
         {
-            return display_service::update_get_sync_displays_on_login().await;
+            return false;
         }
-        if let Some(displays) = display_service::existing_login_displays()? {
-            return Ok(displays);
-        }
-        let (sender, mut ready) = oneshot::channel();
-        self.display_jobs.submit(Box::new(move || {
-            let _ = sender.send(display_service::get_sync_displays_on_login());
-        }))?;
-        let mut heartbeat = Message::new();
-        heartbeat.set_test_delay(TestDelay::default());
-        loop {
-            tokio::select! {
-                result = &mut ready => return result?,
-                _ = tokio::time::sleep(SEC30 / 2) => {
-                    self.stream.send(&heartbeat).await?;
-                    self.display_jobs.login_heartbeat = Some(Instant::now());
-                    self.last_test_delay = None;
-                }
+        super::try_activate_screen();
+        self.login = Some(match display_service::existing_login_displays() {
+            Ok(Some(displays)) => LoginDisplays::Ready(Ok(displays)),
+            Ok(None) => self.queue_headless_login(display_service::get_sync_displays_on_login),
+            Err(error) => LoginDisplays::Ready(Err(error)),
+        });
+        self.login_pending()
+    }
+
+    fn queue_headless_login(
+        &mut self,
+        prepare: impl FnOnce() -> Snapshot + Send + 'static,
+    ) -> LoginDisplays {
+        let (sender, ready) = oneshot::channel();
+        match self.submit(Box::new(move || {
+            if !sender.is_closed() {
+                let _ = sender.send(prepare());
             }
+        })) {
+            Ok(()) => LoginDisplays::Waiting(ready),
+            Err(error) => LoginDisplays::Ready(Err(error)),
         }
     }
 
+    pub(super) fn login_pending(&self) -> bool {
+        matches!(self.login, Some(LoginDisplays::Waiting(_)))
+    }
+
+    pub(super) fn poll_login(&mut self) -> bool {
+        let Some(LoginDisplays::Waiting(receiver)) = &mut self.login else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return false,
+            Err(error) => Err(error.into()),
+        };
+        self.login = Some(LoginDisplays::Ready(result));
+        true
+    }
+
+    pub(super) fn login_displays(&mut self) -> Snapshot {
+        match self.login.take() {
+            Some(LoginDisplays::Ready(result)) => result,
+            Some(LoginDisplays::Waiting(_)) => {
+                Err(anyhow!("The login display is still being prepared"))
+            }
+            None => {
+                super::try_activate_screen();
+                display_service::get_sync_displays_on_login()
+            }
+        }
+    }
+}
+
+impl Connection {
     pub(super) fn dispatch_display(
         &mut self,
         operation: impl FnOnce() -> ResultType<()> + Send + 'static,
@@ -169,6 +209,27 @@ fn report(peer: &mut ConnInner, error: hbb_common::anyhow::Error) {
 mod tests {
     use super::*;
     use hbb_common::tokio;
+
+    #[tokio::test]
+    async fn virtual_display_close_cancels_a_pending_headless_login() {
+        let mut jobs = DisplayJobs::default();
+        let (started, ready) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        jobs.login = Some(jobs.queue_headless_login(move || {
+            started.send(()).unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            Ok((vec![DisplayInfo::default()], 0))
+        }));
+        ready.await.unwrap();
+        assert!(jobs.login_pending());
+        assert!(!jobs.poll_login());
+        jobs.stop();
+        release.send(()).unwrap();
+        jobs.finish().await;
+        assert!(!jobs.poll_login());
+        assert!(!jobs.login_pending());
+    }
 
     #[test]
     fn virtual_display_resolution_revocation_only_cancels_earlier_requests() {
