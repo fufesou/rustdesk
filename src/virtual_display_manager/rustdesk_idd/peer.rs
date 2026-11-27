@@ -2,6 +2,17 @@ use super::{display_target, profile, update, Manager, PEER_INDICES};
 use hbb_common::{anyhow::Context, bail, ResultType};
 use virtual_display::MonitorMode;
 
+pub fn plug_in_index_modes(index: u32, modes: Vec<MonitorMode>) -> ResultType<()> {
+    // Released Amyuni clients replay one anonymous request per saved monitor.
+    if index == 0 {
+        return plug_in_peer_request(vec![modes]).map(|_| ());
+    }
+    if !PEER_INDICES.contains(&index) {
+        bail!("Invalid virtual display index {index}");
+    }
+    update(|m| m.plug_in(index, &modes))
+}
+
 pub fn plug_in_peer_request(modes: Vec<Vec<MonitorMode>>) -> ResultType<Vec<u32>> {
     update(|manager| {
         manager

@@ -3,8 +3,8 @@ mod peer;
 pub(crate) mod privacy;
 mod profile;
 
-pub use peer::plug_in_peer_request;
 pub(crate) use peer::plug_out_monitor;
+pub use peer::{plug_in_index_modes, plug_in_peer_request};
 
 use hbb_common::{
     anyhow::{anyhow, Context},
@@ -37,14 +37,23 @@ struct Monitor {
 }
 
 impl Monitor {
-    fn matches_source(&mut self, name: &str) -> bool {
-        if self.name.is_none() {
-            match self.profile.source() {
-                Ok(current) => self.name = current,
-                Err(error) => {
-                    hbb_common::log::trace!("Virtual display source is unavailable: {error:#}")
-                }
+    fn refresh_source(&mut self) -> bool {
+        match self.profile.source() {
+            Ok(name) => self.name = name,
+            Err(error) if profile::target_is_gone(&error) => {
+                self.name = None;
+                return false;
             }
+            Err(error) => {
+                hbb_common::log::trace!("Virtual display source is unavailable: {error:#}")
+            }
+        }
+        true
+    }
+
+    fn matches_source(&mut self, name: &str, refresh_on_mismatch: bool) -> bool {
+        if self.name.is_none() || (refresh_on_mismatch && self.name.as_deref() != Some(name)) {
+            self.refresh_source();
         }
         self.name.as_deref() == Some(name)
     }
@@ -71,11 +80,13 @@ fn install_driver(force: bool) -> ResultType<()> {
 
 impl Manager {
     fn peer_slots_changed(&self, next: &Self) -> bool {
-        PEER_INDICES.any(|i| match (self.monitors.get(&i), next.monitors.get(&i)) {
-            (Some(old), Some(new)) => !Arc::ptr_eq(&old.profile, &new.profile),
-            (None, None) => false,
-            _ => true,
-        })
+        PEER_INDICES
+            .into_iter()
+            .any(|i| match (self.monitors.get(&i), next.monitors.get(&i)) {
+                (Some(old), Some(new)) => !Arc::ptr_eq(&old.profile, &new.profile),
+                (None, None) => false,
+                _ => true,
+            })
     }
 
     fn plug_in(&mut self, index: u32, modes: &[MonitorMode]) -> ResultType<()> {
@@ -175,23 +186,13 @@ pub fn plug_in_headless() -> ResultType<()> {
 }
 
 pub fn get_virtual_displays() -> Vec<u32> {
-    let snapshot = MANAGER.lock().unwrap().clone();
-    snapshot
+    MANAGER
+        .lock()
+        .unwrap()
         .monitors
-        .range(PEER_INDICES)
-        .filter_map(|(&i, m)| (!m.profile.no_longer_attached()).then_some(i))
+        .iter_mut()
+        .filter_map(|(&i, m)| (m.refresh_source() && PEER_INDICES.contains(&i)).then_some(i))
         .collect()
-}
-
-pub fn plug_in_index_modes(index: u32, modes: Vec<MonitorMode>) -> ResultType<()> {
-    // Released Amyuni clients replay one anonymous request per saved monitor.
-    if index == 0 {
-        return plug_in_peer_request(vec![modes]).map(|_| ());
-    }
-    if !PEER_INDICES.contains(&index) {
-        bail!("Invalid virtual display index {index}");
-    }
-    update(|m| m.plug_in(index, &modes))
 }
 
 pub fn plug_out_peer_request(indices: &[u32]) -> ResultType<()> {
@@ -218,7 +219,7 @@ pub fn is_virtual_display(name: &str) -> bool {
         .unwrap()
         .monitors
         .values_mut()
-        .any(|m| m.matches_source(name))
+        .any(|m| m.matches_source(name, false))
 }
 
 pub(crate) fn change_resolution_if_is_virtual_display(
@@ -227,56 +228,49 @@ pub(crate) fn change_resolution_if_is_virtual_display(
     privacy_active: bool,
 ) -> ResultType<bool> {
     let requested_name = name.trim_end_matches('\0');
-    update(|manager| change_resolution(manager, requested_name, (w, h), privacy_active))
-}
-
-fn change_resolution(
-    manager: &mut Manager,
-    requested_name: &str,
-    (w, h): (u32, u32),
-    privacy_active: bool,
-) -> ResultType<bool> {
-    let Some((index, monitor)) = manager
-        .monitors
-        .iter_mut()
-        .find_map(|(&i, m)| m.matches_source(requested_name).then_some((i, m)))
-    else {
-        return Ok(false);
-    };
-    let current_name = monitor.profile.wait_for_source(None)?;
-    if current_name != requested_name {
-        monitor.name = Some(current_name);
-        return Err(anyhow!(
-            "The virtual display changed before applying its resolution"
-        ));
-    }
-    let current = crate::platform::current_resolution(&current_name)?;
-    if (current.width as u32, current.height as u32) == (w, h) {
-        return Ok(true);
-    }
-    if profile::supports_resolution(&current_name, (w, h)) {
-        crate::platform::change_resolution(&current_name, w as _, h as _)?;
-        return Ok(true);
-    }
-    if privacy_active {
-        bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
-    }
-    // Even a failed replacement can recreate the old mode under a new GDI name.
-    monitor.name = None;
-    if let Err(error) = monitor.profile.set_mode(MonitorMode {
-        width: w,
-        height: h,
-        sync: DEFAULT_MODE.sync,
-    }) {
-        if monitor.profile.no_longer_attached() {
-            manager.monitors.remove(&index);
+    update(|manager| {
+        let Some((index, monitor)) = manager
+            .monitors
+            .iter_mut()
+            .find_map(|(&i, m)| m.matches_source(requested_name, true).then_some((i, m)))
+        else {
+            return Ok(false);
+        };
+        let current_name = monitor.profile.wait_for_source(None)?;
+        if current_name != requested_name {
+            monitor.name = Some(current_name);
+            return Err(anyhow!(
+                "The virtual display changed before applying its resolution"
+            ));
         }
-        return Err(error);
-    }
-    let active = monitor.profile.wait_for_source(Some((w, h)))?;
-    monitor.name = Some(active.clone());
-    crate::platform::change_resolution(&active, w as _, h as _)?;
-    Ok(true)
+        let current = crate::platform::current_resolution(&current_name)?;
+        if (current.width as u32, current.height as u32) == (w, h) {
+            return Ok(true);
+        }
+        if profile::supports_resolution(&current_name, (w, h)) {
+            crate::platform::change_resolution(&current_name, w as _, h as _)?;
+            return Ok(true);
+        }
+        if privacy_active {
+            bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
+        }
+        // Even a failed replacement can recreate the old mode under a new GDI name.
+        monitor.name = None;
+        if let Err(error) = monitor.profile.set_mode(MonitorMode {
+            width: w,
+            height: h,
+            sync: DEFAULT_MODE.sync,
+        }) {
+            if monitor.profile.no_longer_attached() {
+                manager.monitors.remove(&index);
+            }
+            return Err(error);
+        }
+        let active = monitor.profile.wait_for_source(Some((w, h)))?;
+        monitor.name = Some(active.clone());
+        crate::platform::change_resolution(&active, w as _, h as _)?;
+        Ok(true)
+    })
 }
 
 #[cfg(test)]
