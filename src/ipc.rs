@@ -1,11 +1,17 @@
 #[path = "ipc/auth.rs"]
 mod ipc_auth;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "ipc/unix_credentials.rs"]
+pub(crate) mod unix_credentials;
 #[cfg(windows)]
 #[path = "ipc/windows.rs"]
 mod ipc_windows;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "ipc/fs.rs"]
 mod ipc_fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "ipc/unix_unlock_pin.rs"]
+pub(crate) mod unix_unlock_pin;
 // The DRM/KMS capture producer, the `_drm` channel and its SCM_RIGHTS framing live in their own
 // module, declared the same way as the other pieces of this file, so the opt-in feature adds a
 // bounded, self-contained surface here instead of ~1800 lines in the middle of the shared IPC.
@@ -57,7 +63,9 @@ pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
 #[cfg(windows)]
 pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use ipc_auth::{active_uid, authorize_service_scoped_ipc_connection};
+use ipc_auth::{
+    active_uid, authorize_service_scoped_ipc_connection, authorize_unix_main_ipc_connection,
+};
 #[cfg(target_os = "macos")]
 use ipc_auth::authorize_user_server_process;
 #[cfg(windows)]
@@ -142,15 +150,13 @@ pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnC
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) async fn connect_trusted_device_service(
+pub(crate) async fn connect_root_service(
     ms_timeout: u64,
 ) -> ResultType<ConnectionTmpl<ConnClient>> {
-    let connection = connect_service(ms_timeout)
+    let connection = connect_with_path(ms_timeout, &Config::ipc_path(crate::POSTFIX_SERVICE))
         .await
         .map_err(crate::trusted_devices::authority::Unavailable)?;
-    if connection.peer_uid() != Some(0) {
-        bail!("Trusted-device system service is not an authenticated root peer");
-    }
+    ipc_auth::verify_service_uid(connection.peer_uid())?;
     Ok(connection)
 }
 
@@ -386,7 +392,17 @@ pub enum Data {
     Socks(Option<config::Socks5Server>),
     FS(FS),
     Test,
-    SyncConfig(Option<Box<(Config, Config2)>>),
+    SyncConfig(
+        #[cfg_attr(
+            any(target_os = "linux", target_os = "macos"),
+            serde(with = "unix_unlock_pin::sync_config")
+        )]
+        Option<Box<(Config, Config2)>>,
+    ),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    UnlockPin(unix_unlock_pin::Request),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    UnlockPinResult(Result<bool, String>),
     #[cfg(target_os = "windows")]
     ClipboardFile(ClipboardFile),
     ClipboardFileEnabled(bool),
@@ -615,6 +631,14 @@ fn legacy_hot_measured() -> bool {
 #[tokio::main(flavor = "current_thread")]
 pub async fn start(postfix: &str) -> ResultType<()> {
     let incoming = new_listener(postfix).await?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if postfix == crate::POSTFIX_SERVICE && crate::platform::is_installed() {
+        if let Err(err) =
+            crate::trusted_devices::config::update(unix_unlock_pin::preserve_legacy_root_pin).await
+        {
+            log::warn!("Could not initialize the root unlock PIN: {err}");
+        }
+    }
     start_with_listener(postfix, incoming).await;
     Ok(())
 }
@@ -631,6 +655,10 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                         if !authorize_service_scoped_ipc_connection(&stream, &postfix) {
                             continue;
                         }
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    if postfix.is_empty() && !authorize_unix_main_ipc_connection(&stream) {
+                        continue;
                     }
                     #[cfg(windows)]
                     if postfix.is_empty() {
@@ -650,24 +678,25 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                     break;
                                 }
                                 Ok(Some(data)) => {
-                                    // On Linux/macOS, the protected `_service` channel is used only for
-                                    // syncing config between root service and the active user process.
-                                    //
-                                    // NOTE: `is_service_ipc_postfix()` also includes `_uinput_*`, but those
-                                    // channels are handled by the dedicated uinput listener/protocol in
-                                    // `src/server/uinput.rs` and therefore do not share this Data enum
-                                    // allowlist. The SyncConfig allowlist here is intentionally scoped to the
-                                    // `_service` channel only.
-                                    //
-                                    // Keep this explicit branch to avoid policy drift between `_service` and
-                                    // uinput IPC paths while still minimizing exposed message surface here.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     if postfix == crate::POSTFIX_SERVICE {
+                                        // Uinput has its own listener. This endpoint admits only PIN requests and full sync.
+                                        if let Data::UnlockPin(request) = data {
+                                            if let Err(err) = unix_unlock_pin::reply(request, &mut stream).await {
+                                                log::trace!("Failed to answer root PIN request: {err}");
+                                                break;
+                                            }
+                                            continue;
+                                        }
                                         if matches!(&data, Data::SyncConfig(_)) {
+                                            if let Err(err) = unix_credentials::verify_sync_client(&stream).await {
+                                                ipc_auth::log_rejected_sync_client(err);
+                                                break;
+                                            }
                                             handle(data, &mut stream).await;
                                         } else {
                                             log::warn!(
-                                                "Rejected non-sync data on protected _service IPC channel: postfix={}, data_kind={:?}, peer_uid={:?}",
+                                                "Rejected unexpected data on protected _service IPC channel: postfix={}, data_kind={:?}, peer_uid={:?}",
                                                 postfix,
                                                 std::mem::discriminant(&data),
                                                 stream.peer_uid()
@@ -851,6 +880,17 @@ impl Drop for CheckIfRestart {
 }
 
 async fn handle(data: Data, stream: &mut Connection) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(&data, Data::Config((name, _)) if name == "unlock-pin")
+        && crate::platform::is_installed()
+    {
+        allow_err!(
+            stream
+                .send(&Data::SecurityConfigError("Unlock PIN is managed by the root service".into()))
+                .await
+        );
+        return;
+    }
     match data {
         Data::SystemInfo(_) => {
             let info = format!(
@@ -1124,6 +1164,11 @@ async fn handle(data: Data, stream: &mut Connection) {
             if let Err(error) = crate::trusted_devices::config::update(move || {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
+                    if unsafe { hbb_common::libc::geteuid() } == 0
+                        && crate::platform::is_installed()
+                    {
+                        unix_unlock_pin::preserve_legacy_root_pin()?;
+                    }
                     crate::trusted_devices::config::sync_config(config, config2)
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1568,13 +1613,15 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        if postfix == crate::POSTFIX_SERVICE {
+            return connect_root_service(ms_timeout).await;
+        }
         let use_user_main_ipc = USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.get());
         let is_root_main_ipc =
             unsafe { hbb_common::libc::geteuid() == 0 } && postfix.is_empty() && use_user_main_ipc;
         if is_root_main_ipc {
             let uid = user_main_ipc_server_uid()?;
-            let path = Config::ipc_path_for_uid(uid, postfix);
-            return connect_with_path(ms_timeout, &path).await;
+            return unix_credentials::verified_main(ms_timeout, uid).await;
         }
         let path = Config::ipc_path(postfix);
         return connect_with_path(ms_timeout, &path).await;
@@ -1586,12 +1633,16 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     }
 }
 
+/// For `_service`, all UIDs connect to the same socket and the server must run as root.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn connect_for_uid(
     ms_timeout: u64,
     uid: u32,
     postfix: &str,
 ) -> ResultType<ConnectionTmpl<ConnClient>> {
+    if postfix == crate::POSTFIX_SERVICE {
+        return connect_root_service(ms_timeout).await;
+    }
     let path = Config::ipc_path_for_uid(uid, postfix);
     let conn = connect_with_path(ms_timeout, &path).await?;
     #[cfg(target_os = "macos")]
@@ -1711,6 +1762,36 @@ where
     async fn send_config(&mut self, name: &str, value: String) -> ResultType<()> {
         self.send(&Data::Config((name.to_owned(), Some(value))))
             .await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) async fn send_takeover_close(&mut self, ms_timeout: u64) -> ResultType<()> {
+        // The listener needs our PID for its executable check before it can reply.
+        self.send(&Data::OnlineStatus(None)).await?;
+        let Some(Data::OnlineStatus(Some(_))) = self.next_timeout(ms_timeout).await? else {
+            bail!("Unexpected status response during main IPC takeover");
+        };
+        self.send(&Data::Close).await
+    }
+
+    #[cfg(any(
+        feature = "hwcodec",
+        all(test, any(target_os = "linux", target_os = "macos"))
+    ))]
+    async fn send_hwcodec_config(
+        &mut self,
+        value: String,
+        readback_timeout_ms: Option<u64>,
+    ) -> ResultType<()> {
+        self.send(&Data::HwCodecConfig(Some(value))).await?;
+        if let Some(ms) = readback_timeout_ms {
+            // The host must resolve this process's executable before it can consume the report.
+            self.send(&Data::HwCodecConfig(None)).await?;
+            let Some(Data::HwCodecConfig(Some(_))) = self.next_timeout(ms).await? else {
+                bail!("Host did not confirm the hardware codec configuration");
+            };
+        }
+        Ok(())
     }
 
     pub async fn next_timeout(&mut self, ms_timeout: u64) -> ResultType<Option<Data>> {
@@ -1899,8 +1980,23 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
     let v = v.trim().to_owned();
+    validate_unlock_pin(&v, translate)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return unix_unlock_pin::set(v);
+    }
+    Config::set_unlock_pin(&v);
+    set_config("unlock-pin", v)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(feature = "flutter", not(any(target_os = "android", target_os = "ios")))
+))]
+fn validate_unlock_pin(v: &str, translate: bool) -> ResultType<()> {
     let min_len = 4;
-    let max_len = crate::ui_interface::max_encrypt_len();
+    let max_len = hbb_common::config::ENCRYPT_MAX_LEN;
     let len = v.chars().count();
     if !v.is_empty() {
         if len < min_len {
@@ -1918,13 +2014,16 @@ pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
             bail!("No more than {max_len} characters");
         }
     }
-    Config::set_unlock_pin(&v);
-    set_config("unlock-pin", v)
+    Ok(())
 }
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_unlock_pin() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::platform::is_installed() {
+        return String::new();
+    }
     if let Ok(Some(v)) = get_config("unlock-pin") {
         Config::set_unlock_pin(&v);
         v
@@ -2287,12 +2386,17 @@ pub fn client_get_hwcodec_config_thread(wait_sec: u64) {
 #[cfg(feature = "hwcodec")]
 #[tokio::main(flavor = "current_thread")]
 pub async fn hwcodec_process() {
+    const IPC_TIMEOUT_MS: u64 = 1_000;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let readback_timeout_ms = crate::platform::is_installed().then_some(IPC_TIMEOUT_MS);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let readback_timeout_ms = None;
     let s = scrap::hwcodec::check_available_hwcodec();
     for _ in 0..5 {
-        match crate::ipc::connect(1000, "").await {
+        match crate::ipc::connect(IPC_TIMEOUT_MS, "").await {
             Ok(mut conn) => {
                 match conn
-                    .send(&crate::ipc::Data::HwCodecConfig(Some(s.clone())))
+                    .send_hwcodec_config(s.clone(), readback_timeout_ms)
                     .await
                 {
                     Ok(()) => {
@@ -2441,6 +2545,57 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 mod test {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn takeover_waits_for_listener_before_sending_close() {
+        const TIMEOUT_MS: u64 = 1_000;
+        let (sender, listener) = tokio::net::UnixStream::pair().unwrap();
+        let mut listener = ConnectionTmpl::new(listener);
+        let sender = tokio::spawn(async move {
+            ConnectionTmpl::new(sender)
+                .send_takeover_close(TIMEOUT_MS)
+                .await
+        });
+        assert!(matches!(
+            listener.next_timeout(TIMEOUT_MS).await.unwrap(),
+            Some(Data::OnlineStatus(None))
+        ));
+        assert!(!sender.is_finished());
+        listener
+            .send(&Data::OnlineStatus(Some((0, false))))
+            .await
+            .unwrap();
+        assert!(matches!(
+            listener.next_timeout(TIMEOUT_MS).await.unwrap(),
+            Some(Data::Close)
+        ));
+        sender.await.unwrap().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn codec_probe_waits_for_host_readback() {
+        const TIMEOUT_MS: u64 = 1_000;
+        let (probe, host) = tokio::net::UnixStream::pair().unwrap();
+        let mut host = ConnectionTmpl::new(host);
+        let probe = tokio::spawn(async move {
+            ConnectionTmpl::new(probe)
+                .send_hwcodec_config("{}".into(), Some(TIMEOUT_MS))
+                .await
+        });
+        assert!(matches!(host.next_timeout(TIMEOUT_MS).await.unwrap(),
+            Some(Data::HwCodecConfig(Some(value))) if value == "{}"));
+        assert!(matches!(
+            host.next_timeout(TIMEOUT_MS).await.unwrap(),
+            Some(Data::HwCodecConfig(None))
+        ));
+        assert!(!probe.is_finished());
+        host.send(&Data::HwCodecConfig(Some("{}".into())))
+            .await
+            .unwrap();
+        probe.await.unwrap().unwrap();
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
