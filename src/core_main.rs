@@ -161,6 +161,14 @@ pub fn core_main() -> Option<CoreMainAction> {
         flutter_args.retain(|arg| arg != "--install");
     }
     if args.len() > 0 {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if args[0] == "--approve-unlock-pin" {
+            let result = match args.as_slice() {
+                [_, uid, digest] => crate::ipc::unix_unlock_pin::admin_approve(uid, digest),
+                _ => Err(hbb_common::anyhow::anyhow!("Expected a target UID and approval digest")),
+            };
+            return result.err().map(CoreMainAction::ExitFailure);
+        }
         if args[0] == "--version" {
             println!("{}", crate::VERSION);
             return None;
@@ -192,6 +200,13 @@ pub fn core_main() -> Option<CoreMainAction> {
         }
     }
     hbb_common::init_log(false, &log_name);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let installed_user =
+        crate::platform::is_installed() && unsafe { hbb_common::libc::geteuid() } != 0;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if installed_user {
+        clear_user_pin_on_startup(&args);
+    }
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]
@@ -432,6 +447,10 @@ pub fn core_main() -> Option<CoreMainAction> {
                 }
                 import_config(&filepath);
             }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if installed_user {
+                clear_legacy_user_pin();
+            }
             return None;
         } else if args[0] == "--password" {
             if is_cli_setting_change_disabled() {
@@ -462,6 +481,9 @@ pub fn core_main() -> Option<CoreMainAction> {
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    set_unix_pin_cli(|| crate::ipc::set_unlock_pin(args[1].to_owned(), false));
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     if let Err(err) = crate::ipc::set_unlock_pin(args[1].to_owned(), false) {
                         println!("{err}");
                     } else {
@@ -739,6 +761,21 @@ pub fn core_main() -> Option<CoreMainAction> {
     return Some(CoreMainAction::StartUi(args));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_user_pin_on_startup(args: &[String]) {
+    // Import compares file timestamps, so let it finish before changing the local file.
+    if args.first().map(String::as_str) != Some("--import-config") {
+        clear_legacy_user_pin();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_legacy_user_pin() {
+    if let Err(err) = config::unix_unlock_pin::discard_user_copy() {
+        log::warn!("Could not remove the legacy user unlock PIN: {err}");
+    }
+}
+
 fn import_config(path: &str) {
     use hbb_common::{config::*, get_exe_time, get_modified_time};
     let path2 = path.replace(".toml", "2.toml");
@@ -759,6 +796,18 @@ fn import_config(path: &str) {
     }
     let config2: Config2 = load_path(path2.into());
     if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let config2 = if crate::platform::is_installed() {
+            if unsafe { hbb_common::libc::geteuid() } == 0 {
+                if let Err(err) = unix_unlock_pin::RootPin::load() {
+                    log::error!("Cannot preserve the root PIN during config import: {err}");
+                    return;
+                }
+            }
+            config2.without_unlock_pin()
+        } else {
+            config2
+        };
         if store_path(Config2::file(), config2).is_err() {
             log::info!("config2 written");
         }
@@ -926,4 +975,98 @@ fn parse_silent_install_args(args: &[String]) -> (Option<bool>, bool) {
 fn is_quick_support_exe(exe: &str) -> bool {
     let exe = exe.to_lowercase();
     exe.contains("-qs-") || exe.contains("-qs.exe") || exe.contains("_qs.exe")
+}
+
+#[cfg(all(
+    any(feature = "flutter", test),
+    any(target_os = "linux", target_os = "macos")
+))]
+fn set_unix_pin_cli(write_pin: impl FnOnce() -> hbb_common::ResultType<()>) {
+    if let Err(err) = write_pin() {
+        println!("{err}");
+        std::process::exit(hbb_common::libc::EXIT_FAILURE);
+    } else {
+        println!("Done!");
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use hbb_common::libc::{EXIT_FAILURE, EXIT_SUCCESS};
+    use std::{env, os::unix::net::UnixStream, process::Command};
+
+    #[test]
+    fn user_pin_cleanup_keeps_newer_imported_settings() -> hbb_common::ResultType<()> {
+        use hbb_common::config::{Config2, APP_NAME};
+        use std::{fs, time::SystemTime};
+
+        const CHILD: &str = "RUSTDESK_TEST_USER_PIN_IMPORT";
+        if env::var_os(CHILD).is_some() {
+            let dir = env::current_dir()?;
+            *APP_NAME.write().unwrap() = dir.join("Client").to_str().unwrap().to_owned();
+            assert_eq!(Config2::file(), dir.join("Client2.toml"));
+            let args = ["--import-config".into(), "Export.toml".into()];
+            super::clear_user_pin_on_startup(&args);
+            super::import_config(&args[1]);
+            super::clear_legacy_user_pin();
+            return Ok(());
+        }
+
+        let dir = env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&dir)?;
+        let target = dir.join("Client2.toml");
+        fs::write(
+            &target,
+            "unlock_pin = 'old-pin'\nrendezvous_server = 'old.example'\n",
+        )?;
+        fs::File::open(&target)?.set_modified(SystemTime::UNIX_EPOCH)?;
+        fs::write(
+            dir.join("Export.toml"),
+            "id = 'fixture'\nkey_pair = [[1], [2]]\n",
+        )?;
+        fs::write(
+            dir.join("Export2.toml"),
+            "rendezvous_server = 'new.example'\n",
+        )?;
+
+        let test = "core_main::tests::user_pin_cleanup_keeps_newer_imported_settings";
+        let result = Command::new(env::current_exe()?)
+            .args(["--exact", test])
+            .env(CHILD, "1")
+            .current_dir(&dir)
+            .output()?;
+        let saved: hbb_common::toml::Table =
+            hbb_common::toml::from_str(&fs::read_to_string(target)?)?;
+        fs::remove_dir_all(dir)?;
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(saved["rendezvous_server"].as_str(), Some("new.example"));
+        assert!(!saved.contains_key("unlock_pin"));
+        Ok(())
+    }
+
+    #[test]
+    fn unix_unlock_pin_command_exit_status() {
+        const CASE: &str = "RUSTDESK_TEST_PIN_CLI_CASE";
+        const TEST: &str = "core_main::tests::unix_unlock_pin_command_exit_status";
+        if let Some(case) = env::var_os(CASE) {
+            return super::set_unix_pin_cli(|| match case.to_str() {
+                Some("confirmed") => Ok(()),
+                Some("offline") => {
+                    let path = env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+                    UnixStream::connect(path).map(drop).map_err(Into::into)
+                }
+                _ => panic!("Unknown PIN test case {case:?}"),
+            });
+        }
+        for (case, expected) in [("offline", EXIT_FAILURE), ("confirmed", EXIT_SUCCESS)] {
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CASE, case)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            let done = String::from_utf8_lossy(&output.stdout).contains("Done!");
+            assert_eq!(done, case == "confirmed", "{output:?}");
+        }
+    }
 }
