@@ -1,4 +1,4 @@
-use super::display_target;
+use super::{display_target, ResolutionControl};
 use crate::platform::win_device::{
     device_io_control_by_path, get_instance_device_path, DeviceError,
 };
@@ -134,6 +134,22 @@ impl Profile {
             Some(target) => display_target::active_source(target),
             None => Ok(None),
         }
+    }
+
+    pub(super) fn apply_resolution(
+        &self,
+        source: &str,
+        (width, height): (u32, u32),
+        control: &ResolutionControl,
+    ) -> ResultType<()> {
+        let current = self.source();
+        if !control.is_allowed() {
+            return Ok(());
+        }
+        if current?.as_deref() != Some(source) {
+            bail!("The virtual display source changed before applying its resolution");
+        }
+        crate::platform::change_resolution(source, width as _, height as _)
     }
 
     pub(super) fn no_longer_attached(&self) -> bool {

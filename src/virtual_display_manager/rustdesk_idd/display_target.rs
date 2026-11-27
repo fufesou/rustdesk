@@ -94,23 +94,19 @@ pub(super) fn active_source(target: Target) -> ResultType<Option<String>> {
     let Some(path) = paths.iter().find(|path| path_target(path) == target) else {
         return Ok(None);
     };
-    let name = match source_name(path) {
-        Ok(name) => name,
-        Err(error) => {
-            // Windows can replace the source between enumerating the paths and reading its name.
-            let still_active = active_paths()?.is_some_and(|paths| {
-                paths.iter().any(|p| {
-                    path_target(p) == target
-                        && p.sourceInfo.adapterId == path.sourceInfo.adapterId
-                        && p.sourceInfo.id == path.sourceInfo.id
-                })
-            });
-            if !still_active {
-                return Ok(None);
-            }
-            return Err(error.into());
-        }
-    };
+    let name = source_name(path);
+    // A successful name lookup can refer to a source that Windows has already reassigned.
+    let still_active = active_paths()?.is_some_and(|paths| {
+        paths.iter().any(|p| {
+            path_target(p) == target
+                && p.sourceInfo.adapterId == path.sourceInfo.adapterId
+                && p.sourceInfo.id == path.sourceInfo.id
+        })
+    });
+    if !still_active {
+        return Ok(None);
+    }
+    let name = name?;
     let end = name.iter().position(|c| *c == 0).unwrap_or(name.len());
     if end == 0 {
         return Ok(None);

@@ -272,8 +272,9 @@ pub(crate) fn change_resolution(
             return Ok(());
         }
         if supported {
-            crate::platform::change_resolution(&current_name, w as _, h as _)?;
-            return Ok(());
+            return monitor
+                .profile
+                .apply_resolution(&current_name, (w, h), control);
         }
         if control.privacy_active {
             bail!("Turn off privacy mode before selecting a resolution that reconnects the virtual display");
@@ -289,10 +290,7 @@ pub(crate) fn change_resolution(
             return Err(error);
         }
         let active = monitor.profile.wait_for_source(Some((w, h)))?;
-        if control.is_allowed() {
-            crate::platform::change_resolution(&active, w as _, h as _)?;
-        }
-        Ok(())
+        monitor.profile.apply_resolution(&active, (w, h), control)
     })
 }
 
