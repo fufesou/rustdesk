@@ -199,8 +199,15 @@ impl DisconnectedDisplays {
             .get_or_insert_with(|| update(|manager| manager.clone()));
     }
 
-    pub(crate) fn detach(&mut self) -> ResultType<()> {
+    pub(crate) fn detach_if(&mut self, desktop_is_idle: impl Fn() -> bool) -> ResultType<()> {
+        if !desktop_is_idle() {
+            return Ok(());
+        }
         update(|manager| {
+            // A new remote may have logged in while an earlier driver operation held the writer.
+            if !desktop_is_idle() {
+                return Ok(());
+            }
             let snapshot = self.0.get_or_insert_with(|| manager.clone());
             manager.detach(&snapshot.still_attached_to(manager))
         })

@@ -301,15 +301,13 @@ fn reset_disconnected_displays(
             }
         }
     }
-    if crate::server::AUTHED_CONNS
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|c| c.conn_type == crate::server::AuthConnType::Remote)
-    {
-        return Ok(());
-    }
-    displays.detach()
+    displays.detach_if(|| {
+        !crate::server::AUTHED_CONNS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.conn_type == crate::server::AuthConnType::Remote)
+    })
 }
 
 fn get_supported_impl(impl_key: &str) -> String {
