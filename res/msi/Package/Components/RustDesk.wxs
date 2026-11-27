@@ -1,8 +1,10 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-	xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall">
+	xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall"
+	xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 	<Fragment>
 
 		<?include ../Includes.wxi?>
+		<?define RustDeskIddUninstall='Installed AND REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE AND RUSTDESK_IDD_WINDOWS_BUILD >= 19041'?>
 
 		<DirectoryRef Id="INSTALLFOLDER_INNER" FileSource="$(var.BuildDir)">
 			<Component Id="App.exe" Guid="620F0F69-4C17-4320-A619-495E329712A4">
@@ -31,6 +33,10 @@
 		<CustomAction Id="TryDeleteStartupShortcut.SetParam" Return="check" Property="ShortcutName" Value="$(var.Product) Tray" />
 		<CustomAction Id="RemoveAmyuniIdd.SetParam" Return="check" Property="RemoveAmyuniIdd" Value="[INSTALLFOLDER_INNER]" />
 		<Binary Id="RustDeskIddDll" SourceFile="$(var.BuildDir)\dylib_virtual_display.dll" />
+		<Property Id="RUSTDESK_IDD_WINDOWS_BUILD" Secure="yes">
+			<RegistrySearch Id="RustDeskIddWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
+		</Property>
+		<util:CheckRebootRequired />
 		<CustomAction Id="RemoveRustDeskIdd" BinaryRef="RustDeskIddDll" DllEntry="RemoveRustDeskIdd" Execute="deferred" Impersonate="no" Return="check" />
 		<!-- The app name comes first and is separated by '|', which cannot occur in a
 		     Windows path nor in a validated app name. wcautil's own delimiter is a
@@ -102,7 +108,8 @@
 			<Custom Action="TerminateBrokers" Before="RemoveRuntimeGeneratedFiles"/>
 			<Custom Action="TerminateBrokers.SetParam" Before="TerminateBrokers"/>
 			<Custom Action="RemoveAmyuniIdd" Before="RemoveRuntimeGeneratedFiles"/>
-			<Custom Action="RemoveRustDeskIdd" Before="RemoveRuntimeGeneratedFiles.SetParam" Condition="Installed AND REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+			<Custom Action="RemoveRustDeskIdd" Before="RemoveRuntimeGeneratedFiles.SetParam" Condition="$(var.RustDeskIddUninstall)" />
+			<Custom Action="Wix4CheckRebootRequired_$(sys.BUILDARCHSHORT)" After="InstallFinalize" Condition="$(var.RustDeskIddUninstall)" />
 			<Custom Action="RemoveAmyuniIdd.SetParam" Before="RemoveAmyuniIdd"/>
 		</InstallExecuteSequence>
 

@@ -2,9 +2,12 @@ use windows::{
     core::{w, HSTRING},
     Win32::{
         Foundation::{ERROR_INSTALL_FAILURE, ERROR_SUCCESS},
-        System::ApplicationInstallationAndServicing::{
-            MsiCloseHandle, MsiCreateRecord, MsiProcessMessage, MsiRecordSetStringW,
-            INSTALLMESSAGE, INSTALLMESSAGE_ERROR, INSTALLMESSAGE_INFO, MSIHANDLE,
+        System::{
+            ApplicationInstallationAndServicing::{
+                MsiCloseHandle, MsiCreateRecord, MsiProcessMessage, MsiRecordSetStringW,
+                INSTALLMESSAGE, INSTALLMESSAGE_ERROR, INSTALLMESSAGE_INFO, MSIHANDLE,
+            },
+            DataExchange::GlobalAddAtomW,
         },
     },
 };
@@ -15,6 +18,16 @@ pub extern "system" fn RemoveRustDeskIdd(install: MSIHANDLE) -> u32 {
     match virtual_display::uninstall_test_driver(&mut reboot) {
         Ok(()) => {
             if reboot {
+                // WiX's CheckRebootRequired reads this WcaUtil atom after InstallFinalize.
+                if unsafe { GlobalAddAtomW(w!("WcaDeferredActionRequiresReboot")) } == 0 {
+                    let error = std::io::Error::last_os_error();
+                    report(
+                        install,
+                        INSTALLMESSAGE_ERROR,
+                        &format!("Cannot mark restart required: {error}"),
+                    );
+                    return ERROR_INSTALL_FAILURE.0;
+                }
                 report(
                     install,
                     INSTALLMESSAGE_INFO,
