@@ -30,6 +30,8 @@ use winapi::{
 };
 
 mod restore_layout;
+mod session;
+use session::Session;
 
 pub(super) const PRIVACY_MODE_IMPL: &str = super::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY;
 
@@ -165,7 +167,7 @@ impl std::fmt::Display for PrivacyDisplayCleanup {
 
 pub struct PrivacyModeImpl {
     impl_key: String,
-    conn_id: i32,
+    session: Session,
     displays: Vec<Display>,
     virtual_displays: Vec<Display>,
     virtual_displays_added: Vec<u32>,
@@ -194,9 +196,9 @@ impl<'a> DerefMut for TurnOnGuard<'a> {
 impl<'a> Drop for TurnOnGuard<'a> {
     fn drop(&mut self) {
         if !self.succeeded {
-            self.privacy_mode
-                .turn_off_privacy(INVALID_PRIVACY_MODE_CONN_ID, None)
-                .ok();
+            allow_err!(self
+                .privacy_mode
+                .turn_off_privacy(INVALID_PRIVACY_MODE_CONN_ID, None));
         }
     }
 }
@@ -205,7 +207,7 @@ impl PrivacyModeImpl {
     pub fn new(impl_key: &str) -> Self {
         Self {
             impl_key: impl_key.to_owned(),
-            conn_id: INVALID_PRIVACY_MODE_CONN_ID,
+            session: Session::Off,
             displays: Vec::new(),
             virtual_displays: Vec::new(),
             virtual_displays_added: Vec::new(),
@@ -619,7 +621,7 @@ impl PrivacyMode for PrivacyModeImpl {
     }
 
     fn clear(&mut self) {
-        allow_err!(self.turn_off_privacy(self.conn_id, None));
+        allow_err!(self.turn_off_privacy(self.session.owner(), None));
     }
 
     fn turn_on_privacy(&mut self, conn_id: i32) -> ResultType<bool> {
@@ -630,9 +632,6 @@ impl PrivacyMode for PrivacyModeImpl {
         if self.check_on_conn_id(conn_id)? {
             log::debug!("Privacy mode of conn {} is already on", conn_id);
             return Ok(true);
-        }
-        if self.saved_layout.is_some() {
-            self.restore()?;
         }
         self.set_displays();
         if self.displays.is_empty() {
@@ -660,6 +659,7 @@ impl PrivacyMode for PrivacyModeImpl {
         let reg_connectivity_1 = reg_display_settings::read_reg_connectivity()?;
         if !virtual_display_manager::is_amyuni_idd() {
             guard.saved_layout = Some(restore_layout::RestoreLayout::capture(&guard.displays)?);
+            guard.session = Session::Restoring(conn_id);
         }
         let primary_display_name = guard.set_primary_display()?;
         guard.disable_physical_displays()?;
@@ -685,11 +685,13 @@ impl PrivacyMode for PrivacyModeImpl {
 
         check_current_displays()?;
 
-        // OpenInputDesktop and block the others' input ?
-        guard.conn_id = conn_id;
+        if virtual_display_manager::is_amyuni_idd() {
+            allow_err!(super::win_input::hook());
+        } else {
+            super::win_input::hook()?;
+        }
+        guard.session = Session::Active(conn_id);
         guard.succeeded = true;
-
-        allow_err!(super::win_input::hook());
 
         Ok(true)
     }
@@ -700,6 +702,10 @@ impl PrivacyMode for PrivacyModeImpl {
         state: Option<PrivacyModeState>,
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
+        let owner = self.session.owner();
+        if !virtual_display_manager::is_amyuni_idd() && owner != INVALID_PRIVACY_MODE_CONN_ID {
+            self.session = Session::Restoring(owner);
+        }
         let local_override = conn_id == INVALID_PRIVACY_MODE_CONN_ID
             && matches!(state, Some(PrivacyModeState::OffByPeer));
         let release_input_first = virtual_display_manager::is_amyuni_idd() || local_override;
@@ -710,11 +716,11 @@ impl PrivacyMode for PrivacyModeImpl {
         let cleanup = self.restore();
         if let Err(error) = &cleanup {
             if !error.is::<PrivacyDisplayCleanup>() {
-                if local_override && self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
+                if local_override && owner != INVALID_PRIVACY_MODE_CONN_ID {
                     let connections = crate::server::AUTHED_CONNS.lock().unwrap();
                     allow_err!(notify_privacy_mode_exit(
                         connections.iter().map(|c| (c.conn_id, &c.sender)),
-                        self.conn_id
+                        owner
                     ));
                 }
                 return cleanup;
@@ -727,7 +733,7 @@ impl PrivacyMode for PrivacyModeImpl {
         // This is because the registry connection may be changed by `self.restore()`, but will not be fully restored.
         restore_reg_connectivity(false, true);
 
-        if self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
+        if owner != INVALID_PRIVACY_MODE_CONN_ID {
             if let Some(state) = state {
                 allow_err!(super::set_privacy_mode_state(
                     conn_id,
@@ -736,7 +742,7 @@ impl PrivacyMode for PrivacyModeImpl {
                     1_000
                 ));
             }
-            self.conn_id = INVALID_PRIVACY_MODE_CONN_ID.to_owned();
+            self.session = Session::Off;
         }
 
         cleanup
@@ -744,7 +750,11 @@ impl PrivacyMode for PrivacyModeImpl {
 
     #[inline]
     fn pre_conn_id(&self) -> i32 {
-        self.conn_id
+        self.session.owner()
+    }
+
+    fn check_on_conn_id(&self, conn_id: i32) -> ResultType<bool> {
+        self.session.check_on(conn_id)
     }
 
     #[inline]
@@ -755,8 +765,8 @@ impl PrivacyMode for PrivacyModeImpl {
 
 impl Drop for PrivacyModeImpl {
     fn drop(&mut self) {
-        if self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
-            allow_err!(self.turn_off_privacy(self.conn_id, None));
+        if self.session.owner() != INVALID_PRIVACY_MODE_CONN_ID {
+            self.clear();
         }
     }
 }
