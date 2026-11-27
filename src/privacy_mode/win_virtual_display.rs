@@ -517,9 +517,17 @@ impl PrivacyModeImpl {
     }
 
     fn restore(&mut self) -> ResultType<()> {
-        Self::restore_displays(&self.displays);
-        Self::restore_displays(&self.virtual_displays);
-        allow_err!(Self::commit_change_display(0));
+        let physical = Self::restore_displays(&self.displays);
+        let virtuals = Self::restore_displays(&self.virtual_displays);
+        let commit = Self::commit_change_display(0);
+        if !virtual_display_manager::is_amyuni_idd() {
+            physical?;
+            commit?;
+        } else {
+            allow_err!(physical);
+            allow_err!(commit);
+        }
+        allow_err!(virtuals);
         self.displays.clear();
         self.virtual_displays.clear();
         if !virtual_display_manager::is_amyuni_idd() {
@@ -549,7 +557,8 @@ impl PrivacyModeImpl {
         Ok(())
     }
 
-    fn restore_displays(displays: &[Display]) {
+    fn restore_displays(displays: &[Display]) -> ResultType<()> {
+        let mut result = Ok(());
         for display in displays {
             unsafe {
                 let mut dm = display.dm.clone();
@@ -558,15 +567,23 @@ impl PrivacyModeImpl {
                 } else {
                     CDS_NORESET | CDS_UPDATEREGISTRY
                 };
-                ChangeDisplaySettingsExW(
+                let rc = ChangeDisplaySettingsExW(
                     display.name.as_ptr(),
                     &mut dm,
                     std::ptr::null_mut(),
                     flags,
                     std::ptr::null_mut(),
                 );
+                if rc != DISP_CHANGE_SUCCESSFUL && result.is_ok() {
+                    result = Err(hbb_common::anyhow::anyhow!(
+                        "Failed to restore display {}: {}",
+                        String::from_utf16_lossy(&display.name).trim_end_matches('\0'),
+                        Self::change_display_settings_ex_err_msg(rc)
+                    ));
+                }
             }
         }
+        result
     }
 }
 
@@ -664,6 +681,11 @@ impl PrivacyMode for PrivacyModeImpl {
         super::win_input::unhook()?;
         let _tmp_ignore_changed_holder = crate::display_service::temp_ignore_displays_changed();
         let cleanup = self.restore();
+        if let Err(error) = &cleanup {
+            if !error.is::<PrivacyDisplayCleanup>() {
+                return cleanup;
+            }
+        }
         // We need to force restore the registry connectivity.
         // This is because the registry connection may be changed by `self.restore()`, but will not be fully restored.
         restore_reg_connectivity(false, true);
