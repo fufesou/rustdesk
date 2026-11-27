@@ -3,7 +3,10 @@ use crate::virtual_display_manager::rustdesk_idd::display_target::{
     configuration, path_target, source_name, Configuration, Target,
 };
 use hbb_common::{anyhow::Context, bail, ResultType};
-use winapi::um::wingdi::DISPLAYCONFIG_PATH_ACTIVE;
+use winapi::{
+    shared::winerror::{ERROR_BAD_CONFIGURATION, ERROR_INVALID_PARAMETER},
+    um::wingdi::DISPLAYCONFIG_PATH_ACTIVE,
+};
 use windows::Win32::Devices::Display::{
     SetDisplayConfig, DISPLAYCONFIG_PATH_INFO, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
     SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
@@ -42,7 +45,7 @@ impl RestoreLayout {
         Ok(Self { saved, physical })
     }
 
-    pub(super) fn restore(&self) -> ResultType<()> {
+    fn connected_paths(&self) -> ResultType<Vec<DISPLAYCONFIG_PATH_INFO>> {
         let (available, _) = configuration(QDC_ALL_PATHS)?
             .context("Display topology changed while restoring privacy mode")?;
         let available: Vec<_> = available
@@ -56,7 +59,11 @@ impl RestoreLayout {
         }) {
             bail!("No physical display is connected; keeping the privacy display");
         }
-        self.apply(&available)?;
+        Ok(available)
+    }
+
+    pub(super) fn restore(&self) -> ResultType<()> {
+        self.apply(&self.connected_paths()?)?;
         let (current, _) = configuration(QDC_ALL_PATHS)?
             .context("Display topology changed after restoring privacy mode")?;
         if !connected_targets_restored(&self.physical, &current)
@@ -69,9 +76,9 @@ impl RestoreLayout {
 
     fn apply(&self, available: &[DISPLAYCONFIG_PATH_INFO]) -> ResultType<()> {
         let (saved, modes) = &self.saved;
-        let status = if paths_still_available(saved, available) {
+        let topology = if paths_still_available(saved, available) {
             // CCD restores the original source-to-target associations even if GDI names changed.
-            unsafe {
+            let status = unsafe {
                 SetDisplayConfig(
                     Some(saved),
                     Some(modes),
@@ -80,21 +87,45 @@ impl RestoreLayout {
                         | SDC_SAVE_TO_DATABASE
                         | SDC_ALLOW_CHANGES,
                 )
+            };
+            if saved_layout_applied(status)? {
+                return Ok(());
             }
+            connected_topology(&self.connected_paths()?)
         } else {
             hbb_common::throttled_log!(
                 super::STATE_CHECK_LOG_INTERVAL,
                 info,
                 "The saved display paths changed; Windows will arrange the connected displays"
             );
-            unsafe { SetDisplayConfig(None, None, SDC_APPLY | connected_topology(available)) }
+            connected_topology(available)
         };
+        let status = unsafe { SetDisplayConfig(None, None, SDC_APPLY | topology) };
         if status != 0 {
             return Err(std::io::Error::from_raw_os_error(status))
                 .context("Restore the physical desktop");
         }
         Ok(())
     }
+}
+
+fn saved_layout_applied(status: i32) -> ResultType<bool> {
+    if status == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::from_raw_os_error(status);
+    if matches!(
+        status as u32,
+        ERROR_BAD_CONFIGURATION | ERROR_INVALID_PARAMETER
+    ) {
+        hbb_common::throttled_log!(
+            super::STATE_CHECK_LOG_INTERVAL,
+            warn,
+            "Windows rejected the saved display configuration ({error}); arranging the connected displays"
+        );
+        return Ok(false);
+    }
+    Err(error).context("Restore the physical desktop")
 }
 
 fn connected_targets_restored(saved: &[Target], current: &[DISPLAYCONFIG_PATH_INFO]) -> bool {
@@ -134,6 +165,20 @@ fn paths_still_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_restore_rearranges_rejected_modes_and_propagates_access_errors() {
+        use winapi::shared::winerror::ERROR_ACCESS_DENIED;
+
+        assert!(saved_layout_applied(0).unwrap());
+        assert!(!saved_layout_applied(ERROR_BAD_CONFIGURATION as i32).unwrap());
+        assert!(!saved_layout_applied(ERROR_INVALID_PARAMETER as i32).unwrap());
+        let error = saved_layout_applied(ERROR_ACCESS_DENIED as i32).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn privacy_restore_accepts_an_unplugged_monitor_but_requires_a_connected_one() {
