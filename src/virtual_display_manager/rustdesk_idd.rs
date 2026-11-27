@@ -52,6 +52,16 @@ fn install_driver(force: bool) -> ResultType<()> {
 }
 
 impl Manager {
+    fn still_attached_to(&self, current: &Self) -> Vec<u32> {
+        self.monitors
+            .iter()
+            .filter_map(|(index, old)| {
+                let monitor = current.monitors.get(index)?;
+                Arc::ptr_eq(&monitor.profile, &old.profile).then_some(*index)
+            })
+            .collect()
+    }
+
     fn peer_slots_changed(&self, next: &Self) -> bool {
         PEER_INDICES
             .into_iter()
@@ -178,6 +188,23 @@ pub fn reset_all() -> ResultType<()> {
         let indices: Vec<_> = manager.monitors.keys().copied().collect();
         manager.detach(&indices)
     })
+}
+
+#[derive(Default)]
+pub(crate) struct DisconnectedDisplays(Option<Manager>);
+
+impl DisconnectedDisplays {
+    pub(crate) fn remember(&mut self) {
+        self.0
+            .get_or_insert_with(|| update(|manager| manager.clone()));
+    }
+
+    pub(crate) fn detach(&mut self) -> ResultType<()> {
+        update(|manager| {
+            let snapshot = self.0.get_or_insert_with(|| manager.clone());
+            manager.detach(&snapshot.still_attached_to(manager))
+        })
+    }
 }
 
 pub(crate) fn resolution_targets() -> BTreeMap<String, Monitor> {

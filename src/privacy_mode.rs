@@ -4,6 +4,7 @@ use crate::{
     display_service,
     ipc::{connect, Data},
     platform::is_installed,
+    virtual_display_manager::rustdesk_idd::DisconnectedDisplays,
 };
 #[cfg(windows)]
 use hbb_common::tokio;
@@ -223,27 +224,43 @@ fn restore_rustdesk_privacy(mode: &mut dyn PrivacyMode) -> Option<ResultType<()>
 }
 
 #[cfg(windows)]
+static DISCONNECT_RETRY: Mutex<Option<(i32, DisconnectedDisplays)>> = Mutex::new(None);
+
+#[cfg(windows)]
 pub(crate) fn reset_after_disconnect(conn_id: i32) -> ResultType<()> {
     if crate::virtual_display_manager::is_amyuni_idd() {
         return crate::virtual_display_manager::reset_all();
     }
-    let result = reset_disconnected_displays(conn_id, false);
-    if result.is_err() && get_privacy_mode_conn_id() == Some(conn_id) {
+    let mut pending = DISCONNECT_RETRY.lock().unwrap();
+    let mut displays = DisconnectedDisplays::default();
+    let result = reset_disconnected_displays(conn_id, &mut displays);
+    if result.is_err() && pending.replace((conn_id, displays)).is_none() {
         // The display service stops polling when the last subscriber disconnects.
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("privacy-display-restore".into())
-            .spawn(move || retry_disconnected_displays(conn_id))?;
+            .spawn(retry_disconnected_displays)
+        {
+            *pending = None;
+            return Err(error.into());
+        }
     }
     result
 }
 
 #[cfg(windows)]
-fn retry_disconnected_displays(conn_id: i32) {
+fn retry_disconnected_displays() {
     const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     loop {
         std::thread::sleep(RETRY_INTERVAL);
-        match reset_disconnected_displays(conn_id, true) {
-            Ok(()) => return,
+        let mut pending = DISCONNECT_RETRY.lock().unwrap();
+        let Some((conn_id, displays)) = pending.as_mut() else {
+            return;
+        };
+        match reset_disconnected_displays(*conn_id, displays) {
+            Ok(()) => {
+                *pending = None;
+                return;
+            }
             Err(error) => hbb_common::throttled_log!(
                 std::time::Duration::from_secs(60),
                 error,
@@ -254,11 +271,11 @@ fn retry_disconnected_displays(conn_id: i32) {
 }
 
 #[cfg(windows)]
-fn reset_disconnected_displays(conn_id: i32, retry_owner_only: bool) -> ResultType<()> {
+fn reset_disconnected_displays(
+    conn_id: i32,
+    displays: &mut DisconnectedDisplays,
+) -> ResultType<()> {
     let mut privacy = PRIVACY_MODE.lock().unwrap();
-    if retry_owner_only && privacy.as_ref().map(|mode| mode.pre_conn_id()) != Some(conn_id) {
-        return Ok(());
-    }
     if let Some(mode) = privacy.as_deref_mut() {
         let owner = mode.pre_conn_id();
         if owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id {
@@ -275,7 +292,9 @@ fn reset_disconnected_displays(conn_id: i32, retry_owner_only: bool) -> ResultTy
             }
             if let Some(Err(error)) = restore_rustdesk_privacy(mode) {
                 // The remote owner is gone. Keep the local operator's keyboard available for recovery.
-                if let Err(unhook) = win_input::unhook() {
+                let unhook = win_input::unhook();
+                displays.remember();
+                if let Err(unhook) = unhook {
                     return Err(error.context(format!("Cannot release local input: {unhook:#}")));
                 }
                 return Err(error);
@@ -290,7 +309,7 @@ fn reset_disconnected_displays(conn_id: i32, retry_owner_only: bool) -> ResultTy
     {
         return Ok(());
     }
-    crate::virtual_display_manager::reset_all()
+    displays.detach()
 }
 
 fn get_supported_impl(impl_key: &str) -> String {

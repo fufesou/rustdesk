@@ -26,3 +26,17 @@ fn disconnect_retries_failed_monitors_and_releases_the_others() {
     detach_monitors(&mut monitors, &[1], |_| Ok(())).unwrap();
     assert!(monitors.is_empty());
 }
+
+#[test]
+fn disconnect_retry_leaves_replacements_and_new_displays_connected() {
+    let monitor = |index| Monitor {
+        profile: Arc::new(Profile::new(index)),
+    };
+    let mut current = Manager::default();
+    current.monitors.insert(1, monitor(1));
+    current.monitors.insert(2, monitor(2));
+    let disconnected = current.clone();
+    current.monitors.insert(1, monitor(1));
+    current.monitors.insert(3, monitor(3));
+    assert_eq!(disconnected.still_attached_to(&current), [2]);
+}
