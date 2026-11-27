@@ -3,6 +3,7 @@ mod peer;
 pub(crate) mod privacy;
 mod profile;
 
+pub use peer::plug_in_peer_request;
 pub(crate) use peer::plug_out_monitor;
 
 use hbb_common::{
@@ -65,6 +66,10 @@ fn install_driver(force: bool) -> ResultType<()> {
 }
 
 impl Manager {
+    fn peer_indices(&self) -> Vec<u32> {
+        self.monitors.range(PEER_INDICES).map(|(&i, _)| i).collect()
+    }
+
     fn plug_in(&mut self, index: u32, modes: &[MonitorMode]) -> ResultType<()> {
         install_driver(false)?;
         if let Some(monitor) = self.monitors.get_mut(&index) {
@@ -110,6 +115,16 @@ impl Manager {
     }
 }
 
+fn update<R>(operation: impl FnOnce(&mut Manager) -> R) -> R {
+    let mut manager = MANAGER.lock().unwrap();
+    let before = manager.peer_indices();
+    let result = operation(&mut manager);
+    if before != manager.peer_indices() {
+        crate::server::display_service::virtual_display_slots_changed();
+    }
+    result
+}
+
 fn detach_monitors<T>(
     monitors: &mut BTreeMap<u32, T>,
     indices: &[u32],
@@ -140,7 +155,7 @@ pub fn install_update_driver() -> ResultType<()> {
 }
 
 pub fn plug_in_headless() -> ResultType<()> {
-    MANAGER.lock().unwrap().plug_in(HEADLESS, &[])
+    update(|m| m.plug_in(HEADLESS, &[]))
 }
 
 pub fn get_virtual_displays() -> Vec<u32> {
@@ -149,7 +164,7 @@ pub fn get_virtual_displays() -> Vec<u32> {
         .unwrap()
         .monitors
         .range(PEER_INDICES)
-        .map(|(i, _)| *i)
+        .filter_map(|(&i, m)| (!m.profile.no_longer_attached()).then_some(i))
         .collect()
 }
 
@@ -161,27 +176,7 @@ pub fn plug_in_index_modes(index: u32, modes: Vec<MonitorMode>) -> ResultType<()
     if !PEER_INDICES.contains(&index) {
         bail!("Invalid virtual display index {index}");
     }
-    MANAGER.lock().unwrap().plug_in(index, &modes)
-}
-
-pub fn plug_in_peer_request(modes: Vec<Vec<MonitorMode>>) -> ResultType<Vec<u32>> {
-    let mut manager = MANAGER.lock().unwrap();
-    let indices: Vec<_> = PEER_INDICES
-        .filter(|i| !manager.monitors.contains_key(i))
-        .take(modes.len())
-        .collect();
-    if indices.len() < modes.len() {
-        bail!("No free RustDesk IDD connector");
-    }
-    for (n, (index, modes)) in indices.iter().zip(&modes).enumerate() {
-        if let Err(error) = manager.plug_in(*index, modes) {
-            if let Err(cleanup) = manager.detach(&indices[..n]) {
-                bail!("{error:#}; rollback failed: {cleanup:#}");
-            }
-            return Err(error);
-        }
-    }
-    Ok(indices)
+    update(|m| m.plug_in(index, &modes))
 }
 
 pub fn plug_out_peer_request(indices: &[u32]) -> ResultType<()> {
@@ -191,13 +186,14 @@ pub fn plug_out_peer_request(indices: &[u32]) -> ResultType<()> {
     {
         bail!("Invalid virtual display index {index}");
     }
-    MANAGER.lock().unwrap().detach(indices)
+    update(|m| m.detach(indices))
 }
 
 pub fn reset_all() -> ResultType<()> {
-    let mut manager = MANAGER.lock().unwrap();
-    let indices: Vec<_> = manager.monitors.keys().copied().collect();
-    manager.detach(&indices)
+    update(|manager| {
+        let indices: Vec<_> = manager.monitors.keys().copied().collect();
+        manager.detach(&indices)
+    })
 }
 
 pub fn is_virtual_display(name: &str) -> bool {
@@ -216,7 +212,15 @@ pub(crate) fn change_resolution_if_is_virtual_display(
     privacy_active: bool,
 ) -> ResultType<bool> {
     let requested_name = name.trim_end_matches('\0');
-    let mut manager = MANAGER.lock().unwrap();
+    update(|manager| change_resolution(manager, requested_name, (w, h), privacy_active))
+}
+
+fn change_resolution(
+    manager: &mut Manager,
+    requested_name: &str,
+    (w, h): (u32, u32),
+    privacy_active: bool,
+) -> ResultType<bool> {
     let Some((index, monitor)) = manager
         .monitors
         .iter_mut()

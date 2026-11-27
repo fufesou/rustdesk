@@ -524,6 +524,11 @@ impl SyncDisplaysInfo {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn virtual_display_slots_changed() {
+    SYNC_DISPLAYS.lock().unwrap().is_synced = false;
+}
+
 pub fn temp_ignore_displays_changed() -> SimpleCallOnReturn {
     TEMP_IGNORE_DISPLAYS_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
     SimpleCallOnReturn {

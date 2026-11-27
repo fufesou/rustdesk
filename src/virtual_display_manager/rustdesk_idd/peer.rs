@@ -1,8 +1,36 @@
-use super::{display_target, profile, MANAGER, PEER_INDICES};
+use super::{display_target, profile, update, Manager, PEER_INDICES};
 use hbb_common::{anyhow::Context, bail, ResultType};
+use virtual_display::MonitorMode;
+
+pub fn plug_in_peer_request(modes: Vec<Vec<MonitorMode>>) -> ResultType<Vec<u32>> {
+    update(|manager| {
+        manager.monitors.retain(|i, m| {
+            !PEER_INDICES.contains(i) || !m.profile.no_longer_attached()
+        });
+        let indices: Vec<_> = PEER_INDICES
+            .filter(|i| !manager.monitors.contains_key(i))
+            .take(modes.len())
+            .collect();
+        if indices.len() < modes.len() {
+            bail!("No free RustDesk IDD connector");
+        }
+        for (n, (index, modes)) in indices.iter().zip(&modes).enumerate() {
+            if let Err(error) = manager.plug_in(*index, modes) {
+                if let Err(cleanup) = manager.detach(&indices[..n]) {
+                    bail!("{error:#}; rollback failed: {cleanup:#}");
+                }
+                return Err(error);
+            }
+        }
+        Ok(indices)
+    })
+}
 
 pub(crate) fn plug_out_monitor(index: i32, force: bool) -> ResultType<()> {
-    let mut manager = MANAGER.lock().unwrap();
+    update(|manager| unplug(manager, index, force))
+}
+
+fn unplug(manager: &mut Manager, index: i32, force: bool) -> ResultType<()> {
     let indices: Vec<u32> =
         if index == super::super::IDD_PLUG_OUT_ALL_INDEX || (index == 0 && !force) {
             manager
