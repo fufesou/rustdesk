@@ -35,6 +35,7 @@ impl PreparedMonitor {
             bail!(crate::privacy_mode::NO_PHYSICAL_DISPLAYS);
         }
         install_driver(false)?;
+        super::plug_out_peer_request(&[CONNECTOR])?;
         let profile = Profile::new(CONNECTOR).attach(&[DEFAULT_MODE], &cancelled)?;
         let name = profile.wait_for_source_while(None, cancelled);
         let prepared = Self {
