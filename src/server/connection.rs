@@ -4949,11 +4949,24 @@ impl Connection {
                 });
                 return;
             }
-            let Some(display) = display_service::get_display_info(display_idx) else {
+            use display_service::ResolutionTarget;
+            let Some(target) = display_service::resolution_target(display_idx) else {
                 return;
             };
             let change = self.display_jobs.resolution_request(move |control| {
-                Self::apply_display_resolution(display_idx, size, Some((&display.name, control)))
+                let result = match target {
+                    ResolutionTarget::Virtual(target) => {
+                        virtual_display_manager::rustdesk_idd::change_resolution(
+                            target,
+                            (size.0 as _, size.1 as _),
+                            control,
+                        )
+                    }
+                    ResolutionTarget::Physical(name) => {
+                        Self::apply_display_resolution(display_idx, size, Some((&name, control)))
+                    }
+                };
+                result
                     .map_err(|error| error.context(format!("Failed to set {}x{}", size.0, size.1)))
             });
             self.dispatch_display(change);
@@ -4996,13 +5009,11 @@ impl Connection {
         let name = display.name();
         #[cfg(windows)]
         if let Some((_, control)) = requested_display {
-            if virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
-                &name,
-                (width as _, height as _),
-                control,
-            )? || !control.is_allowed()
-            {
+            if !control.is_allowed() {
                 return Ok(());
+            }
+            if virtual_display_manager::rustdesk_idd::is_driver_display(&name) {
+                bail!("The virtual display changed before applying its resolution");
             }
         }
         #[allow(unused_mut)]

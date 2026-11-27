@@ -195,20 +195,10 @@ pub(crate) fn resolution_targets() -> BTreeMap<String, Monitor> {
         .collect()
 }
 
-pub fn is_virtual_display(name: &str) -> bool {
-    resolution_targets().contains_key(name.trim_end_matches('\0'))
-}
-
-pub(crate) fn change_resolution_if_is_virtual_display(
-    name: &str,
-    size: (u32, u32),
-    control: &ResolutionControl,
-) -> ResultType<bool> {
-    let Some(target) = resolution_targets().remove(name.trim_end_matches('\0')) else {
-        return Ok(false);
-    };
-    change_resolution(target, size, control)?;
-    Ok(true)
+pub(crate) fn is_driver_display(name: &str) -> bool {
+    super::windows::get_device_names(Some(super::RUSTDESK_IDD_DEVICE_STRING))
+        .iter()
+        .any(|source| source.trim_end_matches('\0') == name.trim_end_matches('\0'))
 }
 
 pub(crate) struct ResolutionControl {

@@ -3,7 +3,7 @@ use crate::common::SimpleCallOnReturn;
 #[cfg(target_os = "linux")]
 use crate::platform::linux::is_x11;
 #[cfg(windows)]
-use crate::virtual_display_manager;
+use crate::virtual_display_manager::{self, rustdesk_idd};
 #[cfg(windows)]
 use hbb_common::get_version_number;
 use hbb_common::protobuf::MessageField;
@@ -500,6 +500,8 @@ static TEMP_IGNORE_DISPLAYS_CHANGED: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 struct SyncDisplaysInfo {
     displays: Vec<DisplayInfo>,
+    #[cfg(windows)]
+    resolution_targets: std::collections::BTreeMap<String, rustdesk_idd::Monitor>,
     is_synced: bool,
 }
 
@@ -746,18 +748,7 @@ pub(super) fn get_original_resolution(
     w: usize,
     h: usize,
 ) -> MessageField<Resolution> {
-    #[cfg(windows)]
-    let is_rustdesk_virtual_display =
-        crate::virtual_display_manager::rustdesk_idd::is_virtual_display(&display_name);
-    #[cfg(not(windows))]
-    let is_rustdesk_virtual_display = false;
-    Some(if is_rustdesk_virtual_display {
-        Resolution {
-            width: 0,
-            height: 0,
-            ..Default::default()
-        }
-    } else {
+    Some({
         let changed_resolutions = CHANGED_RESOLUTIONS.write().unwrap();
         let (width, height) = match changed_resolutions.get(display_name) {
             Some(res) => {
@@ -791,6 +782,24 @@ pub(super) fn get_sync_displays() -> Vec<DisplayInfo> {
 
 pub(super) fn get_display_info(idx: usize) -> Option<DisplayInfo> {
     SYNC_DISPLAYS.lock().unwrap().displays.get(idx).cloned()
+}
+
+#[cfg(windows)]
+pub(super) enum ResolutionTarget {
+    Virtual(rustdesk_idd::Monitor),
+    Physical(String),
+}
+
+#[cfg(windows)]
+pub(super) fn resolution_target(idx: usize) -> Option<ResolutionTarget> {
+    let sync = SYNC_DISPLAYS.lock().unwrap();
+    let name = &sync.displays.get(idx)?.name;
+    Some(
+        match sync.resolution_targets.get(name.trim_end_matches('\0')) {
+            Some(monitor) => ResolutionTarget::Virtual(monitor.clone()),
+            None => ResolutionTarget::Physical(name.clone()),
+        },
+    )
 }
 
 // True when at least one advertised (synced) display is NOT served by the DRM/KMS capture path,
@@ -888,7 +897,24 @@ pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
             }
         })
         .collect::<Vec<DisplayInfo>>();
-    SYNC_DISPLAYS.lock().unwrap().check_changed(&displays);
+    #[cfg(windows)]
+    let targets = rustdesk_idd::resolution_targets();
+    #[cfg(windows)]
+    let displays = {
+        let mut displays = displays;
+        for display in &mut displays {
+            if targets.contains_key(display.name.trim_end_matches('\0')) {
+                display.original_resolution = Some(Resolution::default()).into();
+            }
+        }
+        displays
+    };
+    let mut sync = SYNC_DISPLAYS.lock().unwrap();
+    #[cfg(windows)]
+    {
+        sync.resolution_targets = targets;
+    }
+    sync.check_changed(&displays);
     displays
 }
 
