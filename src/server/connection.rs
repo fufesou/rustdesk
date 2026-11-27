@@ -7349,7 +7349,7 @@ mod raii {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 display_service::restore_resolutions();
                 #[cfg(windows)]
-                if let Err(error) = privacy_mode::reset_after_disconnect() {
+                if let Err(error) = privacy_mode::reset_after_disconnect(self.0) {
                     log::error!("Failed to disconnect virtual displays: {error:#}");
                 }
                 #[cfg(target_os = "linux")]

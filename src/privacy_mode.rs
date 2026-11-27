@@ -223,16 +223,28 @@ fn restore_rustdesk_privacy(mode: &mut dyn PrivacyMode) -> Option<ResultType<()>
 }
 
 #[cfg(windows)]
-pub(crate) fn reset_after_disconnect() -> ResultType<()> {
+pub(crate) fn reset_after_disconnect(conn_id: i32) -> ResultType<()> {
     if crate::virtual_display_manager::is_amyuni_idd() {
         return crate::virtual_display_manager::reset_all();
     }
     if let Some(mode) = PRIVACY_MODE.lock().unwrap().as_deref_mut() {
-        if mode.pre_conn_id() != INVALID_PRIVACY_MODE_CONN_ID {
+        let owner = mode.pre_conn_id();
+        if owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id {
+            return Ok(());
+        }
+        if owner == conn_id {
             if let Some(result) = restore_rustdesk_privacy(mode) {
                 result?;
             }
         }
+    }
+    if crate::server::AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.conn_type == crate::server::AuthConnType::Remote)
+    {
+        return Ok(());
     }
     crate::virtual_display_manager::reset_all()
 }
